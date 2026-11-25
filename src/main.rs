@@ -28,7 +28,7 @@ use nogml::{
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
-    storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store},
+    storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store_async},
     sync::{self, SyncRunOptions},
 };
 
@@ -66,13 +66,17 @@ struct Cli {
 
 #[derive(Debug, Clone, Args)]
 struct CommonConfigArgs {
-    /// Storage backend (`sqlite` or `memory`).
+    /// Storage backend (`sqlite`, `memory`, or `postgres`).
     #[arg(long, env = "NOGML_STORAGE", default_value = "sqlite", global = true)]
     storage: StorageBackend,
 
     /// SQLite database file path (when `--storage=sqlite`).
     #[arg(long, env = "NOGML_DB_PATH", default_value = "nogml.db", global = true)]
     db_path: PathBuf,
+
+    /// PostgreSQL connection URL (when `--storage=postgres`; requires `--features postgres`).
+    #[arg(long, env = "NOGML_DATABASE_URL", global = true)]
+    database_url: Option<String>,
 
     /// Blob storage backend (`inline`, `fs`, `memory`, or `s3`).
     #[arg(
@@ -879,6 +883,7 @@ impl CommonConfigArgs {
         let mut cfg = Config {
             storage: self.storage,
             db_path: self.db_path,
+            database_url: self.database_url,
             blob_backend: self.blob_backend,
             blob_dir: self.blob_dir,
             blob_s3_bucket: self.blob_s3_bucket,
@@ -1467,9 +1472,11 @@ async fn run(cli: Cli) -> AppResult<()> {
                 .watch_webhook_url
                 .as_deref()
                 .is_some_and(|u| !u.trim().is_empty());
-            let state = AppState::from_config(config)?;
+            let state = AppState::from_config_async(config).await?;
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let event_bridge_handle = state.spawn_event_bridge_listener(shutdown_rx.clone());
 
             let imap_handle = if has_imap {
                 let imap_state = state.clone();
@@ -1526,6 +1533,9 @@ async fn run(cli: Cli) -> AppResult<()> {
             if let Some(h) = watch_handle {
                 let _ = h.await;
             }
+            if let Some(h) = event_bridge_handle {
+                let _ = h.await;
+            }
 
             serve_res.map_err(|e| AppError::Internal(format!("HTTP server error: {e}")))?;
             Ok(())
@@ -1535,14 +1545,14 @@ async fn run(cli: Cli) -> AppResult<()> {
             // MCP stdio MUST keep stdout strictly clean for JSON-RPC frames.
             init_tracing(cli.log_json, true);
             let config = cli.common.into_config(None);
-            let state = AppState::from_config(config)?;
+            let state = AppState::from_config_async(config).await?;
             mcp::run_stdio(state).await
         }
 
         Command::Sync { provider } => {
             init_tracing(cli.log_json, true);
             let config = cli.common.into_config(None);
-            let state = AppState::from_config(config)?;
+            let state = AppState::from_config_async(config).await?;
             match provider {
                 SyncCommand::Gmail {
                     mode,
@@ -1577,7 +1587,7 @@ async fn run(cli: Cli) -> AppResult<()> {
             let config = cli.common.into_config(None);
             match action {
                 StorageCommand::MigrateBlobs { to } => {
-                    let store = open_store(&config)?;
+                    let store = open_store_async(&config).await?;
                     let source = open_blob_store(&config)?;
                     let mut target_config = config.clone();
                     target_config.blob_backend = to;
@@ -1592,7 +1602,7 @@ async fn run(cli: Cli) -> AppResult<()> {
         Command::Search { action } => {
             init_tracing(cli.log_json, true);
             let config = cli.common.into_config(None);
-            let state = AppState::from_config(config)?;
+            let state = AppState::from_config_async(config).await?;
             match action {
                 SearchCommand::Reindex => {
                     let report =
@@ -1629,7 +1639,7 @@ async fn run(cli: Cli) -> AppResult<()> {
             }
 
             let config = cli.common.into_config(None);
-            let state = AppState::from_config(config)?;
+            let state = AppState::from_config_async(config).await?;
 
             match action {
                 MailAction::Search {

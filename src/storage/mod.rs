@@ -4,6 +4,8 @@
 //! IMAP, Resend, and Sync modules depend solely on `Arc<dyn MailStore>`.
 
 pub mod memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod sqlite;
 
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth::Principal,
     config::{Config, StorageBackend},
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LabelColor, PopSettings,
         Profile, SendAs, ThreadSummary, VacationSettings,
@@ -24,6 +26,8 @@ use crate::{
 };
 
 pub use memory::MemoryStore;
+#[cfg(feature = "postgres")]
+pub use postgres::{PG_EVENTS_CHANNEL, PostgresEventBridge, PostgresStore};
 pub use sqlite::SqliteStore;
 
 // ============================================================================
@@ -729,7 +733,7 @@ pub trait MailStore: Send + Sync {
     ) -> AppResult<PendingApproval>;
 }
 
-/// Construct the configured `MailStore` implementation (`sqlite` or `memory`).
+/// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).
 pub fn open_store(config: &Config) -> AppResult<Arc<dyn MailStore>> {
     match config.storage {
         StorageBackend::Sqlite => {
@@ -737,5 +741,78 @@ pub fn open_store(config: &Config) -> AppResult<Arc<dyn MailStore>> {
             Ok(Arc::new(store))
         }
         StorageBackend::Memory => Ok(Arc::new(MemoryStore::new(&config.user_email))),
+        StorageBackend::Postgres => open_postgres_store_sync(config),
     }
+}
+
+/// Asynchronously construct and eagerly initialize the configured `MailStore` implementation.
+///
+/// For `StorageBackend::Postgres`, this eagerly connects, runs idempotent DDL schema creation,
+/// and seeds the default mailbox so startup fails fast on connectivity or configuration errors.
+pub async fn open_store_async(config: &Config) -> AppResult<Arc<dyn MailStore>> {
+    match config.storage {
+        StorageBackend::Postgres => open_postgres_store_async(config).await,
+        _ => open_store(config),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn require_database_url(config: &Config) -> AppResult<&str> {
+    config
+        .database_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Config(
+                "NOGML_DATABASE_URL / --database-url is required when NOGML_STORAGE=postgres"
+                    .to_string(),
+            )
+        })
+}
+
+#[cfg(feature = "postgres")]
+fn open_postgres_store_sync(config: &Config) -> AppResult<Arc<dyn MailStore>> {
+    let url = require_database_url(config)?;
+    let store = PostgresStore::from_url(url, &config.user_email)?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_store_sync(_config: &Config) -> AppResult<Arc<dyn MailStore>> {
+    Err(AppError::Config(
+        "Rebuild nogml with --features postgres to use the Postgres storage backend".to_string(),
+    ))
+}
+
+#[cfg(feature = "postgres")]
+async fn open_postgres_store_async(config: &Config) -> AppResult<Arc<dyn MailStore>> {
+    let url = require_database_url(config)?;
+    let store = PostgresStore::connect(url, &config.user_email).await?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn open_postgres_store_async(config: &Config) -> AppResult<Arc<dyn MailStore>> {
+    open_postgres_store_sync(config)
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) fn open_postgres_with_bridge_sync(
+    config: &Config,
+) -> AppResult<(Arc<dyn MailStore>, Arc<PostgresEventBridge>)> {
+    let url = require_database_url(config)?;
+    let store = PostgresStore::from_url(url, &config.user_email)?;
+    let bridge = Arc::new(store.event_bridge());
+    Ok((Arc::new(store), bridge))
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) async fn open_postgres_with_bridge_async(
+    config: &Config,
+) -> AppResult<(Arc<dyn MailStore>, Arc<PostgresEventBridge>)> {
+    let url = require_database_url(config)?;
+    let store = PostgresStore::connect(url, &config.user_email).await?;
+    let bridge = Arc::new(store.event_bridge());
+    Ok((Arc::new(store), bridge))
 }

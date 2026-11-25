@@ -204,6 +204,7 @@ async fn run_full_isolation_suite(storage: StorageBackend) {
             Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap())
         }
         StorageBackend::Memory => Arc::new(MemoryStore::new(&cfg.user_email)),
+        StorageBackend::Postgres => unreachable!("multi_mailbox_e2e runs sqlite and memory"),
     };
     let transport_calls = Arc::new(AtomicUsize::new(0));
     let state = AppState::with_backends(cfg, store.clone(), Arc::new(NoopResend))
@@ -837,6 +838,7 @@ async fn multi_mailbox_hybrid_vector_search_isolation() {
                 Arc::new(MemoryStore::new(ALICE)),
                 Arc::new(MemoryVectorStore::for_mailbox_new(ALICE)),
             ),
+            StorageBackend::Postgres => unreachable!("hybrid test runs sqlite and memory"),
         };
 
         let search = Arc::new(HybridSearchIndex::new(

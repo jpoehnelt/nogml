@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["email", "mcp", "ai-agent", "gmail-api", "imap"]
 categories = ["email", "web-programming::http-server", "command-line-utilities"]
 
+[features]
+default = []
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+
 [dependencies]
 # Async runtime & HTTP server
 axum = { version = "0.8", features = ["macros", "multipart"] }
@@ -32,6 +36,10 @@ url = "2"
 r2d2 = "0.8"
 r2d2_sqlite = { version = "0.37", features = ["bundled"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
+
+# Optional PostgreSQL persistence & LISTEN/NOTIFY event bridge (`--features postgres`)
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 
 # MIME parsing/building, encoding & webhook verification
 base64 = "0.22"
