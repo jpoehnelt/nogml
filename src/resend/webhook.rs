@@ -209,9 +209,57 @@ fn build_minimal_rfc2822_fallback(input: &ComposeEmailInput) -> Vec<u8> {
     out.into_bytes()
 }
 
+fn collect_resend_recipient_candidates(
+    event: &ResendWebhookEvent,
+    fetched: Option<&ResendReceivedEmail>,
+    raw_bytes: Option<&[u8]>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    candidates.extend(event.data.to.iter().cloned());
+    if let Some(ref cc) = event.data.cc {
+        candidates.extend(cc.iter().cloned());
+    }
+    if let Some(ref bcc) = event.data.bcc {
+        candidates.extend(bcc.iter().cloned());
+    }
+    if let Some(email) = fetched {
+        candidates.extend(email.to.iter().cloned());
+        candidates.extend(email.cc.iter().cloned());
+        candidates.extend(email.bcc.iter().cloned());
+        for hdr in [
+            "delivered-to",
+            "x-original-to",
+            "envelope-to",
+            "to",
+            "cc",
+            "bcc",
+        ] {
+            if let Some(val) = find_header_ci(&email.headers, hdr) {
+                candidates.push(val.to_string());
+            }
+        }
+    }
+    if let Some(raw) = raw_bytes
+        && let Ok(parsed) = crate::mime::parse_rfc2822(raw)
+    {
+        candidates.extend(parsed.to);
+        candidates.extend(parsed.cc);
+        candidates.extend(parsed.bcc);
+        for hdr in parsed.headers {
+            if matches!(
+                hdr.name.to_ascii_lowercase().as_str(),
+                "delivered-to" | "x-original-to" | "envelope-to"
+            ) {
+                candidates.push(hdr.value);
+            }
+        }
+    }
+    candidates
+}
+
 /// Ingest a Resend `email.received` webhook event, fetching full email content and attachments
 /// via the Resend Receiving API (gracefully falling back to webhook metadata on API failure)
-/// and delegating to [`ingest_inbound_rfc2822`].
+/// and delegating to [`ingest_inbound_rfc2822`] for each matching local mailbox.
 pub async fn handle_email_received(
     state: &AppState,
     event: &ResendWebhookEvent,
@@ -219,36 +267,52 @@ pub async fn handle_email_received(
 ) -> AppResult<Response> {
     let email_id = event.data.email_id.trim();
 
-    // Fast-path dedup before calling the Resend Receiving API.
-    if let Some(mid) = event
-        .data
-        .message_id
-        .as_deref()
-        .and_then(crate::mime::normalize_message_id)
-        && let Some(existing) = state.store.find_message_by_rfc_message_id(&mid).await?
+    // Fast-path dedup before calling the Resend Receiving API (only when single-mailbox or
+    // every pre-matched target mailbox already has the message).
+    let initial_candidates = collect_resend_recipient_candidates(event, None, None);
+    let initial_targets = state.config.resolve_inbound_mailboxes(&initial_candidates);
+    if !initial_targets.is_empty()
+        && (!state.config.has_explicit_mailbox_routing() || initial_targets.len() == 1)
     {
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "status": "duplicate",
-                "message_id": existing.id,
-                "thread_id": existing.thread_id,
-            })),
-        )
-            .into_response());
-    }
-    if !email_id.is_empty()
-        && let Some(existing) = state.store.find_message_by_resend_id(email_id).await?
-    {
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "status": "duplicate",
-                "message_id": existing.id,
-                "thread_id": existing.thread_id,
-            })),
-        )
-            .into_response());
+        let mut first_dup: Option<(String, String, String)> = None;
+        let mut all_dups = true;
+        let norm_mid = event
+            .data
+            .message_id
+            .as_deref()
+            .and_then(crate::mime::normalize_message_id);
+
+        for mb in &initial_targets {
+            let mb_store = state.for_mailbox(mb).store;
+            let mut found = None;
+            if let Some(ref mid) = norm_mid {
+                found = mb_store.find_message_by_rfc_message_id(mid).await?;
+            }
+            if found.is_none() && !email_id.is_empty() {
+                found = mb_store.find_message_by_resend_id(email_id).await?;
+            }
+            if let Some(existing) = found {
+                if first_dup.is_none() {
+                    first_dup = Some((mb.clone(), existing.id, existing.thread_id));
+                }
+            } else {
+                all_dups = false;
+                break;
+            }
+        }
+
+        if all_dups && let Some((mb, msg_id, thread_id)) = first_dup {
+            return Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "status": "duplicate",
+                    "mailbox_id": mb,
+                    "message_id": msg_id,
+                    "thread_id": thread_id,
+                })),
+            )
+                .into_response());
+        }
     }
 
     // Attempt to fetch the full received email from Resend Receiving API.
@@ -294,6 +358,27 @@ pub async fn handle_email_received(
                 }
             }
         }
+    }
+
+    // Resolve target local mailbox(es) from webhook + fetched metadata + raw RFC 2822 headers.
+    let recipient_candidates =
+        collect_resend_recipient_candidates(event, fetched.as_ref(), raw_rfc2822.as_deref());
+    let target_mailboxes = state
+        .config
+        .resolve_inbound_mailboxes(&recipient_candidates);
+    if target_mailboxes.is_empty() {
+        tracing::info!(
+            email_id = %email_id,
+            "Ignoring Resend inbound email with no matching local mailbox"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": "no_matching_local_mailbox",
+            })),
+        )
+            .into_response());
     }
 
     // Fetch & download attachments when raw RFC 2822 wasn't downloaded and attachments are indicated.
@@ -463,7 +548,7 @@ pub async fn handle_email_received(
         }
     };
 
-    let envelope = InboundEnvelope {
+    let base_envelope = InboundEnvelope {
         raw_rfc2822: raw_bytes,
         source: "resend_inbound".to_string(),
         provider_id: (!email_id.is_empty()).then(|| email_id.to_string()),
@@ -484,47 +569,159 @@ pub async fn handle_email_received(
         fallback_references: references_header,
     };
 
-    let outcome =
-        ingest_inbound_rfc2822(state.store.as_ref(), &state.events, filter, envelope).await?;
+    if target_mailboxes.len() == 1 {
+        let mb = &target_mailboxes[0];
+        let mb_state = state.for_mailbox(mb);
+        let outcome = ingest_inbound_rfc2822(
+            mb_state.store.as_ref(),
+            &mb_state.events,
+            filter,
+            base_envelope,
+        )
+        .await?;
 
-    match outcome {
-        IngestOutcome::Stored { message, decision } => {
-            state.post_store_message(&message).await?;
-            let filter_label = match decision {
-                FilterDecision::Allow => "allow",
-                FilterDecision::Spam { .. } => "spam",
-                FilterDecision::Reject { .. } => "reject",
-                FilterDecision::Mutate { .. } => "mutate",
-            };
-            Ok((
+        return match outcome {
+            IngestOutcome::Stored { message, decision } => {
+                mb_state.post_store_message(&message).await?;
+                let filter_label = match decision {
+                    FilterDecision::Allow => "allow",
+                    FilterDecision::Spam { .. } => "spam",
+                    FilterDecision::Reject { .. } => "reject",
+                    FilterDecision::Mutate { .. } => "mutate",
+                };
+                Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "received",
+                        "mailbox_id": mb,
+                        "message_id": message.id,
+                        "thread_id": message.thread_id,
+                        "labels": message.label_ids,
+                        "filter_decision": filter_label,
+                    })),
+                )
+                    .into_response())
+            }
+            IngestOutcome::Duplicate { message } => Ok((
                 StatusCode::OK,
                 Json(json!({
+                    "status": "duplicate",
+                    "mailbox_id": mb,
+                    "message_id": message.id,
+                    "thread_id": message.thread_id,
+                })),
+            )
+                .into_response()),
+            IngestOutcome::Rejected { reason } => Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "status": "rejected",
+                    "mailbox_id": mb,
+                    "reason": reason,
+                })),
+            )
+                .into_response()),
+        };
+    }
+
+    // Multiple local mailboxes matched (e.g. To: alice@example.com, Cc: bob@example.com).
+    let mut deliveries = Vec::with_capacity(target_mailboxes.len());
+    let mut first_received: Option<(String, String, Vec<String>, &'static str)> = None;
+    let mut any_received = false;
+    let mut any_duplicate = false;
+    let mut first_rejected: Option<String> = None;
+
+    for mb in &target_mailboxes {
+        let mb_state = state.for_mailbox(mb);
+        let outcome = ingest_inbound_rfc2822(
+            mb_state.store.as_ref(),
+            &mb_state.events,
+            filter,
+            base_envelope.clone(),
+        )
+        .await?;
+
+        match outcome {
+            IngestOutcome::Stored { message, decision } => {
+                mb_state.post_store_message(&message).await?;
+                let filter_label = match decision {
+                    FilterDecision::Allow => "allow",
+                    FilterDecision::Spam { .. } => "spam",
+                    FilterDecision::Reject { .. } => "reject",
+                    FilterDecision::Mutate { .. } => "mutate",
+                };
+                any_received = true;
+                if first_received.is_none() {
+                    first_received = Some((
+                        message.id.clone(),
+                        message.thread_id.clone(),
+                        message.label_ids.clone(),
+                        filter_label,
+                    ));
+                }
+                deliveries.push(json!({
+                    "mailbox_id": mb,
                     "status": "received",
                     "message_id": message.id,
                     "thread_id": message.thread_id,
                     "labels": message.label_ids,
                     "filter_decision": filter_label,
-                })),
-            )
-                .into_response())
+                }));
+            }
+            IngestOutcome::Duplicate { message } => {
+                any_duplicate = true;
+                deliveries.push(json!({
+                    "mailbox_id": mb,
+                    "status": "duplicate",
+                    "message_id": message.id,
+                    "thread_id": message.thread_id,
+                }));
+            }
+            IngestOutcome::Rejected { reason } => {
+                if first_rejected.is_none() {
+                    first_rejected = Some(reason.clone());
+                }
+                deliveries.push(json!({
+                    "mailbox_id": mb,
+                    "status": "rejected",
+                    "reason": reason,
+                }));
+            }
         }
-        IngestOutcome::Duplicate { message } => Ok((
+    }
+
+    if let Some((msg_id, thread_id, labels, filter_label)) = first_received {
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "received",
+                "message_id": msg_id,
+                "thread_id": thread_id,
+                "labels": labels,
+                "filter_decision": filter_label,
+                "deliveries": deliveries,
+            })),
+        )
+            .into_response())
+    } else if any_duplicate && !any_received {
+        Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "duplicate",
-                "message_id": message.id,
-                "thread_id": message.thread_id,
+                "deliveries": deliveries,
             })),
         )
-            .into_response()),
-        IngestOutcome::Rejected { reason } => Ok((
+            .into_response())
+    } else {
+        Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "rejected",
-                "reason": reason,
+                "reason": first_rejected.unwrap_or_else(|| "rejected".to_string()),
+                "deliveries": deliveries,
             })),
         )
-            .into_response()),
+            .into_response())
     }
 }
 
@@ -535,35 +732,38 @@ async fn handle_delivery_status(
 ) -> AppResult<Response> {
     let resend_id = event.data.email_id.trim();
     let detail = format_bounce_detail(event.data.bounce.as_ref());
-
-    let updated = if !resend_id.is_empty() {
-        state
-            .store
-            .record_delivery_status(resend_id, status)
-            .await?
-    } else {
-        None
-    };
-
-    let message_id = if let Some(msg) = updated {
-        msg.id
-    } else if let Some(mid) = event
+    let norm_mid = event
         .data
         .message_id
         .as_deref()
-        .and_then(crate::mime::normalize_message_id)
-    {
-        state
-            .store
-            .find_message_by_rfc_message_id(&mid)
-            .await?
-            .map(|m| m.id)
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+        .and_then(crate::mime::normalize_message_id);
 
-    state.events.publish(
+    let mut target_state: Option<AppState> = None;
+    let mut message_id = String::new();
+
+    for mb in state.config.known_mailboxes() {
+        let mb_state = state.for_mailbox(&mb);
+        if !resend_id.is_empty()
+            && let Some(msg) = mb_state
+                .store
+                .record_delivery_status(resend_id, status)
+                .await?
+        {
+            message_id = msg.id;
+            target_state = Some(mb_state);
+            break;
+        }
+        if let Some(ref mid) = norm_mid
+            && let Some(msg) = mb_state.store.find_message_by_rfc_message_id(mid).await?
+        {
+            message_id = msg.id;
+            target_state = Some(mb_state);
+            break;
+        }
+    }
+
+    let publish_state = target_state.as_ref().unwrap_or(state);
+    publish_state.events.publish(
         EventSource::ResendWebhook,
         MailEvent::DeliveryStatus {
             message_id: message_id.clone(),
@@ -623,10 +823,10 @@ mod tests {
     const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 
     /// Minimal self-contained in-memory `MailStore` for isolated `resend` unit tests.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct MockStore {
-        messages: Mutex<Vec<StoredMessage>>,
-        next_id: Mutex<u64>,
+        messages: Arc<Mutex<Vec<StoredMessage>>>,
+        next_id: Arc<Mutex<u64>>,
     }
 
     impl MockStore {
@@ -641,6 +841,12 @@ mod tests {
 
     #[async_trait]
     impl MailStore for MockStore {
+        fn mailbox_id(&self) -> &str {
+            "agent@example.com"
+        }
+        fn for_mailbox(&self, _mailbox_id: &str) -> Arc<dyn MailStore> {
+            Arc::new(self.clone())
+        }
         async fn get_profile(&self, _email_address: &str) -> AppResult<Profile> {
             unreachable!()
         }

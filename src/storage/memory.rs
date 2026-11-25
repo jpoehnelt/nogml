@@ -760,9 +760,11 @@ enum ResolvedMailbox {
     },
 }
 
-/// In-memory implementation of [`MailStore`].
+/// In-memory implementation of [`MailStore`], partitioned by normalized `mailbox_id`.
 #[derive(Clone)]
 pub struct MemoryStore {
+    mailbox_id: String,
+    mailboxes: Arc<RwLock<HashMap<String, Arc<RwLock<MemoryState>>>>>,
     state: Arc<RwLock<MemoryState>>,
 }
 
@@ -774,8 +776,14 @@ impl Default for MemoryStore {
 
 impl MemoryStore {
     pub fn new(default_email: &str) -> Self {
+        let mailbox_id = crate::config::normalize_mailbox_id(default_email);
+        let state = Arc::new(RwLock::new(MemoryState::new(&mailbox_id)));
+        let mut map = HashMap::new();
+        map.insert(mailbox_id.clone(), state.clone());
         Self {
-            state: Arc::new(RwLock::new(MemoryState::new(default_email))),
+            mailbox_id,
+            mailboxes: Arc::new(RwLock::new(map)),
+            state,
         }
     }
 
@@ -1054,6 +1062,32 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
 impl MailStore for MemoryStore {
     fn backend_name(&self) -> &'static str {
         "memory"
+    }
+
+    fn mailbox_id(&self) -> &str {
+        &self.mailbox_id
+    }
+
+    fn for_mailbox(&self, mailbox_id: &str) -> Arc<dyn MailStore> {
+        let normalized = crate::config::normalize_mailbox_id(mailbox_id);
+        let target = if normalized.is_empty() {
+            self.mailbox_id.clone()
+        } else {
+            normalized
+        };
+
+        let state = {
+            let mut map = self.mailboxes.write().unwrap_or_else(|e| e.into_inner());
+            map.entry(target.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(MemoryState::new(&target))))
+                .clone()
+        };
+
+        Arc::new(Self {
+            mailbox_id: target,
+            mailboxes: self.mailboxes.clone(),
+            state,
+        })
     }
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let state = self.read_state()?;

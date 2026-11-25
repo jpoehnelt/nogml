@@ -27,14 +27,74 @@ use crate::{
 
 pub use s3::{S3BlobConfig, S3BlobStore};
 
+/// Encode a normalized mailbox identifier into a collision-free, path-safe blob key segment
+/// consisting strictly of `[a-z0-9\-_.]` with no `..` sequences.
+pub fn sanitize_mailbox_segment(mailbox_id: &str) -> String {
+    let norm = crate::config::normalize_mailbox_id(mailbox_id);
+    if norm.is_empty() {
+        return "default".to_string();
+    }
+
+    let bytes = norm.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + 8);
+    for (idx, &b) in bytes.iter().enumerate() {
+        let next_is_dot = bytes.get(idx + 1) == Some(&b'.');
+        let prev_is_dot = idx > 0 && bytes[idx - 1] == b'.';
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' | b'-' => out.push(b as char),
+            b'.' if !next_is_dot && !prev_is_dot && idx > 0 && idx + 1 < bytes.len() => {
+                out.push('.');
+            }
+            other => {
+                out.push_str(&format!("_{other:02x}_"));
+            }
+        }
+    }
+
+    if out.len() > 200 || out.is_empty() {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(norm.as_bytes());
+        format!("mb_{:x}", digest)
+    } else {
+        out
+    }
+}
+
+/// Canonical blob prefix for a mailbox (`mailboxes/<sanitized_mailbox_id>`).
+pub fn mailbox_blob_prefix(mailbox_id: &str) -> String {
+    format!("mailboxes/{}", sanitize_mailbox_segment(mailbox_id))
+}
+
 /// Canonical blob key for a message's verbatim RFC 2822 bytes.
 pub fn raw_message_blob_key(message_id: &str) -> String {
     format!("messages/{message_id}/raw.eml")
 }
 
+/// Mailbox-prefixed blob key for a message's verbatim RFC 2822 bytes.
+pub fn mailbox_raw_message_blob_key(mailbox_id: &str, message_id: &str) -> String {
+    format!(
+        "{}/{}",
+        mailbox_blob_prefix(mailbox_id),
+        raw_message_blob_key(message_id)
+    )
+}
+
 /// Canonical blob key for an individual message attachment.
 pub fn attachment_blob_key(message_id: &str, attachment_id: &str) -> String {
     format!("attachments/{message_id}/{attachment_id}")
+}
+
+/// Mailbox-prefixed blob key for an individual message attachment.
+pub fn mailbox_attachment_blob_key(
+    mailbox_id: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        mailbox_blob_prefix(mailbox_id),
+        attachment_blob_key(message_id, attachment_id)
+    )
 }
 
 /// Validate and normalize a logical blob key into safe relative path segments,
@@ -107,6 +167,65 @@ pub trait BlobStore: Send + Sync {
 /// Returns `true` when `blobs` is an external blob store (anything other than `"inline"`).
 pub fn is_external_blob_store(blobs: &dyn BlobStore) -> bool {
     blobs.backend_name() != "inline"
+}
+
+/// Wrapper [`BlobStore`] that transparently prefixes every key with a fixed path prefix
+/// (such as `mailboxes/<sanitized_mailbox_id>`) so multiple mailboxes never collide on
+/// filesystem, in-memory, or S3/R2 object keys.
+#[derive(Clone)]
+pub struct PrefixedBlobStore {
+    inner: Arc<dyn BlobStore>,
+    prefix: String,
+}
+
+impl PrefixedBlobStore {
+    /// Wrap `inner` so every key is prefixed with `prefix` (trimmed of leading/trailing `/`).
+    pub fn new(inner: Arc<dyn BlobStore>, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into().trim_matches('/').to_string();
+        Self { inner, prefix }
+    }
+
+    /// Wrap `inner` scoped to `mailbox_id` (`mailboxes/<sanitized_mailbox_id>/...`).
+    pub fn for_mailbox(inner: Arc<dyn BlobStore>, mailbox_id: &str) -> Self {
+        Self::new(inner, mailbox_blob_prefix(mailbox_id))
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    fn prefixed_key(&self, key: &str) -> AppResult<String> {
+        let _ = sanitize_blob_key(key)?;
+        if self.prefix.is_empty() {
+            Ok(key.trim().to_string())
+        } else {
+            let combined = format!("{}/{}", self.prefix, key.trim());
+            let _ = sanitize_blob_key(&combined)?;
+            Ok(combined)
+        }
+    }
+}
+
+#[async_trait]
+impl BlobStore for PrefixedBlobStore {
+    async fn put(&self, key: &str, bytes: &[u8]) -> AppResult<()> {
+        let full = self.prefixed_key(key)?;
+        self.inner.put(&full, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> AppResult<Option<Vec<u8>>> {
+        let full = self.prefixed_key(key)?;
+        self.inner.get(&full).await
+    }
+
+    async fn delete(&self, key: &str) -> AppResult<()> {
+        let full = self.prefixed_key(key)?;
+        self.inner.delete(&full).await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
 }
 
 /// Default inline placeholder backend: raw RFC 2822 and attachment bytes are stored directly in `MailStore`.

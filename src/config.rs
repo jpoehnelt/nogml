@@ -5,6 +5,56 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::ScopedTokenConfig;
 
+/// Normalize a mailbox identifier (email address) by trimming whitespace and lowercasing ASCII.
+pub fn normalize_mailbox_id(mailbox_id: &str) -> String {
+    mailbox_id.trim().to_ascii_lowercase()
+}
+
+/// Extract normalized lowercase email addresses from raw header/recipient entries
+/// (supporting `"Display Name <user@example.com>"`, comma-separated address lists,
+/// angle-bracketed addresses, and bare email strings).
+pub fn extract_email_addresses(raw_entries: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_addr = |candidate: &str| {
+        let trimmed = candidate.trim().trim_matches(|c| c == '"' || c == '\'');
+        let email = if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>'))
+            && lt < gt
+        {
+            trimmed[lt + 1..gt].trim()
+        } else {
+            trimmed
+        };
+        let norm = normalize_mailbox_id(email);
+        if norm.contains('@') && !norm.contains(char::is_whitespace) && !out.contains(&norm) {
+            out.push(norm);
+        }
+    };
+
+    for entry in raw_entries {
+        // Split comma-separated lists while ignoring commas inside quotes.
+        let mut current = String::new();
+        let mut in_quotes = false;
+        for ch in entry.chars() {
+            match ch {
+                '"' => {
+                    in_quotes = !in_quotes;
+                    current.push(ch);
+                }
+                ',' if !in_quotes => {
+                    push_addr(&current);
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.is_empty() {
+            push_addr(&current);
+        }
+    }
+
+    out
+}
+
 /// Selectable storage backend behind `MailStore`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +194,9 @@ pub struct Config {
     pub oauth2_signing_secret: Option<String>,
     /// Primary mailbox email address (returned by `/profile` and used as default `From`).
     pub user_email: String,
+    /// Additional local mailbox email addresses hosted by this instance (`NOGML_MAILBOXES` / `--mailboxes`).
+    #[serde(default)]
+    pub mailboxes: Vec<String>,
     /// Default domain for generated Message-IDs and fallback sender addresses.
     pub default_domain: String,
 
@@ -293,6 +346,7 @@ impl Default for Config {
             oauth2_client_secret: None,
             oauth2_signing_secret: None,
             user_email: "me@localhost".to_string(),
+            mailboxes: Vec::new(),
             default_domain: "localhost".to_string(),
 
             transport: TransportBackend::Resend,
@@ -407,6 +461,59 @@ impl Config {
     /// Returns `true` when bearer token authentication is enforced.
     pub fn auth_required(&self) -> bool {
         !self.auth_tokens.is_empty() || !self.scoped_tokens.is_empty() || self.oauth2_enabled()
+    }
+
+    /// Return the deduplicated, normalized list of all local mailboxes known to this instance:
+    /// `user_email`, `mailboxes`, and any explicit `mailbox_id` entries in `scoped_tokens`.
+    pub fn known_mailboxes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push_unique = |raw: &str| {
+            let norm = normalize_mailbox_id(raw);
+            if !norm.is_empty() && !out.contains(&norm) {
+                out.push(norm);
+            }
+        };
+
+        push_unique(&self.user_email);
+        for mb in &self.mailboxes {
+            push_unique(mb);
+        }
+        for st in &self.scoped_tokens {
+            if let Some(ref mb) = st.mailbox_id {
+                push_unique(mb);
+            }
+        }
+        out
+    }
+
+    /// Returns `true` when more than one local mailbox is configured across `user_email`,
+    /// `mailboxes`, and `scoped_tokens`.
+    pub fn is_multi_mailbox(&self) -> bool {
+        self.known_mailboxes().len() > 1
+    }
+
+    /// Returns `true` when inbound webhooks should strictly route by recipient address
+    /// (true whenever `mailboxes` is non-empty or more than one mailbox is known).
+    pub fn has_explicit_mailbox_routing(&self) -> bool {
+        !self.mailboxes.is_empty() || self.is_multi_mailbox()
+    }
+
+    /// Resolve which local mailbox(es) should receive an inbound message addressed to
+    /// `recipient_candidates`.
+    ///
+    /// When multi-mailbox routing is active (`has_explicit_mailbox_routing()`), returns ONLY
+    /// matching local mailboxes from `known_mailboxes()` (empty if none match).
+    /// When running in default single-mailbox mode, falls back to `[normalize_mailbox_id(&user_email)]`.
+    pub fn resolve_inbound_mailboxes(&self, recipient_candidates: &[String]) -> Vec<String> {
+        let known = self.known_mailboxes();
+        if !self.has_explicit_mailbox_routing() {
+            return known;
+        }
+        let extracted = extract_email_addresses(recipient_candidates);
+        known
+            .into_iter()
+            .filter(|mb| extracted.iter().any(|rcpt| rcpt == mb))
+            .collect()
     }
 
     /// Returns `true` when any upstream Gmail sync credentials are configured.

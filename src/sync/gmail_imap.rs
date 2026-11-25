@@ -105,13 +105,18 @@ impl SyncSource for GmailImapSyncSource {
     }
 
     fn account_key(&self, config: &Config) -> String {
-        format!(
-            "gmail_imap:{}",
-            config
-                .gmail_imap_user
-                .as_deref()
-                .unwrap_or(&config.user_email)
-        )
+        let user = config
+            .gmail_imap_user
+            .as_deref()
+            .unwrap_or(&config.user_email);
+        if config.is_multi_mailbox() {
+            format!(
+                "gmail_imap:{}:{user}",
+                crate::config::normalize_mailbox_id(&config.user_email)
+            )
+        } else {
+            format!("gmail_imap:{user}")
+        }
     }
 
     async fn pull(

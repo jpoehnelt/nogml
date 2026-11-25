@@ -207,9 +207,28 @@ pub fn verify_jwt(token: &str, secret: &str, expected_typ: &str) -> AppResult<OA
     Ok(claims)
 }
 
-/// Mint a signed OAuth2 `access_token` JWT for `mailbox_id`.
+/// Mint a signed OAuth2 `access_token` JWT for `config.user_email`.
 pub fn mint_access_token(
     config: &Config,
+    scopes: Vec<AuthScope>,
+    scope_str: Option<String>,
+    agent_policy: Option<AgentPolicyOverride>,
+    ttl_secs: i64,
+) -> AppResult<String> {
+    mint_access_token_for_mailbox(
+        config,
+        &config.user_email,
+        scopes,
+        scope_str,
+        agent_policy,
+        ttl_secs,
+    )
+}
+
+/// Mint a signed OAuth2 `access_token` JWT for an explicit `mailbox_id`.
+pub fn mint_access_token_for_mailbox(
+    config: &Config,
+    mailbox_id: &str,
     scopes: Vec<AuthScope>,
     scope_str: Option<String>,
     agent_policy: Option<AgentPolicyOverride>,
@@ -229,7 +248,7 @@ pub fn mint_access_token(
 
     let now = Utc::now().timestamp();
     let claims = OAuth2Claims {
-        sub: config.user_email.clone(),
+        sub: mailbox_id.to_string(),
         iss: "nogml".to_string(),
         aud: client_id.to_string(),
         typ: TOKEN_TYPE_ACCESS.to_string(),
@@ -246,9 +265,20 @@ pub fn mint_access_token(
     sign_jwt(&claims, secret)
 }
 
-/// Mint a signed OAuth2 `refresh_token` JWT for `mailbox_id`.
+/// Mint a signed OAuth2 `refresh_token` JWT for `config.user_email`.
 pub fn mint_refresh_token(
     config: &Config,
+    scopes: Vec<AuthScope>,
+    scope_str: Option<String>,
+    agent_policy: Option<AgentPolicyOverride>,
+) -> AppResult<String> {
+    mint_refresh_token_for_mailbox(config, &config.user_email, scopes, scope_str, agent_policy)
+}
+
+/// Mint a signed OAuth2 `refresh_token` JWT for an explicit `mailbox_id`.
+pub fn mint_refresh_token_for_mailbox(
+    config: &Config,
+    mailbox_id: &str,
     scopes: Vec<AuthScope>,
     scope_str: Option<String>,
     agent_policy: Option<AgentPolicyOverride>,
@@ -267,7 +297,7 @@ pub fn mint_refresh_token(
 
     let now = Utc::now().timestamp();
     let claims = OAuth2Claims {
-        sub: config.user_email.clone(),
+        sub: mailbox_id.to_string(),
         iss: "nogml".to_string(),
         aud: client_id.to_string(),
         typ: TOKEN_TYPE_REFRESH.to_string(),
@@ -286,6 +316,7 @@ pub fn mint_refresh_token(
 
 fn mint_auth_code(
     config: &Config,
+    mailbox_id: &str,
     scopes: Vec<AuthScope>,
     scope_str: Option<String>,
     redirect_uri: Option<String>,
@@ -306,7 +337,7 @@ fn mint_auth_code(
 
     let now = Utc::now().timestamp();
     let claims = OAuth2Claims {
-        sub: config.user_email.clone(),
+        sub: mailbox_id.to_string(),
         iss: "nogml".to_string(),
         aud: client_id.to_string(),
         typ: TOKEN_TYPE_AUTH_CODE.to_string(),
@@ -321,6 +352,18 @@ fn mint_auth_code(
         agent_policy: None,
     };
     sign_jwt(&claims, secret)
+}
+
+fn resolve_oauth2_mailbox(config: &Config, requested: Option<&str>) -> Result<String, String> {
+    let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(config.user_email.clone());
+    };
+    let norm = crate::config::normalize_mailbox_id(raw);
+    if config.known_mailboxes().iter().any(|m| m == &norm) {
+        Ok(norm)
+    } else {
+        Err(format!("Unknown mailbox '{raw}'"))
+    }
 }
 
 /// Map a space-delimited OAuth2 `scope` string (supporting both `nogml` short scopes
@@ -514,6 +557,7 @@ struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    login_hint: Option<String>,
 }
 
 async fn authorize_handler(
@@ -595,8 +639,14 @@ async fn authorize_handler(
         None
     };
 
+    let target_mailbox = match resolve_oauth2_mailbox(&state.config, params.login_hint.as_deref()) {
+        Ok(mb) => mb,
+        Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_request", msg),
+    };
+
     let code = match mint_auth_code(
         &state.config,
+        &target_mailbox,
         scopes.clone(),
         params.scope.clone(),
         params.redirect_uri.clone(),
@@ -659,6 +709,7 @@ struct TokenRequest {
     code_verifier: Option<String>,
     refresh_token: Option<String>,
     scope: Option<String>,
+    mailbox: Option<String>,
 }
 
 fn parse_basic_client_auth(headers: &HeaderMap) -> Option<(String, String)> {
@@ -701,6 +752,7 @@ fn parse_token_request(headers: &HeaderMap, body: &[u8]) -> Result<TokenRequest,
                 "code_verifier" => req.code_verifier = Some(val),
                 "refresh_token" => req.refresh_token = Some(val),
                 "scope" => req.scope = Some(val),
+                "mailbox" => req.mailbox = Some(val),
                 _ => {}
             }
         }
@@ -800,7 +852,7 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
         );
     };
 
-    let (scopes, scope_str, agent_policy) = match grant_type {
+    let (subject_mailbox, scopes, scope_str, agent_policy) = match grant_type {
         "authorization_code" => {
             let Some(code) = req.code.as_deref().filter(|s| !s.is_empty()) else {
                 return oauth2_error(
@@ -863,7 +915,7 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                     );
                 }
             }
-            (claims.scopes, claims.scope, claims.agent_policy)
+            (claims.sub, claims.scopes, claims.scope, claims.agent_policy)
         }
         "refresh_token" => {
             let Some(rt) = req.refresh_token.as_deref().filter(|s| !s.is_empty()) else {
@@ -915,14 +967,19 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                 claims.scopes
             };
             let scope_out = req.scope.clone().or(claims.scope);
-            (granted_scopes, scope_out, claims.agent_policy)
+            (claims.sub, granted_scopes, scope_out, claims.agent_policy)
         }
         "client_credentials" => {
             let scopes = match parse_oauth2_scopes(req.scope.as_deref()) {
                 Ok(s) => s,
                 Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_scope", msg),
             };
-            (scopes, req.scope.clone(), None)
+            let target_mailbox = match resolve_oauth2_mailbox(&state.config, req.mailbox.as_deref())
+            {
+                Ok(mb) => mb,
+                Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_request", msg),
+            };
+            (target_mailbox, scopes, req.scope.clone(), None)
         }
         other => {
             return oauth2_error(
@@ -934,8 +991,9 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
     };
 
     let canonical_scope = scope_str.unwrap_or_else(|| format_oauth2_scopes(&scopes));
-    let access_token = match mint_access_token(
+    let access_token = match mint_access_token_for_mailbox(
         &state.config,
+        &subject_mailbox,
         scopes.clone(),
         Some(canonical_scope.clone()),
         agent_policy.clone(),
@@ -950,8 +1008,9 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
             );
         }
     };
-    let refresh_token = match mint_refresh_token(
+    let refresh_token = match mint_refresh_token_for_mailbox(
         &state.config,
+        &subject_mailbox,
         scopes,
         Some(canonical_scope.clone()),
         agent_policy,

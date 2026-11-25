@@ -91,7 +91,12 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
             recv = rx.recv() => {
                 match recv {
                     Ok(env) => {
-                        let sub = match state.store.get_watch().await {
+                        let mb_state = if env.mailbox_id.is_empty() {
+                            state.clone()
+                        } else {
+                            state.for_mailbox(&env.mailbox_id)
+                        };
+                        let sub = match mb_state.store.get_watch().await {
                             Ok(Some(sub)) => sub,
                             Ok(None) => continue,
                             Err(err) => {
@@ -105,7 +110,7 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
                             continue;
                         }
 
-                        let history_id = match state.store.current_history_id().await {
+                        let history_id = match mb_state.store.current_history_id().await {
                             Ok(hid) => hid.to_string(),
                             Err(err) => {
                                 warn!(%err, "Failed to read current_history_id for watch webhook");
@@ -114,12 +119,12 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
                         };
 
                         let inner = json!({
-                            "emailAddress": state.config.user_email,
+                            "emailAddress": mb_state.config.user_email,
                             "historyId": history_id,
                         });
                         let encoded_data = general_purpose::STANDARD.encode(inner.to_string().as_bytes());
                         let payload = json!({
-                            "emailAddress": state.config.user_email,
+                            "emailAddress": mb_state.config.user_email,
                             "historyId": history_id,
                             "topicName": sub.topic_name,
                             "message": {

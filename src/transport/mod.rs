@@ -589,8 +589,14 @@ pub async fn ingest_inbound_rfc2822(
         Err(err) => return Err(err),
     };
 
-    // 5. Publish unified domain event.
-    events.publish(
+    // 5. Publish unified domain event scoped to the receiving mailbox.
+    let event_mailbox = if !events.mailbox_id().is_empty() {
+        events.mailbox_id()
+    } else {
+        store.mailbox_id()
+    };
+    events.publish_for_mailbox(
+        event_mailbox,
         source_to_event_source(&source_name),
         MailEvent::MessageReceived {
             message_id: stored.id.clone(),

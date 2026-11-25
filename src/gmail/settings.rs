@@ -1,13 +1,9 @@
 //! Gmail `users.settings.*` handlers (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`).
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::StatusCode,
-};
+use axum::{Json, extract::Path, http::StatusCode};
 
 use crate::{
-    AppState,
+    MailboxState,
     auth::{resolve_user_id, validate_email_header, validate_resource_id},
     error::{AppError, AppResult},
     models::{
@@ -30,7 +26,7 @@ fn validate_send_as_fields(send_as: &SendAs) -> AppResult<()> {
 
 /// `GET /gmail/v1/users/{userId}/settings/sendAs`
 pub async fn list_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<ListSendAsResponse>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -42,7 +38,7 @@ pub async fn list_send_as(
 
 /// `GET /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
 pub async fn get_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
 ) -> AppResult<Json<SendAs>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -58,7 +54,7 @@ pub async fn get_send_as(
 
 /// `POST /gmail/v1/users/{userId}/settings/sendAs`
 pub async fn create_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(mut payload): Json<SendAs>,
 ) -> AppResult<Json<SendAs>> {
@@ -106,7 +102,7 @@ pub async fn create_send_as(
 
 /// `PUT /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
 pub async fn update_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
     Json(payload): Json<SendAs>,
 ) -> AppResult<Json<SendAs>> {
@@ -143,7 +139,7 @@ pub async fn update_send_as(
 
 /// `PATCH /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
 pub async fn patch_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
     Json(payload): Json<SendAs>,
 ) -> AppResult<Json<SendAs>> {
@@ -191,7 +187,7 @@ pub async fn patch_send_as(
 
 /// `DELETE /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
 pub async fn delete_send_as(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -217,7 +213,7 @@ pub async fn delete_send_as(
 
 /// `GET /gmail/v1/users/{userId}/settings/vacation`
 pub async fn get_vacation(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<VacationSettings>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -227,7 +223,7 @@ pub async fn get_vacation(
 
 /// `PUT /gmail/v1/users/{userId}/settings/vacation`
 pub async fn update_vacation(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(payload): Json<VacationSettings>,
 ) -> AppResult<Json<VacationSettings>> {
@@ -243,7 +239,7 @@ pub async fn update_vacation(
 
 /// `GET /gmail/v1/users/{userId}/settings/autoForwarding`
 pub async fn get_auto_forwarding(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<AutoForwarding>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -253,7 +249,7 @@ pub async fn get_auto_forwarding(
 
 /// `PUT /gmail/v1/users/{userId}/settings/autoForwarding`
 pub async fn update_auto_forwarding(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(payload): Json<AutoForwarding>,
 ) -> AppResult<Json<AutoForwarding>> {
@@ -269,7 +265,7 @@ pub async fn update_auto_forwarding(
 
 /// `GET /gmail/v1/users/{userId}/settings/imap`
 pub async fn get_imap(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<ImapSettings>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -279,7 +275,7 @@ pub async fn get_imap(
 
 /// `PUT /gmail/v1/users/{userId}/settings/imap`
 pub async fn update_imap(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(payload): Json<ImapSettings>,
 ) -> AppResult<Json<ImapSettings>> {
@@ -292,7 +288,7 @@ pub async fn update_imap(
 
 /// `GET /gmail/v1/users/{userId}/settings/pop`
 pub async fn get_pop(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<PopSettings>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -302,7 +298,7 @@ pub async fn get_pop(
 
 /// `PUT /gmail/v1/users/{userId}/settings/pop`
 pub async fn update_pop(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(payload): Json<PopSettings>,
 ) -> AppResult<Json<PopSettings>> {

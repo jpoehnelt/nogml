@@ -28,7 +28,7 @@ use nogml::{
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
-    storage::{AiSearchQuery, AiThreadQuery, open_store},
+    storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store},
     sync::{self, SyncRunOptions},
 };
 
@@ -129,14 +129,13 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_BLOB_S3_FORCE_PATH_STYLE", global = true)]
     blob_s3_force_path_style: Option<bool>,
 
-    /// Primary mailbox email address.
-    #[arg(
-        long,
-        env = "NOGML_USER_EMAIL",
-        default_value = "me@localhost",
-        global = true
-    )]
-    user_email: String,
+    /// Primary mailbox email address (defaults to sole existing mailbox in SQLite DB or `me@localhost`).
+    #[arg(long, env = "NOGML_USER_EMAIL", global = true)]
+    user_email: Option<String>,
+
+    /// Comma-separated additional local mailboxes hosted by this instance.
+    #[arg(long, env = "NOGML_MAILBOXES", value_delimiter = ',', global = true)]
+    mailboxes: Vec<String>,
 
     /// Default domain for generated Message-IDs and fallback sender addresses.
     #[arg(
@@ -681,6 +680,10 @@ enum SyncCommand {
         /// Optional Gmail search query filter.
         #[arg(long)]
         query: Option<String>,
+
+        /// Target local mailbox email address (defaults to `--user-email`).
+        #[arg(long)]
+        mailbox: Option<String>,
     },
 }
 
@@ -856,6 +859,23 @@ enum ApprovalsAction {
 
 impl CommonConfigArgs {
     fn into_config(self, serve: Option<ServeArgs>) -> Config {
+        let user_email = match self.user_email {
+            Some(email) if !email.trim().is_empty() => email,
+            _ => {
+                let detected = if self.storage == StorageBackend::Sqlite
+                    && self.mailboxes.is_empty()
+                    && self.db_path.exists()
+                {
+                    SqliteStore::list_mailbox_ids(&self.db_path)
+                        .ok()
+                        .and_then(|mut mbs| (mbs.len() == 1).then(|| mbs.remove(0)))
+                } else {
+                    None
+                };
+                detected.unwrap_or_else(|| "me@localhost".to_string())
+            }
+        };
+
         let mut cfg = Config {
             storage: self.storage,
             db_path: self.db_path,
@@ -869,7 +889,8 @@ impl CommonConfigArgs {
             blob_s3_secret_access_key: self.blob_s3_secret_access_key,
             blob_s3_session_token: self.blob_s3_session_token,
             blob_s3_force_path_style: self.blob_s3_force_path_style,
-            user_email: self.user_email,
+            user_email,
+            mailboxes: self.mailboxes,
             default_domain: self.default_domain,
             transport: self.transport,
             resend_api_key: self.resend_api_key,
@@ -1528,9 +1549,15 @@ async fn run(cli: Cli) -> AppResult<()> {
                     full,
                     max_messages,
                     query,
+                    mailbox,
                 } => {
+                    let target_state =
+                        match mailbox.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(mb) => state.for_mailbox(mb),
+                            None => state,
+                        };
                     let report = sync::run_gmail_sync(
-                        &state,
+                        &target_state,
                         SyncRunOptions {
                             mode,
                             full,

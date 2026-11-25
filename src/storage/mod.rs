@@ -548,6 +548,13 @@ pub trait MailStore: Send + Sync {
         "custom"
     }
 
+    /// Normalized lowercase mailbox identifier this store handle is scoped to.
+    fn mailbox_id(&self) -> &str;
+
+    /// Return a lightweight `MailStore` handle sharing the underlying backend state/pool
+    /// while isolating all reads and writes strictly to `mailbox_id`.
+    fn for_mailbox(&self, mailbox_id: &str) -> Arc<dyn MailStore>;
+
     // --- Profile & History ---
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile>;
     async fn current_history_id(&self) -> AppResult<u64>;

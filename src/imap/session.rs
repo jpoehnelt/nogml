@@ -110,6 +110,7 @@ enum AuthState {
 }
 
 struct ImapSession {
+    base_state: AppState,
     state: AppState,
     auth: AuthState,
     principal: Option<Principal>,
@@ -130,6 +131,7 @@ pub async fn handle_connection(
 ) {
     let mut reader = BufReader::new(stream);
     let mut session = ImapSession {
+        base_state: state.clone(),
         state,
         auth: AuthState::NotAuthenticated,
         principal: None,
@@ -231,6 +233,7 @@ pub async fn handle_connection(
             match acceptor.accept(tcp).await {
                 Ok(tls_stream) => {
                     reader = BufReader::new(ImapStream::Tls(Box::new(tls_stream)));
+                    session.state = session.base_state.clone();
                     session.auth = AuthState::NotAuthenticated;
                     session.principal = None;
                     session.condstore_enabled = false;
@@ -537,8 +540,9 @@ impl ImapSession {
         }
         let user = args[0].as_str_lossy().unwrap_or_default();
         let pass = args[1].as_str_lossy().unwrap_or_default();
-        match self.state.auth.authenticate_imap(&user, &pass).await {
+        match self.base_state.auth.authenticate_imap(&user, &pass).await {
             Ok(principal) => {
+                self.state = self.base_state.for_mailbox(&principal.mailbox_id);
                 self.principal = Some(principal);
                 self.auth = AuthState::Authenticated;
                 let cap = self.capability_string(stream.get_ref().is_tls());
@@ -629,7 +633,10 @@ impl ImapSession {
                 .await?;
                 return Ok(());
             };
-            self.state.auth.authenticate_xoauth2(&user, &token).await
+            self.base_state
+                .auth
+                .authenticate_xoauth2(&user, &token)
+                .await
         } else {
             // Format: [authzid]\0authcid\0passwd
             let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
@@ -643,11 +650,15 @@ impl ImapSession {
             }
             let authcid = String::from_utf8_lossy(parts[1]);
             let passwd = String::from_utf8_lossy(parts[2]);
-            self.state.auth.authenticate_imap(&authcid, &passwd).await
+            self.base_state
+                .auth
+                .authenticate_imap(&authcid, &passwd)
+                .await
         };
 
         match auth_result {
             Ok(principal) => {
+                self.state = self.base_state.for_mailbox(&principal.mailbox_id);
                 self.principal = Some(principal);
                 self.auth = AuthState::Authenticated;
                 let cap = self.capability_string(stream.get_ref().is_tls());
@@ -2380,7 +2391,16 @@ impl ImapSession {
                 }
                 ev = event_rx.recv() => {
                     match ev {
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Ok(env) => {
+                            let active_mb = self.state.mailbox_id();
+                            if env.mailbox_id.is_empty()
+                                || active_mb.is_empty()
+                                || env.mailbox_id.eq_ignore_ascii_case(active_mb)
+                            {
+                                self.flush_selected_updates(stream).await?;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             self.flush_selected_updates(stream).await?;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {

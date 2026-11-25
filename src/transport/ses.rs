@@ -998,7 +998,44 @@ pub async fn ses_webhook_handler(
         .as_ref()
         .and_then(format_ses_auth_results);
 
-    let envelope = InboundEnvelope {
+    let mut recipient_candidates: Vec<String> = Vec::new();
+    if let Some(m) = mail {
+        recipient_candidates.extend(m.destination.iter().cloned());
+    }
+    if let Some(c) = common {
+        recipient_candidates.extend(c.to.iter().cloned());
+        recipient_candidates.extend(c.cc.iter().cloned());
+    }
+    if let Ok(parsed) = crate::mime::parse_rfc2822(&raw_rfc2822) {
+        recipient_candidates.extend(parsed.to);
+        recipient_candidates.extend(parsed.cc);
+        recipient_candidates.extend(parsed.bcc);
+        for hdr in parsed.headers {
+            if matches!(
+                hdr.name.to_ascii_lowercase().as_str(),
+                "delivered-to" | "x-original-to" | "envelope-to"
+            ) {
+                recipient_candidates.push(hdr.value);
+            }
+        }
+    }
+
+    let target_mailboxes = state
+        .config
+        .resolve_inbound_mailboxes(&recipient_candidates);
+    if target_mailboxes.is_empty() {
+        tracing::info!("Ignoring SES inbound email with no matching local mailbox");
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": "no_matching_local_mailbox",
+            })),
+        )
+            .into_response());
+    }
+
+    let base_envelope = InboundEnvelope {
         raw_rfc2822,
         source,
         provider_id,
@@ -1019,52 +1056,158 @@ pub async fn ses_webhook_handler(
         fallback_references: None,
     };
 
-    let outcome = ingest_inbound_rfc2822(
-        state.store.as_ref(),
-        &state.events,
-        state.filter.as_ref(),
-        envelope,
-    )
-    .await?;
+    if target_mailboxes.len() == 1 {
+        let mb = &target_mailboxes[0];
+        let mb_state = state.for_mailbox(mb);
+        let outcome = ingest_inbound_rfc2822(
+            mb_state.store.as_ref(),
+            &mb_state.events,
+            mb_state.filter.as_ref(),
+            base_envelope,
+        )
+        .await?;
 
-    match outcome {
-        IngestOutcome::Stored { message, decision } => {
-            state.post_store_message(&message).await?;
-            let filter_label = match decision {
-                FilterDecision::Allow => "allow",
-                FilterDecision::Spam { .. } => "spam",
-                FilterDecision::Reject { .. } => "reject",
-                FilterDecision::Mutate { .. } => "mutate",
-            };
-            Ok((
+        return match outcome {
+            IngestOutcome::Stored { message, decision } => {
+                mb_state.post_store_message(&message).await?;
+                let filter_label = match decision {
+                    FilterDecision::Allow => "allow",
+                    FilterDecision::Spam { .. } => "spam",
+                    FilterDecision::Reject { .. } => "reject",
+                    FilterDecision::Mutate { .. } => "mutate",
+                };
+                Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "received",
+                        "mailbox_id": mb,
+                        "message_id": message.id,
+                        "thread_id": message.thread_id,
+                        "labels": message.label_ids,
+                        "filter_decision": filter_label,
+                    })),
+                )
+                    .into_response())
+            }
+            IngestOutcome::Duplicate { message } => Ok((
                 StatusCode::OK,
                 Json(json!({
+                    "status": "duplicate",
+                    "mailbox_id": mb,
+                    "message_id": message.id,
+                    "thread_id": message.thread_id,
+                })),
+            )
+                .into_response()),
+            IngestOutcome::Rejected { reason } => Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "status": "rejected",
+                    "mailbox_id": mb,
+                    "reason": reason,
+                })),
+            )
+                .into_response()),
+        };
+    }
+
+    let mut deliveries = Vec::with_capacity(target_mailboxes.len());
+    let mut first_received: Option<(String, String, Vec<String>, &'static str)> = None;
+    let mut any_received = false;
+    let mut any_duplicate = false;
+    let mut first_rejected: Option<String> = None;
+
+    for mb in &target_mailboxes {
+        let mb_state = state.for_mailbox(mb);
+        let outcome = ingest_inbound_rfc2822(
+            mb_state.store.as_ref(),
+            &mb_state.events,
+            mb_state.filter.as_ref(),
+            base_envelope.clone(),
+        )
+        .await?;
+
+        match outcome {
+            IngestOutcome::Stored { message, decision } => {
+                mb_state.post_store_message(&message).await?;
+                let filter_label = match decision {
+                    FilterDecision::Allow => "allow",
+                    FilterDecision::Spam { .. } => "spam",
+                    FilterDecision::Reject { .. } => "reject",
+                    FilterDecision::Mutate { .. } => "mutate",
+                };
+                any_received = true;
+                if first_received.is_none() {
+                    first_received = Some((
+                        message.id.clone(),
+                        message.thread_id.clone(),
+                        message.label_ids.clone(),
+                        filter_label,
+                    ));
+                }
+                deliveries.push(json!({
+                    "mailbox_id": mb,
                     "status": "received",
                     "message_id": message.id,
                     "thread_id": message.thread_id,
                     "labels": message.label_ids,
                     "filter_decision": filter_label,
-                })),
-            )
-                .into_response())
+                }));
+            }
+            IngestOutcome::Duplicate { message } => {
+                any_duplicate = true;
+                deliveries.push(json!({
+                    "mailbox_id": mb,
+                    "status": "duplicate",
+                    "message_id": message.id,
+                    "thread_id": message.thread_id,
+                }));
+            }
+            IngestOutcome::Rejected { reason } => {
+                if first_rejected.is_none() {
+                    first_rejected = Some(reason.clone());
+                }
+                deliveries.push(json!({
+                    "mailbox_id": mb,
+                    "status": "rejected",
+                    "reason": reason,
+                }));
+            }
         }
-        IngestOutcome::Duplicate { message } => Ok((
+    }
+
+    if let Some((msg_id, thread_id, labels, filter_label)) = first_received {
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "received",
+                "message_id": msg_id,
+                "thread_id": thread_id,
+                "labels": labels,
+                "filter_decision": filter_label,
+                "deliveries": deliveries,
+            })),
+        )
+            .into_response())
+    } else if any_duplicate && !any_received {
+        Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "duplicate",
-                "message_id": message.id,
-                "thread_id": message.thread_id,
+                "deliveries": deliveries,
             })),
         )
-            .into_response()),
-        IngestOutcome::Rejected { reason } => Ok((
+            .into_response())
+    } else {
+        Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "rejected",
-                "reason": reason,
+                "reason": first_rejected.unwrap_or_else(|| "rejected".to_string()),
+                "deliveries": deliveries,
             })),
         )
-            .into_response()),
+            .into_response())
     }
 }
 

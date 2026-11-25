@@ -68,8 +68,10 @@ impl ResendClient for MockResend {
     }
 }
 
+#[derive(Clone)]
 struct MockStore {
-    inner: Mutex<MockStoreState>,
+    mailbox_id: String,
+    inner: Arc<Mutex<MockStoreState>>,
 }
 
 struct MockStoreState {
@@ -111,7 +113,8 @@ impl MockStore {
         })
         .collect();
         Self {
-            inner: Mutex::new(MockStoreState {
+            mailbox_id: crate::config::normalize_mailbox_id(email),
+            inner: Arc::new(Mutex::new(MockStoreState {
                 next_id: 1,
                 history_id: 10,
                 messages: Vec::new(),
@@ -121,13 +124,19 @@ impl MockStore {
                 history: Vec::new(),
                 watch: None,
                 settings: UserSettings::default_for_email(email),
-            }),
+            })),
         }
     }
 }
 
 #[async_trait]
 impl MailStore for MockStore {
+    fn mailbox_id(&self) -> &str {
+        &self.mailbox_id
+    }
+    fn for_mailbox(&self, _mailbox_id: &str) -> Arc<dyn MailStore> {
+        Arc::new(self.clone())
+    }
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let s = self.inner.lock().unwrap();
         Ok(Profile {

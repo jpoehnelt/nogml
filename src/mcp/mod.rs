@@ -56,10 +56,15 @@ impl McpServer {
         Self { state, principal }
     }
 
-    /// Construct an MCP server bound to an authenticated HTTP [`Principal`], enforcing
-    /// its [`AuthScope`]s and [`crate::auth::AgentPolicyOverride`].
+    /// Construct an MCP server bound to an authenticated HTTP [`Principal`], scoping
+    /// [`AppState`] to `principal.mailbox_id` and enforcing its [`AuthScope`]s and
+    /// [`crate::auth::AgentPolicyOverride`].
     pub fn with_principal(state: AppState, principal: Principal) -> Self {
-        Self { state, principal }
+        let scoped = state.for_mailbox(&principal.mailbox_id);
+        Self {
+            state: scoped,
+            principal,
+        }
     }
 
     /// Handle one JSON-RPC 2.0 request object. Returns `Ok(None)` for notifications (no `id`).

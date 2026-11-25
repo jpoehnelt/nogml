@@ -90,8 +90,9 @@ struct StoreInner {
 }
 
 /// Pure in-memory `MailStore` for `imap` & `sync` unit tests.
+#[derive(Clone)]
 pub(crate) struct TestMailStore {
-    inner: Mutex<StoreInner>,
+    inner: Arc<Mutex<StoreInner>>,
 }
 
 impl TestMailStore {
@@ -118,14 +119,14 @@ impl TestMailStore {
             );
         }
         Self {
-            inner: Mutex::new(StoreInner {
+            inner: Arc::new(Mutex::new(StoreInner {
                 next_id: 1,
                 all_mail_uid_next: 1,
                 messages: HashMap::new(),
                 labels,
                 label_uids: HashMap::new(),
                 sync_states: HashMap::new(),
-            }),
+            })),
         }
     }
 
@@ -282,6 +283,12 @@ impl TestMailStore {
 
 #[async_trait]
 impl MailStore for TestMailStore {
+    fn mailbox_id(&self) -> &str {
+        "agent@example.com"
+    }
+    fn for_mailbox(&self, _mailbox_id: &str) -> Arc<dyn MailStore> {
+        Arc::new(self.clone())
+    }
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let inner = self.inner.lock().unwrap();
         let threads: HashSet<&str> = inner
