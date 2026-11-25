@@ -16,7 +16,10 @@ use nogml::{
     AppState, ai,
     blob::{migrate_blobs, open_blob_store},
     build_router,
-    config::{BlobBackend, Config, DraftOnlyAction, StorageBackend, SyncMode},
+    config::{
+        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, StorageBackend,
+        SyncMode,
+    },
     ensure_crypto_provider,
     error::{AppError, AppResult},
     gmail, imap, mcp,
@@ -265,6 +268,117 @@ struct CommonConfigArgs {
 
     #[arg(long, env = "NOGML_SYNC_MAX_MESSAGES", global = true)]
     sync_max_messages: Option<usize>,
+
+    // --- Inbound filter pipeline ---
+    /// Enable `AuthResultsFilter` to parse `Authentication-Results` headers.
+    #[arg(
+        long,
+        env = "NOGML_FILTER_AUTH_RESULTS",
+        default_value_t = false,
+        global = true
+    )]
+    filter_auth_results: bool,
+
+    /// Action on DMARC failure (`spam`, `reject`, `tag`, `allow`).
+    #[arg(
+        long,
+        env = "NOGML_FILTER_DMARC_FAIL_ACTION",
+        default_value = "spam",
+        global = true
+    )]
+    filter_dmarc_fail_action: AuthFailAction,
+
+    /// Action on SPF failure (`spam`, `reject`, `tag`, `allow`).
+    #[arg(
+        long,
+        env = "NOGML_FILTER_SPF_FAIL_ACTION",
+        default_value = "tag",
+        global = true
+    )]
+    filter_spf_fail_action: AuthFailAction,
+
+    /// Action on DKIM failure (`spam`, `reject`, `tag`, `allow`).
+    #[arg(
+        long,
+        env = "NOGML_FILTER_DKIM_FAIL_ACTION",
+        default_value = "tag",
+        global = true
+    )]
+    filter_dkim_fail_action: AuthFailAction,
+
+    /// Rspamd base URL (`{url}/checkv2`). Enables `RspamdFilter` when set.
+    #[arg(long, env = "NOGML_RSPAMD_URL", global = true)]
+    rspamd_url: Option<String>,
+
+    /// Optional Rspamd `Password` header value.
+    #[arg(long, env = "NOGML_RSPAMD_PASSWORD", global = true)]
+    rspamd_password: Option<String>,
+
+    /// Timeout for Rspamd `/checkv2` calls in milliseconds.
+    #[arg(
+        long,
+        env = "NOGML_RSPAMD_TIMEOUT_MS",
+        default_value_t = 5_000,
+        global = true
+    )]
+    rspamd_timeout_ms: u64,
+
+    /// Optional Rspamd spam score threshold override.
+    #[arg(long, env = "NOGML_RSPAMD_SPAM_THRESHOLD", global = true)]
+    rspamd_spam_threshold: Option<f32>,
+
+    /// Action on Rspamd `reject` / `soft reject` (`reject` or `spam`).
+    #[arg(
+        long,
+        env = "NOGML_RSPAMD_REJECT_ACTION",
+        default_value = "reject",
+        global = true
+    )]
+    rspamd_reject_action: RspamdRejectAction,
+
+    /// Reject inbound mail when Rspamd is unreachable or times out (default false, fail-open).
+    #[arg(
+        long,
+        env = "NOGML_RSPAMD_FAIL_CLOSED",
+        default_value_t = false,
+        global = true
+    )]
+    rspamd_fail_closed: bool,
+
+    /// OpenAI-compatible chat completions base URL (`{url}/chat/completions`).
+    #[arg(long, env = "NOGML_LLM_TRIAGE_BASE_URL", global = true)]
+    llm_triage_base_url: Option<String>,
+
+    /// Bearer API key for the LLM triage endpoint.
+    #[arg(long, env = "NOGML_LLM_TRIAGE_API_KEY", global = true)]
+    llm_triage_api_key: Option<String>,
+
+    /// Model name passed to `/chat/completions` for inbound triage.
+    #[arg(
+        long,
+        env = "NOGML_LLM_TRIAGE_MODEL",
+        default_value = "gpt-4o-mini",
+        global = true
+    )]
+    llm_triage_model: String,
+
+    /// Timeout for LLM triage calls in milliseconds.
+    #[arg(
+        long,
+        env = "NOGML_LLM_TRIAGE_TIMEOUT_MS",
+        default_value_t = 10_000,
+        global = true
+    )]
+    llm_triage_timeout_ms: u64,
+
+    /// Maximum plain-text body characters sent to the LLM triage prompt.
+    #[arg(
+        long,
+        env = "NOGML_LLM_TRIAGE_MAX_BODY_CHARS",
+        default_value_t = 2_000,
+        global = true
+    )]
+    llm_triage_max_body_chars: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -546,6 +660,21 @@ impl CommonConfigArgs {
             gmail_imap_mailbox: self.gmail_imap_mailbox,
             sync_query: self.sync_query,
             sync_max_messages: self.sync_max_messages,
+            filter_auth_results: self.filter_auth_results,
+            filter_dmarc_fail_action: self.filter_dmarc_fail_action,
+            filter_spf_fail_action: self.filter_spf_fail_action,
+            filter_dkim_fail_action: self.filter_dkim_fail_action,
+            rspamd_url: self.rspamd_url,
+            rspamd_password: self.rspamd_password,
+            rspamd_timeout_ms: self.rspamd_timeout_ms,
+            rspamd_spam_threshold: self.rspamd_spam_threshold,
+            rspamd_reject_action: self.rspamd_reject_action,
+            rspamd_fail_closed: self.rspamd_fail_closed,
+            llm_triage_base_url: self.llm_triage_base_url,
+            llm_triage_api_key: self.llm_triage_api_key,
+            llm_triage_model: self.llm_triage_model,
+            llm_triage_timeout_ms: self.llm_triage_timeout_ms,
+            llm_triage_max_body_chars: self.llm_triage_max_body_chars,
             ..Config::default()
         };
 

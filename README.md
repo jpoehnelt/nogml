@@ -34,8 +34,8 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
   | SqliteStore| | Inline    | | ResendTransp. | | NoopFilter    | | StaticToken  | | StoreSearch | | ConfigPolicy   |
   | MemoryStore| | FsBlob    | | (SES / SMTP)  | | FilterChain   | | (JWT / OIDC) | | (Tantivy /  | | (Approval /    |
-  | (Postgres) | | MemoryBlob| |               | | (Rspamd / AI) | |              | |  pgvector)  | |  DLP / Budget) |
-  |            | | S3Blob    | |               | |               | |              | |             | |                |
+  | (Postgres) | | MemoryBlob| |               | | AuthResults   | |              | |  pgvector)  | |  DLP / Budget) |
+  |            | | S3Blob    | |               | | Rspamd / LLM  | |              | |             | |                |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
 ```
 
@@ -44,7 +44,7 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, history, IMAP UIDs, watch state, and sync state |
 | `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
 | `MailTransport` | `src/transport/` | `ResendTransport` (`src/resend/`) | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
-| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend webhooks, Gmail import, IMAP `APPEND`, and Gmail sync |
+| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
 | `SearchIndex` | `src/search_index.rs` | `StoreSearchIndex` | Search backend used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
 | `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202, `Deny` returning 403) and `dry_run` checks |
@@ -183,6 +183,21 @@ Every CLI flag has a matching environment variable:
 | `GMAIL_CLIENT_ID` / `SECRET` / `REFRESH_TOKEN` / `ACCESS_TOKEN` | `--gmail-*` | *(none)* | Upstream Gmail REST API credentials |
 | `GMAIL_IMAP_USER` / `PASSWORD` | `--gmail-imap-*` | *(none)* | Upstream Gmail IMAP credentials |
 | `NOGML_WATCH_WEBHOOK_URL` | `--watch-webhook-url` | *(none)* | Optional push webhook URL for active Gmail `/watch` subscriptions |
+| `NOGML_FILTER_AUTH_RESULTS` | `--filter-auth-results` | `false` | Enable `AuthResultsFilter` to evaluate `Authentication-Results` headers (`spf`, `dkim`, `dmarc`) |
+| `NOGML_FILTER_DMARC_FAIL_ACTION` | `--filter-dmarc-fail-action` | `spam` | Action on DMARC failure (`spam`, `reject`, `tag`, `allow`) |
+| `NOGML_FILTER_SPF_FAIL_ACTION` | `--filter-spf-fail-action` | `tag` | Action on SPF failure (`spam`, `reject`, `tag`, `allow`; `softfail` downgrades to `tag`) |
+| `NOGML_FILTER_DKIM_FAIL_ACTION` | `--filter-dkim-fail-action` | `tag` | Action on DKIM failure (`spam`, `reject`, `tag`, `allow`) |
+| `NOGML_RSPAMD_URL` | `--rspamd-url` | *(disabled)* | Rspamd base URL (`{url}/checkv2`) to enable `RspamdFilter` |
+| `NOGML_RSPAMD_PASSWORD` | `--rspamd-password` | *(none)* | Optional `Password` header sent to Rspamd |
+| `NOGML_RSPAMD_TIMEOUT_MS` | `--rspamd-timeout-ms` | `5000` | Rspamd HTTP request timeout in milliseconds |
+| `NOGML_RSPAMD_SPAM_THRESHOLD` | `--rspamd-spam-threshold` | *(Rspamd `required_score`)* | Optional score threshold override for `Spam` classification |
+| `NOGML_RSPAMD_REJECT_ACTION` | `--rspamd-reject-action` | `reject` | Action on Rspamd `reject` or `soft reject` (`reject` or `spam`) |
+| `NOGML_RSPAMD_FAIL_CLOSED` | `--rspamd-fail-closed` | `false` | Reject mail when Rspamd is unreachable or times out (default fails open to `Allow`) |
+| `NOGML_LLM_TRIAGE_BASE_URL` | `--llm-triage-base-url` | *(disabled; `https://api.openai.com/v1` when key set)* | OpenAI-compatible base URL (`{url}/chat/completions`) to enable `LlmTriageFilter` |
+| `NOGML_LLM_TRIAGE_API_KEY` | `--llm-triage-api-key` | *(none)* | Bearer token for the LLM triage endpoint (always fails open to `Allow` on errors) |
+| `NOGML_LLM_TRIAGE_MODEL` | `--llm-triage-model` | `gpt-4o-mini` | Model name sent to `/chat/completions` |
+| `NOGML_LLM_TRIAGE_TIMEOUT_MS` | `--llm-triage-timeout-ms` | `10000` | LLM triage HTTP timeout in milliseconds |
+| `NOGML_LLM_TRIAGE_MAX_BODY_CHARS` | `--llm-triage-max-body-chars` | `2000` | Maximum sanitized plain-text body characters sent to the LLM classifier |
 | `NOGML_LOG_JSON` | `--log-json` | `false` | Emit JSON logs |
 
 ## Connecting clients

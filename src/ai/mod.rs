@@ -1378,6 +1378,12 @@ async fn get_capabilities(
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
     let cfg = &state.config;
+    let active_filters = state.filter.active_filters();
+    let filter_backend = if active_filters.is_empty() {
+        state.filter.backend_name().to_string()
+    } else {
+        active_filters.join(",")
+    };
     let body = json!({
         "service": "nogml",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1421,11 +1427,12 @@ async fn get_capabilities(
         "sync_enabled": cfg.gmail_sync_configured(),
         "sync_mode": cfg.sync_mode,
         "imap_enabled": cfg.imap_bind.is_some() || cfg.imap_tls_bind.is_some(),
+        "active_filters": active_filters,
         "backends": {
             "storage": state.store.backend_name(),
             "blob": state.blobs.backend_name(),
             "transport": state.transport.name(),
-            "filter": state.filter.backend_name(),
+            "filter": filter_backend,
             "auth": state.auth.backend_name(),
             "search": state.search.backend_name(),
             "outbound_policy": state.outbound_policy.backend_name(),

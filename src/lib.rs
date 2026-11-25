@@ -36,7 +36,7 @@ use crate::{
     config::Config,
     error::AppResult,
     events::EventBus,
-    filter::{InboundFilter, NoopFilter},
+    filter::{InboundFilter, open_filter},
     resend::{HttpResendClient, ResendClient, ResendTransport},
     search_index::{SearchIndex, StoreSearchIndex},
     storage::{MailStore, StoredAttachment, StoredMessage, open_store},
@@ -105,7 +105,7 @@ impl AppState {
             resend.clone(),
             config.user_email.clone(),
         ));
-        let filter: Arc<dyn InboundFilter> = Arc::new(NoopFilter);
+        let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let search: Arc<dyn SearchIndex> = Arc::new(StoreSearchIndex::new(store.clone()));
         let outbound_policy: Arc<dyn OutboundPolicy> =
