@@ -246,6 +246,7 @@ pub struct HistoryListPage {
 pub struct AiSearchQuery {
     pub q: Option<String>,
     pub labels: Vec<String>,
+    pub unread: Option<bool>,
     pub thread_id: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,

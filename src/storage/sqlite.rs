@@ -2875,6 +2875,20 @@ impl MailStore for SqliteStore {
                 ));
             }
 
+            if let Some(want_unread) = query.unread {
+                bind_values.push(SqlValue::Text(LABEL_UNREAD.to_string()));
+                let p = bind_values.len();
+                if want_unread {
+                    where_clauses.push(format!(
+                        "EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
+                    ));
+                } else {
+                    where_clauses.push(format!(
+                        "NOT EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
+                    ));
+                }
+            }
+
             if let Some(ref tid) = query.thread_id
                 && !tid.trim().is_empty()
             {

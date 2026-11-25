@@ -539,6 +539,12 @@ impl MailStore for TestMailStore {
                         return false;
                     }
                 }
+                if let Some(want_unread) = query.unread {
+                    let is_unread = m.label_ids.iter().any(|l| l == LABEL_UNREAD);
+                    if is_unread != want_unread {
+                        return false;
+                    }
+                }
                 if let Some(from) = &query.from
                     && !m
                         .from_addr

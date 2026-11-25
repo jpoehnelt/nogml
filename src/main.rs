@@ -17,13 +17,14 @@ use nogml::{
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
-        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, SmtpTlsMode,
-        StorageBackend, SyncMode, TransportBackend,
+        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, SearchBackend,
+        SmtpTlsMode, StorageBackend, SyncMode, TransportBackend,
     },
     ensure_crypto_provider,
     error::{AppError, AppResult},
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
+    search_index::reindex_mailbox,
     storage::{AiSearchQuery, AiThreadQuery, open_store},
     sync::{self, SyncRunOptions},
 };
@@ -452,6 +453,42 @@ struct CommonConfigArgs {
         global = true
     )]
     llm_triage_max_body_chars: usize,
+
+    // --- Pluggable search & embeddings ---
+    /// Search index backend (`store` [default] or `hybrid`).
+    #[arg(
+        long,
+        env = "NOGML_SEARCH_BACKEND",
+        default_value = "store",
+        global = true
+    )]
+    search_backend: SearchBackend,
+
+    /// OpenAI-compatible embeddings base URL (`{url}/embeddings`, e.g. OpenAI or Ollama `/v1`).
+    #[arg(long, env = "NOGML_EMBEDDING_BASE_URL", global = true)]
+    embedding_base_url: Option<String>,
+
+    /// Optional Bearer API key for the embeddings endpoint.
+    #[arg(long, env = "NOGML_EMBEDDING_API_KEY", global = true)]
+    embedding_api_key: Option<String>,
+
+    /// Embedding model name sent to `/embeddings`.
+    #[arg(
+        long,
+        env = "NOGML_EMBEDDING_MODEL",
+        default_value = "text-embedding-3-small",
+        global = true
+    )]
+    embedding_model: String,
+
+    /// HTTP timeout for embedding requests in seconds.
+    #[arg(
+        long,
+        env = "NOGML_EMBEDDING_TIMEOUT_SECS",
+        default_value_t = 15,
+        global = true
+    )]
+    embedding_timeout_secs: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -472,6 +509,12 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: StorageCommand,
+    },
+
+    /// Search index maintenance operations (e.g. backfilling embeddings).
+    Search {
+        #[command(subcommand)]
+        action: SearchCommand,
     },
 
     /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints.
@@ -584,13 +627,21 @@ enum StorageCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SearchCommand {
+    /// Re-index all stored messages into the active SearchIndex backend.
+    Reindex,
+}
+
+#[derive(Debug, Subcommand)]
 enum MailAction {
-    /// Search messages using FTS5 and structured filters.
+    /// Search messages using FTS5 or hybrid semantic search and structured filters.
     Search {
         #[arg(long)]
         q: Option<String>,
         #[arg(long, value_delimiter = ',')]
         labels: Vec<String>,
+        #[arg(long)]
+        unread: Option<bool>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = false)]
@@ -762,6 +813,11 @@ impl CommonConfigArgs {
             llm_triage_model: self.llm_triage_model,
             llm_triage_timeout_ms: self.llm_triage_timeout_ms,
             llm_triage_max_body_chars: self.llm_triage_max_body_chars,
+            search_backend: self.search_backend,
+            embedding_base_url: self.embedding_base_url,
+            embedding_api_key: self.embedding_api_key,
+            embedding_model: self.embedding_model,
+            embedding_timeout_secs: self.embedding_timeout_secs,
             ..Config::default()
         };
 
@@ -948,6 +1004,7 @@ async fn run_remote_mail(
         MailAction::Search {
             q,
             labels,
+            unread,
             limit,
             include_body,
             max_chars,
@@ -962,6 +1019,9 @@ async fn run_remote_mail(
             }
             if !labels.is_empty() {
                 params.push(("labels".to_string(), labels.join(",")));
+            }
+            if let Some(unread) = unread {
+                params.push(("unread".to_string(), unread.to_string()));
             }
             let resp = with_optional_bearer(
                 client.get(format!("{base}/v1/search")).query(&params),
@@ -1309,6 +1369,19 @@ async fn run(cli: Cli) -> AppResult<()> {
             }
         }
 
+        Command::Search { action } => {
+            init_tracing(cli.log_json, true);
+            let config = cli.common.into_config(None);
+            let state = AppState::from_config(config)?;
+            match action {
+                SearchCommand::Reindex => {
+                    let report =
+                        reindex_mailbox(state.store.as_ref(), state.search.as_ref()).await?;
+                    emit_output(serde_json::to_value(report)?, None, false)
+                }
+            }
+        }
+
         Command::Schema { command } => {
             let schema = ai::runtime_schema(command.as_deref());
             emit_output(schema, None, true)
@@ -1342,6 +1415,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                 MailAction::Search {
                     q,
                     labels,
+                    unread,
                     limit,
                     include_body,
                     max_chars,
@@ -1351,6 +1425,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                         .search(&AiSearchQuery {
                             q,
                             labels,
+                            unread,
                             limit,
                             ..Default::default()
                         })

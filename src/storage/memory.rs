@@ -1941,6 +1941,12 @@ impl MailStore for MemoryStore {
                 {
                     return false;
                 }
+                if let Some(want_unread) = query.unread {
+                    let is_unread = m.label_ids.iter().any(|l| l == LABEL_UNREAD);
+                    if is_unread != want_unread {
+                        return false;
+                    }
+                }
                 if let Some(ref tid) = query.thread_id
                     && !tid.trim().is_empty()
                     && m.thread_id != tid.trim()
