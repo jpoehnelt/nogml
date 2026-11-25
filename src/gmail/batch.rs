@@ -34,7 +34,9 @@ pub async fn batch_handler(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::BadRequest("Missing Content-Type header for batch request".into()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("Missing Content-Type header for batch request".into())
+        })?;
 
     let parts = parse_multipart_parts(content_type, &body)?;
     if parts.is_empty() {
@@ -59,13 +61,14 @@ pub async fn batch_handler(
     for part in parts {
         let part_content_id = part.header("content-id").map(strip_angle_brackets);
 
-        let sub_response = match build_embedded_request(&part.body, outer_auth.as_ref(), outer_api_key.as_ref()) {
-            Ok(req) => match sub_router.clone().oneshot(req).await {
-                Ok(resp) => resp,
-                Err(infallible) => match infallible {},
-            },
-            Err(err) => err.into_response(),
-        };
+        let sub_response =
+            match build_embedded_request(&part.body, outer_auth.as_ref(), outer_api_key.as_ref()) {
+                Ok(req) => match sub_router.clone().oneshot(req).await {
+                    Ok(resp) => resp,
+                    Err(infallible) => match infallible {},
+                },
+                Err(err) => err.into_response(),
+            };
 
         write_batch_part(
             &mut out,
@@ -78,10 +81,8 @@ pub async fn batch_handler(
 
     out.extend_from_slice(format!("--{response_boundary}--\r\n").as_bytes());
 
-    let ct_value = HeaderValue::from_str(&format!(
-        "multipart/mixed; boundary={response_boundary}"
-    ))
-    .map_err(|e| AppError::Internal(format!("Invalid batch boundary header: {e}")))?;
+    let ct_value = HeaderValue::from_str(&format!("multipart/mixed; boundary={response_boundary}"))
+        .map_err(|e| AppError::Internal(format!("Invalid batch boundary header: {e}")))?;
 
     let mut resp = Response::new(Body::from(out));
     *resp.status_mut() = StatusCode::OK;
@@ -136,8 +137,9 @@ fn build_embedded_request(
         .next()
         .ok_or_else(|| AppError::BadRequest("Missing request URI in batch part".into()))?;
 
-    let method = Method::from_bytes(method_str.as_bytes())
-        .map_err(|_| AppError::BadRequest(format!("Invalid HTTP method '{method_str}' in batch part")))?;
+    let method = Method::from_bytes(method_str.as_bytes()).map_err(|_| {
+        AppError::BadRequest(format!("Invalid HTTP method '{method_str}' in batch part"))
+    })?;
 
     let normalized_uri = normalize_batch_target(target_raw)?;
 

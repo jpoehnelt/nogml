@@ -101,8 +101,10 @@ impl AppState {
             Ok(b) => b,
             Err(_) => Arc::new(InlineBlobStore),
         };
-        let transport: Arc<dyn MailTransport> =
-            Arc::new(ResendTransport::new(resend.clone(), config.user_email.clone()));
+        let transport: Arc<dyn MailTransport> = Arc::new(ResendTransport::new(
+            resend.clone(),
+            config.user_email.clone(),
+        ));
         let filter: Arc<dyn InboundFilter> = Arc::new(NoopFilter);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let search: Arc<dyn SearchIndex> = Arc::new(StoreSearchIndex::new(store.clone()));
@@ -634,7 +636,11 @@ mod pluggable_seam_tests {
             is_deleted: false,
             attachments: vec![],
         };
-        assert!(!sync::apply_sync_inbound_filter(&state, &mut sync_input).await.unwrap());
+        assert!(
+            !sync::apply_sync_inbound_filter(&state, &mut sync_input)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

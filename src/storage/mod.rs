@@ -508,8 +508,11 @@ pub trait MailStore: Send + Sync {
     async fn list_drafts(&self, query: &MessageListQuery) -> AppResult<DraftListPage>;
     async fn get_draft(&self, id: &str) -> AppResult<Option<StoredDraft>>;
     async fn create_draft(&self, message: NewMessageInput) -> AppResult<StoredDraft>;
-    async fn update_draft(&self, draft_id: &str, message: NewMessageInput)
-        -> AppResult<StoredDraft>;
+    async fn update_draft(
+        &self,
+        draft_id: &str,
+        message: NewMessageInput,
+    ) -> AppResult<StoredDraft>;
     async fn delete_draft(&self, draft_id: &str) -> AppResult<bool>;
 
     // --- AI-First Search & Triage ---

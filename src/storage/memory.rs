@@ -469,8 +469,7 @@ impl MemoryState {
     fn delete_message_inner(&mut self, id: &str) -> Option<StoredMessage> {
         let msg = self.messages.remove(id)?;
         self.attachments.remove(id);
-        self.message_label_uids
-            .retain(|(mid, _), _| mid != id);
+        self.message_label_uids.retain(|(mid, _), _| mid != id);
         self.drafts.retain(|_, d| d.message_id != id);
         let hid = self.bump_history_id();
         self.record_history_event(
@@ -800,7 +799,10 @@ fn rewrite_search_term_labels(
         SearchTerm::Label(val) => {
             let key_exact = val.to_ascii_lowercase();
             let key_hyphen = key_exact.replace('/', "-");
-            if let Some(id) = name_to_id.get(&key_exact).or_else(|| name_to_id.get(&key_hyphen)) {
+            if let Some(id) = name_to_id
+                .get(&key_exact)
+                .or_else(|| name_to_id.get(&key_hyphen))
+            {
                 SearchTerm::Or(vec![SearchTerm::Label(val), SearchTerm::Label(id.clone())])
             } else {
                 SearchTerm::Label(val)
@@ -809,7 +811,10 @@ fn rewrite_search_term_labels(
         SearchTerm::InMailbox(val) => {
             let key_exact = val.to_ascii_lowercase();
             let key_hyphen = key_exact.replace('/', "-");
-            if let Some(id) = name_to_id.get(&key_exact).or_else(|| name_to_id.get(&key_hyphen)) {
+            if let Some(id) = name_to_id
+                .get(&key_exact)
+                .or_else(|| name_to_id.get(&key_hyphen))
+            {
                 SearchTerm::Or(vec![
                     SearchTerm::InMailbox(val),
                     SearchTerm::Label(id.clone()),
@@ -818,9 +823,9 @@ fn rewrite_search_term_labels(
                 SearchTerm::InMailbox(val)
             }
         }
-        SearchTerm::Not(inner) => SearchTerm::Not(Box::new(rewrite_search_term_labels(
-            *inner, name_to_id,
-        ))),
+        SearchTerm::Not(inner) => {
+            SearchTerm::Not(Box::new(rewrite_search_term_labels(*inner, name_to_id)))
+        }
         SearchTerm::And(terms) => SearchTerm::And(
             terms
                 .into_iter()
@@ -837,10 +842,7 @@ fn rewrite_search_term_labels(
     }
 }
 
-fn parse_query_with_labels(
-    state: &MemoryState,
-    raw_q: &str,
-) -> crate::search::SearchQuery {
+fn parse_query_with_labels(state: &MemoryState, raw_q: &str) -> crate::search::SearchQuery {
     let mut parsed = crate::search::parse_query(raw_q);
     if !parsed.terms.is_empty() {
         let mut map = HashMap::new();
@@ -1049,9 +1051,11 @@ impl MailStore for MemoryStore {
             query.max_results.min(500)
         };
         let resolved_label_filter = match query.label_id.as_deref() {
-            Some(l) if !l.trim().is_empty() => {
-                Some(state.resolve_existing_label_id(l).unwrap_or_else(|| l.to_string()))
-            }
+            Some(l) if !l.trim().is_empty() => Some(
+                state
+                    .resolve_existing_label_id(l)
+                    .unwrap_or_else(|| l.to_string()),
+            ),
             _ => None,
         };
 
@@ -1122,7 +1126,11 @@ impl MailStore for MemoryStore {
         let resolved_labels: Vec<String> = query
             .label_ids
             .iter()
-            .map(|l| state.resolve_existing_label_id(l).unwrap_or_else(|| l.clone()))
+            .map(|l| {
+                state
+                    .resolve_existing_label_id(l)
+                    .unwrap_or_else(|| l.clone())
+            })
             .collect();
         let explicit_spam_trash = resolved_labels
             .iter()
@@ -1165,7 +1173,11 @@ impl MailStore for MemoryStore {
         });
 
         let total = matching.len();
-        let page: Vec<StoredMessage> = matching.into_iter().skip(offset).take(max_results).collect();
+        let page: Vec<StoredMessage> = matching
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect();
         let next_page_token = if offset + page.len() < total {
             Some((offset + page.len()).to_string())
         } else {
@@ -1259,11 +1271,10 @@ impl MailStore for MemoryStore {
         attachment_id: &str,
     ) -> AppResult<Option<StoredAttachment>> {
         let state = self.read_state()?;
-        Ok(state.attachments.get(message_id).and_then(|list| {
-            list.iter()
-                .find(|a| a.id == attachment_id)
-                .cloned()
-        }))
+        Ok(state
+            .attachments
+            .get(message_id)
+            .and_then(|list| list.iter().find(|a| a.id == attachment_id).cloned()))
     }
 
     async fn list_attachment_meta(&self, message_id: &str) -> AppResult<Vec<AttachmentMeta>> {
@@ -1304,7 +1315,11 @@ impl MailStore for MemoryStore {
         let required_labels: Vec<String> = query
             .label_ids
             .iter()
-            .map(|l| state.resolve_existing_label_id(l).unwrap_or_else(|| l.clone()))
+            .map(|l| {
+                state
+                    .resolve_existing_label_id(l)
+                    .unwrap_or_else(|| l.clone())
+            })
             .collect();
         let explicit_spam_trash = required_labels
             .iter()
@@ -1339,7 +1354,10 @@ impl MailStore for MemoryStore {
             if !required_labels.is_empty() {
                 let thread_labels: HashSet<&String> =
                     msgs.iter().flat_map(|m| m.label_ids.iter()).collect();
-                if !required_labels.iter().all(|req| thread_labels.contains(req)) {
+                if !required_labels
+                    .iter()
+                    .all(|req| thread_labels.contains(req))
+                {
                     continue;
                 }
             }
@@ -1348,11 +1366,7 @@ impl MailStore for MemoryStore {
             {
                 continue;
             }
-            let max_ts = msgs
-                .iter()
-                .map(|m| m.internal_date_ms)
-                .max()
-                .unwrap_or(0);
+            let max_ts = msgs.iter().map(|m| m.internal_date_ms).max().unwrap_or(0);
             let snippet = msgs.last().map(|m| m.snippet.clone()).unwrap_or_default();
             let history_id = msgs.iter().map(|m| m.history_id).max().unwrap_or(1);
             matching.push((
@@ -1552,11 +1566,9 @@ impl MailStore for MemoryStore {
                 if trimmed.is_empty() {
                     return Err(AppError::BadRequest("Label name cannot be empty".into()));
                 }
-                if state
-                    .labels
-                    .values()
-                    .any(|l| l.id != id && (l.name.eq_ignore_ascii_case(trimmed) || l.id == trimmed))
-                {
+                if state.labels.values().any(|l| {
+                    l.id != id && (l.name.eq_ignore_ascii_case(trimmed) || l.id == trimmed)
+                }) {
                     return Err(AppError::Conflict(format!(
                         "Label name already exists: {trimmed}"
                     )));
@@ -1574,8 +1586,12 @@ impl MailStore for MemoryStore {
             )
         } else {
             (
-                input.message_list_visibility.or(existing.message_list_visibility),
-                input.label_list_visibility.or(existing.label_list_visibility),
+                input
+                    .message_list_visibility
+                    .or(existing.message_list_visibility),
+                input
+                    .label_list_visibility
+                    .or(existing.label_list_visibility),
                 input.color.or(existing.color),
             )
         };
@@ -1621,7 +1637,9 @@ impl MailStore for MemoryStore {
                 msg.label_ids.retain(|l| l != id);
                 msg.history_id = hid;
             }
-            state.message_label_uids.remove(&(mid.clone(), id.to_string()));
+            state
+                .message_label_uids
+                .remove(&(mid.clone(), id.to_string()));
             state.record_history_event(
                 hid,
                 HistoryEventKind::LabelRemoved,
@@ -1741,8 +1759,8 @@ impl MailStore for MemoryStore {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|raw| parse_query_with_labels(&state, raw));
-        let effective_include_spam_trash = query.include_spam_trash
-            || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
+        let effective_include_spam_trash =
+            query.include_spam_trash || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
         let mut drafts: Vec<StoredDraft> = Vec::new();
         for d in state.drafts.values() {
@@ -1881,7 +1899,11 @@ impl MailStore for MemoryStore {
         let resolved_labels: Vec<String> = query
             .labels
             .iter()
-            .map(|l| state.resolve_existing_label_id(l).unwrap_or_else(|| l.clone()))
+            .map(|l| {
+                state
+                    .resolve_existing_label_id(l)
+                    .unwrap_or_else(|| l.clone())
+            })
             .collect();
         let explicit_spam_trash = resolved_labels
             .iter()
@@ -2007,9 +2029,11 @@ impl MailStore for MemoryStore {
         };
 
         let resolved_label = match query.label.as_deref() {
-            Some(l) if !l.trim().is_empty() => {
-                Some(state.resolve_existing_label_id(l).unwrap_or_else(|| l.to_string()))
-            }
+            Some(l) if !l.trim().is_empty() => Some(
+                state
+                    .resolve_existing_label_id(l)
+                    .unwrap_or_else(|| l.to_string()),
+            ),
             _ => None,
         };
         let explicit_spam_trash = resolved_label
@@ -2055,11 +2079,7 @@ impl MailStore for MemoryStore {
             if query.unread_only && !summary.unread {
                 continue;
             }
-            let max_ts = msgs
-                .iter()
-                .map(|m| m.internal_date_ms)
-                .max()
-                .unwrap_or(0);
+            let max_ts = msgs.iter().map(|m| m.internal_date_ms).max().unwrap_or(0);
             if let Some((cursor_ts, ref cursor_id)) = cursor
                 && !(max_ts < cursor_ts
                     || (max_ts == cursor_ts && tid.as_str() < cursor_id.as_str()))
@@ -2325,10 +2345,7 @@ impl MailStore for MemoryStore {
 
         let same_mailbox = match (&src, &dst) {
             (ResolvedMailbox::AllMail, ResolvedMailbox::AllMail) => true,
-            (
-                ResolvedMailbox::Label { id: a, .. },
-                ResolvedMailbox::Label { id: b, .. },
-            ) => a == b,
+            (ResolvedMailbox::Label { id: a, .. }, ResolvedMailbox::Label { id: b, .. }) => a == b,
             _ => false,
         };
 
@@ -2356,7 +2373,8 @@ impl MailStore for MemoryStore {
                 }
             }
 
-            if is_move && !same_mailbox
+            if is_move
+                && !same_mailbox
                 && let ResolvedMailbox::Label { id: src_id, .. } = &src
             {
                 rem.push(src_id.clone());
@@ -2407,11 +2425,7 @@ impl MailStore for MemoryStore {
         let (uid_validity, assigned_uid) = match &resolved {
             ResolvedMailbox::AllMail => (state.all_mail_uid_validity, msg.all_mail_uid),
             ResolvedMailbox::Label { id, .. } => {
-                let uv = state
-                    .labels
-                    .get(id)
-                    .map(|l| l.uid_validity)
-                    .unwrap_or(1);
+                let uv = state.labels.get(id).map(|l| l.uid_validity).unwrap_or(1);
                 let uid = state
                     .message_label_uids
                     .get(&(msg.id.clone(), id.clone()))
@@ -2468,22 +2482,19 @@ impl MailStore for MemoryStore {
                 .collect();
             let labels_changed = !to_add.is_empty() || !to_remove.is_empty();
 
-            if flags_changed
-                && let Some(m) = state.messages.get_mut(&existing_id)
-            {
+            if flags_changed && let Some(m) = state.messages.get_mut(&existing_id) {
                 m.is_answered = input.is_answered;
                 m.is_deleted = input.is_deleted;
             }
 
-            let updated = if labels_changed {
-                state.modify_message_labels_resolved(&existing_id, &to_add, &to_remove)?
-            } else {
-                state
-                    .messages
-                    .get(&existing_id)
-                    .cloned()
-                    .ok_or_else(|| AppError::Storage("Missing message after sync update".into()))?
-            };
+            let updated =
+                if labels_changed {
+                    state.modify_message_labels_resolved(&existing_id, &to_add, &to_remove)?
+                } else {
+                    state.messages.get(&existing_id).cloned().ok_or_else(|| {
+                        AppError::Storage("Missing message after sync update".into())
+                    })?
+                };
 
             let kind = if labels_changed || flags_changed {
                 UpsertOutcomeKind::Updated
@@ -2501,9 +2512,7 @@ impl MailStore for MemoryStore {
             .rfc822_message_id
             .as_deref()
             .and_then(normalize_rfc_message_id)
-            && let Some(existing_id) = state
-                .find_msg_by_norm_rfc_id(&norm)
-                .map(|m| m.id.clone())
+            && let Some(existing_id) = state.find_msg_by_norm_rfc_id(&norm).map(|m| m.id.clone())
         {
             if let Some(m) = state.messages.get_mut(&existing_id) {
                 if m.upstream_gmail_id.is_none() && input.upstream_gmail_id.is_some() {
@@ -2845,13 +2854,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(store
-            .get_message(&s1.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .label_ids
-            .contains(&LABEL_STARRED.to_string()));
+        assert!(
+            store
+                .get_message(&s1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .label_ids
+                .contains(&LABEL_STARRED.to_string())
+        );
         store
             .batch_modify_labels(
                 &[s1.id.clone(), s2.id.clone()],
@@ -2862,10 +2873,12 @@ mod tests {
             .unwrap();
 
         let th_trashed = store.trash_thread(&s1.thread_id).await.unwrap();
-        assert!(th_trashed
-            .messages
-            .iter()
-            .all(|m| m.label_ids.contains(&LABEL_TRASH.to_string())));
+        assert!(
+            th_trashed
+                .messages
+                .iter()
+                .all(|m| m.label_ids.contains(&LABEL_TRASH.to_string()))
+        );
         let q_in_trash = store
             .list_messages(&MessageListQuery {
                 q: Some("in:trash".to_string()),
@@ -2875,10 +2888,12 @@ mod tests {
             .unwrap();
         assert_eq!(q_in_trash.messages.len(), 2);
         let th_untrashed = store.untrash_thread(&s1.thread_id).await.unwrap();
-        assert!(th_untrashed
-            .messages
-            .iter()
-            .all(|m| !m.label_ids.contains(&LABEL_TRASH.to_string())));
+        assert!(
+            th_untrashed
+                .messages
+                .iter()
+                .all(|m| !m.label_ids.contains(&LABEL_TRASH.to_string()))
+        );
         store
             .modify_thread_labels(&s1.thread_id, &[LABEL_INBOX.to_string()], &[])
             .await
@@ -2971,7 +2986,10 @@ mod tests {
         assert!(mbs.iter().any(|m| m.name == "Projects/Gamma"));
 
         let (_uv, app_uid, appended) = store
-            .imap_append("INBOX", sample_msg("Appended", "c@ex.com", "via imap", 1_700_000_030_000))
+            .imap_append(
+                "INBOX",
+                sample_msg("Appended", "c@ex.com", "via imap", 1_700_000_030_000),
+            )
             .await
             .unwrap();
         assert!(app_uid >= 1);
@@ -3013,7 +3031,12 @@ mod tests {
             .unwrap();
         assert_eq!(ulbl.id, ulbl_again.id);
 
-        let mut synced = sample_msg("Launch checklist", "Alice <alice@example.com>", "body", 1_700_000_010_000);
+        let mut synced = sample_msg(
+            "Launch checklist",
+            "Alice <alice@example.com>",
+            "body",
+            1_700_000_010_000,
+        );
         synced.rfc822_message_id = Some("launch-1@example.com".to_string());
         synced.upstream_gmail_id = Some("gm_100".to_string());
         synced.upstream_thread_id = Some("gm_th_100".to_string());
@@ -3053,7 +3076,12 @@ mod tests {
 
         // 9. Drafts, settings, watch, sync state, delete label, delete thread
         let draft = store
-            .create_draft(sample_msg("Draft subj", "user@example.com", "draft text", 1_700_000_040_000))
+            .create_draft(sample_msg(
+                "Draft subj",
+                "user@example.com",
+                "draft text",
+                1_700_000_040_000,
+            ))
             .await
             .unwrap();
         let drafts = store
@@ -3065,7 +3093,12 @@ mod tests {
         let updated_draft = store
             .update_draft(
                 &draft.id,
-                sample_msg("Draft subj v2", "user@example.com", "draft v2", 1_700_000_050_000),
+                sample_msg(
+                    "Draft subj v2",
+                    "user@example.com",
+                    "draft v2",
+                    1_700_000_050_000,
+                ),
             )
             .await
             .unwrap();
@@ -3076,7 +3109,12 @@ mod tests {
         new_settings.vacation.enable_auto_reply = Some(true);
         store.save_settings(new_settings).await.unwrap();
         assert_eq!(
-            store.get_settings().await.unwrap().vacation.enable_auto_reply,
+            store
+                .get_settings()
+                .await
+                .unwrap()
+                .vacation
+                .enable_auto_reply,
             Some(true)
         );
 

@@ -192,9 +192,7 @@ impl Config {
                         && self.gmail_client_secret.is_some()
                         && self.gmail_refresh_token.is_some())
             }
-            SyncMode::Imap => {
-                self.gmail_imap_user.is_some() && self.gmail_imap_password.is_some()
-            }
+            SyncMode::Imap => self.gmail_imap_user.is_some() && self.gmail_imap_password.is_some(),
         }
     }
 

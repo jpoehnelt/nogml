@@ -53,19 +53,39 @@ struct CommonConfigArgs {
     db_path: PathBuf,
 
     /// Blob storage backend (`inline`, `fs`, or `memory`).
-    #[arg(long, env = "NOGML_BLOB_BACKEND", default_value = "inline", global = true)]
+    #[arg(
+        long,
+        env = "NOGML_BLOB_BACKEND",
+        default_value = "inline",
+        global = true
+    )]
     blob_backend: BlobBackend,
 
     /// Filesystem blob directory (when `--blob-backend=fs`).
-    #[arg(long, env = "NOGML_BLOB_DIR", default_value = "nogml-blobs", global = true)]
+    #[arg(
+        long,
+        env = "NOGML_BLOB_DIR",
+        default_value = "nogml-blobs",
+        global = true
+    )]
     blob_dir: PathBuf,
 
     /// Primary mailbox email address.
-    #[arg(long, env = "NOGML_USER_EMAIL", default_value = "me@localhost", global = true)]
+    #[arg(
+        long,
+        env = "NOGML_USER_EMAIL",
+        default_value = "me@localhost",
+        global = true
+    )]
     user_email: String,
 
     /// Default domain for generated Message-IDs and fallback sender addresses.
-    #[arg(long, env = "NOGML_DEFAULT_DOMAIN", default_value = "localhost", global = true)]
+    #[arg(
+        long,
+        env = "NOGML_DEFAULT_DOMAIN",
+        default_value = "localhost",
+        global = true
+    )]
     default_domain: String,
 
     /// Resend API key (`re_...`).
@@ -73,7 +93,12 @@ struct CommonConfigArgs {
     resend_api_key: Option<String>,
 
     /// Resend API base URL (override for testing).
-    #[arg(long, env = "RESEND_BASE_URL", default_value = "https://api.resend.com", global = true)]
+    #[arg(
+        long,
+        env = "RESEND_BASE_URL",
+        default_value = "https://api.resend.com",
+        global = true
+    )]
     resend_base_url: String,
 
     /// Resend Svix webhook signing secret (`whsec_...`).
@@ -89,23 +114,48 @@ struct CommonConfigArgs {
     draft_only: bool,
 
     /// Action when `draft_only` is active (`block` or `downgrade`).
-    #[arg(long, env = "NOGML_DRAFT_ONLY_ACTION", default_value = "block", global = true)]
+    #[arg(
+        long,
+        env = "NOGML_DRAFT_ONLY_ACTION",
+        default_value = "block",
+        global = true
+    )]
     draft_only_action: DraftOnlyAction,
 
     /// Comma-separated recipient allowlist (exact email, `@domain`, or `*.domain`).
-    #[arg(long, env = "NOGML_ALLOWED_RECIPIENTS", value_delimiter = ',', global = true)]
+    #[arg(
+        long,
+        env = "NOGML_ALLOWED_RECIPIENTS",
+        value_delimiter = ',',
+        global = true
+    )]
     allowed_recipients: Vec<String>,
 
     /// Maximum recipients permitted per outbound send.
-    #[arg(long, env = "NOGML_MAX_SEND_RECIPIENTS", default_value_t = 50, global = true)]
+    #[arg(
+        long,
+        env = "NOGML_MAX_SEND_RECIPIENTS",
+        default_value_t = 50,
+        global = true
+    )]
     max_send_recipients: usize,
 
     /// Default body character limit for AI/MCP reads.
-    #[arg(long, env = "NOGML_DEFAULT_MAX_BODY_CHARS", default_value_t = 4000, global = true)]
+    #[arg(
+        long,
+        env = "NOGML_DEFAULT_MAX_BODY_CHARS",
+        default_value_t = 4000,
+        global = true
+    )]
     default_max_body_chars: usize,
 
     /// Strip control/BiDi override chars and tag external content on AI/MCP reads.
-    #[arg(long, env = "NOGML_UNTRUSTED_CONTENT_GUARD", default_value_t = true, global = true)]
+    #[arg(
+        long,
+        env = "NOGML_UNTRUSTED_CONTENT_GUARD",
+        default_value_t = true,
+        global = true
+    )]
     untrusted_content_guard: bool,
 
     // --- Upstream Gmail Sync ---
@@ -127,13 +177,28 @@ struct CommonConfigArgs {
     #[arg(long, env = "GMAIL_USER_ID", default_value = "me", global = true)]
     gmail_user_id: String,
 
-    #[arg(long, env = "GMAIL_API_BASE_URL", default_value = "https://gmail.googleapis.com", global = true)]
+    #[arg(
+        long,
+        env = "GMAIL_API_BASE_URL",
+        default_value = "https://gmail.googleapis.com",
+        global = true
+    )]
     gmail_api_base_url: String,
 
-    #[arg(long, env = "GMAIL_OAUTH_TOKEN_URL", default_value = "https://oauth2.googleapis.com/token", global = true)]
+    #[arg(
+        long,
+        env = "GMAIL_OAUTH_TOKEN_URL",
+        default_value = "https://oauth2.googleapis.com/token",
+        global = true
+    )]
     gmail_oauth_token_url: String,
 
-    #[arg(long, env = "GMAIL_IMAP_HOST", default_value = "imap.gmail.com", global = true)]
+    #[arg(
+        long,
+        env = "GMAIL_IMAP_HOST",
+        default_value = "imap.gmail.com",
+        global = true
+    )]
     gmail_imap_host: String,
 
     #[arg(long, env = "GMAIL_IMAP_PORT", default_value_t = 993, global = true)]
@@ -148,7 +213,12 @@ struct CommonConfigArgs {
     #[arg(long, env = "GMAIL_IMAP_PASSWORD", global = true)]
     gmail_imap_password: Option<String>,
 
-    #[arg(long, env = "GMAIL_IMAP_MAILBOX", default_value = "[Gmail]/All Mail", global = true)]
+    #[arg(
+        long,
+        env = "GMAIL_IMAP_MAILBOX",
+        default_value = "[Gmail]/All Mail",
+        global = true
+    )]
     gmail_imap_mailbox: String,
 
     #[arg(long, env = "NOGML_SYNC_QUERY", global = true)]
@@ -669,8 +739,7 @@ async fn run_remote_mail(
             strip_quotes,
             include_html,
         } => {
-            let encoded_id: String =
-                url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+            let encoded_id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
             let path = if thread {
                 format!("{base}/v1/threads/{encoded_id}")
             } else {
@@ -1054,11 +1123,10 @@ async fn run(cli: Cli) -> AppResult<()> {
                     include_html,
                 } => {
                     if thread {
-                        let detail = state
-                            .store
-                            .get_thread(&id)
-                            .await?
-                            .ok_or_else(|| AppError::NotFound(format!("Thread {id} not found")))?;
+                        let detail =
+                            state.store.get_thread(&id).await?.ok_or_else(|| {
+                                AppError::NotFound(format!("Thread {id} not found"))
+                            })?;
                         let messages: Vec<_> = detail
                             .messages
                             .iter()
@@ -1079,11 +1147,10 @@ async fn run(cli: Cli) -> AppResult<()> {
                             json_flag,
                         )
                     } else {
-                        let msg = state
-                            .store
-                            .get_message(&id)
-                            .await?
-                            .ok_or_else(|| AppError::NotFound(format!("Message {id} not found")))?;
+                        let msg =
+                            state.store.get_message(&id).await?.ok_or_else(|| {
+                                AppError::NotFound(format!("Message {id} not found"))
+                            })?;
                         let compact = ai::to_compact_message(
                             &msg,
                             &state.config,

@@ -437,10 +437,7 @@ mod tests {
             apply_fields_mask(val.clone(), "id,nonexistent,payload/missing").unwrap(),
             json!({ "id": "m1" })
         );
-        assert_eq!(
-            apply_fields_mask(val, "totallyMissing").unwrap(),
-            json!({})
-        );
+        assert_eq!(apply_fields_mask(val, "totallyMissing").unwrap(), json!({}));
     }
 
     #[test]
@@ -464,7 +461,8 @@ mod tests {
         });
 
         assert_eq!(
-            apply_fields_mask(val.clone(), "messages(id),messages(threadId),emptyList(id)").unwrap(),
+            apply_fields_mask(val.clone(), "messages(id),messages(threadId),emptyList(id)")
+                .unwrap(),
             json!({
                 "messages": [
                     { "id": "1", "threadId": "t1" },

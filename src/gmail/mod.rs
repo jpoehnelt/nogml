@@ -72,10 +72,7 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
             "/upload/gmail/v1/users/{userId}/messages",
             post(insert_message),
         )
-        .route(
-            "/gmail/v1/users/{userId}/messages/send",
-            post(send_message),
-        )
+        .route("/gmail/v1/users/{userId}/messages/send", post(send_message))
         .route(
             "/upload/gmail/v1/users/{userId}/messages/send",
             post(send_message),
@@ -151,14 +148,8 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
             "/gmail/v1/users/{userId}/drafts",
             get(list_drafts).post(create_draft),
         )
-        .route(
-            "/upload/gmail/v1/users/{userId}/drafts",
-            post(create_draft),
-        )
-        .route(
-            "/gmail/v1/users/{userId}/drafts/send",
-            post(send_draft),
-        )
+        .route("/upload/gmail/v1/users/{userId}/drafts", post(create_draft))
+        .route("/gmail/v1/users/{userId}/drafts/send", post(send_draft))
         .route(
             "/upload/gmail/v1/users/{userId}/drafts/send",
             post(send_draft),
@@ -709,8 +700,8 @@ async fn send_message(
         )
     })?;
 
-    let thread_id = (!extracted.metadata.thread_id.is_empty())
-        .then_some(extracted.metadata.thread_id);
+    let thread_id =
+        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
@@ -766,8 +757,8 @@ async fn insert_message(
 
     let labels = extracted.metadata.label_ids.unwrap_or_default();
     validate_label_ids(&labels)?;
-    let thread_id = (!extracted.metadata.thread_id.is_empty())
-        .then_some(extracted.metadata.thread_id);
+    let thread_id =
+        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
@@ -883,8 +874,8 @@ async fn import_message(
         labels.retain(|l| l != LABEL_SPAM);
     }
 
-    let thread_id = (!extracted.metadata.thread_id.is_empty())
-        .then_some(extracted.metadata.thread_id);
+    let thread_id =
+        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
@@ -1770,7 +1761,8 @@ async fn list_history(
 
         match entry.kind {
             HistoryEventKind::MessageAdded => {
-                acc.messages_added.push(HistoryMessageAdded { message: msg });
+                acc.messages_added
+                    .push(HistoryMessageAdded { message: msg });
             }
             HistoryEventKind::MessageDeleted => {
                 acc.messages_deleted

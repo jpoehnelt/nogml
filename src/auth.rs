@@ -129,7 +129,9 @@ impl AuthProvider for StaticTokenAuthProvider {
 
     async fn authenticate_imap(&self, username: &str, password: &str) -> AppResult<Principal> {
         if !username.eq_ignore_ascii_case(&self.imap_username) {
-            return Err(AppError::Unauthorized("Invalid IMAP credentials".to_string()));
+            return Err(AppError::Unauthorized(
+                "Invalid IMAP credentials".to_string(),
+            ));
         }
 
         let valid = match self.imap_password.as_deref() {
@@ -144,7 +146,9 @@ impl AuthProvider for StaticTokenAuthProvider {
         if valid {
             Ok(Principal::full_access(&self.mailbox_id))
         } else {
-            Err(AppError::Unauthorized("Invalid IMAP credentials".to_string()))
+            Err(AppError::Unauthorized(
+                "Invalid IMAP credentials".to_string(),
+            ))
         }
     }
 
@@ -183,7 +187,10 @@ pub fn constant_time_token_matches(candidate: &str, allowed: &[String]) -> bool 
 /// 2. `X-API-Key: <token>`
 /// 3. `?access_token=<token>`
 pub fn extract_request_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = auth_val.trim();
         if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
             let token = trimmed[7..].trim();
@@ -262,11 +269,7 @@ pub fn validate_resource_id(id: &str) -> AppResult<()> {
         ));
     }
 
-    if id
-        .bytes()
-        .any(|b| b <= 0x1f || b == 0x7f)
-        || id.chars().any(char::is_control)
-    {
+    if id.bytes().any(|b| b <= 0x1f || b == 0x7f) || id.chars().any(char::is_control) {
         return Err(AppError::validation(
             "Resource ID contains disallowed control characters",
             None,
@@ -308,27 +311,26 @@ pub fn validate_email_header(name: &str, value: &str) -> AppResult<()> {
         ));
     }
 
-    if name
-        .bytes()
-        .any(|b| b <= 0x20 || b >= 0x7f || b == b':')
-    {
+    if name.bytes().any(|b| b <= 0x20 || b >= 0x7f || b == b':') {
         return Err(AppError::validation(
             format!("Invalid email header name '{name}'"),
-            Some("Header names must consist of visible ASCII characters excluding ':'.".to_string()),
+            Some(
+                "Header names must consist of visible ASCII characters excluding ':'.".to_string(),
+            ),
         ));
     }
 
     if value.contains('\r') || value.contains('\n') || value.contains('\0') {
         return Err(AppError::validation(
             format!("Header '{name}' contains disallowed CR, LF, or NUL character"),
-            Some("Remove newline characters from email headers to prevent header injection.".to_string()),
+            Some(
+                "Remove newline characters from email headers to prevent header injection."
+                    .to_string(),
+            ),
         ));
     }
 
-    if value
-        .bytes()
-        .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
-    {
+    if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
         return Err(AppError::validation(
             format!("Header '{name}' contains disallowed control characters"),
             None,
@@ -519,7 +521,12 @@ mod tests {
         for path in ["/healthz", "/readyz", "/webhooks/resend"] {
             let res = app
                 .clone()
-                .oneshot(HttpRequest::builder().uri(path).body(Body::empty()).unwrap())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "path {path} should be exempt");

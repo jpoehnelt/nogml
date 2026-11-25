@@ -11,9 +11,7 @@ use crate::{
     config::{Config, DraftOnlyAction},
     error::{AppError, AppResult},
     mime::{ComposeEmailInput, build_rfc2822},
-    models::{
-        AiSendEmailRequest, DryRunPreview, DryRunResponse, PolicyCheckResult, UntrustedMeta,
-    },
+    models::{AiSendEmailRequest, DryRunPreview, DryRunResponse, PolicyCheckResult, UntrustedMeta},
     storage::parse_simple_email_address,
 };
 
@@ -272,7 +270,9 @@ pub fn validate_email_header(name: &str, value: &str) -> AppResult<()> {
     if value.contains('\r') || value.contains('\n') || value.contains('\0') {
         return Err(AppError::validation(
             format!("Email header '{name}' contains forbidden CR/LF/NUL characters"),
-            Some("Header values must be single-line strings without CR/LF or NUL bytes.".to_string()),
+            Some(
+                "Header values must be single-line strings without CR/LF or NUL bytes.".to_string(),
+            ),
         ));
     }
     Ok(())
@@ -504,11 +504,9 @@ pub async fn resolve_reply_threading(
 
     if let Some(reply_id) = reply_to_message_id {
         validate_resource_id(reply_id)?;
-        let parent = state
-            .store
-            .get_message(reply_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("Reply target message '{reply_id}' not found")))?;
+        let parent = state.store.get_message(reply_id).await?.ok_or_else(|| {
+            AppError::NotFound(format!("Reply target message '{reply_id}' not found"))
+        })?;
 
         thread_id = Some(parent.thread_id.clone());
 
@@ -747,10 +745,9 @@ pub async fn evaluate_resolved_dry_run(
             subject: resolved.subject.clone(),
             text: resolved.text.clone(),
             html: resolved.html.clone(),
-            message_id: Some(format!(
-                "<preview@{} >",
-                state.config.default_domain
-            ).replace(' ', "")),
+            message_id: Some(
+                format!("<preview@{} >", state.config.default_domain).replace(' ', ""),
+            ),
             in_reply_to: resolved.in_reply_to.clone(),
             references: resolved.references.clone(),
             extra_headers: HashMap::new(),

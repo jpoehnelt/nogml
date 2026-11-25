@@ -608,7 +608,9 @@ async fn gmail_message_formats_repeatable_metadata_headers_and_attachments() {
     // 3. format=minimal
     let minimal: Value = srv
         .client
-        .get(srv.url(&format!("/gmail/v1/users/me/messages/{msg_id}?format=minimal")))
+        .get(srv.url(&format!(
+            "/gmail/v1/users/me/messages/{msg_id}?format=minimal"
+        )))
         .send()
         .await
         .unwrap()
@@ -1507,7 +1509,10 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
         .header("content-type", "application/json")
         .header("svix-id", "msg_bad_1")
         .header("svix-timestamp", now_secs.to_string())
-        .header("svix-signature", "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        .header(
+            "svix-signature",
+            "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
         .body(inbound_payload.clone())
         .send()
         .await
@@ -1527,9 +1532,13 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
     assert_eq!(missing_sig_status, StatusCode::UNAUTHORIZED);
 
     // 2. Valid Svix-signed `email.received` (no Bearer auth needed on webhook route)
-    let valid_sig =
-        sign_svix_payload("msg_valid_in_1", now_secs, &inbound_payload, TEST_WEBHOOK_SECRET)
-            .unwrap();
+    let valid_sig = sign_svix_payload(
+        "msg_valid_in_1",
+        now_secs,
+        &inbound_payload,
+        TEST_WEBHOOK_SECRET,
+    )
+    .unwrap();
     let wh_resp = srv
         .client
         .post(srv.url("/webhooks/resend"))
@@ -1552,7 +1561,9 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
     // 3a. Readable via Gmail REST API v1 (+ attachment)
     let gmail_msg: Value = srv
         .client
-        .get(srv.url(&format!("/gmail/v1/users/me/messages/{ingested_id}?format=full")))
+        .get(srv.url(&format!(
+            "/gmail/v1/users/me/messages/{ingested_id}?format=full"
+        )))
         .bearer_auth(TEST_BEARER_TOKEN)
         .send()
         .await
@@ -1619,9 +1630,7 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
         .to_string();
     let ai_att_bytes = srv
         .client
-        .get(srv.url(&format!(
-            "/v1/messages/{ingested_id}/attachments/{att_id}"
-        )))
+        .get(srv.url(&format!("/v1/messages/{ingested_id}/attachments/{att_id}")))
         .bearer_auth(TEST_BEARER_TOKEN)
         .send()
         .await
@@ -1722,8 +1731,13 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
         "data": { "email_id": "re_out_888" }
     }))
     .unwrap();
-    let delivered_sig =
-        sign_svix_payload("msg_deliv_1", now_secs, &delivered_body, TEST_WEBHOOK_SECRET).unwrap();
+    let delivered_sig = sign_svix_payload(
+        "msg_deliv_1",
+        now_secs,
+        &delivered_body,
+        TEST_WEBHOOK_SECRET,
+    )
+    .unwrap();
     let deliv_resp: Value = srv
         .client
         .post(srv.url("/webhooks/resend"))
@@ -1741,8 +1755,17 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
     assert_eq!(deliv_resp["delivery_status"], "delivered");
     assert_eq!(deliv_resp["message_id"], out_msg_id);
 
-    let stored_after_deliv = srv.state.store.get_message(&out_msg_id).await.unwrap().unwrap();
-    assert_eq!(stored_after_deliv.delivery_status.as_deref(), Some("delivered"));
+    let stored_after_deliv = srv
+        .state
+        .store
+        .get_message(&out_msg_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_after_deliv.delivery_status.as_deref(),
+        Some("delivered")
+    );
 
     let (ev1_name, _, ev1_data) =
         read_next_sse_event(&mut sse_resp, &mut sse_buf, Duration::from_secs(3)).await;
@@ -1783,8 +1806,17 @@ async fn resend_webhooks_svix_verification_inbound_cross_protocol_and_delivery_s
         .unwrap();
     assert_eq!(bounce_resp["delivery_status"], "bounced");
 
-    let stored_after_bounce = srv.state.store.get_message(&out_msg_id).await.unwrap().unwrap();
-    assert_eq!(stored_after_bounce.delivery_status.as_deref(), Some("bounced"));
+    let stored_after_bounce = srv
+        .state
+        .store
+        .get_message(&out_msg_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_after_bounce.delivery_status.as_deref(),
+        Some("bounced")
+    );
 
     let (ev2_name, _, ev2_data) =
         read_next_sse_event(&mut sse_resp, &mut sse_buf, Duration::from_secs(3)).await;
@@ -2189,9 +2221,12 @@ async fn mcp_streamable_http_initialize_tools_and_resources() {
         .await
         .unwrap();
     assert_eq!(search_resp["result"]["isError"], false);
-    let search_data: Value =
-        serde_json::from_str(search_resp["result"]["content"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let search_data: Value = serde_json::from_str(
+        search_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(search_data["messages"][0]["id"], msg_id);
 
     let triage_resp: Value = srv
@@ -2241,8 +2276,7 @@ async fn mcp_streamable_http_initialize_tools_and_resources() {
         "application/json"
     );
     let inbox_body: Value =
-        serde_json::from_str(inbox_res["result"]["contents"][0]["text"].as_str().unwrap())
-            .unwrap();
+        serde_json::from_str(inbox_res["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(inbox_body["threads"][0]["id"], thread_id);
     assert_eq!(inbox_body["threads"][0]["unread"], false);
 
@@ -2262,9 +2296,12 @@ async fn mcp_streamable_http_initialize_tools_and_resources() {
         .json()
         .await
         .unwrap();
-    let thread_body: Value =
-        serde_json::from_str(thread_res["result"]["contents"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let thread_body: Value = serde_json::from_str(
+        thread_res["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(thread_body["id"], thread_id);
     assert_eq!(thread_body["messages"][0]["id"], msg_id);
 
@@ -2492,7 +2529,10 @@ async fn real_binary_live_serve_and_mail_remote_cli_commands() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(ready, "live `nogml serve` did not become ready on {base_url}");
+    assert!(
+        ready,
+        "live `nogml serve` did not become ready on {base_url}"
+    );
 
     // 1. `nogml mail --url http://127.0.0.1:<port> labels`
     let labels_out = Command::new(bin)

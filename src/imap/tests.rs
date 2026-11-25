@@ -135,19 +135,17 @@ impl TestMailStore {
         }
         match name {
             "[Gmail]/All Mail" => Some(("[Gmail]/All Mail".to_string(), None)),
-            "[Gmail]/Sent Mail" => {
-                Some(("[Gmail]/Sent Mail".to_string(), Some(LABEL_SENT.to_string())))
-            }
-            "[Gmail]/Drafts" => {
-                Some(("[Gmail]/Drafts".to_string(), Some(LABEL_DRAFT.to_string())))
-            }
-            "[Gmail]/Trash" => {
-                Some(("[Gmail]/Trash".to_string(), Some(LABEL_TRASH.to_string())))
-            }
+            "[Gmail]/Sent Mail" => Some((
+                "[Gmail]/Sent Mail".to_string(),
+                Some(LABEL_SENT.to_string()),
+            )),
+            "[Gmail]/Drafts" => Some(("[Gmail]/Drafts".to_string(), Some(LABEL_DRAFT.to_string()))),
+            "[Gmail]/Trash" => Some(("[Gmail]/Trash".to_string(), Some(LABEL_TRASH.to_string()))),
             "[Gmail]/Spam" => Some(("[Gmail]/Spam".to_string(), Some(LABEL_SPAM.to_string()))),
-            "[Gmail]/Starred" => {
-                Some(("[Gmail]/Starred".to_string(), Some(LABEL_STARRED.to_string())))
-            }
+            "[Gmail]/Starred" => Some((
+                "[Gmail]/Starred".to_string(),
+                Some(LABEL_STARRED.to_string()),
+            )),
             other => inner
                 .labels
                 .values()
@@ -285,7 +283,11 @@ impl TestMailStore {
 impl MailStore for TestMailStore {
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let inner = self.inner.lock().unwrap();
-        let threads: HashSet<&str> = inner.messages.values().map(|m| m.thread_id.as_str()).collect();
+        let threads: HashSet<&str> = inner
+            .messages
+            .values()
+            .map(|m| m.thread_id.as_str())
+            .collect();
         Ok(Profile {
             email_address: email_address.to_string(),
             messages_total: inner.messages.len() as i32,
@@ -614,9 +616,10 @@ impl MailStore for TestMailStore {
     }
     async fn imap_mailbox_info(&self, mailbox_name: &str) -> AppResult<Option<ImapMailboxInfo>> {
         let list = self.imap_list_mailboxes().await?;
-        Ok(list
-            .into_iter()
-            .find(|m| m.name == mailbox_name || (mailbox_name.eq_ignore_ascii_case("INBOX") && m.name == "INBOX")))
+        Ok(list.into_iter().find(|m| {
+            m.name == mailbox_name
+                || (mailbox_name.eq_ignore_ascii_case("INBOX") && m.name == "INBOX")
+        }))
     }
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {
         let inner = self.inner.lock().unwrap();
@@ -732,7 +735,10 @@ impl MailStore for TestMailStore {
                 }
                 None => msg.all_mail_uid,
             };
-            if is_move && let Some(ref s_lid) = src_lbl && src_lbl != dst_lbl {
+            if is_move
+                && let Some(ref s_lid) = src_lbl
+                && src_lbl != dst_lbl
+            {
                 msg.label_ids.retain(|l| l != s_lid);
             }
             inner.messages.insert(mid.clone(), msg);
@@ -939,10 +945,7 @@ async fn test_read_command_sync_and_literal_plus() {
 
     // Synchronizing literal `{5}` should trigger `+ Ready\r\n`.
     let client_task = tokio::spawn(async move {
-        client
-            .write_all(b"A1 APPEND INBOX {5}\r\n")
-            .await
-            .unwrap();
+        client.write_all(b"A1 APPEND INBOX {5}\r\n").await.unwrap();
         let mut resp = [0u8; 9];
         tokio::io::AsyncReadExt::read_exact(&mut client, &mut resp)
             .await
@@ -1029,8 +1032,7 @@ fn test_mime_envelope_bodystructure_and_sections() {
     assert!(bs.contains("\"TEXT\" \"HTML\""));
     assert!(bs.contains("\"MIXED\""));
 
-    let hdr_subj =
-        extract_body_section(raw, &parse_body_section("HEADER.FIELDS (Subject)"), None);
+    let hdr_subj = extract_body_section(raw, &parse_body_section("HEADER.FIELDS (Subject)"), None);
     let hdr_str = String::from_utf8_lossy(&hdr_subj);
     assert!(hdr_str.contains("Subject: Multipart Test"));
     assert!(!hdr_str.contains("From: Alice"));
@@ -1053,11 +1055,7 @@ async fn spawn_test_imap(state: AppState) -> (std::net::SocketAddr, watch::Sende
     (addr, tx)
 }
 
-async fn send_cmd(
-    reader: &mut BufReader<TcpStream>,
-    tag: &str,
-    cmd: &str,
-) -> Vec<String> {
+async fn send_cmd(reader: &mut BufReader<TcpStream>, tag: &str, cmd: &str) -> Vec<String> {
     reader
         .get_mut()
         .write_all(format!("{tag} {cmd}\r\n").as_bytes())
@@ -1096,8 +1094,7 @@ async fn test_imap_full_protocol_flow_and_async_imap_client() {
     assert!(id_res.last().unwrap().starts_with("T0 OK"));
 
     // AUTHENTICATE PLAIN with SASL-IR
-    let sasl = base64::engine::general_purpose::STANDARD
-        .encode("\0agent@example.com\0secret-pass");
+    let sasl = base64::engine::general_purpose::STANDARD.encode("\0agent@example.com\0secret-pass");
     let auth_res = send_cmd(&mut reader, "T1", &format!("AUTHENTICATE PLAIN {sasl}")).await;
     assert!(auth_res.last().unwrap().starts_with("T1 OK"));
 
@@ -1108,24 +1105,34 @@ async fn test_imap_full_protocol_flow_and_async_imap_client() {
     let list_res = send_cmd(&mut reader, "T3", r#"LIST "" "*""#).await;
     assert!(list_res.iter().any(|l| l.contains(r#""INBOX""#)));
     assert!(list_res.iter().any(|l| l.contains(r#"\All"#)));
-    assert!(list_res.iter().any(|l| l.contains(r#"\Noselect \HasChildren"#)));
+    assert!(
+        list_res
+            .iter()
+            .any(|l| l.contains(r#"\Noselect \HasChildren"#))
+    );
 
     // CREATE / RENAME / DELETE user label + reject system folder
-    assert!(send_cmd(&mut reader, "T4", r#"CREATE "Work""#)
-        .await
-        .last()
-        .unwrap()
-        .starts_with("T4 OK"));
-    assert!(send_cmd(&mut reader, "T5", r#"RENAME "Work" "Projects""#)
-        .await
-        .last()
-        .unwrap()
-        .starts_with("T5 OK"));
-    assert!(send_cmd(&mut reader, "T6", r#"DELETE "INBOX""#)
-        .await
-        .last()
-        .unwrap()
-        .starts_with("T6 NO"));
+    assert!(
+        send_cmd(&mut reader, "T4", r#"CREATE "Work""#)
+            .await
+            .last()
+            .unwrap()
+            .starts_with("T4 OK")
+    );
+    assert!(
+        send_cmd(&mut reader, "T5", r#"RENAME "Work" "Projects""#)
+            .await
+            .last()
+            .unwrap()
+            .starts_with("T5 OK")
+    );
+    assert!(
+        send_cmd(&mut reader, "T6", r#"DELETE "INBOX""#)
+            .await
+            .last()
+            .unwrap()
+            .starts_with("T6 NO")
+    );
 
     // APPEND with LITERAL+
     let raw_msg = concat!(
@@ -1140,7 +1147,11 @@ async fn test_imap_full_protocol_flow_and_async_imap_client() {
         "T7 APPEND INBOX (\\Flagged) \"10-Feb-2025 09:00:00 +0000\" {{{}+}}\r\n{raw_msg}\r\n",
         raw_msg.len()
     );
-    reader.get_mut().write_all(append_cmd.as_bytes()).await.unwrap();
+    reader
+        .get_mut()
+        .write_all(append_cmd.as_bytes())
+        .await
+        .unwrap();
     let mut append_line = String::new();
     reader.read_line(&mut append_line).await.unwrap();
     assert!(append_line.starts_with("T7 OK [APPENDUID "));
@@ -1154,7 +1165,12 @@ async fn test_imap_full_protocol_flow_and_async_imap_client() {
     assert!(select_res.last().unwrap().contains("[READ-WRITE]"));
 
     // UID SEARCH
-    let search_res = send_cmd(&mut reader, "T10", r#"UID SEARCH FLAGGED SUBJECT "Quarterly""#).await;
+    let search_res = send_cmd(
+        &mut reader,
+        "T10",
+        r#"UID SEARCH FLAGGED SUBJECT "Quarterly""#,
+    )
+    .await;
     assert!(search_res.iter().any(|l| l.trim() == "* SEARCH 1"));
 
     // UID STORE +FLAGS (\Seen \Deleted)
@@ -1206,7 +1222,12 @@ async fn test_imap_full_protocol_flow_and_async_imap_client() {
     let f = &fetches[0];
     assert_eq!(f.uid, Some(1));
     assert!(f.gmail_msg_id().is_some());
-    assert!(f.body().unwrap().windows(b"Quarterly Plan".len()).any(|w| w == b"Quarterly Plan"));
+    assert!(
+        f.body()
+            .unwrap()
+            .windows(b"Quarterly Plan".len())
+            .any(|w| w == b"Quarterly Plan")
+    );
     assert!(f.envelope().is_some());
     assert!(f.bodystructure().is_some());
 
@@ -1306,8 +1327,7 @@ async fn test_imap_auth_continuation_examine_expunge_search_and_body_peek_vs_bod
     reader.read_line(&mut cont).await.unwrap();
     assert!(cont.starts_with("+ "), "expected continuation, got: {cont}");
 
-    let sasl = base64::engine::general_purpose::STANDARD
-        .encode("\0agent@example.com\0secret-pass");
+    let sasl = base64::engine::general_purpose::STANDARD.encode("\0agent@example.com\0secret-pass");
     reader
         .get_mut()
         .write_all(format!("{sasl}\r\n").as_bytes())
@@ -1384,11 +1404,13 @@ async fn test_imap_auth_continuation_examine_expunge_search_and_body_peek_vs_bod
     assert!(exp.last().unwrap().starts_with("A13 OK"));
 
     // CLOSE & LOGOUT
-    assert!(send_cmd(&mut reader, "A14", "CLOSE")
-        .await
-        .last()
-        .unwrap()
-        .starts_with("A14 OK"));
+    assert!(
+        send_cmd(&mut reader, "A14", "CLOSE")
+            .await
+            .last()
+            .unwrap()
+            .starts_with("A14 OK")
+    );
     let _ = send_cmd(&mut reader, "A15", "LOGOUT").await;
     let _ = shutdown_tx.send(true);
 }

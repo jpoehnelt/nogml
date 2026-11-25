@@ -9,11 +9,7 @@ use wiremock::{
 use crate::{
     config::{Config, SyncMode},
     events::MailEvent,
-    imap::{
-        mime_fmt::parse_raw_to_new_message_input,
-        serve_plain_listener,
-        tests::test_app_state,
-    },
+    imap::{mime_fmt::parse_raw_to_new_message_input, serve_plain_listener, tests::test_app_state},
     models::{LABEL_INBOX, LABEL_STARRED, LABEL_UNREAD},
     sync::{SyncRunOptions, get_sync_status, run_background_sync, run_gmail_sync},
 };
@@ -145,7 +141,13 @@ async fn test_gmail_api_oauth_full_sync_and_incremental_history() {
     // Verify SyncCompleted event was published
     let mut saw_sync_completed = false;
     while let Ok(env) = events_rx.try_recv() {
-        if matches!(env.event, MailEvent::SyncCompleted { messages_added: 2, .. }) {
+        if matches!(
+            env.event,
+            MailEvent::SyncCompleted {
+                messages_added: 2,
+                ..
+            }
+        ) {
             saw_sync_completed = true;
         }
     }
@@ -569,7 +571,11 @@ async fn test_gmail_api_query_max_messages_and_error_state_persistence() {
     let mut bad_cfg = Config::for_test();
     bad_cfg.sync_mode = SyncMode::Api;
     let bad_state = test_app_state(bad_cfg);
-    assert!(run_gmail_sync(&bad_state, SyncRunOptions::default()).await.is_err());
+    assert!(
+        run_gmail_sync(&bad_state, SyncRunOptions::default())
+            .await
+            .is_err()
+    );
     let status = get_sync_status(&bad_state).await.unwrap();
     assert_eq!(status.state, "error");
     assert!(status.last_error.is_some());

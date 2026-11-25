@@ -58,10 +58,7 @@ enum Token {
     RBrace,
     Minus,
     Or,
-    Word {
-        key: Option<String>,
-        value: String,
-    },
+    Word { key: Option<String>, value: String },
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -683,7 +680,10 @@ mod tests {
     #[test]
     fn addresses_subject_and_quoted_phrases() {
         let msg = sample_message();
-        assert!(matches_message(&parse_query("from:alice@example.com"), &msg));
+        assert!(matches_message(
+            &parse_query("from:alice@example.com"),
+            &msg
+        ));
         assert!(matches_message(&parse_query("to:bob"), &msg));
         assert!(matches_message(&parse_query("cc:carol"), &msg));
         assert!(matches_message(&parse_query("bcc:secret"), &msg));
@@ -699,16 +699,16 @@ mod tests {
             &parse_query(r#""attached Q4 budget""#),
             &msg
         ));
-        assert!(!matches_message(
-            &parse_query(r#""missing phrase""#),
-            &msg
-        ));
+        assert!(!matches_message(&parse_query(r#""missing phrase""#), &msg));
     }
 
     #[test]
     fn labels_in_is_and_include_spam_trash_flags() {
         let msg = sample_message();
-        assert!(matches_message(&parse_query("in:inbox is:unread is:starred is:important"), &msg));
+        assert!(matches_message(
+            &parse_query("in:inbox is:unread is:starred is:important"),
+            &msg
+        ));
         assert!(!matches_message(&parse_query("is:read"), &msg));
         assert!(!matches_message(&parse_query("is:draft"), &msg));
         assert!(matches_message(&parse_query("label:Work/Finance"), &msg));
@@ -728,7 +728,10 @@ mod tests {
         let msg = sample_message();
         assert!(matches_message(&parse_query("has:attachment"), &msg));
         assert!(matches_message(&parse_query("filename:pdf"), &msg));
-        assert!(matches_message(&parse_query("filename:Q4_Budget_Report.pdf"), &msg));
+        assert!(matches_message(
+            &parse_query("filename:Q4_Budget_Report.pdf"),
+            &msg
+        ));
         assert!(!matches_message(&parse_query("filename:xlsx"), &msg));
 
         assert!(matches_message(&parse_query("larger:10k smaller:1m"), &msg));
@@ -752,24 +755,45 @@ mod tests {
     #[test]
     fn dates_and_relative_time_filters() {
         let msg = sample_message(); // 2026-06-15T12:00:00Z
-        assert!(matches_message(&parse_query("after:2026/06/01 before:2026/07/01"), &msg));
-        assert!(matches_message(&parse_query("after:2026-06-15 before:2026-06-16"), &msg));
+        assert!(matches_message(
+            &parse_query("after:2026/06/01 before:2026/07/01"),
+            &msg
+        ));
+        assert!(matches_message(
+            &parse_query("after:2026-06-15 before:2026-06-16"),
+            &msg
+        ));
         assert!(!matches_message(&parse_query("after:2026/06/16"), &msg));
         assert!(!matches_message(&parse_query("before:2026/06/15"), &msg));
 
         // Pin "now" to 2026-06-20T12:00:00Z (5 days after msg).
         let now_ms = msg.internal_date_ms + 5 * 86_400_000;
-        assert!(matches_message(&parse_query_at("older_than:3d", now_ms), &msg));
-        assert!(!matches_message(&parse_query_at("older_than:10d", now_ms), &msg));
-        assert!(matches_message(&parse_query_at("newer_than:10d", now_ms), &msg));
-        assert!(!matches_message(&parse_query_at("newer_than:2d", now_ms), &msg));
+        assert!(matches_message(
+            &parse_query_at("older_than:3d", now_ms),
+            &msg
+        ));
+        assert!(!matches_message(
+            &parse_query_at("older_than:10d", now_ms),
+            &msg
+        ));
+        assert!(matches_message(
+            &parse_query_at("newer_than:10d", now_ms),
+            &msg
+        ));
+        assert!(!matches_message(
+            &parse_query_at("newer_than:2d", now_ms),
+            &msg
+        ));
     }
 
     #[test]
     fn boolean_negation_or_and_brace_groups() {
         let msg = sample_message();
         assert!(matches_message(&parse_query("-from:eve@example.com"), &msg));
-        assert!(!matches_message(&parse_query("-from:alice@example.com"), &msg));
+        assert!(!matches_message(
+            &parse_query("-from:alice@example.com"),
+            &msg
+        ));
         assert!(matches_message(
             &parse_query("from:eve@example.com OR from:alice@example.com"),
             &msg
@@ -806,20 +830,41 @@ mod tests {
 
         // Sent/draft/trash/spam mailboxes.
         msg.label_ids = vec![LABEL_SENT.to_string(), LABEL_DRAFT.to_string()];
-        assert!(matches_message(&parse_query("in:sent is:draft in:drafts"), &msg));
+        assert!(matches_message(
+            &parse_query("in:sent is:draft in:drafts"),
+            &msg
+        ));
         msg.label_ids = vec![LABEL_TRASH.to_string()];
         assert!(matches_message(&parse_query("in:trash"), &msg));
         msg.label_ids = vec![LABEL_SPAM.to_string()];
         assert!(matches_message(&parse_query("in:spam"), &msg));
 
         // Epoch seconds & months/years relative filters.
-        assert!(matches_message(&parse_query("after:1781500000 before:1781600000"), &msg));
+        assert!(matches_message(
+            &parse_query("after:1781500000 before:1781600000"),
+            &msg
+        ));
         let one_year_later = msg.internal_date_ms + 366 * 86_400_000;
-        assert!(matches_message(&parse_query_at("older_than:1y", one_year_later), &msg));
-        assert!(matches_message(&parse_query_at("older_than:2m", one_year_later), &msg));
+        assert!(matches_message(
+            &parse_query_at("older_than:1y", one_year_later),
+            &msg
+        ));
+        assert!(matches_message(
+            &parse_query_at("older_than:2m", one_year_later),
+            &msg
+        ));
 
         // Malformed inputs must parse gracefully without panicking.
-        for weird in ["OR", "OR foo", "foo OR", "(unclosed", "((a)", "{a b", "foo:", r#"subject:"unclosed"#] {
+        for weird in [
+            "OR",
+            "OR foo",
+            "foo OR",
+            "(unclosed",
+            "((a)",
+            "{a b",
+            "foo:",
+            r#"subject:"unclosed"#,
+        ] {
             let parsed = parse_query(weird);
             let _ = matches_message(&parsed, &msg);
         }

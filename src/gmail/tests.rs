@@ -28,12 +28,12 @@ use crate::{
     },
     resend::ResendClient,
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage,
-        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
-        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
-        StoredAttachment, StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage,
-        StoredThreadDetail, SyncState, ThreadListPage, TriagePatch, TriageResult,
-        UpdateLabelInput, UpsertOutcome, UserSettings, WatchSubscription,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage, HistoryEventKind,
+        HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry, MailStore,
+        MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome, UserSettings,
+        WatchSubscription,
     },
 };
 
@@ -430,7 +430,9 @@ impl MailStore for MockStore {
                 .collect()
         };
         if ids.is_empty() {
-            return Err(AppError::NotFound(format!("Thread '{thread_id}' not found")));
+            return Err(AppError::NotFound(format!(
+                "Thread '{thread_id}' not found"
+            )));
         }
         for id in ids {
             self.modify_message_labels(&id, add_labels, remove_labels)
@@ -876,7 +878,12 @@ async fn messages_send_json_media_multipart_and_events() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let sent1 = json_body(res).await;
-    assert!(sent1["labelIds"].as_array().unwrap().contains(&serde_json::json!("SENT")));
+    assert!(
+        sent1["labelIds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("SENT"))
+    );
     let ev = rx.try_recv().unwrap();
     assert!(matches!(ev.event, MailEvent::MessageSent { .. }));
 
@@ -948,7 +955,10 @@ async fn messages_insert_import_formats_attachments_modify_trash_delete_and_hist
     assert_eq!(res.status(), StatusCode::OK);
     let full = json_body(res).await;
     let parts = full["payload"]["parts"].as_array().unwrap();
-    let att_id = parts[1]["body"]["attachmentId"].as_str().unwrap().to_string();
+    let att_id = parts[1]["body"]["attachmentId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // GET attachment bytes
     let res = app
@@ -1005,7 +1015,9 @@ async fn messages_insert_import_formats_attachments_modify_trash_delete_and_hist
         .oneshot(
             Request::post(format!("/gmail/v1/users/me/messages/{msg_id}/modify"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"addLabelIds":["STARRED"],"removeLabelIds":["UNREAD"]}"#))
+                .body(Body::from(
+                    r#"{"addLabelIds":["STARRED"],"removeLabelIds":["UNREAD"]}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -1182,9 +1194,7 @@ async fn threads_and_drafts_full_lifecycle() {
         .oneshot(
             Request::put(format!("/gmail/v1/users/me/drafts/{draft_id}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(
-                    r#"{{"message":{{"raw":"{raw_v2}"}}}}"#
-                )))
+                .body(Body::from(format!(r#"{{"message":{{"raw":"{raw_v2}"}}}}"#)))
                 .unwrap(),
         )
         .await

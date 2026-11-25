@@ -73,7 +73,10 @@ pub enum ReadCommandOutcome {
     /// Client closed the connection cleanly.
     Eof,
     /// Client sent a literal larger than `max_literal_bytes` (with parsed tag if available).
-    LiteralTooLarge { tag: Option<String>, size: usize },
+    LiteralTooLarge {
+        tag: Option<String>,
+        size: usize,
+    },
 }
 
 /// Read one complete IMAP command (handling synchronizing `{N}` and `LITERAL+` `{N+}` literals).
@@ -175,7 +178,9 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
             let take = pos + 1;
             total += take;
             if total > max_bytes {
-                return Err(AppError::BadRequest("IMAP command line too long".to_string()));
+                return Err(AppError::BadRequest(
+                    "IMAP command line too long".to_string(),
+                ));
             }
             buf.extend_from_slice(&available[..take]);
             reader.consume(take);
@@ -184,7 +189,9 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
             let len = available.len();
             total += len;
             if total > max_bytes {
-                return Err(AppError::BadRequest("IMAP command line too long".to_string()));
+                return Err(AppError::BadRequest(
+                    "IMAP command line too long".to_string(),
+                ));
             }
             buf.extend_from_slice(available);
             reader.consume(len);
@@ -228,9 +235,7 @@ pub fn parse_command_chunks(chunks: &[RawChunk]) -> AppResult<ImapCommand> {
     let tag = match &tokens[0] {
         ImapArg::Atom(s) => s.clone(),
         _ => {
-            return Err(AppError::BadRequest(
-                "IMAP tag must be an atom".to_string(),
-            ));
+            return Err(AppError::BadRequest("IMAP tag must be an atom".to_string()));
         }
     };
     let name = match &tokens[1] {
@@ -318,10 +323,7 @@ pub fn tokenize_chunks(chunks: &[RawChunk]) -> AppResult<Vec<ImapArg>> {
                                 "Unterminated quoted string in IMAP command".to_string(),
                             ));
                         }
-                        stack
-                            .last_mut()
-                            .expect("frame")
-                            .push(ImapArg::Quoted(out));
+                        stack.last_mut().expect("frame").push(ImapArg::Quoted(out));
                         continue;
                     }
 
@@ -478,7 +480,9 @@ fn wildcard_match_rec(p: &[char], s: &[char], delim: char) -> bool {
 
 /// Format an IMAP quoted string (escaping `\` and `"`), or a literal `{N}\r\n...` if it contains CR/LF or non-ASCII.
 pub fn imap_string(s: &str) -> String {
-    if s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || !b.is_ascii()) {
+    if s.bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || !b.is_ascii())
+    {
         format!("{{{}}}\r\n{}", s.len(), s)
     } else {
         imap_quote(s)

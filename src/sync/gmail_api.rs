@@ -114,10 +114,11 @@ pub async fn acquire_access_token(client: &Client, config: &Config) -> AppResult
         });
     }
 
-    let parsed: OAuthTokenResponse = serde_json::from_str(&body).map_err(|e| AppError::Upstream {
-        status: 502,
-        message: format!("Invalid OAuth2 token response: {e}"),
-    })?;
+    let parsed: OAuthTokenResponse =
+        serde_json::from_str(&body).map_err(|e| AppError::Upstream {
+            status: 502,
+            message: format!("Invalid OAuth2 token response: {e}"),
+        })?;
     let ttl_secs = parsed.expires_in.unwrap_or(3600);
     let expires_at = Instant::now() + Duration::from_secs(ttl_secs);
 
@@ -160,9 +161,7 @@ pub async fn sync_gmail_api(
 
     // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
     let mut need_full = opts.full || sync_state.last_history_id.is_none();
-    if !need_full
-        && let Some(start_history_id) = sync_state.last_history_id.clone()
-    {
+    if !need_full && let Some(start_history_id) = sync_state.last_history_id.clone() {
         match run_incremental(
             &client,
             base,
@@ -288,9 +287,7 @@ async fn run_incremental(
         );
         if let Some(ref pt) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(
-                &url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>(),
-            );
+            url.push_str(&url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>());
         }
 
         let (status, body) = get_with_retry(client, &url, token).await?;
@@ -437,10 +434,7 @@ async fn run_full_backfill(
     let baseline_history_id = profile.history_id;
 
     let max_messages = opts.max_messages.or(state.config.sync_max_messages);
-    let query = opts
-        .query
-        .as_deref()
-        .or(state.config.sync_query.as_deref());
+    let query = opts.query.as_deref().or(state.config.sync_query.as_deref());
 
     let mut page_token: Option<String> = None;
     let mut listed_ids: Vec<String> = Vec::new();
@@ -457,9 +451,7 @@ async fn run_full_backfill(
         }
         if let Some(ref pt) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(
-                &url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>(),
-            );
+            url.push_str(&url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>());
         }
 
         let (status, body) = get_with_retry(client, &url, token).await?;
@@ -497,7 +489,12 @@ async fn run_full_backfill(
     // Skip messages already present locally by upstream_gmail_id.
     let mut missing_ids = Vec::new();
     for id in listed_ids {
-        if state.store.find_message_by_upstream_id(&id).await?.is_some() {
+        if state
+            .store
+            .find_message_by_upstream_id(&id)
+            .await?
+            .is_some()
+        {
             report.messages_deduplicated += 1;
         } else {
             missing_ids.push(id);
@@ -648,8 +645,7 @@ async fn get_with_retry(
             Ok(r) => {
                 let status = r.status();
                 let bytes = r.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-                let retryable =
-                    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
                 if retryable && attempt < 2 {
                     tokio::time::sleep(delay).await;
                     delay *= 3;

@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value as SqlValue};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
+    types::Value as SqlValue,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -227,10 +230,9 @@ impl SqliteStore {
             )
         });
         // Single connection ensures all operations share the same `:memory:` database.
-        let pool = Pool::builder()
-            .max_size(1)
-            .build(manager)
-            .map_err(|e| AppError::Storage(format!("Failed to build in-memory SQLite pool: {e}")))?;
+        let pool = Pool::builder().max_size(1).build(manager).map_err(|e| {
+            AppError::Storage(format!("Failed to build in-memory SQLite pool: {e}"))
+        })?;
 
         let store = Self {
             pool,
@@ -608,10 +610,7 @@ fn load_labels_for_messages(
             "SELECT message_id, label_id FROM message_labels WHERE message_id IN ({placeholders}) ORDER BY label_id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-        let params_vec: Vec<SqlValue> = chunk
-            .iter()
-            .map(|id| SqlValue::Text(id.clone()))
-            .collect();
+        let params_vec: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Text(id.clone())).collect();
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -666,7 +665,11 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> 
 
 fn load_message_by_id(conn: &Connection, id: &str) -> AppResult<Option<StoredMessage>> {
     let mut msg = match conn
-        .query_row("SELECT * FROM messages WHERE id = ?1", params![id], message_from_row)
+        .query_row(
+            "SELECT * FROM messages WHERE id = ?1",
+            params![id],
+            message_from_row,
+        )
         .optional()
         .map_err(sql_err)?
     {
@@ -677,7 +680,11 @@ fn load_message_by_id(conn: &Connection, id: &str) -> AppResult<Option<StoredMes
     Ok(Some(msg))
 }
 
-fn resolve_thread_id_tx(tx: &Transaction<'_>, input: &NewMessageInput, msg_id: &str) -> AppResult<String> {
+fn resolve_thread_id_tx(
+    tx: &Transaction<'_>,
+    input: &NewMessageInput,
+    msg_id: &str,
+) -> AppResult<String> {
     if let Some(ref tid) = input.thread_id
         && !tid.trim().is_empty()
     {
@@ -999,8 +1006,11 @@ fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredM
         return Ok(None);
     };
     let hid = bump_history_id(tx)?;
-    tx.execute("DELETE FROM messages_fts WHERE message_id = ?1", params![id])
-        .map_err(sql_err)?;
+    tx.execute(
+        "DELETE FROM messages_fts WHERE message_id = ?1",
+        params![id],
+    )
+    .map_err(sql_err)?;
     tx.execute("DELETE FROM messages WHERE id = ?1", params![id])
         .map_err(sql_err)?;
     record_history_event(
@@ -1074,7 +1084,9 @@ fn load_thread_detail_conn(
     thread_id: &str,
 ) -> AppResult<Option<StoredThreadDetail>> {
     let mut stmt = conn
-        .prepare("SELECT * FROM messages WHERE thread_id = ?1 ORDER BY internal_date_ms ASC, id ASC")
+        .prepare(
+            "SELECT * FROM messages WHERE thread_id = ?1 ORDER BY internal_date_ms ASC, id ASC",
+        )
         .map_err(sql_err)?;
     let rows = stmt
         .query_map(params![thread_id], message_from_row)
@@ -1248,7 +1260,10 @@ enum ResolvedMailbox {
     },
 }
 
-fn resolve_imap_mailbox(conn: &Connection, mailbox_name: &str) -> AppResult<Option<ResolvedMailbox>> {
+fn resolve_imap_mailbox(
+    conn: &Connection,
+    mailbox_name: &str,
+) -> AppResult<Option<ResolvedMailbox>> {
     if mailbox_name.eq_ignore_ascii_case("INBOX") {
         return Ok(Some(ResolvedMailbox::Label {
             id: LABEL_INBOX.to_string(),
@@ -1471,8 +1486,10 @@ fn load_imap_messages_resolved(
     let mut label_map = load_labels_for_messages(conn, &ids)?;
 
     let mut entries = Vec::with_capacity(raw_entries.len());
-    for (idx, (uid, message_id, thread_id, internal_date_ms, size_estimate, is_answered, is_deleted)) in
-        raw_entries.into_iter().enumerate()
+    for (
+        idx,
+        (uid, message_id, thread_id, internal_date_ms, size_estimate, is_answered, is_deleted),
+    ) in raw_entries.into_iter().enumerate()
     {
         let label_ids = label_map.remove(&message_id).unwrap_or_default();
         entries.push(ImapMessageEntry {
@@ -1499,7 +1516,10 @@ fn rewrite_search_term_labels(
         SearchTerm::Label(val) => {
             let key_exact = val.to_ascii_lowercase();
             let key_hyphen = key_exact.replace('/', "-");
-            if let Some(id) = name_to_id.get(&key_exact).or_else(|| name_to_id.get(&key_hyphen)) {
+            if let Some(id) = name_to_id
+                .get(&key_exact)
+                .or_else(|| name_to_id.get(&key_hyphen))
+            {
                 SearchTerm::Or(vec![SearchTerm::Label(val), SearchTerm::Label(id.clone())])
             } else {
                 SearchTerm::Label(val)
@@ -1508,7 +1528,10 @@ fn rewrite_search_term_labels(
         SearchTerm::InMailbox(val) => {
             let key_exact = val.to_ascii_lowercase();
             let key_hyphen = key_exact.replace('/', "-");
-            if let Some(id) = name_to_id.get(&key_exact).or_else(|| name_to_id.get(&key_hyphen)) {
+            if let Some(id) = name_to_id
+                .get(&key_exact)
+                .or_else(|| name_to_id.get(&key_hyphen))
+            {
                 SearchTerm::Or(vec![
                     SearchTerm::InMailbox(val),
                     SearchTerm::Label(id.clone()),
@@ -1517,9 +1540,9 @@ fn rewrite_search_term_labels(
                 SearchTerm::InMailbox(val)
             }
         }
-        SearchTerm::Not(inner) => SearchTerm::Not(Box::new(rewrite_search_term_labels(
-            *inner, name_to_id,
-        ))),
+        SearchTerm::Not(inner) => {
+            SearchTerm::Not(Box::new(rewrite_search_term_labels(*inner, name_to_id)))
+        }
         SearchTerm::And(terms) => SearchTerm::And(
             terms
                 .into_iter()
@@ -1541,7 +1564,9 @@ fn load_label_name_to_id_map(conn: &Connection) -> AppResult<HashMap<String, Str
         .prepare("SELECT id, name FROM labels")
         .map_err(sql_err)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(sql_err)?;
     let mut map = HashMap::new();
     for r in rows {
@@ -1554,7 +1579,10 @@ fn load_label_name_to_id_map(conn: &Connection) -> AppResult<HashMap<String, Str
     Ok(map)
 }
 
-fn parse_query_with_labels(conn: &Connection, raw_q: &str) -> AppResult<crate::search::SearchQuery> {
+fn parse_query_with_labels(
+    conn: &Connection,
+    raw_q: &str,
+) -> AppResult<crate::search::SearchQuery> {
     let mut parsed = crate::search::parse_query(raw_q);
     if !parsed.terms.is_empty() {
         let map = load_label_name_to_id_map(conn)?;
@@ -1611,7 +1639,10 @@ fn load_all_messages_filtered(
 
     let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(bind_values.iter()), message_from_row)
+        .query_map(
+            rusqlite::params_from_iter(bind_values.iter()),
+            message_from_row,
+        )
         .map_err(sql_err)?;
     let mut messages = Vec::new();
     for r in rows {
@@ -1631,7 +1662,10 @@ fn load_all_messages_filtered(
     Ok(messages)
 }
 
-fn read_setting<T: serde::de::DeserializeOwned>(conn: &Connection, key: &str) -> AppResult<Option<T>> {
+fn read_setting<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    key: &str,
+) -> AppResult<Option<T>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT value_json FROM settings WHERE key = ?1",
@@ -1680,9 +1714,11 @@ impl MailStore for SqliteStore {
                 .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
                 .map_err(sql_err)?;
             let threads_total: i32 = conn
-                .query_row("SELECT COUNT(DISTINCT thread_id) FROM messages", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT COUNT(DISTINCT thread_id) FROM messages",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(sql_err)?;
             let history_id = read_current_history_id(conn)?;
             Ok(Profile {
@@ -1696,7 +1732,8 @@ impl MailStore for SqliteStore {
     }
 
     async fn current_history_id(&self) -> AppResult<u64> {
-        self.run_blocking(|conn| read_current_history_id(conn)).await
+        self.run_blocking(|conn| read_current_history_id(conn))
+            .await
     }
 
     async fn list_history(&self, query: &HistoryListQuery) -> AppResult<HistoryListPage> {
@@ -2056,7 +2093,10 @@ impl MailStore for SqliteStore {
 
             let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
             for msg in visible_msgs {
-                by_thread.entry(msg.thread_id.clone()).or_default().push(msg);
+                by_thread
+                    .entry(msg.thread_id.clone())
+                    .or_default()
+                    .push(msg);
             }
 
             let mut matching_threads: Vec<(i64, StoredThreadDetail)> = Vec::new();
@@ -2070,7 +2110,10 @@ impl MailStore for SqliteStore {
                 if !required_labels.is_empty() {
                     let thread_labels: HashSet<&String> =
                         msgs.iter().flat_map(|m| m.label_ids.iter()).collect();
-                    if !required_labels.iter().all(|req| thread_labels.contains(req)) {
+                    if !required_labels
+                        .iter()
+                        .all(|req| thread_labels.contains(req))
+                    {
                         continue;
                     }
                 }
@@ -2080,11 +2123,7 @@ impl MailStore for SqliteStore {
                     continue;
                 }
 
-                let max_ts = msgs
-                    .iter()
-                    .map(|m| m.internal_date_ms)
-                    .max()
-                    .unwrap_or(0);
+                let max_ts = msgs.iter().map(|m| m.internal_date_ms).max().unwrap_or(0);
                 let snippet = msgs.last().map(|m| m.snippet.clone()).unwrap_or_default();
                 let history_id = msgs.iter().map(|m| m.history_id).max().unwrap_or(1);
                 matching_threads.push((
@@ -2292,7 +2331,10 @@ impl MailStore for SqliteStore {
                 .label_list_visibility
                 .unwrap_or_else(|| "labelShow".to_string());
             let (color_text, color_bg) = match input.color {
-                Some(ref c) => (Some(c.text_color.as_str()), Some(c.background_color.as_str())),
+                Some(ref c) => (
+                    Some(c.text_color.as_str()),
+                    Some(c.background_color.as_str()),
+                ),
                 None => (None, None),
             };
 
@@ -2535,7 +2577,10 @@ impl MailStore for SqliteStore {
                 .label_list_visibility
                 .unwrap_or_else(|| "labelShow".to_string());
             let (color_text, color_bg) = match input.color {
-                Some(ref c) => (Some(c.text_color.as_str()), Some(c.background_color.as_str())),
+                Some(ref c) => (
+                    Some(c.text_color.as_str()),
+                    Some(c.background_color.as_str()),
+                ),
                 None => (None, None),
             };
             tx.execute(
@@ -2628,7 +2673,8 @@ impl MailStore for SqliteStore {
             }
 
             let total = drafts.len();
-            let page: Vec<StoredDraft> = drafts.into_iter().skip(offset).take(max_results).collect();
+            let page: Vec<StoredDraft> =
+                drafts.into_iter().skip(offset).take(max_results).collect();
             let next_page_token = if offset + page.len() < total {
                 Some((offset + page.len()).to_string())
             } else {
@@ -3565,8 +3611,9 @@ impl MailStore for SqliteStore {
                 let updated = if labels_changed {
                     modify_message_labels_resolved_tx(&tx, &existing_id, &to_add, &to_remove)?
                 } else {
-                    load_message_by_id(&tx, &existing_id)?
-                        .ok_or_else(|| AppError::Storage("Missing message after sync update".into()))?
+                    load_message_by_id(&tx, &existing_id)?.ok_or_else(|| {
+                        AppError::Storage("Missing message after sync update".into())
+                    })?
                 };
 
                 let kind = if labels_changed || flags_changed {
@@ -3835,8 +3882,7 @@ impl MailStore for SqliteStore {
         let default_email = self.default_email.clone();
         self.run_blocking(move |conn| {
             let defaults = UserSettings::default_for_email(&default_email);
-            let send_as: Vec<SendAs> =
-                read_setting(conn, "send_as")?.unwrap_or(defaults.send_as);
+            let send_as: Vec<SendAs> = read_setting(conn, "send_as")?.unwrap_or(defaults.send_as);
             let vacation: VacationSettings =
                 read_setting(conn, "vacation")?.unwrap_or(defaults.vacation);
             let auto_forwarding: AutoForwarding =
@@ -3943,7 +3989,11 @@ mod tests {
             let labels = store.list_labels().await.unwrap();
             assert_eq!(labels.len(), SYSTEM_LABEL_IDS.len());
             for sys in SYSTEM_LABEL_IDS {
-                assert!(labels.iter().any(|l| l.id == *sys && l.label_type == "system"));
+                assert!(
+                    labels
+                        .iter()
+                        .any(|l| l.id == *sys && l.label_type == "system")
+                );
             }
 
             let settings = store.get_settings().await.unwrap();
@@ -4147,18 +4197,21 @@ mod tests {
             .await
             .unwrap();
         assert!(hist.entries.len() >= 4);
-        assert!(hist
-            .entries
-            .iter()
-            .any(|e| e.kind == HistoryEventKind::MessageAdded));
-        assert!(hist
-            .entries
-            .iter()
-            .any(|e| e.kind == HistoryEventKind::LabelAdded));
-        assert!(hist
-            .entries
-            .iter()
-            .any(|e| e.kind == HistoryEventKind::LabelRemoved));
+        assert!(
+            hist.entries
+                .iter()
+                .any(|e| e.kind == HistoryEventKind::MessageAdded)
+        );
+        assert!(
+            hist.entries
+                .iter()
+                .any(|e| e.kind == HistoryEventKind::LabelAdded)
+        );
+        assert!(
+            hist.entries
+                .iter()
+                .any(|e| e.kind == HistoryEventKind::LabelRemoved)
+        );
 
         // Draft lifecycle
         let d = store
@@ -4301,15 +4354,28 @@ mod tests {
         let outcome = store.upsert_synced_message(synced.clone()).await.unwrap();
         assert_eq!(outcome.kind, UpsertOutcomeKind::Deduplicated);
         assert_eq!(outcome.message.id, local_stored.id);
-        assert_eq!(outcome.message.upstream_gmail_id.as_deref(), Some("18f0001"));
-        assert!(outcome.message.label_ids.contains(&LABEL_STARRED.to_string()));
+        assert_eq!(
+            outcome.message.upstream_gmail_id.as_deref(),
+            Some("18f0001")
+        );
+        assert!(
+            outcome
+                .message
+                .label_ids
+                .contains(&LABEL_STARRED.to_string())
+        );
 
         // Re-syncing same upstream_gmail_id with changed labels -> Updated
         let mut synced2 = synced;
         synced2.label_ids = vec![LABEL_SENT.to_string()];
         let outcome2 = store.upsert_synced_message(synced2).await.unwrap();
         assert_eq!(outcome2.kind, UpsertOutcomeKind::Updated);
-        assert!(!outcome2.message.label_ids.contains(&LABEL_STARRED.to_string()));
+        assert!(
+            !outcome2
+                .message
+                .label_ids
+                .contains(&LABEL_STARRED.to_string())
+        );
 
         // Watch & SyncState round-trip
         let watch = WatchSubscription {
@@ -4320,7 +4386,10 @@ mod tests {
             expiration_ms: 9_999_999,
         };
         store.set_watch(watch.clone()).await.unwrap();
-        assert_eq!(store.get_watch().await.unwrap().unwrap().topic_name, watch.topic_name);
+        assert_eq!(
+            store.get_watch().await.unwrap().unwrap().topic_name,
+            watch.topic_name
+        );
         store.clear_watch().await.unwrap();
         assert!(store.get_watch().await.unwrap().is_none());
 

@@ -38,7 +38,9 @@ use crate::{
     config::{Config, SyncMode},
     error::{AiError, AppError, AppResult},
     events::{EventEnvelope, EventSource, MailEvent},
-    mime::{ComposeEmailInput, apply_fields_mask, build_rfc2822, generate_snippet, strip_quoted_text},
+    mime::{
+        ComposeEmailInput, apply_fields_mask, build_rfc2822, generate_snippet, strip_quoted_text,
+    },
     models::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
         AiTriageRequest, CompactMessage, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT,
@@ -144,7 +146,10 @@ pub async fn execute_send_email_with_source(
     if resolved.to.is_empty() {
         return Err(AppError::validation(
             "At least one 'to' recipient is required",
-            Some("Provide at least one email address in 'to', or supply 'reply_to_message_id'.".to_string()),
+            Some(
+                "Provide at least one email address in 'to', or supply 'reply_to_message_id'."
+                    .to_string(),
+            ),
         ));
     }
 
@@ -333,10 +338,7 @@ pub async fn execute_send_email_with_source(
 }
 
 /// Execute an AI-first draft creation (shared across `/v1/drafts`, MCP `create_draft`, and CLI).
-pub async fn execute_create_draft(
-    state: &AppState,
-    req: AiCreateDraftRequest,
-) -> AppResult<Value> {
+pub async fn execute_create_draft(state: &AppState, req: AiCreateDraftRequest) -> AppResult<Value> {
     execute_create_draft_with_source(state, req, EventSource::Api).await
 }
 

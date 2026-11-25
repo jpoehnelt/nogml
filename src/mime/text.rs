@@ -14,19 +14,13 @@ pub fn generate_snippet(text: &str, html: Option<&str>) -> String {
         return String::new();
     };
 
-    let normalized: String = source
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if normalized.chars().count() <= MAX_SNIPPET_CHARS {
         return normalized;
     }
 
-    let truncated: String = normalized
-        .chars()
-        .take(MAX_SNIPPET_CHARS - 3)
-        .collect();
+    let truncated: String = normalized.chars().take(MAX_SNIPPET_CHARS - 3).collect();
     format!("{}...", truncated.trim_end())
 }
 
@@ -188,7 +182,10 @@ mod tests {
 
     #[test]
     fn snippet_normalizes_whitespace_and_truncates_to_200_chars() {
-        assert_eq!(generate_snippet("  Hello \n\t  world!  ", None), "Hello world!");
+        assert_eq!(
+            generate_snippet("  Hello \n\t  world!  ", None),
+            "Hello world!"
+        );
 
         let long_text = "a".repeat(250);
         let snippet = generate_snippet(&long_text, None);
@@ -247,7 +244,8 @@ mod tests {
 
     #[test]
     fn sanitize_strips_control_and_bidi_preserves_safe_chars() {
-        let dirty = "Hello\x00\x07\x1B[31m\u{202E}evil\u{202C}\u{2066}iso\u{2069}\u{E0041}\nLine\t2\r\n👨‍👩‍👧‍👦";
+        let dirty =
+            "Hello\x00\x07\x1B[31m\u{202E}evil\u{202C}\u{2066}iso\u{2069}\u{E0041}\nLine\t2\r\n👨‍👩‍👧‍👦";
         let clean = sanitize_untrusted_text(dirty);
         assert_eq!(clean, "Hello[31meviliso\nLine\t2\r\n👨‍👩‍👧‍👦");
     }

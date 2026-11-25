@@ -16,10 +16,8 @@ use base64::{
 use mail_builder::{
     MessageBuilder,
     headers::{
-        address::Address as BuilderAddress,
-        content_type::ContentType as BuilderContentType,
-        message_id::MessageId as BuilderMessageId,
-        text::Text as BuilderText,
+        address::Address as BuilderAddress, content_type::ContentType as BuilderContentType,
+        message_id::MessageId as BuilderMessageId, text::Text as BuilderText,
     },
     mime::MimePart as BuilderMimePart,
 };
@@ -383,10 +381,7 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
             let part = BuilderMimePart::new(content_type, att.data.as_slice())
                 .inline()
                 .cid(bare_cid);
-            builder
-                .attachments
-                .get_or_insert_with(Vec::new)
-                .push(part);
+            builder.attachments.get_or_insert_with(Vec::new).push(part);
         } else {
             let filename = att
                 .filename
@@ -481,8 +476,7 @@ pub fn parsed_to_resend_request(
                 .or_else(|| Some("attachment".to_string())),
             content: Some(STANDARD.encode(&att.data)),
             path: None,
-            content_type: (!att.content_type.trim().is_empty())
-                .then(|| att.content_type.clone()),
+            content_type: (!att.content_type.trim().is_empty()).then(|| att.content_type.clone()),
             content_id: att.content_id.clone(),
         })
         .collect();
@@ -566,7 +560,9 @@ mod tests {
             reply_to: vec!["replies@example.com".to_string()],
             subject: "Q4 Report — Final".to_string(),
             text: Some("Hi Bob,\n\nPlease find the Q4 report attached.".to_string()),
-            html: Some("<p>Hi Bob,</p><p>Please find the <b>Q4 report</b> attached.</p>".to_string()),
+            html: Some(
+                "<p>Hi Bob,</p><p>Please find the <b>Q4 report</b> attached.</p>".to_string(),
+            ),
             message_id: Some("<MSG-100@Example.COM>".to_string()),
             in_reply_to: Some("<MSG-99@Example.COM>".to_string()),
             references: Some("<MSG-98@Example.COM> <MSG-99@Example.COM>".to_string()),
@@ -593,7 +589,10 @@ mod tests {
         let parsed = parse_rfc2822(&raw).expect("parse rfc2822");
 
         assert_eq!(parsed.from, "Alice Smith <alice@example.com>");
-        assert_eq!(parsed.to, vec!["Bob Jones <bob@example.com>", "carol@example.com"]);
+        assert_eq!(
+            parsed.to,
+            vec!["Bob Jones <bob@example.com>", "carol@example.com"]
+        );
         assert_eq!(parsed.cc, vec!["dave@example.com"]);
         assert_eq!(parsed.bcc, vec!["audit@example.com"]);
         assert_eq!(parsed.reply_to, vec!["replies@example.com"]);
@@ -608,7 +607,11 @@ mod tests {
             parsed.references_header.as_deref(),
             Some("<msg-98@example.com> <msg-99@example.com>")
         );
-        assert!(parsed.text_body.contains("Please find the Q4 report attached."));
+        assert!(
+            parsed
+                .text_body
+                .contains("Please find the Q4 report attached.")
+        );
         assert!(
             parsed
                 .html_body
@@ -656,17 +659,13 @@ mod tests {
         let alt_parts = alt.parts.as_ref().expect("alt parts");
         assert_eq!(alt_parts[0].part_id.as_deref(), Some("0.0"));
         assert_eq!(alt_parts[0].mime_type.as_deref(), Some("text/plain"));
-        let decoded_text = decode_base64url(
-            alt_parts[0]
-                .body
-                .as_ref()
+        let decoded_text =
+            decode_base64url(alt_parts[0].body.as_ref().unwrap().data.as_deref().unwrap()).unwrap();
+        assert!(
+            String::from_utf8(decoded_text)
                 .unwrap()
-                .data
-                .as_deref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(String::from_utf8(decoded_text).unwrap().contains("Q4 report"));
+                .contains("Q4 report")
+        );
 
         let att_part = &top_parts[1];
         assert_eq!(att_part.filename.as_deref(), Some("report.pdf"));
@@ -688,8 +687,16 @@ mod tests {
         assert!(meta.body.is_none());
         let meta_headers = meta.headers.unwrap();
         assert_eq!(meta_headers.len(), 2);
-        assert!(meta_headers.iter().any(|h| h.name.eq_ignore_ascii_case("subject") && h.value == "Q4 Report — Final"));
-        assert!(meta_headers.iter().any(|h| h.name.eq_ignore_ascii_case("x-custom-tag") && h.value == "alpha-42"));
+        assert!(
+            meta_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("subject") && h.value == "Q4 Report — Final")
+        );
+        assert!(
+            meta_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("x-custom-tag") && h.value == "alpha-42")
+        );
 
         // Verify minimal & raw formats return None payload.
         assert!(
@@ -709,7 +716,10 @@ mod tests {
         assert_eq!(resend_req.to.len(), 2);
         assert_eq!(resend_req.cc.as_ref().unwrap(), &vec!["dave@example.com"]);
         assert_eq!(resend_req.bcc.as_ref().unwrap(), &vec!["audit@example.com"]);
-        assert_eq!(resend_req.reply_to.as_ref().unwrap(), &vec!["replies@example.com"]);
+        assert_eq!(
+            resend_req.reply_to.as_ref().unwrap(),
+            &vec!["replies@example.com"]
+        );
         assert_eq!(resend_req.subject, "Q4 Report — Final");
         let req_headers = resend_req.headers.as_ref().unwrap();
         assert_eq!(
@@ -727,7 +737,9 @@ mod tests {
         let req_atts = resend_req.attachments.as_ref().unwrap();
         assert_eq!(req_atts.len(), 2);
         assert_eq!(
-            STANDARD.decode(req_atts[0].content.as_deref().unwrap()).unwrap(),
+            STANDARD
+                .decode(req_atts[0].content.as_deref().unwrap())
+                .unwrap(),
             b"%PDF-1.4\nfake-pdf-data"
         );
     }
@@ -744,7 +756,8 @@ mod tests {
 
     #[test]
     fn parse_plain_text_only_email_keeps_html_body_none() {
-        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Plain\r\n\r\nJust plain text.";
+        let raw =
+            b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Plain\r\n\r\nJust plain text.";
         let parsed = parse_rfc2822(raw).unwrap();
         assert!(parsed.html_body.is_none());
         assert_eq!(parsed.text_body.trim(), "Just plain text.");
@@ -833,9 +846,10 @@ mod tests {
             text: Some("body".to_string()),
             ..Default::default()
         };
-        bad_compose
-            .extra_headers
-            .insert("X-Evil".to_string(), "ok\r\nBcc: attacker@evil.com".to_string());
+        bad_compose.extra_headers.insert(
+            "X-Evil".to_string(),
+            "ok\r\nBcc: attacker@evil.com".to_string(),
+        );
         assert!(build_rfc2822(&bad_compose).is_err());
     }
 }
