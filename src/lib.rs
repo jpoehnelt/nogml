@@ -23,21 +23,26 @@ pub mod sync;
 pub mod transport;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
     sync::{Arc, Mutex as StdMutex, Once},
 };
 
-use axum::Router;
+use axum::{
+    Router,
+    extract::{FromRef, FromRequestParts},
+    http::request::Parts,
+};
 use tokio::sync::Mutex;
 
 use crate::{
     ai::safety::{ConfigOutboundPolicy, OutboundPolicy},
-    auth::{AuthProvider, StaticTokenAuthProvider},
+    auth::{AuthProvider, Principal, StaticTokenAuthProvider},
     blob::{
-        BlobStore, InlineBlobStore, attachment_blob_key, is_external_blob_store, open_blob_store,
-        raw_message_blob_key,
+        BlobStore, InlineBlobStore, PrefixedBlobStore, attachment_blob_key, is_external_blob_store,
+        open_blob_store, raw_message_blob_key,
     },
-    config::Config,
+    config::{Config, normalize_mailbox_id},
     error::AppResult,
     events::EventBus,
     filter::{InboundFilter, open_filter},
@@ -86,6 +91,26 @@ pub struct AppState {
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
     pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
+    primary_mailbox_id: String,
+    base_blobs: Arc<dyn BlobStore>,
+    sync_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+fn scope_blobs_for_mailbox(
+    base_blobs: &Arc<dyn BlobStore>,
+    config: &Config,
+    primary_mailbox_id: &str,
+    target_mailbox_id: &str,
+) -> Arc<dyn BlobStore> {
+    let use_prefix = config.is_multi_mailbox() || target_mailbox_id != primary_mailbox_id;
+    if use_prefix && is_external_blob_store(base_blobs.as_ref()) {
+        Arc::new(PrefixedBlobStore::for_mailbox(
+            base_blobs.clone(),
+            target_mailbox_id,
+        ))
+    } else {
+        base_blobs.clone()
+    }
 }
 
 impl AppState {
@@ -93,8 +118,15 @@ impl AppState {
     /// `BlobStore`, `MailTransport`, and `SearchIndex`.
     pub fn from_config(config: Config) -> AppResult<Self> {
         ensure_crypto_provider();
+        let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
         let store = open_store(&config)?;
-        let blobs = open_blob_store(&config)?;
+        let base_blobs = open_blob_store(&config)?;
+        let blobs = scope_blobs_for_mailbox(
+            &base_blobs,
+            &config,
+            &primary_mailbox_id,
+            &primary_mailbox_id,
+        );
         let resend: Arc<dyn ResendClient> = Arc::new(HttpResendClient::from_config(&config));
         let transport = open_transport(&config, resend.clone())?;
         let search = open_search_index(&config, store.clone())?;
@@ -102,6 +134,9 @@ impl AppState {
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let outbound_policy: Arc<dyn OutboundPolicy> =
             Arc::new(ConfigOutboundPolicy::from_config(&config));
+        let sync_lock = Arc::new(Mutex::new(()));
+        let mut locks = HashMap::new();
+        locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
 
         Ok(Self {
             config: Arc::new(config),
@@ -113,11 +148,14 @@ impl AppState {
             search,
             outbound_policy,
             resend,
-            events: EventBus::new(),
-            sync_lock: Arc::new(Mutex::new(())),
+            events: EventBus::with_mailbox(&primary_mailbox_id),
+            sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            primary_mailbox_id,
+            base_blobs,
+            sync_locks: Arc::new(StdMutex::new(locks)),
         })
     }
 
@@ -130,10 +168,17 @@ impl AppState {
         resend: Arc<dyn ResendClient>,
     ) -> Self {
         ensure_crypto_provider();
-        let blobs: Arc<dyn BlobStore> = match open_blob_store(&config) {
+        let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
+        let base_blobs: Arc<dyn BlobStore> = match open_blob_store(&config) {
             Ok(b) => b,
             Err(_) => Arc::new(InlineBlobStore),
         };
+        let blobs = scope_blobs_for_mailbox(
+            &base_blobs,
+            &config,
+            &primary_mailbox_id,
+            &primary_mailbox_id,
+        );
         let transport: Arc<dyn MailTransport> = match open_transport(&config, resend.clone()) {
             Ok(t) => t,
             Err(_) => Arc::new(ResendTransport::new(
@@ -149,6 +194,9 @@ impl AppState {
         };
         let outbound_policy: Arc<dyn OutboundPolicy> =
             Arc::new(ConfigOutboundPolicy::from_config(&config));
+        let sync_lock = Arc::new(Mutex::new(()));
+        let mut locks = HashMap::new();
+        locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
 
         Self {
             config: Arc::new(config),
@@ -160,17 +208,107 @@ impl AppState {
             search,
             outbound_policy,
             resend,
-            events: EventBus::new(),
-            sync_lock: Arc::new(Mutex::new(())),
+            events: EventBus::with_mailbox(&primary_mailbox_id),
+            sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            primary_mailbox_id,
+            base_blobs,
+            sync_locks: Arc::new(StdMutex::new(locks)),
+        }
+    }
+
+    /// Return the normalized mailbox ID active on this `AppState`.
+    pub fn mailbox_id(&self) -> &str {
+        self.events.mailbox_id()
+    }
+
+    /// Return a lightweight `AppState` scoped strictly to `mailbox_id`:
+    /// - `store` is partitioned via [`MailStore::for_mailbox`]
+    /// - `blobs` is prefixed with `mailboxes/<sanitized_mb>/...` in multi-mailbox mode or
+    ///   for non-primary mailboxes (never double-prefixing)
+    /// - `search` is scoped via [`SearchIndex::for_mailbox`]
+    /// - `events` shares the broadcast/replay bus, tagged and filtered to `mailbox_id`
+    /// - `config.user_email` reflects `mailbox_id` so profile, sendAs, and outbound `From`
+    ///   match the active mailbox
+    /// - `sync_lock` is scoped per mailbox so mailboxes can sync independently
+    pub fn for_mailbox(&self, mailbox_id: &str) -> Self {
+        let normalized = normalize_mailbox_id(mailbox_id);
+        let target = if normalized.is_empty() {
+            self.primary_mailbox_id.clone()
+        } else {
+            normalized
+        };
+
+        let store = self.store.for_mailbox(&target);
+        let blobs = scope_blobs_for_mailbox(
+            &self.base_blobs,
+            &self.config,
+            &self.primary_mailbox_id,
+            &target,
+        );
+        let search = self
+            .search
+            .for_mailbox(&target)
+            .unwrap_or_else(|| self.search.clone());
+        let events = self.events.for_mailbox(&target);
+
+        let config = if self.config.user_email.eq_ignore_ascii_case(&target) {
+            self.config.clone()
+        } else {
+            let mut cloned = (*self.config).clone();
+            if !target.eq_ignore_ascii_case(&self.primary_mailbox_id)
+                && !cloned
+                    .mailboxes
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(&self.primary_mailbox_id))
+            {
+                cloned.mailboxes.push(self.primary_mailbox_id.clone());
+            }
+            cloned.user_email = target.clone();
+            Arc::new(cloned)
+        };
+
+        let sync_lock = {
+            let mut locks = self.sync_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks
+                .entry(target)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        Self {
+            config,
+            store,
+            blobs,
+            transport: self.transport.clone(),
+            filter: self.filter.clone(),
+            auth: self.auth.clone(),
+            search,
+            outbound_policy: self.outbound_policy.clone(),
+            resend: self.resend.clone(),
+            events,
+            sync_lock,
+            resumable_uploads: self.resumable_uploads.clone(),
+            approval_in_flight: self.approval_in_flight.clone(),
+            used_oauth_codes: self.used_oauth_codes.clone(),
+            primary_mailbox_id: self.primary_mailbox_id.clone(),
+            base_blobs: self.base_blobs.clone(),
+            sync_locks: self.sync_locks.clone(),
         }
     }
 
     /// Replace the [`BlobStore`] backend on this `AppState`.
     pub fn with_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
-        self.blobs = blobs;
+        let active_mb = self.mailbox_id().to_string();
+        self.base_blobs = blobs;
+        self.blobs = scope_blobs_for_mailbox(
+            &self.base_blobs,
+            &self.config,
+            &self.primary_mailbox_id,
+            &active_mb,
+        );
         self
     }
 
@@ -271,6 +409,30 @@ impl AppState {
         }
         let _ = self.search.remove(message_id).await;
         Ok(())
+    }
+}
+
+/// Axum extractor that resolves the authenticated [`Principal`] from request extensions
+/// (populated by [`auth::require_auth`]) and scopes [`AppState`] strictly to
+/// `principal.mailbox_id`.
+///
+/// Falls back to the router's default [`AppState`] when no `Principal` extension is present.
+pub struct MailboxState(pub AppState);
+
+impl<S> FromRequestParts<S> for MailboxState
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let base = AppState::from_ref(state);
+        let scoped = match parts.extensions.get::<Principal>() {
+            Some(principal) => base.for_mailbox(&principal.mailbox_id),
+            None => base,
+        };
+        Ok(Self(scoped))
     }
 }
 

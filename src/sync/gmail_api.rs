@@ -69,7 +69,15 @@ impl SyncSource for GmailApiSyncSource {
     }
 
     fn account_key(&self, config: &Config) -> String {
-        format!("gmail_api:{}", config.gmail_user_id)
+        if config.is_multi_mailbox() {
+            format!(
+                "gmail_api:{}:{}",
+                crate::config::normalize_mailbox_id(&config.user_email),
+                config.gmail_user_id
+            )
+        } else {
+            format!("gmail_api:{}", config.gmail_user_id)
+        }
     }
 
     async fn pull(

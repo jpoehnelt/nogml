@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
-    extract::{Path, RawQuery, State},
+    extract::{Path, RawQuery},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware,
     response::{IntoResponse, Response},
@@ -26,7 +26,7 @@ use axum::{
 use chrono::{Duration, Utc};
 
 use crate::{
-    AppState,
+    AppState, MailboxState,
     ai::safety::{OutboundCheck, OutboundDecision},
     auth::{
         AgentPolicyOverride, Principal, resolve_user_id, validate_email_header,
@@ -643,7 +643,7 @@ async fn execute_gmail_send(
 
 /// `GET /gmail/v1/users/{userId}/profile`
 async fn get_profile(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<Profile>> {
     let email = resolve_user_id(&user_id, &state.config)?;
@@ -657,7 +657,7 @@ async fn get_profile(
 
 /// `GET /gmail/v1/users/{userId}/messages`
 async fn list_messages(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListMessagesResponse>> {
@@ -689,7 +689,7 @@ async fn list_messages(
 
 /// `GET /gmail/v1/users/{userId}/messages/{id}`
 async fn get_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Message>> {
@@ -1161,7 +1161,7 @@ async fn handle_resumable_cancel(
 }
 
 async fn send_message_resumable_put(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
@@ -1182,7 +1182,7 @@ async fn send_message_resumable_put(
 }
 
 async fn send_message_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1196,7 +1196,7 @@ async fn send_message_resumable_delete(
 }
 
 async fn insert_message_resumable_put(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1215,7 +1215,7 @@ async fn insert_message_resumable_put(
 }
 
 async fn insert_message_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1229,7 +1229,7 @@ async fn insert_message_resumable_delete(
 }
 
 async fn import_message_resumable_put(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1248,7 +1248,7 @@ async fn import_message_resumable_put(
 }
 
 async fn import_message_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1262,7 +1262,7 @@ async fn import_message_resumable_delete(
 }
 
 async fn create_draft_resumable_put(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1281,7 +1281,7 @@ async fn create_draft_resumable_put(
 }
 
 async fn create_draft_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1295,7 +1295,7 @@ async fn create_draft_resumable_delete(
 }
 
 async fn send_draft_resumable_put(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
@@ -1316,7 +1316,7 @@ async fn send_draft_resumable_put(
 }
 
 async fn send_draft_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1330,7 +1330,7 @@ async fn send_draft_resumable_delete(
 }
 
 async fn update_draft_resumable_delete(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<StatusCode> {
@@ -1346,7 +1346,7 @@ async fn update_draft_resumable_delete(
 
 /// `POST /gmail/v1/users/{userId}/messages/send` & `/upload/gmail/v1/users/{userId}/messages/send`
 async fn send_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
@@ -1385,7 +1385,7 @@ async fn send_message(
 
 /// `POST /gmail/v1/users/{userId}/messages` & `/upload/gmail/v1/users/{userId}/messages` (`insert`)
 async fn insert_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -1436,7 +1436,7 @@ async fn insert_message(
 
 /// `POST /gmail/v1/users/{userId}/messages/import` & `/upload/gmail/v1/users/{userId}/messages/import`
 async fn import_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -1493,7 +1493,7 @@ async fn import_message(
 
 /// `POST /gmail/v1/users/{userId}/messages/{id}/modify`
 async fn modify_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     Json(req): Json<ModifyMessageRequest>,
 ) -> AppResult<Json<Message>> {
@@ -1523,7 +1523,7 @@ async fn modify_message(
 
 /// `POST /gmail/v1/users/{userId}/messages/{id}/trash`
 async fn trash_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Message>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1546,7 +1546,7 @@ async fn trash_message(
 
 /// `POST /gmail/v1/users/{userId}/messages/{id}/untrash`
 async fn untrash_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Message>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1569,7 +1569,7 @@ async fn untrash_message(
 
 /// `DELETE /gmail/v1/users/{userId}/messages/{id}`
 async fn delete_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1610,7 +1610,7 @@ async fn delete_message(
 
 /// `POST /gmail/v1/users/{userId}/messages/batchModify`
 async fn batch_modify_messages(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(req): Json<BatchModifyMessagesRequest>,
 ) -> AppResult<StatusCode> {
@@ -1655,7 +1655,7 @@ async fn batch_modify_messages(
 
 /// `POST /gmail/v1/users/{userId}/messages/batchDelete`
 async fn batch_delete_messages(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(req): Json<BatchDeleteMessagesRequest>,
 ) -> AppResult<StatusCode> {
@@ -1700,7 +1700,7 @@ async fn batch_delete_messages(
 
 /// `GET /gmail/v1/users/{userId}/messages/{messageId}/attachments/{id}`
 async fn get_attachment(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, message_id, id)): Path<(String, String, String)>,
 ) -> AppResult<Json<MessagePartBody>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1732,7 +1732,7 @@ async fn get_attachment(
 
 /// `GET /gmail/v1/users/{userId}/threads`
 async fn list_threads(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListThreadsResponse>> {
@@ -1765,7 +1765,7 @@ async fn list_threads(
 
 /// `GET /gmail/v1/users/{userId}/threads/{id}`
 async fn get_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Thread>> {
@@ -1787,7 +1787,7 @@ async fn get_thread(
 
 /// `POST /gmail/v1/users/{userId}/threads/{id}/modify`
 async fn modify_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     Json(req): Json<ModifyThreadRequest>,
 ) -> AppResult<Json<Thread>> {
@@ -1819,7 +1819,7 @@ async fn modify_thread(
 
 /// `POST /gmail/v1/users/{userId}/threads/{id}/trash`
 async fn trash_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Thread>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1844,7 +1844,7 @@ async fn trash_thread(
 
 /// `POST /gmail/v1/users/{userId}/threads/{id}/untrash`
 async fn untrash_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Thread>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1869,7 +1869,7 @@ async fn untrash_thread(
 
 /// `DELETE /gmail/v1/users/{userId}/threads/{id}`
 async fn delete_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1904,7 +1904,7 @@ async fn delete_thread(
 
 /// `GET /gmail/v1/users/{userId}/labels`
 async fn list_labels(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<ListLabelsResponse>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1918,7 +1918,7 @@ async fn list_labels(
 
 /// `GET /gmail/v1/users/{userId}/labels/{id}`
 async fn get_label(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Label>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1933,7 +1933,7 @@ async fn get_label(
 
 /// `POST /gmail/v1/users/{userId}/labels`
 async fn create_label(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(payload): Json<Label>,
 ) -> AppResult<Json<Label>> {
@@ -1961,7 +1961,7 @@ async fn create_label(
 
 /// `PUT /gmail/v1/users/{userId}/labels/{id}`
 async fn update_label(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     Json(payload): Json<Label>,
 ) -> AppResult<Json<Label>> {
@@ -1989,7 +1989,7 @@ async fn update_label(
 
 /// `PATCH /gmail/v1/users/{userId}/labels/{id}`
 async fn patch_label(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     Json(payload): Json<Label>,
 ) -> AppResult<Json<Label>> {
@@ -2017,7 +2017,7 @@ async fn patch_label(
 
 /// `DELETE /gmail/v1/users/{userId}/labels/{id}`
 async fn delete_label(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -2084,7 +2084,7 @@ async fn format_stored_draft(
 
 /// `GET /gmail/v1/users/{userId}/drafts`
 async fn list_drafts(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListDraftsResponse>> {
@@ -2119,7 +2119,7 @@ async fn list_drafts(
 
 /// `GET /gmail/v1/users/{userId}/drafts/{id}`
 async fn get_draft(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Draft>> {
@@ -2254,7 +2254,7 @@ async fn complete_send_draft(
 
 /// `POST /gmail/v1/users/{userId}/drafts` & `/upload/gmail/v1/users/{userId}/drafts`
 async fn create_draft(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -2284,7 +2284,7 @@ async fn create_draft(
 
 /// `PUT /gmail/v1/users/{userId}/drafts/{id}` & `/upload/gmail/v1/users/{userId}/drafts/{id}`
 async fn update_draft(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -2332,7 +2332,7 @@ async fn update_draft(
 
 /// `DELETE /gmail/v1/users/{userId}/drafts/{id}`
 async fn delete_draft(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -2361,7 +2361,7 @@ async fn delete_draft(
 
 /// `POST /gmail/v1/users/{userId}/drafts/send` & `/upload/gmail/v1/users/{userId}/drafts/send`
 async fn send_draft(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
@@ -2413,7 +2413,7 @@ struct HistoryRecordAcc {
 
 /// `GET /gmail/v1/users/{userId}/history`
 async fn list_history(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListHistoryResponse>> {
@@ -2485,7 +2485,7 @@ async fn list_history(
 
 /// `POST /gmail/v1/users/{userId}/watch`
 async fn watch_mailbox(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     Json(req): Json<WatchRequest>,
 ) -> AppResult<Json<WatchResponse>> {
@@ -2531,7 +2531,7 @@ async fn watch_mailbox(
 
 /// `POST /gmail/v1/users/{userId}/stop`
 async fn stop_watch(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(user_id): Path<String>,
     body: Bytes,
 ) -> AppResult<StatusCode> {

@@ -49,6 +49,11 @@ pub trait SearchIndex: Send + Sync {
     /// Execute an AI-first structured/full-text/semantic search query.
     async fn search(&self, query: &AiSearchQuery) -> AppResult<AiMessagePage>;
 
+    /// Return a lightweight `SearchIndex` handle scoped strictly to `mailbox_id`, if supported.
+    fn for_mailbox(&self, _mailbox_id: &str) -> Option<Arc<dyn SearchIndex>> {
+        None
+    }
+
     /// Short backend identifier reported by `GET /v1/capabilities`.
     fn backend_name(&self) -> &'static str;
 }
@@ -80,6 +85,10 @@ impl SearchIndex for StoreSearchIndex {
         self.store.search_messages_ai(query).await
     }
 
+    fn for_mailbox(&self, mailbox_id: &str) -> Option<Arc<dyn SearchIndex>> {
+        Some(Arc::new(Self::new(self.store.for_mailbox(mailbox_id))))
+    }
+
     fn backend_name(&self) -> &'static str {
         match self.store.backend_name() {
             "sqlite" => "sqlite_fts5",
@@ -99,8 +108,13 @@ pub fn open_search_index(
         SearchBackend::Hybrid => {
             let provider = Arc::new(OpenAiEmbeddingProvider::from_config(config)?);
             let vectors: Arc<dyn VectorStore> = match config.storage {
-                StorageBackend::Sqlite => Arc::new(SqliteVectorStore::open(&config.db_path)?),
-                StorageBackend::Memory => Arc::new(MemoryVectorStore::new()),
+                StorageBackend::Sqlite => Arc::new(SqliteVectorStore::open_for_mailbox(
+                    &config.db_path,
+                    &config.user_email,
+                )?),
+                StorageBackend::Memory => {
+                    Arc::new(MemoryVectorStore::for_mailbox_new(&config.user_email))
+                }
             };
             Ok(Arc::new(HybridSearchIndex::new(store, provider, vectors)))
         }

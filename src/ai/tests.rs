@@ -63,9 +63,10 @@ struct StoreData {
     settings: Option<UserSettings>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TestMailStore {
-    data: RwLock<StoreData>,
-    seq: AtomicU64,
+    data: Arc<RwLock<StoreData>>,
+    seq: Arc<AtomicU64>,
     user_email: String,
 }
 
@@ -93,13 +94,13 @@ impl TestMailStore {
             );
         }
         Self {
-            data: RwLock::new(StoreData {
+            data: Arc::new(RwLock::new(StoreData {
                 labels,
                 settings: Some(UserSettings::default_for_email(user_email)),
                 ..Default::default()
-            }),
-            seq: AtomicU64::new(1),
-            user_email: user_email.to_string(),
+            })),
+            seq: Arc::new(AtomicU64::new(1)),
+            user_email: crate::config::normalize_mailbox_id(user_email),
         }
     }
 
@@ -111,6 +112,14 @@ impl TestMailStore {
 
 #[async_trait]
 impl MailStore for TestMailStore {
+    fn mailbox_id(&self) -> &str {
+        &self.user_email
+    }
+
+    fn for_mailbox(&self, _mailbox_id: &str) -> Arc<dyn MailStore> {
+        Arc::new(self.clone())
+    }
+
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let data = self.data.read().unwrap();
         let threads: HashSet<&str> = data

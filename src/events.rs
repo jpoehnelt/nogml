@@ -132,6 +132,9 @@ impl MailEvent {
 pub struct EventEnvelope {
     pub id: u64,
     pub timestamp: DateTime<Utc>,
+    /// Normalized mailbox ID that emitted this event (empty when emitted on an unscoped bus).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mailbox_id: String,
     pub source: EventSource,
     pub event: MailEvent,
 }
@@ -143,11 +146,18 @@ pub struct EventBus {
     seq: Arc<AtomicU64>,
     replay: Arc<RwLock<VecDeque<EventEnvelope>>>,
     replay_capacity: usize,
+    mailbox_id: String,
 }
 
 impl EventBus {
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CHANNEL_CAPACITY, DEFAULT_REPLAY_CAPACITY)
+    }
+
+    pub fn with_mailbox(mailbox_id: &str) -> Self {
+        let mut bus = Self::new();
+        bus.mailbox_id = crate::config::normalize_mailbox_id(mailbox_id);
+        bus
     }
 
     pub fn with_capacity(channel_capacity: usize, replay_capacity: usize) -> Self {
@@ -157,15 +167,44 @@ impl EventBus {
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(RwLock::new(VecDeque::with_capacity(replay_capacity))),
             replay_capacity,
+            mailbox_id: String::new(),
+        }
+    }
+
+    /// Return the normalized mailbox ID attached to this bus handle (empty if unscoped).
+    pub fn mailbox_id(&self) -> &str {
+        &self.mailbox_id
+    }
+
+    /// Return a lightweight handle sharing the same broadcast channel and replay buffer,
+    /// tagged and filtered to `mailbox_id`.
+    pub fn for_mailbox(&self, mailbox_id: &str) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            seq: self.seq.clone(),
+            replay: self.replay.clone(),
+            replay_capacity: self.replay_capacity,
+            mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
         }
     }
 
     /// Publish an event to all active subscribers and record it in the replay buffer.
     pub fn publish(&self, source: EventSource, event: MailEvent) -> EventEnvelope {
+        self.publish_for_mailbox(&self.mailbox_id, source, event)
+    }
+
+    /// Publish an event tagged with an explicit `mailbox_id`.
+    pub fn publish_for_mailbox(
+        &self,
+        mailbox_id: &str,
+        source: EventSource,
+        event: MailEvent,
+    ) -> EventEnvelope {
         let id = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let envelope = EventEnvelope {
             id,
             timestamp: Utc::now(),
+            mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
             source,
             event,
         };
@@ -184,13 +223,18 @@ impl EventBus {
         self.tx.subscribe()
     }
 
-    /// Return buffered events with `id > since_id`, up to `limit`.
+    /// Return buffered events with `id > since_id`, scoped to `self.mailbox_id` when set, up to `limit`.
     pub fn events_since(&self, since_id: u64, limit: usize) -> Vec<EventEnvelope> {
         let Ok(buf) = self.replay.read() else {
             return Vec::new();
         };
         buf.iter()
-            .filter(|e| e.id > since_id)
+            .filter(|e| {
+                e.id > since_id
+                    && (self.mailbox_id.is_empty()
+                        || e.mailbox_id.is_empty()
+                        || e.mailbox_id.eq_ignore_ascii_case(&self.mailbox_id))
+            })
             .take(limit)
             .cloned()
             .collect()

@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -44,13 +45,16 @@ const STARRED_MAILBOX: &str = "[Gmail]/Starred";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    key TEXT NOT NULL,
     int_val INTEGER,
-    text_val TEXT
+    text_val TEXT,
+    PRIMARY KEY (mailbox_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS labels (
-    id TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
     name TEXT NOT NULL,
     label_type TEXT NOT NULL,
     message_list_visibility TEXT,
@@ -59,27 +63,34 @@ CREATE TABLE IF NOT EXISTS labels (
     color_background TEXT,
     uid_validity INTEGER NOT NULL,
     uid_next INTEGER NOT NULL DEFAULT 1,
-    upstream_label_id TEXT UNIQUE
+    upstream_label_id TEXT,
+    PRIMARY KEY (mailbox_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_labels_name_nocase ON labels (name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_labels_mailbox_name_nocase ON labels (mailbox_id, name COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_mailbox_upstream
+    ON labels (mailbox_id, upstream_label_id) WHERE upstream_label_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS imap_meta (
-    mailbox_name TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    mailbox_name TEXT NOT NULL,
     uid_validity INTEGER NOT NULL,
-    uid_next INTEGER NOT NULL DEFAULT 1
+    uid_next INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (mailbox_id, mailbox_name)
 );
 
 CREATE TABLE IF NOT EXISTS imap_expunged_uids (
+    mailbox_id TEXT NOT NULL,
     mailbox_key TEXT NOT NULL,
     imap_uid INTEGER NOT NULL,
     modseq INTEGER NOT NULL,
-    PRIMARY KEY (mailbox_key, imap_uid)
+    PRIMARY KEY (mailbox_id, mailbox_key, imap_uid)
 );
 CREATE INDEX IF NOT EXISTS idx_imap_expunged_mailbox_modseq
-    ON imap_expunged_uids (mailbox_key, modseq);
+    ON imap_expunged_uids (mailbox_id, mailbox_key, modseq);
 
 CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     raw_rfc2822 BLOB NOT NULL,
     snippet TEXT NOT NULL,
@@ -100,49 +111,72 @@ CREATE TABLE IF NOT EXISTS messages (
     references_header TEXT,
     resend_id TEXT,
     delivery_status TEXT,
-    upstream_gmail_id TEXT UNIQUE,
+    upstream_gmail_id TEXT,
     upstream_thread_id TEXT,
     source TEXT NOT NULL DEFAULT 'local',
     all_mail_uid INTEGER NOT NULL,
     is_answered INTEGER NOT NULL DEFAULT 0,
-    is_deleted INTEGER NOT NULL DEFAULT 0
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mailbox_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages (thread_id, internal_date_ms, id);
-CREATE INDEX IF NOT EXISTS idx_messages_date_id ON messages (internal_date_ms DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_rfc822_norm ON messages (rfc822_message_id_norm);
-CREATE INDEX IF NOT EXISTS idx_messages_resend_id ON messages (resend_id);
-CREATE INDEX IF NOT EXISTS idx_messages_upstream_thread ON messages (upstream_thread_id);
-CREATE INDEX IF NOT EXISTS idx_messages_all_mail_uid ON messages (all_mail_uid);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_thread_id
+    ON messages (mailbox_id, thread_id, internal_date_ms, id);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_date_id
+    ON messages (mailbox_id, internal_date_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_rfc822_norm
+    ON messages (mailbox_id, rfc822_message_id_norm);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_resend_id
+    ON messages (mailbox_id, resend_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mailbox_upstream_gmail
+    ON messages (mailbox_id, upstream_gmail_id) WHERE upstream_gmail_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_upstream_thread
+    ON messages (mailbox_id, upstream_thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_all_mail_uid
+    ON messages (mailbox_id, all_mail_uid);
 
 CREATE TABLE IF NOT EXISTS message_labels (
-    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    mailbox_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    label_id TEXT NOT NULL,
     imap_uid INTEGER NOT NULL,
-    PRIMARY KEY (message_id, label_id)
+    PRIMARY KEY (mailbox_id, message_id, label_id),
+    FOREIGN KEY (mailbox_id, message_id) REFERENCES messages(mailbox_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (mailbox_id, label_id) REFERENCES labels(mailbox_id, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_message_labels_label_uid ON message_labels (label_id, imap_uid);
+CREATE INDEX IF NOT EXISTS idx_message_labels_mailbox_label_uid
+    ON message_labels (mailbox_id, label_id, imap_uid);
 
 CREATE TABLE IF NOT EXISTS attachments (
-    id TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
     part_id TEXT NOT NULL,
     filename TEXT,
     content_type TEXT NOT NULL,
     content_id TEXT,
     size_bytes INTEGER NOT NULL,
-    data BLOB NOT NULL
+    data BLOB NOT NULL,
+    PRIMARY KEY (mailbox_id, id),
+    FOREIGN KEY (mailbox_id, message_id) REFERENCES messages(mailbox_id, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments (message_id, part_id, id);
+CREATE INDEX IF NOT EXISTS idx_attachments_mailbox_message_id
+    ON attachments (mailbox_id, message_id, part_id, id);
 
 CREATE TABLE IF NOT EXISTS drafts (
-    id TEXT PRIMARY KEY,
-    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
-    updated_at_ms INTEGER NOT NULL
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, id),
+    UNIQUE (mailbox_id, message_id),
+    FOREIGN KEY (mailbox_id, message_id) REFERENCES messages(mailbox_id, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts (updated_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_drafts_mailbox_updated
+    ON drafts (mailbox_id, updated_at_ms DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS history_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mailbox_id TEXT NOT NULL,
     history_id INTEGER NOT NULL,
     kind TEXT NOT NULL,
     message_id TEXT NOT NULL,
@@ -151,9 +185,11 @@ CREATE TABLE IF NOT EXISTS history_events (
     context_labels_json TEXT NOT NULL DEFAULT '[]',
     upstream_gmail_id TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_history_events_hid ON history_events (history_id, id);
+CREATE INDEX IF NOT EXISTS idx_history_events_mailbox_hid
+    ON history_events (mailbox_id, history_id, id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    mailbox_id UNINDEXED,
     message_id UNINDEXED,
     subject,
     from_addr,
@@ -165,7 +201,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
-    account_key TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    account_key TEXT NOT NULL,
     provider TEXT NOT NULL,
     last_history_id TEXT,
     imap_mailbox TEXT,
@@ -177,11 +214,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_error TEXT,
     messages_synced INTEGER NOT NULL DEFAULT 0,
     last_pushed_history_id INTEGER,
-    messages_pushed INTEGER NOT NULL DEFAULT 0
+    messages_pushed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mailbox_id, account_key)
 );
 
 CREATE TABLE IF NOT EXISTS watch_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+    mailbox_id TEXT PRIMARY KEY,
     topic_name TEXT NOT NULL,
     label_ids_json TEXT NOT NULL,
     label_filter_behavior TEXT NOT NULL,
@@ -190,12 +228,15 @@ CREATE TABLE IF NOT EXISTS watch_state (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value_json TEXT NOT NULL
+    mailbox_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (mailbox_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS pending_approvals (
-    id TEXT PRIMARY KEY,
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
     status TEXT NOT NULL,
     reason TEXT NOT NULL,
     requester_json TEXT,
@@ -209,22 +250,51 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     decision_note TEXT,
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
-    decided_at_ms INTEGER
+    decided_at_ms INTEGER,
+    PRIMARY KEY (mailbox_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_pending_approvals_status_created
-    ON pending_approvals (status, created_at_ms DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_pending_approvals_created
-    ON pending_approvals (created_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_status_created
+    ON pending_approvals (mailbox_id, status, created_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_created
+    ON pending_approvals (mailbox_id, created_at_ms DESC, id DESC);
 "#;
 
-/// SQLite-backed implementation of [`MailStore`].
+/// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: Pool<SqliteConnectionManager>,
-    default_email: String,
+    mailbox_id: String,
+    seeded_mailboxes: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SqliteStore {
+    /// Inspect an existing SQLite database file at `path` and return all distinct `mailbox_id`
+    /// values stored in `meta` (sorted). Returns an empty list if the file does not exist or
+    /// uses a legacy v1 schema without a `mailbox_id` column.
+    pub fn list_mailbox_ids(path: &Path) -> AppResult<Vec<String>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = Connection::open(path).map_err(sql_err)?;
+        if !table_exists(&conn, "meta")? || !column_exists_conn(&conn, "meta", "mailbox_id")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT mailbox_id FROM meta ORDER BY mailbox_id ASC")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let mb = r.map_err(sql_err)?;
+            if !mb.trim().is_empty() {
+                out.push(mb);
+            }
+        }
+        Ok(out)
+    }
+
     /// Open (or create) a SQLite database at `path`, run migrations, and seed system labels.
     pub fn open(path: &Path, default_email: &str) -> AppResult<Self> {
         if let Some(parent) = path.parent()
@@ -247,9 +317,11 @@ impl SqliteStore {
             .build(manager)
             .map_err(|e| AppError::Storage(format!("Failed to build SQLite pool: {e}")))?;
 
+        let mailbox_id = crate::config::normalize_mailbox_id(default_email);
         let store = Self {
             pool,
-            default_email: default_email.to_string(),
+            mailbox_id,
+            seeded_mailboxes: Arc::new(Mutex::new(HashSet::new())),
         };
         store.initialize()?;
         Ok(store)
@@ -269,9 +341,11 @@ impl SqliteStore {
             AppError::Storage(format!("Failed to build in-memory SQLite pool: {e}"))
         })?;
 
+        let mailbox_id = crate::config::normalize_mailbox_id(default_email);
         let store = Self {
             pool,
-            default_email: default_email.to_string(),
+            mailbox_id,
+            seeded_mailboxes: Arc::new(Mutex::new(HashSet::new())),
         };
         store.initialize()?;
         Ok(store)
@@ -282,105 +356,414 @@ impl SqliteStore {
             .pool
             .get()
             .map_err(|e| AppError::Storage(format!("SQLite pool error: {e}")))?;
+
+        if needs_v1_multi_mailbox_migration(&conn)? {
+            migrate_v1_to_multi_mailbox(&mut conn, &self.mailbox_id)?;
+        }
+
         conn.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
-
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_err)?;
-
-        // Idempotent column migrations for existing databases.
-        ensure_column_exists(&tx, "history_events", "upstream_gmail_id", "TEXT")?;
-        ensure_column_exists(&tx, "sync_state", "last_pushed_history_id", "INTEGER")?;
-        ensure_column_exists(
-            &tx,
-            "sync_state",
-            "messages_pushed",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-
-        tx.execute(
-            "INSERT OR IGNORE INTO meta (key, int_val) VALUES ('history_id', 1)",
-            [],
-        )
-        .map_err(sql_err)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO meta (key, int_val) VALUES ('next_uid_validity', 1)",
-            [],
-        )
-        .map_err(sql_err)?;
-
-        // Seed [Gmail]/All Mail IMAP metadata
-        let all_mail_exists: Option<i64> = tx
-            .query_row(
-                "SELECT uid_validity FROM imap_meta WHERE mailbox_name = ?1",
-                params![ALL_MAIL_MAILBOX],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        if all_mail_exists.is_none() {
-            let uv = alloc_uid_validity(&tx)?;
-            tx.execute(
-                "INSERT INTO imap_meta (mailbox_name, uid_validity, uid_next) VALUES (?1, ?2, 1)",
-                params![ALL_MAIL_MAILBOX, uv as i64],
-            )
-            .map_err(sql_err)?;
+        ensure_mailbox_seeded(&mut conn, &self.mailbox_id)?;
+        if let Ok(mut seeded) = self.seeded_mailboxes.lock() {
+            seeded.insert(self.mailbox_id.clone());
         }
-
-        // Seed system labels
-        for &label_id in SYSTEM_LABEL_IDS {
-            let exists: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM labels WHERE id = ?1",
-                    params![label_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_err)?;
-            if exists.is_none() {
-                let uv = alloc_uid_validity(&tx)?;
-                let (msg_vis, lbl_vis) = if label_id == LABEL_TRASH || label_id == LABEL_SPAM {
-                    ("hide", "labelHide")
-                } else {
-                    ("show", "labelShow")
-                };
-                tx.execute(
-                    "INSERT INTO labels
-                     (id, name, label_type, message_list_visibility, label_list_visibility, uid_validity, uid_next)
-                     VALUES (?1, ?2, 'system', ?3, ?4, ?5, 1)",
-                    params![label_id, label_id, msg_vis, lbl_vis, uv as i64],
-                )
-                .map_err(sql_err)?;
-            }
-        }
-
-        // Seed default user settings (primary sendAs, vacation, autoForwarding, imap, pop)
-        let defaults = UserSettings::default_for_email(&self.default_email);
-        seed_setting_if_missing(&tx, "send_as", &defaults.send_as)?;
-        seed_setting_if_missing(&tx, "vacation", &defaults.vacation)?;
-        seed_setting_if_missing(&tx, "auto_forwarding", &defaults.auto_forwarding)?;
-        seed_setting_if_missing(&tx, "imap", &defaults.imap)?;
-        seed_setting_if_missing(&tx, "pop", &defaults.pop)?;
-
-        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
     async fn run_blocking<F, T>(&self, f: F) -> AppResult<T>
     where
-        F: FnOnce(&mut Connection) -> AppResult<T> + Send + 'static,
+        F: FnOnce(&mut Connection, &str) -> AppResult<T> + Send + 'static,
         T: Send + 'static,
     {
         let pool = self.pool.clone();
+        let mailbox_id = self.mailbox_id.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool
                 .get()
                 .map_err(|e| AppError::Storage(format!("SQLite pool error: {e}")))?;
-            f(&mut conn)
+            f(&mut conn, &mailbox_id)
         })
         .await
         .map_err(|e| AppError::Storage(format!("SQLite blocking task failed: {e}")))?
     }
+}
+
+fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    Ok(exists.is_some())
+}
+
+fn column_exists_conn(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_err)?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_err)?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    Ok(exists)
+}
+
+const MULTI_MAILBOX_TABLES: &[&str] = &[
+    "meta",
+    "labels",
+    "imap_meta",
+    "imap_expunged_uids",
+    "messages",
+    "message_labels",
+    "attachments",
+    "drafts",
+    "history_events",
+    "sync_state",
+    "watch_state",
+    "settings",
+    "pending_approvals",
+];
+
+fn needs_v1_multi_mailbox_migration(conn: &Connection) -> AppResult<bool> {
+    for &tbl in MULTI_MAILBOX_TABLES {
+        if table_exists(conn, tbl)? && !column_exists_conn(conn, tbl, "mailbox_id")? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_v1_to_multi_mailbox(conn: &mut Connection, default_mailbox: &str) -> AppResult<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .map_err(sql_err)?;
+
+    let result = (|| -> AppResult<()> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+
+        // Backfill optional legacy columns on v1 tables before renaming/copying.
+        if table_exists(&tx, "history_events")?
+            && !column_exists_conn(&tx, "history_events", "mailbox_id")?
+        {
+            ensure_column_exists(
+                &tx,
+                "history_events",
+                "context_labels_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column_exists(&tx, "history_events", "upstream_gmail_id", "TEXT")?;
+        }
+        if table_exists(&tx, "sync_state")? && !column_exists_conn(&tx, "sync_state", "mailbox_id")?
+        {
+            ensure_column_exists(&tx, "sync_state", "last_pushed_history_id", "INTEGER")?;
+            ensure_column_exists(
+                &tx,
+                "sync_state",
+                "messages_pushed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
+        let mut renamed = Vec::new();
+        for &tbl in MULTI_MAILBOX_TABLES {
+            if table_exists(&tx, tbl)? && !column_exists_conn(&tx, tbl, "mailbox_id")? {
+                tx.execute(&format!("ALTER TABLE {tbl} RENAME TO {tbl}__v1_legacy"), [])
+                    .map_err(sql_err)?;
+                renamed.push(tbl);
+            }
+        }
+        tx.execute("DROP TABLE IF EXISTS messages_fts", [])
+            .map_err(sql_err)?;
+
+        tx.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
+
+        if renamed.contains(&"meta") {
+            tx.execute(
+                "INSERT INTO meta (mailbox_id, key, int_val, text_val)
+                 SELECT ?1, key, int_val, text_val FROM meta__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"labels") {
+            tx.execute(
+                "INSERT INTO labels (
+                    mailbox_id, id, name, label_type, message_list_visibility, label_list_visibility,
+                    color_text, color_background, uid_validity, uid_next, upstream_label_id
+                 )
+                 SELECT ?1, id, name, label_type, message_list_visibility, label_list_visibility,
+                        color_text, color_background, uid_validity, uid_next, upstream_label_id
+                 FROM labels__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"imap_meta") {
+            tx.execute(
+                "INSERT INTO imap_meta (mailbox_id, mailbox_name, uid_validity, uid_next)
+                 SELECT ?1, mailbox_name, uid_validity, uid_next FROM imap_meta__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"imap_expunged_uids") {
+            tx.execute(
+                "INSERT INTO imap_expunged_uids (mailbox_id, mailbox_key, imap_uid, modseq)
+                 SELECT ?1, mailbox_key, imap_uid, modseq FROM imap_expunged_uids__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"messages") {
+            tx.execute(
+                "INSERT INTO messages (
+                    mailbox_id, id, thread_id, raw_rfc2822, snippet, history_id, internal_date_ms,
+                    size_estimate, subject, from_addr, to_addrs_json, cc_addrs_json, bcc_addrs_json,
+                    text_body, html_body, has_attachments, rfc822_message_id, rfc822_message_id_norm,
+                    in_reply_to, references_header, resend_id, delivery_status, upstream_gmail_id,
+                    upstream_thread_id, source, all_mail_uid, is_answered, is_deleted
+                 )
+                 SELECT ?1, id, thread_id, raw_rfc2822, snippet, history_id, internal_date_ms,
+                        size_estimate, subject, from_addr, to_addrs_json, cc_addrs_json, bcc_addrs_json,
+                        text_body, html_body, has_attachments, rfc822_message_id, rfc822_message_id_norm,
+                        in_reply_to, references_header, resend_id, delivery_status, upstream_gmail_id,
+                        upstream_thread_id, source, all_mail_uid, is_answered, is_deleted
+                 FROM messages__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+
+            // Rebuild FTS5 index with mailbox_id.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, subject, from_addr, to_addrs_json, cc_addrs_json, text_body, snippet
+                     FROM messages WHERE mailbox_id = ?1",
+                )
+                .map_err(sql_err)?;
+            let rows: Vec<(String, String, String, String, String, String, String)> = stmt
+                .query_map(params![default_mailbox], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .map_err(sql_err)?
+                .collect::<Result<_, _>>()
+                .map_err(sql_err)?;
+            drop(stmt);
+
+            for (mid, subject, from_addr, to_json, cc_json, text_body, snippet) in rows {
+                let to_joined = serde_json::from_str::<Vec<String>>(&to_json)
+                    .unwrap_or_default()
+                    .join(" ");
+                let cc_joined = serde_json::from_str::<Vec<String>>(&cc_json)
+                    .unwrap_or_default()
+                    .join(" ");
+                tx.execute(
+                    "INSERT INTO messages_fts (mailbox_id, message_id, subject, from_addr, to_addrs, cc_addrs, text_body, snippet)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        default_mailbox,
+                        mid,
+                        subject,
+                        from_addr,
+                        to_joined,
+                        cc_joined,
+                        text_body,
+                        snippet,
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        if renamed.contains(&"message_labels") {
+            tx.execute(
+                "INSERT INTO message_labels (mailbox_id, message_id, label_id, imap_uid)
+                 SELECT ?1, message_id, label_id, imap_uid FROM message_labels__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"attachments") {
+            tx.execute(
+                "INSERT INTO attachments (
+                    mailbox_id, id, message_id, part_id, filename, content_type, content_id, size_bytes, data
+                 )
+                 SELECT ?1, id, message_id, part_id, filename, content_type, content_id, size_bytes, data
+                 FROM attachments__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"drafts") {
+            tx.execute(
+                "INSERT INTO drafts (mailbox_id, id, message_id, updated_at_ms)
+                 SELECT ?1, id, message_id, updated_at_ms FROM drafts__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"history_events") {
+            tx.execute(
+                "INSERT INTO history_events (
+                    id, mailbox_id, history_id, kind, message_id, thread_id,
+                    label_ids_json, context_labels_json, upstream_gmail_id
+                 )
+                 SELECT id, ?1, history_id, kind, message_id, thread_id,
+                        label_ids_json, context_labels_json, upstream_gmail_id
+                 FROM history_events__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"sync_state") {
+            tx.execute(
+                "INSERT INTO sync_state (
+                    mailbox_id, account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
+                    imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
+                    messages_synced, last_pushed_history_id, messages_pushed
+                 )
+                 SELECT ?1, account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
+                        imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
+                        messages_synced, last_pushed_history_id, messages_pushed
+                 FROM sync_state__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"watch_state") {
+            tx.execute(
+                "INSERT INTO watch_state (
+                    mailbox_id, topic_name, label_ids_json, label_filter_behavior, history_id, expiration_ms
+                 )
+                 SELECT ?1, topic_name, label_ids_json, label_filter_behavior, history_id, expiration_ms
+                 FROM watch_state__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"settings") {
+            tx.execute(
+                "INSERT INTO settings (mailbox_id, key, value_json)
+                 SELECT ?1, key, value_json FROM settings__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+        if renamed.contains(&"pending_approvals") {
+            tx.execute(
+                "INSERT INTO pending_approvals (
+                    mailbox_id, id, status, reason, requester_json, outbound_message_json,
+                    reply_to_message_id, thread_id, draft_id, sent_message_id, provider_message_id,
+                    decided_by, decision_note, created_at_ms, expires_at_ms, decided_at_ms
+                 )
+                 SELECT ?1, id, status, reason, requester_json, outbound_message_json,
+                        reply_to_message_id, thread_id, draft_id, sent_message_id, provider_message_id,
+                        decided_by, decision_note, created_at_ms, expires_at_ms, decided_at_ms
+                 FROM pending_approvals__v1_legacy",
+                params![default_mailbox],
+            )
+            .map_err(sql_err)?;
+        }
+
+        for tbl in renamed {
+            tx.execute(&format!("DROP TABLE IF EXISTS {tbl}__v1_legacy"), [])
+                .map_err(sql_err)?;
+        }
+
+        tx.commit().map_err(sql_err)?;
+        Ok(())
+    })();
+
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    result
+}
+
+fn ensure_mailbox_seeded(conn: &mut Connection, mailbox_id: &str) -> AppResult<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_err)?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO meta (mailbox_id, key, int_val) VALUES (?1, 'history_id', 1)",
+        params![mailbox_id],
+    )
+    .map_err(sql_err)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO meta (mailbox_id, key, int_val) VALUES (?1, 'next_uid_validity', 1)",
+        params![mailbox_id],
+    )
+    .map_err(sql_err)?;
+
+    // Seed [Gmail]/All Mail IMAP metadata
+    let all_mail_exists: Option<i64> = tx
+        .query_row(
+            "SELECT uid_validity FROM imap_meta WHERE mailbox_id = ?1 AND mailbox_name = ?2",
+            params![mailbox_id, ALL_MAIL_MAILBOX],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if all_mail_exists.is_none() {
+        let uv = alloc_uid_validity(&tx, mailbox_id)?;
+        tx.execute(
+            "INSERT INTO imap_meta (mailbox_id, mailbox_name, uid_validity, uid_next) VALUES (?1, ?2, ?3, 1)",
+            params![mailbox_id, ALL_MAIL_MAILBOX, uv as i64],
+        )
+        .map_err(sql_err)?;
+    }
+
+    // Seed system labels
+    for &label_id in SYSTEM_LABEL_IDS {
+        let exists: Option<String> = tx
+            .query_row(
+                "SELECT id FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+                params![mailbox_id, label_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_none() {
+            let uv = alloc_uid_validity(&tx, mailbox_id)?;
+            let (msg_vis, lbl_vis) = if label_id == LABEL_TRASH || label_id == LABEL_SPAM {
+                ("hide", "labelHide")
+            } else {
+                ("show", "labelShow")
+            };
+            tx.execute(
+                "INSERT INTO labels
+                 (mailbox_id, id, name, label_type, message_list_visibility, label_list_visibility, uid_validity, uid_next)
+                 VALUES (?1, ?2, ?3, 'system', ?4, ?5, ?6, 1)",
+                params![mailbox_id, label_id, label_id, msg_vis, lbl_vis, uv as i64],
+            )
+            .map_err(sql_err)?;
+        }
+    }
+
+    // Seed default user settings (primary sendAs, vacation, autoForwarding, imap, pop)
+    let defaults = UserSettings::default_for_email(mailbox_id);
+    seed_setting_if_missing(&tx, mailbox_id, "send_as", &defaults.send_as)?;
+    seed_setting_if_missing(&tx, mailbox_id, "vacation", &defaults.vacation)?;
+    seed_setting_if_missing(
+        &tx,
+        mailbox_id,
+        "auto_forwarding",
+        &defaults.auto_forwarding,
+    )?;
+    seed_setting_if_missing(&tx, mailbox_id, "imap", &defaults.imap)?;
+    seed_setting_if_missing(&tx, mailbox_id, "pop", &defaults.pop)?;
+
+    tx.commit().map_err(sql_err)?;
+    Ok(())
 }
 
 // ============================================================================
@@ -411,56 +794,57 @@ fn normalize_rfc_message_id(raw: &str) -> Option<String> {
 
 fn seed_setting_if_missing<T: serde::Serialize>(
     tx: &Transaction<'_>,
+    mailbox_id: &str,
     key: &str,
     value: &T,
 ) -> AppResult<()> {
     let json = serde_json::to_string(value)
         .map_err(|e| AppError::Storage(format!("Failed to serialize setting {key}: {e}")))?;
     tx.execute(
-        "INSERT OR IGNORE INTO settings (key, value_json) VALUES (?1, ?2)",
-        params![key, json],
+        "INSERT OR IGNORE INTO settings (mailbox_id, key, value_json) VALUES (?1, ?2, ?3)",
+        params![mailbox_id, key, json],
     )
     .map_err(sql_err)?;
     Ok(())
 }
 
-fn alloc_uid_validity(tx: &Transaction<'_>) -> AppResult<u32> {
+fn alloc_uid_validity(tx: &Transaction<'_>, mailbox_id: &str) -> AppResult<u32> {
     let current: i64 = tx
         .query_row(
-            "SELECT int_val FROM meta WHERE key = 'next_uid_validity'",
-            [],
+            "SELECT int_val FROM meta WHERE mailbox_id = ?1 AND key = 'next_uid_validity'",
+            params![mailbox_id],
             |row| row.get(0),
         )
         .map_err(sql_err)?;
     tx.execute(
-        "UPDATE meta SET int_val = ?1 WHERE key = 'next_uid_validity'",
-        params![current + 1],
+        "UPDATE meta SET int_val = ?1 WHERE mailbox_id = ?2 AND key = 'next_uid_validity'",
+        params![current + 1, mailbox_id],
     )
     .map_err(sql_err)?;
     Ok(current.max(1) as u32)
 }
 
-fn bump_history_id(tx: &Transaction<'_>) -> AppResult<u64> {
+fn bump_history_id(tx: &Transaction<'_>, mailbox_id: &str) -> AppResult<u64> {
     tx.execute(
-        "UPDATE meta SET int_val = int_val + 1 WHERE key = 'history_id'",
-        [],
+        "UPDATE meta SET int_val = int_val + 1 WHERE mailbox_id = ?1 AND key = 'history_id'",
+        params![mailbox_id],
     )
     .map_err(sql_err)?;
     let hid: i64 = tx
         .query_row(
-            "SELECT int_val FROM meta WHERE key = 'history_id'",
-            [],
+            "SELECT int_val FROM meta WHERE mailbox_id = ?1 AND key = 'history_id'",
+            params![mailbox_id],
             |row| row.get(0),
         )
         .map_err(sql_err)?;
     Ok(hid.max(1) as u64)
 }
 
-fn read_current_history_id(conn: &Connection) -> AppResult<u64> {
+fn read_current_history_id(conn: &Connection, mailbox_id: &str) -> AppResult<u64> {
     let hid: i64 = conn
         .query_row(
-            "SELECT int_val FROM meta WHERE key = 'history_id'",
-            [],
+            "SELECT int_val FROM meta WHERE mailbox_id = ?1 AND key = 'history_id'",
+            params![mailbox_id],
             |row| row.get(0),
         )
         .map_err(sql_err)?;
@@ -516,6 +900,7 @@ fn ensure_column_exists(
 #[allow(clippy::too_many_arguments)]
 fn record_history_event(
     tx: &Transaction<'_>,
+    mailbox_id: &str,
     history_id: u64,
     kind: HistoryEventKind,
     message_id: &str,
@@ -529,9 +914,10 @@ fn record_history_event(
     let ctx_json = serde_json::to_string(context_labels)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
     tx.execute(
-        "INSERT INTO history_events (history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO history_events (mailbox_id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
+            mailbox_id,
             history_id as i64,
             history_kind_to_str(kind),
             message_id,
@@ -545,47 +931,51 @@ fn record_history_event(
     Ok(())
 }
 
-fn alloc_all_mail_uid(tx: &Transaction<'_>) -> AppResult<u32> {
+fn alloc_all_mail_uid(tx: &Transaction<'_>, mailbox_id: &str) -> AppResult<u32> {
     let uid: i64 = tx
         .query_row(
-            "SELECT uid_next FROM imap_meta WHERE mailbox_name = ?1",
-            params![ALL_MAIL_MAILBOX],
+            "SELECT uid_next FROM imap_meta WHERE mailbox_id = ?1 AND mailbox_name = ?2",
+            params![mailbox_id, ALL_MAIL_MAILBOX],
             |row| row.get(0),
         )
         .map_err(sql_err)?;
     tx.execute(
-        "UPDATE imap_meta SET uid_next = ?1 WHERE mailbox_name = ?2",
-        params![uid + 1, ALL_MAIL_MAILBOX],
+        "UPDATE imap_meta SET uid_next = ?1 WHERE mailbox_id = ?2 AND mailbox_name = ?3",
+        params![uid + 1, mailbox_id, ALL_MAIL_MAILBOX],
     )
     .map_err(sql_err)?;
     Ok(uid.max(1) as u32)
 }
 
-fn alloc_label_uid(tx: &Transaction<'_>, label_id: &str) -> AppResult<u32> {
+fn alloc_label_uid(tx: &Transaction<'_>, mailbox_id: &str, label_id: &str) -> AppResult<u32> {
     let uid: i64 = tx
         .query_row(
-            "SELECT uid_next FROM labels WHERE id = ?1",
-            params![label_id],
+            "SELECT uid_next FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+            params![mailbox_id, label_id],
             |row| row.get(0),
         )
         .map_err(sql_err)?;
     tx.execute(
-        "UPDATE labels SET uid_next = ?1 WHERE id = ?2",
-        params![uid + 1, label_id],
+        "UPDATE labels SET uid_next = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+        params![uid + 1, mailbox_id, label_id],
     )
     .map_err(sql_err)?;
     Ok(uid.max(1) as u32)
 }
 
-fn ensure_label_exists_tx(tx: &Transaction<'_>, raw_label: &str) -> AppResult<String> {
+fn ensure_label_exists_tx(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    raw_label: &str,
+) -> AppResult<String> {
     let trimmed = raw_label.trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("Label ID cannot be empty".into()));
     }
     if let Some(id) = tx
         .query_row(
-            "SELECT id FROM labels WHERE id = ?1",
-            params![trimmed],
+            "SELECT id FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+            params![mailbox_id, trimmed],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -595,8 +985,8 @@ fn ensure_label_exists_tx(tx: &Transaction<'_>, raw_label: &str) -> AppResult<St
     }
     if let Some(id) = tx
         .query_row(
-            "SELECT id FROM labels WHERE name = ?1 COLLATE NOCASE",
-            params![trimmed],
+            "SELECT id FROM labels WHERE mailbox_id = ?1 AND name = ?2 COLLATE NOCASE",
+            params![mailbox_id, trimmed],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -606,8 +996,8 @@ fn ensure_label_exists_tx(tx: &Transaction<'_>, raw_label: &str) -> AppResult<St
     }
     if let Some(id) = tx
         .query_row(
-            "SELECT id FROM labels WHERE upstream_label_id = ?1",
-            params![trimmed],
+            "SELECT id FROM labels WHERE mailbox_id = ?1 AND upstream_label_id = ?2",
+            params![mailbox_id, trimmed],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -616,25 +1006,29 @@ fn ensure_label_exists_tx(tx: &Transaction<'_>, raw_label: &str) -> AppResult<St
         return Ok(id);
     }
 
-    let uv = alloc_uid_validity(tx)?;
+    let uv = alloc_uid_validity(tx, mailbox_id)?;
     tx.execute(
-        "INSERT INTO labels (id, name, label_type, message_list_visibility, label_list_visibility, uid_validity, uid_next)
-         VALUES (?1, ?2, 'user', 'show', 'labelShow', ?3, 1)",
-        params![trimmed, trimmed, uv as i64],
+        "INSERT INTO labels (mailbox_id, id, name, label_type, message_list_visibility, label_list_visibility, uid_validity, uid_next)
+         VALUES (?1, ?2, ?3, 'user', 'show', 'labelShow', ?4, 1)",
+        params![mailbox_id, trimmed, trimmed, uv as i64],
     )
     .map_err(sql_err)?;
     Ok(trimmed.to_string())
 }
 
-fn resolve_existing_label_id(conn: &Connection, raw_label: &str) -> AppResult<Option<String>> {
+fn resolve_existing_label_id(
+    conn: &Connection,
+    mailbox_id: &str,
+    raw_label: &str,
+) -> AppResult<Option<String>> {
     let trimmed = raw_label.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
     if let Some(id) = conn
         .query_row(
-            "SELECT id FROM labels WHERE id = ?1",
-            params![trimmed],
+            "SELECT id FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+            params![mailbox_id, trimmed],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -643,20 +1037,28 @@ fn resolve_existing_label_id(conn: &Connection, raw_label: &str) -> AppResult<Op
         return Ok(Some(id));
     }
     conn.query_row(
-        "SELECT id FROM labels WHERE name = ?1 COLLATE NOCASE",
-        params![trimmed],
+        "SELECT id FROM labels WHERE mailbox_id = ?1 AND name = ?2 COLLATE NOCASE",
+        params![mailbox_id, trimmed],
         |row| row.get::<_, String>(0),
     )
     .optional()
     .map_err(sql_err)
 }
 
-fn load_message_labels(conn: &Connection, message_id: &str) -> AppResult<Vec<String>> {
+fn load_message_labels(
+    conn: &Connection,
+    mailbox_id: &str,
+    message_id: &str,
+) -> AppResult<Vec<String>> {
     let mut stmt = conn
-        .prepare("SELECT label_id FROM message_labels WHERE message_id = ?1 ORDER BY label_id ASC")
+        .prepare(
+            "SELECT label_id FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2 ORDER BY label_id ASC",
+        )
         .map_err(sql_err)?;
     let rows = stmt
-        .query_map(params![message_id], |row| row.get::<_, String>(0))
+        .query_map(params![mailbox_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(sql_err)?;
     let mut labels = Vec::new();
     for r in rows {
@@ -667,6 +1069,7 @@ fn load_message_labels(conn: &Connection, message_id: &str) -> AppResult<Vec<Str
 
 fn load_labels_for_messages(
     conn: &Connection,
+    mailbox_id: &str,
     message_ids: &[String],
 ) -> AppResult<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -676,14 +1079,16 @@ fn load_labels_for_messages(
     // Batch in chunks of 500 to stay well below SQLite's bind parameter limit.
     for chunk in message_ids.chunks(500) {
         let placeholders = (0..chunk.len())
-            .map(|i| format!("?{}", i + 1))
+            .map(|i| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT message_id, label_id FROM message_labels WHERE message_id IN ({placeholders}) ORDER BY label_id ASC"
+            "SELECT message_id, label_id FROM message_labels WHERE mailbox_id = ?1 AND message_id IN ({placeholders}) ORDER BY label_id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-        let params_vec: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Text(id.clone())).collect();
+        let mut params_vec: Vec<SqlValue> = Vec::with_capacity(chunk.len() + 1);
+        params_vec.push(SqlValue::Text(mailbox_id.to_string()));
+        params_vec.extend(chunk.iter().map(|id| SqlValue::Text(id.clone())));
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -736,11 +1141,15 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> 
     })
 }
 
-fn load_message_by_id(conn: &Connection, id: &str) -> AppResult<Option<StoredMessage>> {
+fn load_message_by_id(
+    conn: &Connection,
+    mailbox_id: &str,
+    id: &str,
+) -> AppResult<Option<StoredMessage>> {
     let mut msg = match conn
         .query_row(
-            "SELECT * FROM messages WHERE id = ?1",
-            params![id],
+            "SELECT * FROM messages WHERE mailbox_id = ?1 AND id = ?2",
+            params![mailbox_id, id],
             message_from_row,
         )
         .optional()
@@ -749,12 +1158,13 @@ fn load_message_by_id(conn: &Connection, id: &str) -> AppResult<Option<StoredMes
         Some(m) => m,
         None => return Ok(None),
     };
-    msg.label_ids = load_message_labels(conn, &msg.id)?;
+    msg.label_ids = load_message_labels(conn, mailbox_id, &msg.id)?;
     Ok(Some(msg))
 }
 
 fn resolve_thread_id_tx(
     tx: &Transaction<'_>,
+    mailbox_id: &str,
     input: &NewMessageInput,
     msg_id: &str,
 ) -> AppResult<String> {
@@ -767,8 +1177,8 @@ fn resolve_thread_id_tx(
         && !utid.trim().is_empty()
         && let Some(existing) = tx
             .query_row(
-                "SELECT thread_id FROM messages WHERE upstream_thread_id = ?1 LIMIT 1",
-                params![utid.trim()],
+                "SELECT thread_id FROM messages WHERE mailbox_id = ?1 AND upstream_thread_id = ?2 LIMIT 1",
+                params![mailbox_id, utid.trim()],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -780,8 +1190,8 @@ fn resolve_thread_id_tx(
         && let Some(norm) = normalize_rfc_message_id(irt)
         && let Some(existing) = tx
             .query_row(
-                "SELECT thread_id FROM messages WHERE rfc822_message_id_norm = ?1 LIMIT 1",
-                params![norm],
+                "SELECT thread_id FROM messages WHERE mailbox_id = ?1 AND rfc822_message_id_norm = ?2 LIMIT 1",
+                params![mailbox_id, norm],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -794,8 +1204,8 @@ fn resolve_thread_id_tx(
             if let Some(norm) = normalize_rfc_message_id(token)
                 && let Some(existing) = tx
                     .query_row(
-                        "SELECT thread_id FROM messages WHERE rfc822_message_id_norm = ?1 LIMIT 1",
-                        params![norm],
+                        "SELECT thread_id FROM messages WHERE mailbox_id = ?1 AND rfc822_message_id_norm = ?2 LIMIT 1",
+                        params![mailbox_id, norm],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()
@@ -808,7 +1218,11 @@ fn resolve_thread_id_tx(
     Ok(msg_id.to_string())
 }
 
-fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<StoredMessage> {
+fn insert_message_tx(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    input: NewMessageInput,
+) -> AppResult<StoredMessage> {
     let msg_id = input
         .id
         .as_deref()
@@ -816,21 +1230,21 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(new_hex_id);
-    let thread_id = resolve_thread_id_tx(tx, &input, &msg_id)?;
+    let thread_id = resolve_thread_id_tx(tx, mailbox_id, &input, &msg_id)?;
 
     // Resolve / ensure labels (deduplicated & sorted)
     let mut label_set = HashSet::new();
     let mut resolved_labels = Vec::new();
     for raw_label in &input.label_ids {
-        let lid = ensure_label_exists_tx(tx, raw_label)?;
+        let lid = ensure_label_exists_tx(tx, mailbox_id, raw_label)?;
         if label_set.insert(lid.clone()) {
             resolved_labels.push(lid);
         }
     }
     resolved_labels.sort();
 
-    let history_id = bump_history_id(tx)?;
-    let all_mail_uid = alloc_all_mail_uid(tx)?;
+    let history_id = bump_history_id(tx, mailbox_id)?;
+    let all_mail_uid = alloc_all_mail_uid(tx, mailbox_id)?;
     let size_estimate = input.raw_rfc2822.len().min(i32::MAX as usize) as i32;
     let has_attachments = !input.attachments.is_empty();
     let rfc_norm = input
@@ -852,21 +1266,22 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
 
     tx.execute(
         "INSERT INTO messages (
-            id, thread_id, raw_rfc2822, snippet, history_id, internal_date_ms, size_estimate,
+            mailbox_id, id, thread_id, raw_rfc2822, snippet, history_id, internal_date_ms, size_estimate,
             subject, from_addr, to_addrs_json, cc_addrs_json, bcc_addrs_json,
             text_body, html_body, has_attachments,
             rfc822_message_id, rfc822_message_id_norm, in_reply_to, references_header,
             resend_id, delivery_status, upstream_gmail_id, upstream_thread_id,
             source, all_mail_uid, is_answered, is_deleted
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-            ?8, ?9, ?10, ?11, ?12,
-            ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19,
-            ?20, NULL, ?21, ?22,
-            ?23, ?24, ?25, ?26
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20,
+            ?21, NULL, ?22, ?23,
+            ?24, ?25, ?26, ?27
         )",
         params![
+            mailbox_id,
             &msg_id,
             &thread_id,
             &input.raw_rfc2822,
@@ -898,10 +1313,10 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
     .map_err(sql_err)?;
 
     for lid in &resolved_labels {
-        let imap_uid = alloc_label_uid(tx, lid)?;
+        let imap_uid = alloc_label_uid(tx, mailbox_id, lid)?;
         tx.execute(
-            "INSERT INTO message_labels (message_id, label_id, imap_uid) VALUES (?1, ?2, ?3)",
-            params![&msg_id, lid, imap_uid as i64],
+            "INSERT INTO message_labels (mailbox_id, message_id, label_id, imap_uid) VALUES (?1, ?2, ?3, ?4)",
+            params![mailbox_id, &msg_id, lid, imap_uid as i64],
         )
         .map_err(sql_err)?;
     }
@@ -909,9 +1324,10 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
     for att in &input.attachments {
         let att_id = format!("att_{}", new_hex_id());
         tx.execute(
-            "INSERT INTO attachments (id, message_id, part_id, filename, content_type, content_id, size_bytes, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO attachments (mailbox_id, id, message_id, part_id, filename, content_type, content_id, size_bytes, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
+                mailbox_id,
                 att_id,
                 &msg_id,
                 &att.part_id,
@@ -929,9 +1345,10 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
     let to_joined = input.to_addrs.join(" ");
     let cc_joined = input.cc_addrs.join(" ");
     tx.execute(
-        "INSERT INTO messages_fts (message_id, subject, from_addr, to_addrs, cc_addrs, text_body, snippet)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages_fts (mailbox_id, message_id, subject, from_addr, to_addrs, cc_addrs, text_body, snippet)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
+            mailbox_id,
             &msg_id,
             &input.subject,
             &input.from_addr,
@@ -945,6 +1362,7 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
 
     record_history_event(
         tx,
+        mailbox_id,
         history_id,
         HistoryEventKind::MessageAdded,
         &msg_id,
@@ -987,22 +1405,28 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
 
 fn record_expunged_uid_tx(
     tx: &Transaction<'_>,
+    mailbox_id: &str,
     mailbox_key: &str,
     imap_uid: u32,
     modseq: u64,
 ) -> AppResult<()> {
     tx.execute(
-        "INSERT OR REPLACE INTO imap_expunged_uids (mailbox_key, imap_uid, modseq) VALUES (?1, ?2, ?3)",
-        params![mailbox_key, imap_uid as i64, modseq as i64],
+        "INSERT OR REPLACE INTO imap_expunged_uids (mailbox_id, mailbox_key, imap_uid, modseq) VALUES (?1, ?2, ?3, ?4)",
+        params![mailbox_id, mailbox_key, imap_uid as i64, modseq as i64],
     )
     .map_err(sql_err)?;
     Ok(())
 }
 
-fn clear_expunged_uid_tx(tx: &Transaction<'_>, mailbox_key: &str, imap_uid: u32) -> AppResult<()> {
+fn clear_expunged_uid_tx(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    mailbox_key: &str,
+    imap_uid: u32,
+) -> AppResult<()> {
     tx.execute(
-        "DELETE FROM imap_expunged_uids WHERE mailbox_key = ?1 AND imap_uid = ?2",
-        params![mailbox_key, imap_uid as i64],
+        "DELETE FROM imap_expunged_uids WHERE mailbox_id = ?1 AND mailbox_key = ?2 AND imap_uid = ?3",
+        params![mailbox_id, mailbox_key, imap_uid as i64],
     )
     .map_err(sql_err)?;
     Ok(())
@@ -1010,11 +1434,12 @@ fn clear_expunged_uid_tx(tx: &Transaction<'_>, mailbox_key: &str, imap_uid: u32)
 
 fn modify_message_labels_resolved_tx(
     tx: &Transaction<'_>,
+    mailbox_id: &str,
     message_id: &str,
     resolved_add: &[String],
     resolved_remove: &[String],
 ) -> AppResult<StoredMessage> {
-    let mut msg = load_message_by_id(tx, message_id)?
+    let mut msg = load_message_by_id(tx, mailbox_id, message_id)?
         .ok_or_else(|| AppError::NotFound(format!("Message not found: {message_id}")))?;
 
     let current_set: HashSet<String> = msg.label_ids.iter().cloned().collect();
@@ -1037,39 +1462,39 @@ fn modify_message_labels_resolved_tx(
     }
 
     if !actually_added.is_empty() || !actually_removed.is_empty() {
-        let new_hid = bump_history_id(tx)?;
+        let new_hid = bump_history_id(tx, mailbox_id)?;
         tx.execute(
-            "UPDATE messages SET history_id = ?1 WHERE id = ?2",
-            params![new_hid as i64, message_id],
+            "UPDATE messages SET history_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+            params![new_hid as i64, mailbox_id, message_id],
         )
         .map_err(sql_err)?;
 
         for lid in &actually_added {
-            let imap_uid = alloc_label_uid(tx, lid)?;
+            let imap_uid = alloc_label_uid(tx, mailbox_id, lid)?;
             tx.execute(
-                "INSERT OR IGNORE INTO message_labels (message_id, label_id, imap_uid) VALUES (?1, ?2, ?3)",
-                params![message_id, lid, imap_uid as i64],
+                "INSERT OR IGNORE INTO message_labels (mailbox_id, message_id, label_id, imap_uid) VALUES (?1, ?2, ?3, ?4)",
+                params![mailbox_id, message_id, lid, imap_uid as i64],
             )
             .map_err(sql_err)?;
-            clear_expunged_uid_tx(tx, lid, imap_uid)?;
+            clear_expunged_uid_tx(tx, mailbox_id, lid, imap_uid)?;
         }
 
         for lid in &actually_removed {
             let removed_uid: Option<i64> = tx
                 .query_row(
-                    "SELECT imap_uid FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
-                    params![message_id, lid],
+                    "SELECT imap_uid FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2 AND label_id = ?3",
+                    params![mailbox_id, message_id, lid],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_err)?;
             tx.execute(
-                "DELETE FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
-                params![message_id, lid],
+                "DELETE FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2 AND label_id = ?3",
+                params![mailbox_id, message_id, lid],
             )
             .map_err(sql_err)?;
             if let Some(uid) = removed_uid {
-                record_expunged_uid_tx(tx, lid, uid.max(1) as u32, new_hid)?;
+                record_expunged_uid_tx(tx, mailbox_id, lid, uid.max(1) as u32, new_hid)?;
             }
         }
 
@@ -1084,9 +1509,9 @@ fn modify_message_labels_resolved_tx(
         }
         let is_in_all_mail = !new_set.contains(LABEL_TRASH) && !new_set.contains(LABEL_SPAM);
         if was_in_all_mail && !is_in_all_mail {
-            record_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid, new_hid)?;
+            record_expunged_uid_tx(tx, mailbox_id, ALL_MAIL_MAILBOX, msg.all_mail_uid, new_hid)?;
         } else if !was_in_all_mail && is_in_all_mail {
-            clear_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid)?;
+            clear_expunged_uid_tx(tx, mailbox_id, ALL_MAIL_MAILBOX, msg.all_mail_uid)?;
         }
 
         let mut context_set = current_set.clone();
@@ -1099,6 +1524,7 @@ fn modify_message_labels_resolved_tx(
         if !actually_added.is_empty() {
             record_history_event(
                 tx,
+                mailbox_id,
                 new_hid,
                 HistoryEventKind::LabelAdded,
                 message_id,
@@ -1111,6 +1537,7 @@ fn modify_message_labels_resolved_tx(
         if !actually_removed.is_empty() {
             record_history_event(
                 tx,
+                mailbox_id,
                 new_hid,
                 HistoryEventKind::LabelRemoved,
                 message_id,
@@ -1122,22 +1549,28 @@ fn modify_message_labels_resolved_tx(
         }
 
         msg.history_id = new_hid;
-        msg.label_ids = load_message_labels(tx, message_id)?;
+        msg.label_ids = load_message_labels(tx, mailbox_id, message_id)?;
     }
 
     Ok(msg)
 }
 
-fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredMessage>> {
-    let Some(msg) = load_message_by_id(tx, id)? else {
+fn delete_message_tx(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    id: &str,
+) -> AppResult<Option<StoredMessage>> {
+    let Some(msg) = load_message_by_id(tx, mailbox_id, id)? else {
         return Ok(None);
     };
     let label_uids: Vec<(String, u32)> = {
         let mut stmt = tx
-            .prepare("SELECT label_id, imap_uid FROM message_labels WHERE message_id = ?1")
+            .prepare(
+                "SELECT label_id, imap_uid FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2",
+            )
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map(params![id], |row| {
+            .query_map(params![mailbox_id, id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?.max(1) as u32,
@@ -1150,26 +1583,30 @@ fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredM
         }
         out
     };
-    let hid = bump_history_id(tx)?;
+    let hid = bump_history_id(tx, mailbox_id)?;
     for (lid, uid) in label_uids {
-        record_expunged_uid_tx(tx, &lid, uid, hid)?;
+        record_expunged_uid_tx(tx, mailbox_id, &lid, uid, hid)?;
     }
     if !msg
         .label_ids
         .iter()
         .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
     {
-        record_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid, hid)?;
+        record_expunged_uid_tx(tx, mailbox_id, ALL_MAIL_MAILBOX, msg.all_mail_uid, hid)?;
     }
     tx.execute(
-        "DELETE FROM messages_fts WHERE message_id = ?1",
-        params![id],
+        "DELETE FROM messages_fts WHERE mailbox_id = ?1 AND message_id = ?2",
+        params![mailbox_id, id],
     )
     .map_err(sql_err)?;
-    tx.execute("DELETE FROM messages WHERE id = ?1", params![id])
-        .map_err(sql_err)?;
+    tx.execute(
+        "DELETE FROM messages WHERE mailbox_id = ?1 AND id = ?2",
+        params![mailbox_id, id],
+    )
+    .map_err(sql_err)?;
     record_history_event(
         tx,
+        mailbox_id,
         hid,
         HistoryEventKind::MessageDeleted,
         &msg.id,
@@ -1181,26 +1618,35 @@ fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredM
     Ok(Some(msg))
 }
 
-fn load_label_with_counts(conn: &Connection, id: &str) -> AppResult<Option<StoredLabel>> {
+fn load_label_with_counts(
+    conn: &Connection,
+    mailbox_id: &str,
+    id: &str,
+) -> AppResult<Option<StoredLabel>> {
     let row = conn
         .query_row(
             "SELECT
                 l.id, l.name, l.label_type, l.message_list_visibility, l.label_list_visibility,
                 l.color_text, l.color_background, l.uid_validity, l.uid_next, l.upstream_label_id,
-                (SELECT COUNT(*) FROM message_labels ml WHERE ml.label_id = l.id) AS messages_total,
                 (SELECT COUNT(*) FROM message_labels ml
-                 INNER JOIN message_labels mu ON mu.message_id = ml.message_id AND mu.label_id = ?2
-                 WHERE ml.label_id = l.id) AS messages_unread,
+                 WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS messages_total,
+                (SELECT COUNT(*) FROM message_labels ml
+                 INNER JOIN message_labels mu
+                    ON mu.mailbox_id = ml.mailbox_id AND mu.message_id = ml.message_id AND mu.label_id = ?3
+                 WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS messages_unread,
                 (SELECT COUNT(DISTINCT m.thread_id) FROM message_labels ml
-                 INNER JOIN messages m ON m.id = ml.message_id
-                 WHERE ml.label_id = l.id) AS threads_total,
+                 INNER JOIN messages m
+                    ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                 WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS threads_total,
                 (SELECT COUNT(DISTINCT m.thread_id) FROM message_labels ml
-                 INNER JOIN messages m ON m.id = ml.message_id
-                 INNER JOIN message_labels mu ON mu.message_id = ml.message_id AND mu.label_id = ?2
-                 WHERE ml.label_id = l.id) AS threads_unread
+                 INNER JOIN messages m
+                    ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                 INNER JOIN message_labels mu
+                    ON mu.mailbox_id = ml.mailbox_id AND mu.message_id = ml.message_id AND mu.label_id = ?3
+                 WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS threads_unread
              FROM labels l
-             WHERE l.id = ?1",
-            params![id, LABEL_UNREAD],
+             WHERE l.mailbox_id = ?1 AND l.id = ?2",
+            params![mailbox_id, id, LABEL_UNREAD],
             label_from_row,
         )
         .optional()
@@ -1237,15 +1683,16 @@ fn label_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredLabel> {
 
 fn load_thread_detail_conn(
     conn: &Connection,
+    mailbox_id: &str,
     thread_id: &str,
 ) -> AppResult<Option<StoredThreadDetail>> {
     let mut stmt = conn
         .prepare(
-            "SELECT * FROM messages WHERE thread_id = ?1 ORDER BY internal_date_ms ASC, id ASC",
+            "SELECT * FROM messages WHERE mailbox_id = ?1 AND thread_id = ?2 ORDER BY internal_date_ms ASC, id ASC",
         )
         .map_err(sql_err)?;
     let rows = stmt
-        .query_map(params![thread_id], message_from_row)
+        .query_map(params![mailbox_id, thread_id], message_from_row)
         .map_err(sql_err)?;
     let mut messages = Vec::new();
     for r in rows {
@@ -1255,7 +1702,7 @@ fn load_thread_detail_conn(
         return Ok(None);
     }
     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-    let mut label_map = load_labels_for_messages(conn, &ids)?;
+    let mut label_map = load_labels_for_messages(conn, mailbox_id, &ids)?;
     for m in &mut messages {
         m.label_ids = label_map.remove(&m.id).unwrap_or_default();
     }
@@ -1418,6 +1865,7 @@ enum ResolvedMailbox {
 
 fn resolve_imap_mailbox(
     conn: &Connection,
+    mailbox_id: &str,
     mailbox_name: &str,
 ) -> AppResult<Option<ResolvedMailbox>> {
     if mailbox_name.eq_ignore_ascii_case("INBOX") {
@@ -1468,8 +1916,8 @@ fn resolve_imap_mailbox(
 
     let user_label: Option<(String, String)> = conn
         .query_row(
-            "SELECT id, name FROM labels WHERE label_type = 'user' AND name = ?1",
-            params![mailbox_name],
+            "SELECT id, name FROM labels WHERE mailbox_id = ?1 AND label_type = 'user' AND name = ?2",
+            params![mailbox_id, mailbox_name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
@@ -1483,40 +1931,43 @@ fn resolve_imap_mailbox(
 
 fn load_imap_mailbox_info_resolved(
     conn: &Connection,
+    mailbox_id: &str,
     resolved: &ResolvedMailbox,
 ) -> AppResult<ImapMailboxInfo> {
     match resolved {
         ResolvedMailbox::AllMail => {
             let (uv, un): (i64, i64) = conn
                 .query_row(
-                    "SELECT uid_validity, uid_next FROM imap_meta WHERE mailbox_name = ?1",
-                    params![ALL_MAIL_MAILBOX],
+                    "SELECT uid_validity, uid_next FROM imap_meta WHERE mailbox_id = ?1 AND mailbox_name = ?2",
+                    params![mailbox_id, ALL_MAIL_MAILBOX],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
             let messages: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM messages m
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM message_labels ml
-                         WHERE ml.message_id = m.id AND ml.label_id IN (?1, ?2)
-                     )",
-                    params![LABEL_TRASH, LABEL_SPAM],
+                     WHERE m.mailbox_id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM message_labels ml
+                           WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?2, ?3)
+                       )",
+                    params![mailbox_id, LABEL_TRASH, LABEL_SPAM],
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
             let unseen: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM messages m
-                     WHERE EXISTS (
-                         SELECT 1 FROM message_labels mu
-                         WHERE mu.message_id = m.id AND mu.label_id = ?3
-                     )
-                     AND NOT EXISTS (
-                         SELECT 1 FROM message_labels ml
-                         WHERE ml.message_id = m.id AND ml.label_id IN (?1, ?2)
-                     )",
-                    params![LABEL_TRASH, LABEL_SPAM, LABEL_UNREAD],
+                     WHERE m.mailbox_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM message_labels mu
+                           WHERE mu.mailbox_id = m.mailbox_id AND mu.message_id = m.id AND mu.label_id = ?4
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM message_labels ml
+                           WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?2, ?3)
+                       )",
+                    params![mailbox_id, LABEL_TRASH, LABEL_SPAM, LABEL_UNREAD],
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
@@ -1537,24 +1988,25 @@ fn load_imap_mailbox_info_resolved(
         } => {
             let (uv, un): (i64, i64) = conn
                 .query_row(
-                    "SELECT uid_validity, uid_next FROM labels WHERE id = ?1",
-                    params![id],
+                    "SELECT uid_validity, uid_next FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mailbox_id, id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
             let messages: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM message_labels WHERE label_id = ?1",
-                    params![id],
+                    "SELECT COUNT(*) FROM message_labels WHERE mailbox_id = ?1 AND label_id = ?2",
+                    params![mailbox_id, id],
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
             let unseen: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM message_labels ml
-                     INNER JOIN message_labels mu ON mu.message_id = ml.message_id AND mu.label_id = ?2
-                     WHERE ml.label_id = ?1",
-                    params![id, LABEL_UNREAD],
+                     INNER JOIN message_labels mu
+                        ON mu.mailbox_id = ml.mailbox_id AND mu.message_id = ml.message_id AND mu.label_id = ?3
+                     WHERE ml.mailbox_id = ?1 AND ml.label_id = ?2",
+                    params![mailbox_id, id, LABEL_UNREAD],
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
@@ -1584,6 +2036,7 @@ struct RawImapEntry {
 
 fn load_imap_messages_resolved(
     conn: &Connection,
+    mailbox_id: &str,
     resolved: &ResolvedMailbox,
 ) -> AppResult<Vec<ImapMessageEntry>> {
     let raw_entries: Vec<RawImapEntry> = match resolved {
@@ -1592,15 +2045,16 @@ fn load_imap_messages_resolved(
                 .prepare(
                     "SELECT m.all_mail_uid, m.id, m.thread_id, m.history_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
                      FROM messages m
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM message_labels ml
-                         WHERE ml.message_id = m.id AND ml.label_id IN (?1, ?2)
-                     )
+                     WHERE m.mailbox_id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM message_labels ml
+                           WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?2, ?3)
+                       )
                      ORDER BY m.all_mail_uid ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![LABEL_TRASH, LABEL_SPAM], |row| {
+                .query_map(params![mailbox_id, LABEL_TRASH, LABEL_SPAM], |row| {
                     Ok(RawImapEntry {
                         uid: row.get::<_, i64>(0)?.max(1) as u32,
                         message_id: row.get::<_, String>(1)?,
@@ -1624,13 +2078,13 @@ fn load_imap_messages_resolved(
                 .prepare(
                     "SELECT ml.imap_uid, m.id, m.thread_id, m.history_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
                      FROM message_labels ml
-                     INNER JOIN messages m ON m.id = ml.message_id
-                     WHERE ml.label_id = ?1
+                     INNER JOIN messages m ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                     WHERE ml.mailbox_id = ?1 AND ml.label_id = ?2
                      ORDER BY ml.imap_uid ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![id], |row| {
+                .query_map(params![mailbox_id, id], |row| {
                     Ok(RawImapEntry {
                         uid: row.get::<_, i64>(0)?.max(1) as u32,
                         message_id: row.get::<_, String>(1)?,
@@ -1652,7 +2106,7 @@ fn load_imap_messages_resolved(
     };
 
     let ids: Vec<String> = raw_entries.iter().map(|e| e.message_id.clone()).collect();
-    let mut label_map = load_labels_for_messages(conn, &ids)?;
+    let mut label_map = load_labels_for_messages(conn, mailbox_id, &ids)?;
 
     let mut entries = Vec::with_capacity(raw_entries.len());
     for (idx, raw) in raw_entries.into_iter().enumerate() {
@@ -1725,12 +2179,15 @@ fn rewrite_search_term_labels(
     }
 }
 
-fn load_label_name_to_id_map(conn: &Connection) -> AppResult<HashMap<String, String>> {
+fn load_label_name_to_id_map(
+    conn: &Connection,
+    mailbox_id: &str,
+) -> AppResult<HashMap<String, String>> {
     let mut stmt = conn
-        .prepare("SELECT id, name FROM labels")
+        .prepare("SELECT id, name FROM labels WHERE mailbox_id = ?1")
         .map_err(sql_err)?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![mailbox_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(sql_err)?;
@@ -1747,11 +2204,12 @@ fn load_label_name_to_id_map(conn: &Connection) -> AppResult<HashMap<String, Str
 
 fn parse_query_with_labels(
     conn: &Connection,
+    mailbox_id: &str,
     raw_q: &str,
 ) -> AppResult<crate::search::SearchQuery> {
     let mut parsed = crate::search::parse_query(raw_q);
     if !parsed.terms.is_empty() {
-        let map = load_label_name_to_id_map(conn)?;
+        let map = load_label_name_to_id_map(conn, mailbox_id)?;
         parsed.terms = parsed
             .terms
             .into_iter()
@@ -1763,12 +2221,13 @@ fn parse_query_with_labels(
 
 fn load_all_messages_filtered(
     conn: &Connection,
+    mailbox_id: &str,
     label_ids: &[String],
     include_spam_trash: bool,
     q: Option<&str>,
 ) -> AppResult<Vec<StoredMessage>> {
     let parsed_q = match q.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(raw) => Some(parse_query_with_labels(conn, raw)?),
+        Some(raw) => Some(parse_query_with_labels(conn, mailbox_id, raw)?),
         None => None,
     };
 
@@ -1779,8 +2238,8 @@ fn load_all_messages_filtered(
         || explicit_spam_trash
         || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-    let mut sql = String::from("SELECT m.* FROM messages m WHERE 1=1");
-    let mut bind_values: Vec<SqlValue> = Vec::new();
+    let mut sql = String::from("SELECT m.* FROM messages m WHERE m.mailbox_id = ?1");
+    let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mailbox_id.to_string())];
 
     if !effective_include_spam_trash {
         bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
@@ -1788,16 +2247,17 @@ fn load_all_messages_filtered(
         bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
         let p2 = bind_values.len();
         sql.push_str(&format!(
-            " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+            " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
         ));
     }
 
     for lid in label_ids {
-        let resolved = resolve_existing_label_id(conn, lid)?.unwrap_or_else(|| lid.clone());
+        let resolved =
+            resolve_existing_label_id(conn, mailbox_id, lid)?.unwrap_or_else(|| lid.clone());
         bind_values.push(SqlValue::Text(resolved));
         let p = bind_values.len();
         sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
+            " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
         ));
     }
 
@@ -1816,7 +2276,7 @@ fn load_all_messages_filtered(
     }
 
     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-    let mut label_map = load_labels_for_messages(conn, &ids)?;
+    let mut label_map = load_labels_for_messages(conn, mailbox_id, &ids)?;
     for m in &mut messages {
         m.label_ids = label_map.remove(&m.id).unwrap_or_default();
     }
@@ -1830,12 +2290,13 @@ fn load_all_messages_filtered(
 
 fn read_setting<T: serde::de::DeserializeOwned>(
     conn: &Connection,
+    mailbox_id: &str,
     key: &str,
 ) -> AppResult<Option<T>> {
     let raw: Option<String> = conn
         .query_row(
-            "SELECT value_json FROM settings WHERE key = ?1",
-            params![key],
+            "SELECT value_json FROM settings WHERE mailbox_id = ?1 AND key = ?2",
+            params![mailbox_id, key],
             |row| row.get(0),
         )
         .optional()
@@ -1848,13 +2309,18 @@ fn read_setting<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn write_setting<T: serde::Serialize>(tx: &Transaction<'_>, key: &str, value: &T) -> AppResult<()> {
+fn write_setting<T: serde::Serialize>(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    key: &str,
+    value: &T,
+) -> AppResult<()> {
     let json = serde_json::to_string(value)
         .map_err(|e| AppError::Storage(format!("Failed to encode setting {key}: {e}")))?;
     tx.execute(
-        "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-        params![key, json],
+        "INSERT INTO settings (mailbox_id, key, value_json) VALUES (?1, ?2, ?3)
+         ON CONFLICT(mailbox_id, key) DO UPDATE SET value_json = excluded.value_json",
+        params![mailbox_id, key, json],
     )
     .map_err(sql_err)?;
     Ok(())
@@ -1869,24 +2335,77 @@ impl MailStore for SqliteStore {
     fn backend_name(&self) -> &'static str {
         "sqlite"
     }
+
+    fn mailbox_id(&self) -> &str {
+        &self.mailbox_id
+    }
+
+    fn for_mailbox(&self, mailbox_id: &str) -> Arc<dyn MailStore> {
+        let normalized = crate::config::normalize_mailbox_id(mailbox_id);
+        let target = if normalized.is_empty() {
+            self.mailbox_id.clone()
+        } else {
+            normalized
+        };
+
+        let already_seeded = self
+            .seeded_mailboxes
+            .lock()
+            .map(|s| s.contains(&target))
+            .unwrap_or(false);
+
+        if !already_seeded {
+            match self.pool.get() {
+                Ok(mut conn) => {
+                    if let Err(err) = ensure_mailbox_seeded(&mut conn, &target) {
+                        tracing::warn!(
+                            mailbox_id = %target,
+                            error = %err,
+                            "Failed to seed SQLite mailbox metadata"
+                        );
+                    } else if let Ok(mut seeded) = self.seeded_mailboxes.lock() {
+                        seeded.insert(target.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        mailbox_id = %target,
+                        error = %err,
+                        "Failed to acquire SQLite pool connection to seed mailbox"
+                    );
+                }
+            }
+        }
+
+        Arc::new(Self {
+            pool: self.pool.clone(),
+            mailbox_id: target,
+            seeded_mailboxes: self.seeded_mailboxes.clone(),
+        })
+    }
+
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let email = if email_address.trim().is_empty() {
-            self.default_email.clone()
+            self.mailbox_id.clone()
         } else {
             email_address.to_string()
         };
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let messages_total: i32 = conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-                .map_err(sql_err)?;
-            let threads_total: i32 = conn
                 .query_row(
-                    "SELECT COUNT(DISTINCT thread_id) FROM messages",
-                    [],
+                    "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                    params![mb],
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
-            let history_id = read_current_history_id(conn)?;
+            let threads_total: i32 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE mailbox_id = ?1",
+                    params![mb],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            let history_id = read_current_history_id(conn, mb)?;
             Ok(Profile {
                 email_address: email,
                 messages_total,
@@ -1898,19 +2417,19 @@ impl MailStore for SqliteStore {
     }
 
     async fn current_history_id(&self) -> AppResult<u64> {
-        self.run_blocking(|conn| read_current_history_id(conn))
+        self.run_blocking(|conn, mb| read_current_history_id(conn, mb))
             .await
     }
 
     async fn list_history(&self, query: &HistoryListQuery) -> AppResult<HistoryListPage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             if query.start_history_id == 0 {
                 return Err(AppError::NotFound(
                     "Invalid startHistoryId: must be greater than 0".into(),
                 ));
             }
-            let current_hid = read_current_history_id(conn)?;
+            let current_hid = read_current_history_id(conn, mb)?;
             let after_row_id: i64 = match query.page_token.as_deref() {
                 None => 0,
                 Some(s) if s.trim().is_empty() => 0,
@@ -1926,9 +2445,9 @@ impl MailStore for SqliteStore {
             };
 
             let resolved_label_filter = match query.label_id.as_deref() {
-                Some(l) if !l.trim().is_empty() => {
-                    Some(resolve_existing_label_id(conn, l)?.unwrap_or_else(|| l.to_string()))
-                }
+                Some(l) if !l.trim().is_empty() => Some(
+                    resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.to_string()),
+                ),
                 _ => None,
             };
 
@@ -1936,24 +2455,27 @@ impl MailStore for SqliteStore {
                 .prepare(
                     "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id
                      FROM history_events
-                     WHERE history_id > ?1 AND id > ?2
+                     WHERE mailbox_id = ?1 AND history_id > ?2 AND id > ?3
                      ORDER BY id ASC",
                 )
                 .map_err(sql_err)?;
 
             let rows = stmt
-                .query_map(params![query.start_history_id as i64, after_row_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
+                .query_map(
+                    params![mb, query.start_history_id as i64, after_row_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
                 .map_err(sql_err)?;
 
             let mut matched: Vec<(i64, StoredHistoryEntry)> = Vec::new();
@@ -2017,11 +2539,11 @@ impl MailStore for SqliteStore {
     }
 
     async fn insert_message(&self, input: NewMessageInput) -> AppResult<StoredMessage> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let msg = insert_message_tx(&tx, input)?;
+            let msg = insert_message_tx(&tx, mb, input)?;
             tx.commit().map_err(sql_err)?;
             Ok(msg)
         })
@@ -2030,13 +2552,13 @@ impl MailStore for SqliteStore {
 
     async fn get_message(&self, id: &str) -> AppResult<Option<StoredMessage>> {
         let id = id.to_string();
-        self.run_blocking(move |conn| load_message_by_id(conn, &id))
+        self.run_blocking(move |conn, mb| load_message_by_id(conn, mb, &id))
             .await
     }
 
     async fn list_messages(&self, query: &MessageListQuery) -> AppResult<MessageListPage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let max_results = if query.max_results == 0 {
                 100
             } else {
@@ -2045,6 +2567,7 @@ impl MailStore for SqliteStore {
             let offset = parse_offset_token(query.page_token.as_deref())?;
             let all = load_all_messages_filtered(
                 conn,
+                mb,
                 &query.label_ids,
                 query.include_spam_trash,
                 query.q.as_deref(),
@@ -2075,23 +2598,24 @@ impl MailStore for SqliteStore {
         let id = id.to_string();
         let add_labels = add_labels.to_vec();
         let remove_labels = remove_labels.to_vec();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let mut resolved_add = Vec::with_capacity(add_labels.len());
             for l in &add_labels {
-                let lid = resolve_existing_label_id(&tx, l)?
+                let lid = resolve_existing_label_id(&tx, mb, l)?
                     .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
                 resolved_add.push(lid);
             }
             let mut resolved_remove = Vec::with_capacity(remove_labels.len());
             for l in &remove_labels {
-                if let Some(lid) = resolve_existing_label_id(&tx, l)? {
+                if let Some(lid) = resolve_existing_label_id(&tx, mb, l)? {
                     resolved_remove.push(lid);
                 }
             }
-            let msg = modify_message_labels_resolved_tx(&tx, &id, &resolved_add, &resolved_remove)?;
+            let msg =
+                modify_message_labels_resolved_tx(&tx, mb, &id, &resolved_add, &resolved_remove)?;
             tx.commit().map_err(sql_err)?;
             Ok(msg)
         })
@@ -2107,25 +2631,31 @@ impl MailStore for SqliteStore {
         let ids = ids.to_vec();
         let add_labels = add_labels.to_vec();
         let remove_labels = remove_labels.to_vec();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let mut resolved_add = Vec::with_capacity(add_labels.len());
             for l in &add_labels {
-                let lid = resolve_existing_label_id(&tx, l)?
+                let lid = resolve_existing_label_id(&tx, mb, l)?
                     .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
                 resolved_add.push(lid);
             }
             let mut resolved_remove = Vec::with_capacity(remove_labels.len());
             for l in &remove_labels {
-                if let Some(lid) = resolve_existing_label_id(&tx, l)? {
+                if let Some(lid) = resolve_existing_label_id(&tx, mb, l)? {
                     resolved_remove.push(lid);
                 }
             }
             for id in &ids {
-                if load_message_by_id(&tx, id)?.is_some() {
-                    modify_message_labels_resolved_tx(&tx, id, &resolved_add, &resolved_remove)?;
+                if load_message_by_id(&tx, mb, id)?.is_some() {
+                    modify_message_labels_resolved_tx(
+                        &tx,
+                        mb,
+                        id,
+                        &resolved_add,
+                        &resolved_remove,
+                    )?;
                 }
             }
             tx.commit().map_err(sql_err)?;
@@ -2146,11 +2676,11 @@ impl MailStore for SqliteStore {
 
     async fn delete_message(&self, id: &str) -> AppResult<bool> {
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let deleted = delete_message_tx(&tx, &id)?.is_some();
+            let deleted = delete_message_tx(&tx, mb, &id)?.is_some();
             tx.commit().map_err(sql_err)?;
             Ok(deleted)
         })
@@ -2159,12 +2689,12 @@ impl MailStore for SqliteStore {
 
     async fn batch_delete_messages(&self, ids: &[String]) -> AppResult<()> {
         let ids = ids.to_vec();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             for id in &ids {
-                delete_message_tx(&tx, id)?;
+                delete_message_tx(&tx, mb, id)?;
             }
             tx.commit().map_err(sql_err)?;
             Ok(())
@@ -2179,12 +2709,12 @@ impl MailStore for SqliteStore {
     ) -> AppResult<Option<StoredAttachment>> {
         let message_id = message_id.to_string();
         let attachment_id = attachment_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             conn.query_row(
                 "SELECT id, message_id, part_id, filename, content_type, content_id, size_bytes, data
                  FROM attachments
-                 WHERE message_id = ?1 AND id = ?2",
-                params![message_id, attachment_id],
+                 WHERE mailbox_id = ?1 AND message_id = ?2 AND id = ?3",
+                params![mb, message_id, attachment_id],
                 |row| {
                     Ok(StoredAttachment {
                         id: row.get(0)?,
@@ -2206,17 +2736,17 @@ impl MailStore for SqliteStore {
 
     async fn list_attachment_meta(&self, message_id: &str) -> AppResult<Vec<AttachmentMeta>> {
         let message_id = message_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, filename, content_type, size_bytes
                      FROM attachments
-                     WHERE message_id = ?1
+                     WHERE mailbox_id = ?1 AND message_id = ?2
                      ORDER BY part_id ASC, id ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![message_id], |row| {
+                .query_map(params![mb, message_id], |row| {
                     Ok(AttachmentMeta {
                         id: row.get(0)?,
                         filename: row.get(1)?,
@@ -2236,7 +2766,7 @@ impl MailStore for SqliteStore {
 
     async fn list_threads(&self, query: &MessageListQuery) -> AppResult<ThreadListPage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let max_results = if query.max_results == 0 {
                 100
             } else {
@@ -2245,7 +2775,7 @@ impl MailStore for SqliteStore {
             let offset = parse_offset_token(query.page_token.as_deref())?;
 
             let parsed_q = match query.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(raw) => Some(parse_query_with_labels(conn, raw)?),
+                Some(raw) => Some(parse_query_with_labels(conn, mb, raw)?),
                 None => None,
             };
 
@@ -2260,12 +2790,12 @@ impl MailStore for SqliteStore {
             let mut required_labels = Vec::new();
             for l in &query.label_ids {
                 required_labels
-                    .push(resolve_existing_label_id(conn, l)?.unwrap_or_else(|| l.clone()));
+                    .push(resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.clone()));
             }
 
             // Load visible messages (filtered only by spam/trash visibility) so threads contain all visible messages.
             let visible_msgs =
-                load_all_messages_filtered(conn, &[], effective_include_spam_trash, None)?;
+                load_all_messages_filtered(conn, mb, &[], effective_include_spam_trash, None)?;
 
             let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
             for msg in visible_msgs {
@@ -2338,7 +2868,7 @@ impl MailStore for SqliteStore {
 
     async fn get_thread(&self, thread_id: &str) -> AppResult<Option<StoredThreadDetail>> {
         let thread_id = thread_id.to_string();
-        self.run_blocking(move |conn| load_thread_detail_conn(conn, &thread_id))
+        self.run_blocking(move |conn, mb| load_thread_detail_conn(conn, mb, &thread_id))
             .await
     }
 
@@ -2351,15 +2881,15 @@ impl MailStore for SqliteStore {
         let thread_id = thread_id.to_string();
         let add_labels = add_labels.to_vec();
         let remove_labels = remove_labels.to_vec();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let mut stmt = tx
-                .prepare("SELECT id FROM messages WHERE thread_id = ?1 ORDER BY internal_date_ms ASC, id ASC")
+                .prepare("SELECT id FROM messages WHERE mailbox_id = ?1 AND thread_id = ?2 ORDER BY internal_date_ms ASC, id ASC")
                 .map_err(sql_err)?;
             let msg_ids: Vec<String> = stmt
-                .query_map(params![&thread_id], |row| row.get(0))
+                .query_map(params![mb, &thread_id], |row| row.get(0))
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
                 .map_err(sql_err)?;
@@ -2371,22 +2901,22 @@ impl MailStore for SqliteStore {
 
             let mut resolved_add = Vec::with_capacity(add_labels.len());
             for l in &add_labels {
-                let lid = resolve_existing_label_id(&tx, l)?
+                let lid = resolve_existing_label_id(&tx, mb, l)?
                     .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
                 resolved_add.push(lid);
             }
             let mut resolved_remove = Vec::with_capacity(remove_labels.len());
             for l in &remove_labels {
-                if let Some(lid) = resolve_existing_label_id(&tx, l)? {
+                if let Some(lid) = resolve_existing_label_id(&tx, mb, l)? {
                     resolved_remove.push(lid);
                 }
             }
 
             for mid in &msg_ids {
-                modify_message_labels_resolved_tx(&tx, mid, &resolved_add, &resolved_remove)?;
+                modify_message_labels_resolved_tx(&tx, mb, mid, &resolved_add, &resolved_remove)?;
             }
 
-            let detail = load_thread_detail_conn(&tx, &thread_id)?
+            let detail = load_thread_detail_conn(&tx, mb, &thread_id)?
                 .ok_or_else(|| AppError::NotFound(format!("Thread not found: {thread_id}")))?;
             tx.commit().map_err(sql_err)?;
             Ok(detail)
@@ -2410,15 +2940,15 @@ impl MailStore for SqliteStore {
 
     async fn delete_thread(&self, thread_id: &str) -> AppResult<bool> {
         let thread_id = thread_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let mut stmt = tx
-                .prepare("SELECT id FROM messages WHERE thread_id = ?1")
+                .prepare("SELECT id FROM messages WHERE mailbox_id = ?1 AND thread_id = ?2")
                 .map_err(sql_err)?;
             let msg_ids: Vec<String> = stmt
-                .query_map(params![&thread_id], |row| row.get(0))
+                .query_map(params![mb, &thread_id], |row| row.get(0))
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
                 .map_err(sql_err)?;
@@ -2428,7 +2958,7 @@ impl MailStore for SqliteStore {
                 return Ok(false);
             }
             for mid in &msg_ids {
-                delete_message_tx(&tx, mid)?;
+                delete_message_tx(&tx, mb, mid)?;
             }
             tx.commit().map_err(sql_err)?;
             Ok(true)
@@ -2437,29 +2967,35 @@ impl MailStore for SqliteStore {
     }
 
     async fn list_labels(&self) -> AppResult<Vec<StoredLabel>> {
-        self.run_blocking(|conn| {
+        self.run_blocking(|conn, mb| {
             let mut stmt = conn
                 .prepare(
                     "SELECT
                         l.id, l.name, l.label_type, l.message_list_visibility, l.label_list_visibility,
                         l.color_text, l.color_background, l.uid_validity, l.uid_next, l.upstream_label_id,
-                        (SELECT COUNT(*) FROM message_labels ml WHERE ml.label_id = l.id) AS messages_total,
                         (SELECT COUNT(*) FROM message_labels ml
-                         INNER JOIN message_labels mu ON mu.message_id = ml.message_id AND mu.label_id = ?1
-                         WHERE ml.label_id = l.id) AS messages_unread,
+                         WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS messages_total,
+                        (SELECT COUNT(*) FROM message_labels ml
+                         INNER JOIN message_labels mu
+                            ON mu.mailbox_id = ml.mailbox_id AND mu.message_id = ml.message_id AND mu.label_id = ?2
+                         WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS messages_unread,
                         (SELECT COUNT(DISTINCT m.thread_id) FROM message_labels ml
-                         INNER JOIN messages m ON m.id = ml.message_id
-                         WHERE ml.label_id = l.id) AS threads_total,
+                         INNER JOIN messages m
+                            ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                         WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS threads_total,
                         (SELECT COUNT(DISTINCT m.thread_id) FROM message_labels ml
-                         INNER JOIN messages m ON m.id = ml.message_id
-                         INNER JOIN message_labels mu ON mu.message_id = ml.message_id AND mu.label_id = ?1
-                         WHERE ml.label_id = l.id) AS threads_unread
+                         INNER JOIN messages m
+                            ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                         INNER JOIN message_labels mu
+                            ON mu.mailbox_id = ml.mailbox_id AND mu.message_id = ml.message_id AND mu.label_id = ?2
+                         WHERE ml.mailbox_id = l.mailbox_id AND ml.label_id = l.id) AS threads_unread
                      FROM labels l
+                     WHERE l.mailbox_id = ?1
                      ORDER BY CASE WHEN l.label_type = 'system' THEN 0 ELSE 1 END, l.name ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![LABEL_UNREAD], label_from_row)
+                .query_map(params![mb, LABEL_UNREAD], label_from_row)
                 .map_err(sql_err)?;
             let mut out = Vec::new();
             for r in rows {
@@ -2472,12 +3008,12 @@ impl MailStore for SqliteStore {
 
     async fn get_label(&self, id: &str) -> AppResult<Option<StoredLabel>> {
         let id = id.to_string();
-        self.run_blocking(move |conn| load_label_with_counts(conn, &id))
+        self.run_blocking(move |conn, mb| load_label_with_counts(conn, mb, &id))
             .await
     }
 
     async fn create_label(&self, input: NewLabelInput) -> AppResult<StoredLabel> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let name = input.name.trim().to_string();
             if name.is_empty() {
                 return Err(AppError::BadRequest("Label name cannot be empty".into()));
@@ -2488,8 +3024,8 @@ impl MailStore for SqliteStore {
 
             let conflict: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM labels WHERE name = ?1 COLLATE NOCASE OR id = ?1",
-                    params![&name],
+                    "SELECT id FROM labels WHERE mailbox_id = ?1 AND (name = ?2 COLLATE NOCASE OR id = ?2)",
+                    params![mb, &name],
                     |row| row.get(0),
                 )
                 .optional()
@@ -2499,7 +3035,7 @@ impl MailStore for SqliteStore {
             }
 
             let id = format!("Label_{}", &new_hex_id()[..8]);
-            let uv = alloc_uid_validity(&tx)?;
+            let uv = alloc_uid_validity(&tx, mb)?;
             let msg_vis = input
                 .message_list_visibility
                 .unwrap_or_else(|| "show".to_string());
@@ -2516,10 +3052,11 @@ impl MailStore for SqliteStore {
 
             tx.execute(
                 "INSERT INTO labels (
-                    id, name, label_type, message_list_visibility, label_list_visibility,
+                    mailbox_id, id, name, label_type, message_list_visibility, label_list_visibility,
                     color_text, color_background, uid_validity, uid_next, upstream_label_id
-                 ) VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                 ) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6, ?7, ?8, 1, ?9)",
                 params![
+                    mb,
                     &id,
                     &name,
                     &msg_vis,
@@ -2532,7 +3069,7 @@ impl MailStore for SqliteStore {
             )
             .map_err(sql_err)?;
 
-            let created = load_label_with_counts(&tx, &id)?
+            let created = load_label_with_counts(&tx, mb, &id)?
                 .ok_or_else(|| AppError::Storage("Failed to load created label".into()))?;
             tx.commit().map_err(sql_err)?;
             Ok(created)
@@ -2547,11 +3084,11 @@ impl MailStore for SqliteStore {
         full_replace: bool,
     ) -> AppResult<StoredLabel> {
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let existing = load_label_with_counts(&tx, &id)?
+            let existing = load_label_with_counts(&tx, mb, &id)?
                 .ok_or_else(|| AppError::NotFound(format!("Label not found: {id}")))?;
             if existing.label_type == "system" || is_system_label(&existing.id) {
                 return Err(AppError::BadRequest(format!(
@@ -2567,8 +3104,8 @@ impl MailStore for SqliteStore {
                     }
                     let conflict: Option<String> = tx
                         .query_row(
-                            "SELECT id FROM labels WHERE (name = ?1 COLLATE NOCASE OR id = ?1) AND id != ?2",
-                            params![trimmed, &id],
+                            "SELECT id FROM labels WHERE mailbox_id = ?1 AND (name = ?2 COLLATE NOCASE OR id = ?2) AND id != ?3",
+                            params![mb, trimmed, &id],
                             |row| row.get(0),
                         )
                         .optional()
@@ -2606,12 +3143,12 @@ impl MailStore for SqliteStore {
                 "UPDATE labels
                  SET name = ?1, message_list_visibility = ?2, label_list_visibility = ?3,
                      color_text = ?4, color_background = ?5
-                 WHERE id = ?6",
-                params![new_name, msg_vis, lbl_vis, color_text, color_bg, &id],
+                 WHERE mailbox_id = ?6 AND id = ?7",
+                params![new_name, msg_vis, lbl_vis, color_text, color_bg, mb, &id],
             )
             .map_err(sql_err)?;
 
-            let updated = load_label_with_counts(&tx, &id)?
+            let updated = load_label_with_counts(&tx, mb, &id)?
                 .ok_or_else(|| AppError::NotFound(format!("Label not found: {id}")))?;
             tx.commit().map_err(sql_err)?;
             Ok(updated)
@@ -2621,11 +3158,11 @@ impl MailStore for SqliteStore {
 
     async fn delete_label(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let existing = load_label_with_counts(&tx, &id)?
+            let existing = load_label_with_counts(&tx, mb, &id)?
                 .ok_or_else(|| AppError::NotFound(format!("Label not found: {id}")))?;
             if existing.label_type == "system" || is_system_label(&existing.id) {
                 return Err(AppError::BadRequest(format!(
@@ -2638,12 +3175,12 @@ impl MailStore for SqliteStore {
                 .prepare(
                     "SELECT m.id, m.thread_id, m.upstream_gmail_id
                      FROM message_labels ml
-                     INNER JOIN messages m ON m.id = ml.message_id
-                     WHERE ml.label_id = ?1",
+                     INNER JOIN messages m ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                     WHERE ml.mailbox_id = ?1 AND ml.label_id = ?2",
                 )
                 .map_err(sql_err)?;
             let affected: Vec<(String, String, Option<String>)> = stmt
-                .query_map(params![&id], |row| {
+                .query_map(params![mb, &id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
                 .map_err(sql_err)?
@@ -2652,15 +3189,16 @@ impl MailStore for SqliteStore {
             drop(stmt);
 
             for (mid, tid, up_id) in affected {
-                let ctx = load_message_labels(&tx, &mid)?;
-                let hid = bump_history_id(&tx)?;
+                let ctx = load_message_labels(&tx, mb, &mid)?;
+                let hid = bump_history_id(&tx, mb)?;
                 tx.execute(
-                    "UPDATE messages SET history_id = ?1 WHERE id = ?2",
-                    params![hid as i64, &mid],
+                    "UPDATE messages SET history_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                    params![hid as i64, mb, &mid],
                 )
                 .map_err(sql_err)?;
                 record_history_event(
                     &tx,
+                    mb,
                     hid,
                     HistoryEventKind::LabelRemoved,
                     &mid,
@@ -2671,8 +3209,11 @@ impl MailStore for SqliteStore {
                 )?;
             }
 
-            tx.execute("DELETE FROM labels WHERE id = ?1", params![&id])
-                .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+                params![mb, &id],
+            )
+            .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
             Ok(())
         })
@@ -2680,7 +3221,7 @@ impl MailStore for SqliteStore {
     }
 
     async fn upsert_upstream_label(&self, input: NewLabelInput) -> AppResult<StoredLabel> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let name = input.name.trim().to_string();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2691,15 +3232,15 @@ impl MailStore for SqliteStore {
                 && !ulid.trim().is_empty()
             {
                 if is_system_label(ulid.trim())
-                    && let Some(sys) = load_label_with_counts(&tx, ulid.trim())?
+                    && let Some(sys) = load_label_with_counts(&tx, mb, ulid.trim())?
                 {
                     tx.commit().map_err(sql_err)?;
                     return Ok(sys);
                 }
                 if let Some(existing_id) = tx
                     .query_row(
-                        "SELECT id FROM labels WHERE upstream_label_id = ?1",
-                        params![ulid.trim()],
+                        "SELECT id FROM labels WHERE mailbox_id = ?1 AND upstream_label_id = ?2",
+                        params![mb, ulid.trim()],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()
@@ -2707,12 +3248,12 @@ impl MailStore for SqliteStore {
                 {
                     if !name.is_empty() {
                         tx.execute(
-                            "UPDATE labels SET name = ?1 WHERE id = ?2 AND label_type = 'user'",
-                            params![&name, &existing_id],
+                            "UPDATE labels SET name = ?1 WHERE mailbox_id = ?2 AND id = ?3 AND label_type = 'user'",
+                            params![&name, mb, &existing_id],
                         )
                         .map_err(sql_err)?;
                     }
-                    let lbl = load_label_with_counts(&tx, &existing_id)?
+                    let lbl = load_label_with_counts(&tx, mb, &existing_id)?
                         .ok_or_else(|| AppError::Storage("Failed to load upstream label".into()))?;
                     tx.commit().map_err(sql_err)?;
                     return Ok(lbl);
@@ -2721,9 +3262,9 @@ impl MailStore for SqliteStore {
 
             // 2. Check by existing id or case-insensitive name
             if !name.is_empty()
-                && let Some(existing_id) = resolve_existing_label_id(&tx, &name)?
+                && let Some(existing_id) = resolve_existing_label_id(&tx, mb, &name)?
             {
-                let existing = load_label_with_counts(&tx, &existing_id)?
+                let existing = load_label_with_counts(&tx, mb, &existing_id)?
                     .ok_or_else(|| AppError::Storage("Failed to load existing label".into()))?;
                 if existing.label_type == "system" {
                     tx.commit().map_err(sql_err)?;
@@ -2731,12 +3272,12 @@ impl MailStore for SqliteStore {
                 }
                 if input.upstream_label_id.is_some() && existing.upstream_label_id.is_none() {
                     tx.execute(
-                        "UPDATE labels SET upstream_label_id = ?1 WHERE id = ?2",
-                        params![&input.upstream_label_id, &existing_id],
+                        "UPDATE labels SET upstream_label_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                        params![&input.upstream_label_id, mb, &existing_id],
                     )
                     .map_err(sql_err)?;
                 }
-                let updated = load_label_with_counts(&tx, &existing_id)?
+                let updated = load_label_with_counts(&tx, mb, &existing_id)?
                     .ok_or_else(|| AppError::Storage("Failed to load updated label".into()))?;
                 tx.commit().map_err(sql_err)?;
                 return Ok(updated);
@@ -2748,7 +3289,7 @@ impl MailStore for SqliteStore {
 
             // 3. Create new user label
             let id = format!("Label_{}", &new_hex_id()[..8]);
-            let uv = alloc_uid_validity(&tx)?;
+            let uv = alloc_uid_validity(&tx, mb)?;
             let msg_vis = input
                 .message_list_visibility
                 .unwrap_or_else(|| "show".to_string());
@@ -2764,10 +3305,11 @@ impl MailStore for SqliteStore {
             };
             tx.execute(
                 "INSERT INTO labels (
-                    id, name, label_type, message_list_visibility, label_list_visibility,
+                    mailbox_id, id, name, label_type, message_list_visibility, label_list_visibility,
                     color_text, color_background, uid_validity, uid_next, upstream_label_id
-                 ) VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                 ) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6, ?7, ?8, 1, ?9)",
                 params![
+                    mb,
                     &id,
                     &name,
                     &msg_vis,
@@ -2779,7 +3321,7 @@ impl MailStore for SqliteStore {
                 ],
             )
             .map_err(sql_err)?;
-            let created = load_label_with_counts(&tx, &id)?
+            let created = load_label_with_counts(&tx, mb, &id)?
                 .ok_or_else(|| AppError::Storage("Failed to load created upstream label".into()))?;
             tx.commit().map_err(sql_err)?;
             Ok(created)
@@ -2789,7 +3331,7 @@ impl MailStore for SqliteStore {
 
     async fn list_drafts(&self, query: &MessageListQuery) -> AppResult<DraftListPage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let max_results = if query.max_results == 0 {
                 100
             } else {
@@ -2797,7 +3339,7 @@ impl MailStore for SqliteStore {
             };
             let offset = parse_offset_token(query.page_token.as_deref())?;
             let parsed_q = match query.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(raw) => Some(parse_query_with_labels(conn, raw)?),
+                Some(raw) => Some(parse_query_with_labels(conn, mb, raw)?),
                 None => None,
             };
             let effective_include_spam_trash = query.include_spam_trash
@@ -2807,12 +3349,13 @@ impl MailStore for SqliteStore {
                 .prepare(
                     "SELECT d.id AS draft_id, d.updated_at_ms, m.*
                      FROM drafts d
-                     INNER JOIN messages m ON m.id = d.message_id
+                     INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id
+                     WHERE d.mailbox_id = ?1
                      ORDER BY d.updated_at_ms DESC, d.id DESC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map(params![mb], |row| {
                     let draft_id: String = row.get("draft_id")?;
                     let updated_ms: i64 = row.get("updated_at_ms")?;
                     let msg = message_from_row(row)?;
@@ -2825,7 +3368,7 @@ impl MailStore for SqliteStore {
                 raw.push(r.map_err(sql_err)?);
             }
             let msg_ids: Vec<String> = raw.iter().map(|(_, _, m)| m.id.clone()).collect();
-            let mut label_map = load_labels_for_messages(conn, &msg_ids)?;
+            let mut label_map = load_labels_for_messages(conn, mb, &msg_ids)?;
 
             let mut drafts = Vec::new();
             for (draft_id, updated_ms, mut msg) in raw {
@@ -2871,11 +3414,11 @@ impl MailStore for SqliteStore {
 
     async fn get_draft(&self, id: &str) -> AppResult<Option<StoredDraft>> {
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let row: Option<(String, i64)> = conn
                 .query_row(
-                    "SELECT message_id, updated_at_ms FROM drafts WHERE id = ?1",
-                    params![&id],
+                    "SELECT message_id, updated_at_ms FROM drafts WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -2883,7 +3426,7 @@ impl MailStore for SqliteStore {
             let Some((message_id, updated_ms)) = row else {
                 return Ok(None);
             };
-            let Some(message) = load_message_by_id(conn, &message_id)? else {
+            let Some(message) = load_message_by_id(conn, mb, &message_id)? else {
                 return Ok(None);
             };
             Ok(Some(StoredDraft {
@@ -2899,16 +3442,16 @@ impl MailStore for SqliteStore {
         if !message.label_ids.iter().any(|l| l == LABEL_DRAFT) {
             message.label_ids.push(LABEL_DRAFT.to_string());
         }
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let stored_msg = insert_message_tx(&tx, message)?;
+            let stored_msg = insert_message_tx(&tx, mb, message)?;
             let draft_id = format!("r{}", new_hex_id());
             let now = Utc::now();
             tx.execute(
-                "INSERT INTO drafts (id, message_id, updated_at_ms) VALUES (?1, ?2, ?3)",
-                params![&draft_id, &stored_msg.id, now.timestamp_millis()],
+                "INSERT INTO drafts (mailbox_id, id, message_id, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![mb, &draft_id, &stored_msg.id, now.timestamp_millis()],
             )
             .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
@@ -2930,14 +3473,14 @@ impl MailStore for SqliteStore {
         if !message.label_ids.iter().any(|l| l == LABEL_DRAFT) {
             message.label_ids.push(LABEL_DRAFT.to_string());
         }
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let old_msg_id: String = tx
                 .query_row(
-                    "SELECT message_id FROM drafts WHERE id = ?1",
-                    params![&draft_id],
+                    "SELECT message_id FROM drafts WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &draft_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -2945,14 +3488,14 @@ impl MailStore for SqliteStore {
                 .ok_or_else(|| AppError::NotFound(format!("Draft not found: {draft_id}")))?;
 
             // Insert replacement message BEFORE deleting old message so ON DELETE CASCADE won't drop the draft row.
-            let new_msg = insert_message_tx(&tx, message)?;
+            let new_msg = insert_message_tx(&tx, mb, message)?;
             let now = Utc::now();
             tx.execute(
-                "UPDATE drafts SET message_id = ?1, updated_at_ms = ?2 WHERE id = ?3",
-                params![&new_msg.id, now.timestamp_millis(), &draft_id],
+                "UPDATE drafts SET message_id = ?1, updated_at_ms = ?2 WHERE mailbox_id = ?3 AND id = ?4",
+                params![&new_msg.id, now.timestamp_millis(), mb, &draft_id],
             )
             .map_err(sql_err)?;
-            delete_message_tx(&tx, &old_msg_id)?;
+            delete_message_tx(&tx, mb, &old_msg_id)?;
 
             tx.commit().map_err(sql_err)?;
             Ok(StoredDraft {
@@ -2966,14 +3509,14 @@ impl MailStore for SqliteStore {
 
     async fn delete_draft(&self, draft_id: &str) -> AppResult<bool> {
         let draft_id = draft_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let msg_id: Option<String> = tx
                 .query_row(
-                    "SELECT message_id FROM drafts WHERE id = ?1",
-                    params![&draft_id],
+                    "SELECT message_id FROM drafts WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &draft_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -2981,9 +3524,12 @@ impl MailStore for SqliteStore {
             let Some(msg_id) = msg_id else {
                 return Ok(false);
             };
-            tx.execute("DELETE FROM drafts WHERE id = ?1", params![&draft_id])
-                .map_err(sql_err)?;
-            delete_message_tx(&tx, &msg_id)?;
+            tx.execute(
+                "DELETE FROM drafts WHERE mailbox_id = ?1 AND id = ?2",
+                params![mb, &draft_id],
+            )
+            .map_err(sql_err)?;
+            delete_message_tx(&tx, mb, &msg_id)?;
             tx.commit().map_err(sql_err)?;
             Ok(true)
         })
@@ -2992,7 +3538,7 @@ impl MailStore for SqliteStore {
 
     async fn search_messages_ai(&self, query: &AiSearchQuery) -> AppResult<AiMessagePage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let limit = if query.limit == 0 {
                 20
             } else {
@@ -3006,7 +3552,7 @@ impl MailStore for SqliteStore {
             let mut resolved_labels = Vec::new();
             for l in &query.labels {
                 resolved_labels
-                    .push(resolve_existing_label_id(conn, l)?.unwrap_or_else(|| l.clone()));
+                    .push(resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.clone()));
             }
             let explicit_spam_trash = resolved_labels
                 .iter()
@@ -3014,14 +3560,16 @@ impl MailStore for SqliteStore {
             let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
 
             let mut sql = String::from("SELECT m.* FROM messages m");
-            let mut where_clauses: Vec<String> = Vec::new();
-            let mut bind_values: Vec<SqlValue> = Vec::new();
+            let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+            let mut where_clauses: Vec<String> = vec!["m.mailbox_id = ?1".to_string()];
 
             if let Some(ref raw_q) = query.q {
                 let trimmed = raw_q.trim();
                 if !trimmed.is_empty() {
                     if let Some(fts_query) = build_fts5_query(trimmed) {
-                        sql.push_str(" INNER JOIN messages_fts f ON f.message_id = m.id");
+                        sql.push_str(
+                            " INNER JOIN messages_fts f ON f.mailbox_id = m.mailbox_id AND f.message_id = m.id",
+                        );
                         bind_values.push(SqlValue::Text(fts_query));
                         let p = bind_values.len();
                         where_clauses.push(format!("messages_fts MATCH ?{p}"));
@@ -3042,7 +3590,7 @@ impl MailStore for SqliteStore {
                 bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
                 let p2 = bind_values.len();
                 where_clauses.push(format!(
-                    "NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                    "NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
                 ));
             }
 
@@ -3050,7 +3598,7 @@ impl MailStore for SqliteStore {
                 bind_values.push(SqlValue::Text(lid.clone()));
                 let p = bind_values.len();
                 where_clauses.push(format!(
-                    "EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
+                    "EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
                 ));
             }
 
@@ -3059,11 +3607,11 @@ impl MailStore for SqliteStore {
                 let p = bind_values.len();
                 if want_unread {
                     where_clauses.push(format!(
-                        "EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
+                        "EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.mailbox_id = m.mailbox_id AND ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
                     ));
                 } else {
                     where_clauses.push(format!(
-                        "NOT EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
+                        "NOT EXISTS (SELECT 1 FROM message_labels ml_unr WHERE ml_unr.mailbox_id = m.mailbox_id AND ml_unr.message_id = m.id AND ml_unr.label_id = ?{p})"
                     ));
                 }
             }
@@ -3151,7 +3699,7 @@ impl MailStore for SqliteStore {
             }
 
             let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-            let mut label_map = load_labels_for_messages(conn, &ids)?;
+            let mut label_map = load_labels_for_messages(conn, mb, &ids)?;
             for m in &mut messages {
                 m.label_ids = label_map.remove(&m.id).unwrap_or_default();
             }
@@ -3175,7 +3723,7 @@ impl MailStore for SqliteStore {
 
     async fn list_thread_summaries(&self, query: &AiThreadQuery) -> AppResult<AiThreadPage> {
         let query = query.clone();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let limit = if query.limit == 0 {
                 20
             } else {
@@ -3187,9 +3735,9 @@ impl MailStore for SqliteStore {
             };
 
             let resolved_label = match query.label.as_deref() {
-                Some(l) if !l.trim().is_empty() => {
-                    Some(resolve_existing_label_id(conn, l)?.unwrap_or_else(|| l.to_string()))
-                }
+                Some(l) if !l.trim().is_empty() => Some(
+                    resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.to_string()),
+                ),
                 _ => None,
             };
             let explicit_spam_trash = resolved_label
@@ -3207,12 +3755,12 @@ impl MailStore for SqliteStore {
                             .prepare(
                                 "SELECT DISTINCT m.thread_id
                                  FROM messages m
-                                 INNER JOIN messages_fts f ON f.message_id = m.id
-                                 WHERE messages_fts MATCH ?1",
+                                 INNER JOIN messages_fts f ON f.mailbox_id = m.mailbox_id AND f.message_id = m.id
+                                 WHERE m.mailbox_id = ?1 AND messages_fts MATCH ?2",
                             )
                             .map_err(sql_err)?;
                         let rows = stmt
-                            .query_map(params![fts_query], |row| row.get::<_, String>(0))
+                            .query_map(params![mb, fts_query], |row| row.get::<_, String>(0))
                             .map_err(sql_err)?;
                         for r in rows {
                             set.insert(r.map_err(sql_err)?);
@@ -3222,11 +3770,12 @@ impl MailStore for SqliteStore {
                         let mut stmt = conn
                             .prepare(
                                 "SELECT DISTINCT thread_id FROM messages
-                                 WHERE LOWER(subject) LIKE ?1 OR LOWER(from_addr) LIKE ?1 OR LOWER(text_body) LIKE ?1 OR LOWER(snippet) LIKE ?1",
+                                 WHERE mailbox_id = ?1
+                                   AND (LOWER(subject) LIKE ?2 OR LOWER(from_addr) LIKE ?2 OR LOWER(text_body) LIKE ?2 OR LOWER(snippet) LIKE ?2)",
                             )
                             .map_err(sql_err)?;
                         let rows = stmt
-                            .query_map(params![pat], |row| row.get::<_, String>(0))
+                            .query_map(params![mb, pat], |row| row.get::<_, String>(0))
                             .map_err(sql_err)?;
                         for r in rows {
                             set.insert(r.map_err(sql_err)?);
@@ -3238,7 +3787,7 @@ impl MailStore for SqliteStore {
             };
 
             let visible_msgs =
-                load_all_messages_filtered(conn, &[], effective_include_spam_trash, None)?;
+                load_all_messages_filtered(conn, mb, &[], effective_include_spam_trash, None)?;
 
             let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
             for msg in visible_msgs {
@@ -3325,17 +3874,17 @@ impl MailStore for SqliteStore {
 
     async fn find_message_by_resend_id(&self, resend_id: &str) -> AppResult<Option<StoredMessage>> {
         let resend_id = resend_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let id: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM messages WHERE resend_id = ?1 LIMIT 1",
-                    params![resend_id],
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND resend_id = ?2 LIMIT 1",
+                    params![mb, resend_id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_err)?;
             match id {
-                Some(mid) => load_message_by_id(conn, &mid),
+                Some(mid) => load_message_by_id(conn, mb, &mid),
                 None => Ok(None),
             }
         })
@@ -3349,17 +3898,17 @@ impl MailStore for SqliteStore {
         let Some(norm) = normalize_rfc_message_id(rfc822_message_id) else {
             return Ok(None);
         };
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let id: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM messages WHERE rfc822_message_id_norm = ?1 LIMIT 1",
-                    params![norm],
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND rfc822_message_id_norm = ?2 LIMIT 1",
+                    params![mb, norm],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_err)?;
             match id {
-                Some(mid) => load_message_by_id(conn, &mid),
+                Some(mid) => load_message_by_id(conn, mb, &mid),
                 None => Ok(None),
             }
         })
@@ -3373,14 +3922,14 @@ impl MailStore for SqliteStore {
     ) -> AppResult<Option<StoredMessage>> {
         let resend_id = resend_id.to_string();
         let status = status.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let id: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM messages WHERE resend_id = ?1 LIMIT 1",
-                    params![&resend_id],
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND resend_id = ?2 LIMIT 1",
+                    params![mb, &resend_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -3389,11 +3938,11 @@ impl MailStore for SqliteStore {
                 return Ok(None);
             };
             tx.execute(
-                "UPDATE messages SET delivery_status = ?1 WHERE id = ?2",
-                params![&status, &mid],
+                "UPDATE messages SET delivery_status = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                params![&status, mb, &mid],
             )
             .map_err(sql_err)?;
-            let msg = load_message_by_id(&tx, &mid)?;
+            let msg = load_message_by_id(&tx, mb, &mid)?;
             tx.commit().map_err(sql_err)?;
             Ok(msg)
         })
@@ -3401,7 +3950,7 @@ impl MailStore for SqliteStore {
     }
 
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
-        self.run_blocking(|conn| {
+        self.run_blocking(|conn, mb| {
             let mut mailboxes = Vec::new();
             let builtins = [
                 ResolvedMailbox::Label {
@@ -3436,27 +3985,29 @@ impl MailStore for SqliteStore {
                     special_use: Some("\\Flagged"),
                 },
             ];
-            for mb in &builtins {
-                mailboxes.push(load_imap_mailbox_info_resolved(conn, mb)?);
+            for item in &builtins {
+                mailboxes.push(load_imap_mailbox_info_resolved(conn, mb, item)?);
             }
 
             let mut stmt = conn
-                .prepare("SELECT id, name FROM labels WHERE label_type = 'user' ORDER BY name ASC")
+                .prepare(
+                    "SELECT id, name FROM labels WHERE mailbox_id = ?1 AND label_type = 'user' ORDER BY name ASC",
+                )
                 .map_err(sql_err)?;
             let user_labels: Vec<(String, String)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_map(params![mb], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
                 .map_err(sql_err)?;
             drop(stmt);
 
             for (id, name) in user_labels {
-                let mb = ResolvedMailbox::Label {
+                let item = ResolvedMailbox::Label {
                     id,
                     name,
                     special_use: None,
                 };
-                mailboxes.push(load_imap_mailbox_info_resolved(conn, &mb)?);
+                mailboxes.push(load_imap_mailbox_info_resolved(conn, mb, &item)?);
             }
             Ok(mailboxes)
         })
@@ -3465,21 +4016,21 @@ impl MailStore for SqliteStore {
 
     async fn imap_mailbox_info(&self, mailbox_name: &str) -> AppResult<Option<ImapMailboxInfo>> {
         let mailbox_name = mailbox_name.to_string();
-        self.run_blocking(move |conn| {
-            let Some(resolved) = resolve_imap_mailbox(conn, &mailbox_name)? else {
+        self.run_blocking(move |conn, mb| {
+            let Some(resolved) = resolve_imap_mailbox(conn, mb, &mailbox_name)? else {
                 return Ok(None);
             };
-            Ok(Some(load_imap_mailbox_info_resolved(conn, &resolved)?))
+            Ok(Some(load_imap_mailbox_info_resolved(conn, mb, &resolved)?))
         })
         .await
     }
 
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {
         let mailbox_name = mailbox_name.to_string();
-        self.run_blocking(move |conn| {
-            let resolved = resolve_imap_mailbox(conn, &mailbox_name)?
+        self.run_blocking(move |conn, mb| {
+            let resolved = resolve_imap_mailbox(conn, mb, &mailbox_name)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
-            load_imap_messages_resolved(conn, &resolved)
+            load_imap_messages_resolved(conn, mb, &resolved)
         })
         .await
     }
@@ -3494,11 +4045,11 @@ impl MailStore for SqliteStore {
         is_deleted: bool,
     ) -> AppResult<StoredMessage> {
         let message_id = message_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let Some(old_msg) = load_message_by_id(&tx, &message_id)? else {
+            let Some(old_msg) = load_message_by_id(&tx, mb, &message_id)? else {
                 return Err(AppError::NotFound(format!(
                     "Message not found: {message_id}"
                 )));
@@ -3525,21 +4076,22 @@ impl MailStore for SqliteStore {
             }
 
             tx.execute(
-                "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE id = ?3",
+                "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE mailbox_id = ?3 AND id = ?4",
                 params![
                     if is_answered { 1_i64 } else { 0_i64 },
                     if is_deleted { 1_i64 } else { 0_i64 },
+                    mb,
                     &message_id
                 ],
             )
             .map_err(sql_err)?;
 
-            let mut msg = modify_message_labels_resolved_tx(&tx, &message_id, &add, &rem)?;
+            let mut msg = modify_message_labels_resolved_tx(&tx, mb, &message_id, &add, &rem)?;
             if flags_changed && msg.history_id == old_msg.history_id {
-                let new_hid = bump_history_id(&tx)?;
+                let new_hid = bump_history_id(&tx, mb)?;
                 tx.execute(
-                    "UPDATE messages SET history_id = ?1 WHERE id = ?2",
-                    params![new_hid as i64, &message_id],
+                    "UPDATE messages SET history_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                    params![new_hid as i64, mb, &message_id],
                 )
                 .map_err(sql_err)?;
                 msg.history_id = new_hid;
@@ -3552,13 +4104,13 @@ impl MailStore for SqliteStore {
 
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>> {
         let mailbox_name = mailbox_name.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let resolved = resolve_imap_mailbox(&tx, &mailbox_name)?
+            let resolved = resolve_imap_mailbox(&tx, mb, &mailbox_name)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
-            let entries = load_imap_messages_resolved(&tx, &resolved)?;
+            let entries = load_imap_messages_resolved(&tx, mb, &resolved)?;
 
             let mut expunged_seqs = Vec::new();
             for entry in entries {
@@ -3568,16 +4120,17 @@ impl MailStore for SqliteStore {
                 expunged_seqs.push(entry.seq);
                 match &resolved {
                     ResolvedMailbox::Label { id, .. } if id == LABEL_TRASH => {
-                        delete_message_tx(&tx, &entry.message_id)?;
+                        delete_message_tx(&tx, mb, &entry.message_id)?;
                     }
                     ResolvedMailbox::AllMail => {
                         tx.execute(
-                            "UPDATE messages SET is_deleted = 0 WHERE id = ?1",
-                            params![&entry.message_id],
+                            "UPDATE messages SET is_deleted = 0 WHERE mailbox_id = ?1 AND id = ?2",
+                            params![mb, &entry.message_id],
                         )
                         .map_err(sql_err)?;
                         modify_message_labels_resolved_tx(
                             &tx,
+                            mb,
                             &entry.message_id,
                             &[LABEL_TRASH.to_string()],
                             &[LABEL_INBOX.to_string()],
@@ -3585,12 +4138,13 @@ impl MailStore for SqliteStore {
                     }
                     ResolvedMailbox::Label { id, .. } => {
                         tx.execute(
-                            "UPDATE messages SET is_deleted = 0 WHERE id = ?1",
-                            params![&entry.message_id],
+                            "UPDATE messages SET is_deleted = 0 WHERE mailbox_id = ?1 AND id = ?2",
+                            params![mb, &entry.message_id],
                         )
                         .map_err(sql_err)?;
                         modify_message_labels_resolved_tx(
                             &tx,
+                            mb,
                             &entry.message_id,
                             &[LABEL_TRASH.to_string()],
                             std::slice::from_ref(id),
@@ -3614,13 +4168,13 @@ impl MailStore for SqliteStore {
         let src_mailbox = src_mailbox.to_string();
         let dst_mailbox = dst_mailbox.to_string();
         let message_ids = message_ids.to_vec();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let src = resolve_imap_mailbox(&tx, &src_mailbox)?
+            let src = resolve_imap_mailbox(&tx, mb, &src_mailbox)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {src_mailbox}")))?;
-            let dst = resolve_imap_mailbox(&tx, &dst_mailbox)?
+            let dst = resolve_imap_mailbox(&tx, mb, &dst_mailbox)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {dst_mailbox}")))?;
 
             let same_mailbox = match (&src, &dst) {
@@ -3632,7 +4186,7 @@ impl MailStore for SqliteStore {
                 _ => false,
             };
 
-            let src_entries = load_imap_messages_resolved(&tx, &src)?;
+            let src_entries = load_imap_messages_resolved(&tx, mb, &src)?;
             let src_uid_map: HashMap<String, u32> = src_entries
                 .into_iter()
                 .map(|e| (e.message_id, e.uid))
@@ -3664,14 +4218,14 @@ impl MailStore for SqliteStore {
                 }
 
                 let updated_msg =
-                    modify_message_labels_resolved_tx(&tx, mid, &add_labels, &remove_labels)?;
+                    modify_message_labels_resolved_tx(&tx, mb, mid, &add_labels, &remove_labels)?;
 
                 let dst_uid = match &dst {
                     ResolvedMailbox::AllMail => updated_msg.all_mail_uid,
                     ResolvedMailbox::Label { id: dst_id, .. } => tx
                         .query_row(
-                            "SELECT imap_uid FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
-                            params![mid, dst_id],
+                            "SELECT imap_uid FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2 AND label_id = ?3",
+                            params![mb, mid, dst_id],
                             |row| row.get::<_, i64>(0),
                         )
                         .map_err(sql_err)?
@@ -3696,11 +4250,11 @@ impl MailStore for SqliteStore {
         if input.source.trim().is_empty() {
             input.source = "imap_append".to_string();
         }
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            let resolved = resolve_imap_mailbox(&tx, &mailbox_name)?
+            let resolved = resolve_imap_mailbox(&tx, mb, &mailbox_name)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
 
             match &resolved {
@@ -3716,13 +4270,13 @@ impl MailStore for SqliteStore {
                 }
             }
 
-            let msg = insert_message_tx(&tx, input)?;
+            let msg = insert_message_tx(&tx, mb, input)?;
             let (uid_validity, assigned_uid) = match &resolved {
                 ResolvedMailbox::AllMail => {
                     let uv: i64 = tx
                         .query_row(
-                            "SELECT uid_validity FROM imap_meta WHERE mailbox_name = ?1",
-                            params![ALL_MAIL_MAILBOX],
+                            "SELECT uid_validity FROM imap_meta WHERE mailbox_id = ?1 AND mailbox_name = ?2",
+                            params![mb, ALL_MAIL_MAILBOX],
                             |row| row.get(0),
                         )
                         .map_err(sql_err)?;
@@ -3731,15 +4285,15 @@ impl MailStore for SqliteStore {
                 ResolvedMailbox::Label { id, .. } => {
                     let uv: i64 = tx
                         .query_row(
-                            "SELECT uid_validity FROM labels WHERE id = ?1",
-                            params![id],
+                            "SELECT uid_validity FROM labels WHERE mailbox_id = ?1 AND id = ?2",
+                            params![mb, id],
                             |row| row.get(0),
                         )
                         .map_err(sql_err)?;
                     let uid: i64 = tx
                         .query_row(
-                            "SELECT imap_uid FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
-                            params![&msg.id, id],
+                            "SELECT imap_uid FROM message_labels WHERE mailbox_id = ?1 AND message_id = ?2 AND label_id = ?3",
+                            params![mb, &msg.id, id],
                             |row| row.get(0),
                         )
                         .map_err(sql_err)?;
@@ -3759,8 +4313,8 @@ impl MailStore for SqliteStore {
         since_modseq: u64,
     ) -> AppResult<Vec<u32>> {
         let mailbox_name = mailbox_name.to_string();
-        self.run_blocking(move |conn| {
-            let resolved = resolve_imap_mailbox(conn, &mailbox_name)?
+        self.run_blocking(move |conn, mb| {
+            let resolved = resolve_imap_mailbox(conn, mb, &mailbox_name)?
                 .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
             let mailbox_key = match &resolved {
                 ResolvedMailbox::AllMail => ALL_MAIL_MAILBOX.to_string(),
@@ -3769,12 +4323,12 @@ impl MailStore for SqliteStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT imap_uid FROM imap_expunged_uids
-                     WHERE mailbox_key = ?1 AND modseq > ?2
+                     WHERE mailbox_id = ?1 AND mailbox_key = ?2 AND modseq > ?3
                      ORDER BY imap_uid ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![mailbox_key, since_modseq as i64], |row| {
+                .query_map(params![mb, mailbox_key, since_modseq as i64], |row| {
                     Ok(row.get::<_, i64>(0)?.max(1) as u32)
                 })
                 .map_err(sql_err)?;
@@ -3788,7 +4342,7 @@ impl MailStore for SqliteStore {
     }
 
     async fn upsert_synced_message(&self, input: NewMessageInput) -> AppResult<UpsertOutcome> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
@@ -3798,20 +4352,20 @@ impl MailStore for SqliteStore {
                 && !ugid.trim().is_empty()
                 && let Some(existing_id) = tx
                     .query_row(
-                        "SELECT id FROM messages WHERE upstream_gmail_id = ?1 LIMIT 1",
-                        params![ugid.trim()],
+                        "SELECT id FROM messages WHERE mailbox_id = ?1 AND upstream_gmail_id = ?2 LIMIT 1",
+                        params![mb, ugid.trim()],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()
                     .map_err(sql_err)?
             {
-                let existing = load_message_by_id(&tx, &existing_id)?
+                let existing = load_message_by_id(&tx, mb, &existing_id)?
                     .ok_or_else(|| AppError::Storage("Missing matched upstream message".into()))?;
 
                 let mut desired_labels = Vec::new();
                 let mut seen = HashSet::new();
                 for raw_l in &input.label_ids {
-                    let lid = ensure_label_exists_tx(&tx, raw_l)?;
+                    let lid = ensure_label_exists_tx(&tx, mb, raw_l)?;
                     if seen.insert(lid.clone()) {
                         desired_labels.push(lid);
                     }
@@ -3836,10 +4390,11 @@ impl MailStore for SqliteStore {
 
                 if flags_changed {
                     tx.execute(
-                        "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE id = ?3",
+                        "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE mailbox_id = ?3 AND id = ?4",
                         params![
                             if input.is_answered { 1_i64 } else { 0_i64 },
                             if input.is_deleted { 1_i64 } else { 0_i64 },
+                            mb,
                             &existing_id
                         ],
                     )
@@ -3847,9 +4402,9 @@ impl MailStore for SqliteStore {
                 }
 
                 let updated = if labels_changed {
-                    modify_message_labels_resolved_tx(&tx, &existing_id, &to_add, &to_remove)?
+                    modify_message_labels_resolved_tx(&tx, mb, &existing_id, &to_add, &to_remove)?
                 } else {
-                    load_message_by_id(&tx, &existing_id)?.ok_or_else(|| {
+                    load_message_by_id(&tx, mb, &existing_id)?.ok_or_else(|| {
                         AppError::Storage("Missing message after sync update".into())
                     })?
                 };
@@ -3873,28 +4428,28 @@ impl MailStore for SqliteStore {
                 .and_then(normalize_rfc_message_id)
                 && let Some(existing_id) = tx
                     .query_row(
-                        "SELECT id FROM messages WHERE rfc822_message_id_norm = ?1 LIMIT 1",
-                        params![norm],
+                        "SELECT id FROM messages WHERE mailbox_id = ?1 AND rfc822_message_id_norm = ?2 LIMIT 1",
+                        params![mb, norm],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()
                     .map_err(sql_err)?
             {
-                let existing = load_message_by_id(&tx, &existing_id)?
+                let existing = load_message_by_id(&tx, mb, &existing_id)?
                     .ok_or_else(|| AppError::Storage("Missing matched rfc822 message".into()))?;
 
                 // Backfill upstream IDs if absent
                 if existing.upstream_gmail_id.is_none() && input.upstream_gmail_id.is_some() {
                     tx.execute(
-                        "UPDATE messages SET upstream_gmail_id = ?1 WHERE id = ?2",
-                        params![&input.upstream_gmail_id, &existing_id],
+                        "UPDATE messages SET upstream_gmail_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                        params![&input.upstream_gmail_id, mb, &existing_id],
                     )
                     .map_err(sql_err)?;
                 }
                 if existing.upstream_thread_id.is_none() && input.upstream_thread_id.is_some() {
                     tx.execute(
-                        "UPDATE messages SET upstream_thread_id = ?1 WHERE id = ?2",
-                        params![&input.upstream_thread_id, &existing_id],
+                        "UPDATE messages SET upstream_thread_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                        params![&input.upstream_thread_id, mb, &existing_id],
                     )
                     .map_err(sql_err)?;
                 }
@@ -3902,15 +4457,15 @@ impl MailStore for SqliteStore {
                 // Merge incoming labels into existing labels
                 let mut to_add = Vec::new();
                 for raw_l in &input.label_ids {
-                    let lid = ensure_label_exists_tx(&tx, raw_l)?;
+                    let lid = ensure_label_exists_tx(&tx, mb, raw_l)?;
                     if !existing.label_ids.contains(&lid) && !to_add.contains(&lid) {
                         to_add.push(lid);
                     }
                 }
                 let updated = if !to_add.is_empty() {
-                    modify_message_labels_resolved_tx(&tx, &existing_id, &to_add, &[])?
+                    modify_message_labels_resolved_tx(&tx, mb, &existing_id, &to_add, &[])?
                 } else {
-                    load_message_by_id(&tx, &existing_id)?
+                    load_message_by_id(&tx, mb, &existing_id)?
                         .ok_or_else(|| AppError::Storage("Missing message after dedup".into()))?
                 };
                 tx.commit().map_err(sql_err)?;
@@ -3921,7 +4476,7 @@ impl MailStore for SqliteStore {
             }
 
             // 3. Insert new message
-            let inserted = insert_message_tx(&tx, input)?;
+            let inserted = insert_message_tx(&tx, mb, input)?;
             tx.commit().map_err(sql_err)?;
             Ok(UpsertOutcome {
                 kind: UpsertOutcomeKind::Inserted,
@@ -3936,17 +4491,17 @@ impl MailStore for SqliteStore {
         upstream_gmail_id: &str,
     ) -> AppResult<Option<StoredMessage>> {
         let upstream_gmail_id = upstream_gmail_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let id: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM messages WHERE upstream_gmail_id = ?1 LIMIT 1",
-                    params![upstream_gmail_id],
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND upstream_gmail_id = ?2 LIMIT 1",
+                    params![mb, upstream_gmail_id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_err)?;
             match id {
-                Some(mid) => load_message_by_id(conn, &mid),
+                Some(mid) => load_message_by_id(conn, mb, &mid),
                 None => Ok(None),
             }
         })
@@ -3958,20 +4513,20 @@ impl MailStore for SqliteStore {
         upstream_gmail_id: &str,
     ) -> AppResult<Option<StoredMessage>> {
         let upstream_gmail_id = upstream_gmail_id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
             let id: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM messages WHERE upstream_gmail_id = ?1 LIMIT 1",
-                    params![upstream_gmail_id],
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND upstream_gmail_id = ?2 LIMIT 1",
+                    params![mb, upstream_gmail_id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_err)?;
             let deleted = match id {
-                Some(mid) => delete_message_tx(&tx, &mid)?,
+                Some(mid) => delete_message_tx(&tx, mb, &mid)?,
                 None => None,
             };
             tx.commit().map_err(sql_err)?;
@@ -3982,13 +4537,13 @@ impl MailStore for SqliteStore {
 
     async fn get_sync_state(&self, account_key: &str) -> AppResult<Option<SyncState>> {
         let account_key = account_key.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             conn.query_row(
                 "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                         imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
                         messages_synced, last_pushed_history_id, messages_pushed
-                 FROM sync_state WHERE account_key = ?1",
-                params![account_key],
+                 FROM sync_state WHERE mailbox_id = ?1 AND account_key = ?2",
+                params![mb, account_key],
                 sync_state_from_row,
             )
             .optional()
@@ -3998,14 +4553,14 @@ impl MailStore for SqliteStore {
     }
 
     async fn save_sync_state(&self, state: SyncState) -> AppResult<()> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             conn.execute(
                 "INSERT INTO sync_state (
-                    account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
+                    mailbox_id, account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                     imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
                     messages_synced, last_pushed_history_id, messages_pushed
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(account_key) DO UPDATE SET
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(mailbox_id, account_key) DO UPDATE SET
                     provider = excluded.provider,
                     last_history_id = excluded.last_history_id,
                     imap_mailbox = excluded.imap_mailbox,
@@ -4019,6 +4574,7 @@ impl MailStore for SqliteStore {
                     last_pushed_history_id = excluded.last_pushed_history_id,
                     messages_pushed = excluded.messages_pushed",
                 params![
+                    mb,
                     &state.account_key,
                     &state.provider,
                     &state.last_history_id,
@@ -4041,17 +4597,17 @@ impl MailStore for SqliteStore {
     }
 
     async fn list_sync_states(&self) -> AppResult<Vec<SyncState>> {
-        self.run_blocking(|conn| {
+        self.run_blocking(|conn, mb| {
             let mut stmt = conn
                 .prepare(
                     "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                             imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
                             messages_synced, last_pushed_history_id, messages_pushed
-                     FROM sync_state ORDER BY account_key ASC",
+                     FROM sync_state WHERE mailbox_id = ?1 ORDER BY account_key ASC",
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map([], sync_state_from_row)
+                .query_map(params![mb], sync_state_from_row)
                 .map_err(sql_err)?;
             let mut out = Vec::new();
             for r in rows {
@@ -4063,19 +4619,20 @@ impl MailStore for SqliteStore {
     }
 
     async fn set_watch(&self, watch: WatchSubscription) -> AppResult<WatchSubscription> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let labels_json = serde_json::to_string(&watch.label_ids)
                 .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
             conn.execute(
-                "INSERT INTO watch_state (id, topic_name, label_ids_json, label_filter_behavior, history_id, expiration_ms)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(id) DO UPDATE SET
+                "INSERT INTO watch_state (mailbox_id, topic_name, label_ids_json, label_filter_behavior, history_id, expiration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(mailbox_id) DO UPDATE SET
                     topic_name = excluded.topic_name,
                     label_ids_json = excluded.label_ids_json,
                     label_filter_behavior = excluded.label_filter_behavior,
                     history_id = excluded.history_id,
                     expiration_ms = excluded.expiration_ms",
                 params![
+                    mb,
                     &watch.topic_name,
                     labels_json,
                     &watch.label_filter_behavior,
@@ -4090,11 +4647,11 @@ impl MailStore for SqliteStore {
     }
 
     async fn get_watch(&self) -> AppResult<Option<WatchSubscription>> {
-        self.run_blocking(|conn| {
+        self.run_blocking(|conn, mb| {
             conn.query_row(
                 "SELECT topic_name, label_ids_json, label_filter_behavior, history_id, expiration_ms
-                 FROM watch_state WHERE id = 1",
-                [],
+                 FROM watch_state WHERE mailbox_id = ?1",
+                params![mb],
                 |row| {
                     let labels_json: String = row.get(1)?;
                     let label_ids: Vec<String> =
@@ -4115,8 +4672,8 @@ impl MailStore for SqliteStore {
     }
 
     async fn clear_watch(&self) -> AppResult<()> {
-        self.run_blocking(|conn| {
-            conn.execute("DELETE FROM watch_state WHERE id = 1", [])
+        self.run_blocking(|conn, mb| {
+            conn.execute("DELETE FROM watch_state WHERE mailbox_id = ?1", params![mb])
                 .map_err(sql_err)?;
             Ok(())
         })
@@ -4124,16 +4681,16 @@ impl MailStore for SqliteStore {
     }
 
     async fn get_settings(&self) -> AppResult<UserSettings> {
-        let default_email = self.default_email.clone();
-        self.run_blocking(move |conn| {
-            let defaults = UserSettings::default_for_email(&default_email);
-            let send_as: Vec<SendAs> = read_setting(conn, "send_as")?.unwrap_or(defaults.send_as);
+        self.run_blocking(move |conn, mb| {
+            let defaults = UserSettings::default_for_email(mb);
+            let send_as: Vec<SendAs> =
+                read_setting(conn, mb, "send_as")?.unwrap_or(defaults.send_as);
             let vacation: VacationSettings =
-                read_setting(conn, "vacation")?.unwrap_or(defaults.vacation);
+                read_setting(conn, mb, "vacation")?.unwrap_or(defaults.vacation);
             let auto_forwarding: AutoForwarding =
-                read_setting(conn, "auto_forwarding")?.unwrap_or(defaults.auto_forwarding);
-            let imap: ImapSettings = read_setting(conn, "imap")?.unwrap_or(defaults.imap);
-            let pop: PopSettings = read_setting(conn, "pop")?.unwrap_or(defaults.pop);
+                read_setting(conn, mb, "auto_forwarding")?.unwrap_or(defaults.auto_forwarding);
+            let imap: ImapSettings = read_setting(conn, mb, "imap")?.unwrap_or(defaults.imap);
+            let pop: PopSettings = read_setting(conn, mb, "pop")?.unwrap_or(defaults.pop);
             Ok(UserSettings {
                 send_as,
                 vacation,
@@ -4146,15 +4703,15 @@ impl MailStore for SqliteStore {
     }
 
     async fn save_settings(&self, settings: UserSettings) -> AppResult<UserSettings> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            write_setting(&tx, "send_as", &settings.send_as)?;
-            write_setting(&tx, "vacation", &settings.vacation)?;
-            write_setting(&tx, "auto_forwarding", &settings.auto_forwarding)?;
-            write_setting(&tx, "imap", &settings.imap)?;
-            write_setting(&tx, "pop", &settings.pop)?;
+            write_setting(&tx, mb, "send_as", &settings.send_as)?;
+            write_setting(&tx, mb, "vacation", &settings.vacation)?;
+            write_setting(&tx, mb, "auto_forwarding", &settings.auto_forwarding)?;
+            write_setting(&tx, mb, "imap", &settings.imap)?;
+            write_setting(&tx, mb, "pop", &settings.pop)?;
             tx.commit().map_err(sql_err)?;
             Ok(settings)
         })
@@ -4165,7 +4722,7 @@ impl MailStore for SqliteStore {
         &self,
         input: NewPendingApprovalInput,
     ) -> AppResult<PendingApproval> {
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let id = input
                 .id
                 .filter(|s| !s.trim().is_empty())
@@ -4182,12 +4739,13 @@ impl MailStore for SqliteStore {
                 .map_err(sql_err)?;
             let inserted = tx.execute(
                 "INSERT INTO pending_approvals (
-                    id, status, reason, requester_json, outbound_message_json,
+                    mailbox_id, id, status, reason, requester_json, outbound_message_json,
                     reply_to_message_id, thread_id, draft_id,
                     sent_message_id, provider_message_id, decided_by, decision_note,
                     created_at_ms, expires_at_ms, decided_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, ?9, ?10, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, ?11, NULL)",
                 params![
+                    mb,
                     id,
                     ApprovalStatus::Pending.as_str(),
                     input.reason,
@@ -4235,7 +4793,7 @@ impl MailStore for SqliteStore {
 
     async fn get_pending_approval(&self, id: &str) -> AppResult<Option<PendingApproval>> {
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let now_ms = Utc::now().timestamp_millis();
             let row = conn
                 .query_row(
@@ -4244,8 +4802,8 @@ impl MailStore for SqliteStore {
                             sent_message_id, provider_message_id, decided_by, decision_note,
                             created_at_ms, expires_at_ms, decided_at_ms
                      FROM pending_approvals
-                     WHERE id = ?1",
-                    params![id],
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
                     pending_approval_from_row,
                 )
                 .optional()
@@ -4262,7 +4820,7 @@ impl MailStore for SqliteStore {
         limit: usize,
     ) -> AppResult<Vec<PendingApproval>> {
         let limit = if limit == 0 { 20 } else { limit } as i64;
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let now_ms = Utc::now().timestamp_millis();
             let mut results = Vec::new();
             match status {
@@ -4274,12 +4832,13 @@ impl MailStore for SqliteStore {
                                     sent_message_id, provider_message_id, decided_by, decision_note,
                                     created_at_ms, expires_at_ms, decided_at_ms
                              FROM pending_approvals
+                             WHERE mailbox_id = ?1
                              ORDER BY created_at_ms DESC, id DESC
-                             LIMIT ?1",
+                             LIMIT ?2",
                         )
                         .map_err(sql_err)?;
                     let rows = stmt
-                        .query_map(params![limit], pending_approval_from_row)
+                        .query_map(params![mb, limit], pending_approval_from_row)
                         .map_err(sql_err)?;
                     for row in rows {
                         let parsed = row.map_err(sql_err)??;
@@ -4294,13 +4853,13 @@ impl MailStore for SqliteStore {
                                     sent_message_id, provider_message_id, decided_by, decision_note,
                                     created_at_ms, expires_at_ms, decided_at_ms
                              FROM pending_approvals
-                             WHERE status = 'pending' AND expires_at_ms > ?1
+                             WHERE mailbox_id = ?1 AND status = 'pending' AND expires_at_ms > ?2
                              ORDER BY created_at_ms DESC, id DESC
-                             LIMIT ?2",
+                             LIMIT ?3",
                         )
                         .map_err(sql_err)?;
                     let rows = stmt
-                        .query_map(params![now_ms, limit], pending_approval_from_row)
+                        .query_map(params![mb, now_ms, limit], pending_approval_from_row)
                         .map_err(sql_err)?;
                     for row in rows {
                         let parsed = row.map_err(sql_err)??;
@@ -4315,13 +4874,14 @@ impl MailStore for SqliteStore {
                                     sent_message_id, provider_message_id, decided_by, decision_note,
                                     created_at_ms, expires_at_ms, decided_at_ms
                              FROM pending_approvals
-                             WHERE status = 'expired' OR (status = 'pending' AND expires_at_ms <= ?1)
+                             WHERE mailbox_id = ?1
+                               AND (status = 'expired' OR (status = 'pending' AND expires_at_ms <= ?2))
                              ORDER BY created_at_ms DESC, id DESC
-                             LIMIT ?2",
+                             LIMIT ?3",
                         )
                         .map_err(sql_err)?;
                     let rows = stmt
-                        .query_map(params![now_ms, limit], pending_approval_from_row)
+                        .query_map(params![mb, now_ms, limit], pending_approval_from_row)
                         .map_err(sql_err)?;
                     for row in rows {
                         let parsed = row.map_err(sql_err)??;
@@ -4336,13 +4896,16 @@ impl MailStore for SqliteStore {
                                     sent_message_id, provider_message_id, decided_by, decision_note,
                                     created_at_ms, expires_at_ms, decided_at_ms
                              FROM pending_approvals
-                             WHERE status = ?1
+                             WHERE mailbox_id = ?1 AND status = ?2
                              ORDER BY created_at_ms DESC, id DESC
-                             LIMIT ?2",
+                             LIMIT ?3",
                         )
                         .map_err(sql_err)?;
                     let rows = stmt
-                        .query_map(params![other.as_str(), limit], pending_approval_from_row)
+                        .query_map(
+                            params![mb, other.as_str(), limit],
+                            pending_approval_from_row,
+                        )
                         .map_err(sql_err)?;
                     for row in rows {
                         let parsed = row.map_err(sql_err)??;
@@ -4371,7 +4934,7 @@ impl MailStore for SqliteStore {
         }
 
         let id = id.to_string();
-        self.run_blocking(move |conn| {
+        self.run_blocking(move |conn, mb| {
             let now_ms = Utc::now().timestamp_millis();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4384,8 +4947,8 @@ impl MailStore for SqliteStore {
                             sent_message_id, provider_message_id, decided_by, decision_note,
                             created_at_ms, expires_at_ms, decided_at_ms
                      FROM pending_approvals
-                     WHERE id = ?1",
-                    params![id],
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
                     pending_approval_from_row,
                 )
                 .optional()
@@ -4403,8 +4966,8 @@ impl MailStore for SqliteStore {
                 tx.execute(
                     "UPDATE pending_approvals
                      SET status = 'expired', decided_at_ms = COALESCE(decided_at_ms, ?1)
-                     WHERE id = ?2 AND status = 'pending'",
-                    params![now_ms, id],
+                     WHERE mailbox_id = ?2 AND id = ?3 AND status = 'pending'",
+                    params![now_ms, mb, id],
                 )
                 .map_err(sql_err)?;
                 tx.commit().map_err(sql_err)?;
@@ -4420,7 +4983,7 @@ impl MailStore for SqliteStore {
                          sent_message_id = ?4,
                          provider_message_id = ?5,
                          decided_at_ms = ?6
-                     WHERE id = ?7 AND status = 'pending'",
+                     WHERE mailbox_id = ?7 AND id = ?8 AND status = 'pending'",
                     params![
                         status.as_str(),
                         decided_by,
@@ -4428,6 +4991,7 @@ impl MailStore for SqliteStore {
                         sent_message_id,
                         provider_message_id,
                         now_ms,
+                        mb,
                         id,
                     ],
                 )

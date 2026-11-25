@@ -271,8 +271,9 @@ impl AuthProvider for StaticTokenAuthProvider {
 
     async fn authenticate_imap(&self, username: &str, password: &str) -> AppResult<Principal> {
         if let Some(principal) = self.match_scoped_token(password) {
+            let is_primary_token = principal.mailbox_id.eq_ignore_ascii_case(&self.mailbox_id);
             if username.eq_ignore_ascii_case(&principal.mailbox_id)
-                || username.eq_ignore_ascii_case(&self.imap_username)
+                || (is_primary_token && username.eq_ignore_ascii_case(&self.imap_username))
             {
                 return Ok(principal);
             }
@@ -316,8 +317,9 @@ impl AuthProvider for StaticTokenAuthProvider {
             ));
         }
         let principal = self.authenticate_bearer(Some(access_token)).await?;
+        let is_primary_token = principal.mailbox_id.eq_ignore_ascii_case(&self.mailbox_id);
         if username.eq_ignore_ascii_case(&principal.mailbox_id)
-            || username.eq_ignore_ascii_case(&self.imap_username)
+            || (is_primary_token && username.eq_ignore_ascii_case(&self.imap_username))
         {
             Ok(principal)
         } else {
@@ -587,6 +589,25 @@ pub fn resolve_user_id<'a>(user_id: &str, config: &'a Config) -> AppResult<&'a s
 
     if user_id == "me" || user_id.eq_ignore_ascii_case(&config.user_email) {
         Ok(config.user_email.as_str())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "Delegation denied for userId '{user_id}'"
+        )))
+    }
+}
+
+/// Resolve Gmail `{userId}` path parameter against an authenticated [`Principal`]'s `mailbox_id`.
+///
+/// Accepts `"me"` or `principal.mailbox_id` (case-insensitive). Returns `403 Forbidden` for
+/// any other user ID, or `400 Bad Request` if `user_id` fails input hardening checks.
+pub fn resolve_user_id_for_principal<'a>(
+    user_id: &str,
+    principal: &'a Principal,
+) -> AppResult<&'a str> {
+    validate_resource_id(user_id)?;
+
+    if user_id == "me" || user_id.eq_ignore_ascii_case(&principal.mailbox_id) {
+        Ok(principal.mailbox_id.as_str())
     } else {
         Err(AppError::Forbidden(format!(
             "Delegation denied for userId '{user_id}'"

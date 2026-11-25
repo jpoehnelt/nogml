@@ -19,7 +19,7 @@ use std::{
 use axum::{
     Extension, Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -36,7 +36,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    AppState,
+    AppState, MailboxState,
     auth::Principal,
     config::{Config, SyncMode},
     error::{AiError, AppError, AppResult},
@@ -980,7 +980,8 @@ pub async fn execute_approve_approval(
     source: EventSource,
 ) -> AppResult<Value> {
     validate_resource_id(id)?;
-    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, id)?;
+    let in_flight_key = format!("{}:{}", state.mailbox_id(), id);
+    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, &in_flight_key)?;
 
     let approval = state
         .store
@@ -1160,7 +1161,8 @@ pub async fn execute_reject_approval(
     source: EventSource,
 ) -> AppResult<Value> {
     validate_resource_id(id)?;
-    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, id)?;
+    let in_flight_key = format!("{}:{}", state.mailbox_id(), id);
+    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, &in_flight_key)?;
 
     let decided_by = req
         .decided_by
@@ -1936,7 +1938,7 @@ struct EventsParams {
 }
 
 async fn get_capabilities(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
     let cfg = &state.config;
@@ -2012,7 +2014,7 @@ async fn get_capabilities(
 }
 
 async fn list_threads(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(params): Query<ListThreadsParams>,
 ) -> Result<Json<Value>, AiError> {
     if let Some(lbl) = params.label.as_deref() {
@@ -2044,7 +2046,7 @@ async fn list_threads(
 }
 
 async fn get_thread(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(id): Path<String>,
     Query(params): Query<ReadThreadParams>,
 ) -> Result<Json<Value>, AiError> {
@@ -2075,7 +2077,7 @@ async fn get_thread(
 }
 
 async fn triage_thread_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiTriageRequest>,
@@ -2085,7 +2087,7 @@ async fn triage_thread_handler(
 }
 
 async fn list_messages(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(params): Query<ListMessagesParams>,
 ) -> Result<Json<Value>, AiError> {
     let mut labels = parse_csv(params.labels.as_deref());
@@ -2147,7 +2149,7 @@ async fn list_messages(
 }
 
 async fn get_message(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(id): Path<String>,
     Query(params): Query<ReadMessageParams>,
 ) -> Result<Json<Value>, AiError> {
@@ -2178,7 +2180,7 @@ async fn get_message(
 }
 
 async fn get_attachment_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> Result<Response, AiError> {
     validate_resource_id(&id)?;
@@ -2216,7 +2218,7 @@ async fn get_attachment_handler(
 }
 
 async fn send_message_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiSendEmailRequest>,
@@ -2238,7 +2240,7 @@ async fn send_message_handler(
 }
 
 async fn modify_messages_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiModifyLabelsRequest>,
 ) -> Result<Json<Value>, AiError> {
@@ -2247,7 +2249,7 @@ async fn modify_messages_handler(
 }
 
 async fn list_drafts(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(params): Query<ListDraftsParams>,
 ) -> Result<Json<Value>, AiError> {
     let limit = params
@@ -2293,7 +2295,7 @@ async fn list_drafts(
 }
 
 async fn create_draft_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiCreateDraftRequest>,
 ) -> Result<Json<Value>, AiError> {
@@ -2302,7 +2304,7 @@ async fn create_draft_handler(
 }
 
 async fn send_draft_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
@@ -2327,7 +2329,7 @@ async fn send_draft_handler(
 }
 
 async fn list_approvals_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(params): Query<ListApprovalsParams>,
 ) -> Result<Json<Value>, AiError> {
     let limit = params
@@ -2339,7 +2341,7 @@ async fn list_approvals_handler(
 }
 
 async fn get_approval_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
@@ -2348,7 +2350,7 @@ async fn get_approval_handler(
 }
 
 async fn approve_approval_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
@@ -2367,7 +2369,7 @@ async fn approve_approval_handler(
 }
 
 async fn reject_approval_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
@@ -2386,7 +2388,7 @@ async fn reject_approval_handler(
 }
 
 async fn delete_draft_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AiError> {
     validate_resource_id(&id)?;
@@ -2398,7 +2400,7 @@ async fn delete_draft_handler(
 }
 
 async fn list_labels(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
     let labels = state.store.list_labels().await?;
@@ -2421,7 +2423,7 @@ async fn list_labels(
 }
 
 async fn search_messages(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Value>, AiError> {
     let mut labels = parse_csv(params.labels.as_deref());
@@ -2488,7 +2490,7 @@ async fn search_messages(
 }
 
 async fn events_sse_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     headers: HeaderMap,
     Query(params): Query<EventsParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AiError> {
@@ -2537,11 +2539,18 @@ async fn events_sse_handler(
         Vec::new()
     };
 
+    let active_mailbox = state.mailbox_id().to_string();
     let live_stream = BroadcastStream::new(rx).filter_map(move |item| {
         let env = match item {
             Ok(env) => env,
             Err(_) => return std::future::ready(None),
         };
+        if !active_mailbox.is_empty()
+            && !env.mailbox_id.is_empty()
+            && !env.mailbox_id.eq_ignore_ascii_case(&active_mailbox)
+        {
+            return std::future::ready(None);
+        }
         if env.id <= last_replayed_id {
             return std::future::ready(None);
         }
@@ -2568,7 +2577,7 @@ async fn events_sse_handler(
 }
 
 async fn sync_gmail_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, AiError> {
@@ -2580,7 +2589,7 @@ async fn sync_gmail_handler(
 }
 
 async fn sync_status_handler(
-    State(state): State<AppState>,
+    MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
     let status = sync::get_sync_status(&state).await?;

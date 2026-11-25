@@ -563,6 +563,20 @@ impl SearchIndex for HybridSearchIndex {
         })
     }
 
+    fn for_mailbox(&self, mailbox_id: &str) -> Option<Arc<dyn SearchIndex>> {
+        let store = self.store.for_mailbox(mailbox_id);
+        let lexical = StoreSearchIndex::new(store.clone());
+        let vectors = self.vectors.for_mailbox(mailbox_id);
+        Some(Arc::new(Self {
+            store,
+            lexical,
+            provider: self.provider.clone(),
+            vectors,
+            rrf_k: self.rrf_k,
+            min_vector_similarity: self.min_vector_similarity,
+        }))
+    }
+
     fn backend_name(&self) -> &'static str {
         "hybrid"
     }
