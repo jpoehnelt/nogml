@@ -198,8 +198,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client: Arc<dyn ResendClient> =
-            Arc::new(HttpResendClient::new(server.uri(), Some("re_transport".into())));
+        let client: Arc<dyn ResendClient> = Arc::new(HttpResendClient::new(
+            server.uri(),
+            Some("re_transport".into()),
+        ));
         let transport = ResendTransport::new(client, "agent@example.com");
 
         assert_eq!(transport.name(), "resend");

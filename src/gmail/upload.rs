@@ -281,7 +281,9 @@ fn extract_multipart_message(content_type: &str, body: &[u8]) -> AppResult<Extra
             .header("content-type")
             .unwrap_or("")
             .to_ascii_lowercase();
-        if part_ct.starts_with("application/json") || (idx == 0 && part_ct.is_empty() && part.body.first() == Some(&b'{')) {
+        if part_ct.starts_with("application/json")
+            || (idx == 0 && part_ct.is_empty() && part.body.first() == Some(&b'{'))
+        {
             if !part.body.is_empty() {
                 metadata = serde_json::from_slice(&part.body)?;
             }
@@ -365,11 +367,7 @@ pub fn extract_draft_upload(
     }
 
     let metadata: Draft = serde_json::from_slice(body)?;
-    let raw_bytes = match metadata
-        .message
-        .as_ref()
-        .and_then(|m| m.raw.as_deref())
-    {
+    let raw_bytes = match metadata.message.as_ref().and_then(|m| m.raw.as_deref()) {
         Some(raw) if !raw.trim().is_empty() => Some(mime::decode_base64url(raw)?),
         _ => None,
     };

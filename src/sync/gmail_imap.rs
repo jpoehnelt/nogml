@@ -102,9 +102,7 @@ pub async fn sync_gmail_imap(
         .gmail_imap_user
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            AppError::Config("Gmail IMAP sync requires gmail_imap_user".to_string())
-        })?;
+        .ok_or_else(|| AppError::Config("Gmail IMAP sync requires gmail_imap_user".to_string()))?;
     let pass = state
         .config
         .gmail_imap_password
@@ -130,9 +128,8 @@ pub async fn sync_gmail_imap(
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(tls_cfg));
-        let server_name = ServerName::try_from(host.clone()).map_err(|e| {
-            AppError::Config(format!("Invalid IMAP TLS hostname '{host}': {e}"))
-        })?;
+        let server_name = ServerName::try_from(host.clone())
+            .map_err(|e| AppError::Config(format!("Invalid IMAP TLS hostname '{host}': {e}")))?;
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -233,20 +230,22 @@ pub async fn sync_gmail_imap(
             "Fetching upstream IMAP messages"
         );
 
-        let fetches_stream = session
-            .uid_fetch(&uid_range, query)
-            .await
-            .map_err(|e| AppError::Upstream {
-                status: 502,
-                message: format!("IMAP UID FETCH failed: {e}"),
-            })?;
-        let fetches: Vec<_> = fetches_stream
-            .try_collect()
-            .await
-            .map_err(|e| AppError::Upstream {
-                status: 502,
-                message: format!("IMAP UID FETCH stream error: {e}"),
-            })?;
+        let fetches_stream =
+            session
+                .uid_fetch(&uid_range, query)
+                .await
+                .map_err(|e| AppError::Upstream {
+                    status: 502,
+                    message: format!("IMAP UID FETCH failed: {e}"),
+                })?;
+        let fetches: Vec<_> =
+            fetches_stream
+                .try_collect()
+                .await
+                .map_err(|e| AppError::Upstream {
+                    status: 502,
+                    message: format!("IMAP UID FETCH stream error: {e}"),
+                })?;
 
         for fetch in fetches {
             let Some(uid) = fetch.uid else {

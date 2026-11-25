@@ -88,7 +88,9 @@ impl ResendClient for StubResendClient {
         _idempotency_key: Option<&str>,
     ) -> AppResult<ResendSendEmailResponse> {
         if self.fail_on_send {
-            panic!("ResendClient::send_email must NOT be called when a custom MailTransport or blocking OutboundPolicy is active");
+            panic!(
+                "ResendClient::send_email must NOT be called when a custom MailTransport or blocking OutboundPolicy is active"
+            );
         }
         Ok(ResendSendEmailResponse {
             id: "re_stub_1".to_string(),
@@ -298,14 +300,20 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
 
     // NAMESPACE
     let ns = imap_cmd(&mut reader, "A2", "NAMESPACE").await;
-    assert!(ns.iter().any(|l| l.contains(r#"* NAMESPACE (("" "/")) NIL NIL"#)));
+    assert!(
+        ns.iter()
+            .any(|l| l.contains(r#"* NAMESPACE (("" "/")) NIL NIL"#))
+    );
     assert!(ns.last().unwrap().starts_with("A2 OK"));
 
     // LIST "" "*" — verify INBOX and all 6 [Gmail]/* SPECIAL-USE attributes
     let list = imap_cmd(&mut reader, "A3", r#"LIST "" "*""#).await;
     assert!(list.last().unwrap().starts_with("A3 OK"));
     let list_joined = list.join("");
-    assert!(list_joined.contains(r#""INBOX""#), "missing INBOX: {list_joined}");
+    assert!(
+        list_joined.contains(r#""INBOX""#),
+        "missing INBOX: {list_joined}"
+    );
     assert!(
         list.iter()
             .any(|l| l.contains(r#"\Noselect \HasChildren"#) && l.contains(r#""[Gmail]""#))
@@ -319,8 +327,7 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
         ("[Gmail]/Starred", r"\Flagged"),
     ] {
         assert!(
-            list.iter()
-                .any(|l| l.contains(folder) && l.contains(attr)),
+            list.iter().any(|l| l.contains(folder) && l.contains(attr)),
             "expected LIST entry for {folder} with {attr}, got:\n{list_joined}"
         );
     }
@@ -408,7 +415,12 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
     // SEARCH & UID SEARCH
     let s_seq = imap_cmd(&mut reader, "A9", r#"SEARCH SUBJECT "Alpha""#).await;
     assert!(s_seq.iter().any(|l| l.trim() == "* SEARCH 1"));
-    let s_uid = imap_cmd(&mut reader, "A10", r#"UID SEARCH FLAGGED FROM "bob@example.com""#).await;
+    let s_uid = imap_cmd(
+        &mut reader,
+        "A10",
+        r#"UID SEARCH FLAGGED FROM "bob@example.com""#,
+    )
+    .await;
     assert!(s_uid.iter().any(|l| l.trim() == "* SEARCH 2"));
 
     // Non-UID FETCH + UID FETCH: UID, FLAGS, ENVELOPE, BODYSTRUCTURE, BODY.PEEK[HEADER],
@@ -434,7 +446,10 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
     let fetch_joined = fetch.join("");
     assert!(fetch.last().unwrap().starts_with("A11 OK"));
     assert!(fetch_joined.contains("UID 1"));
-    assert!(fetch_joined.contains("FLAGS ()"), "BODY.PEEK must not set \\Seen: {fetch_joined}");
+    assert!(
+        fetch_joined.contains("FLAGS ()"),
+        "BODY.PEEK must not set \\Seen: {fetch_joined}"
+    );
     assert!(fetch_joined.contains("ENVELOPE ("));
     assert!(fetch_joined.contains("\"IMAP Full Lifecycle Alpha\""));
     assert!(fetch_joined.contains("BODYSTRUCTURE ("));
@@ -459,7 +474,10 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
 
     // STORE: \Seen <-> UNREAD and \Flagged <-> STARRED bidirectional verification
     let st1 = imap_cmd(&mut reader, "A12", r#"UID STORE 1 +FLAGS (\Seen \Flagged)"#).await;
-    assert!(st1.iter().any(|l| l.contains("\\Seen") && l.contains("\\Flagged")));
+    assert!(
+        st1.iter()
+            .any(|l| l.contains("\\Seen") && l.contains("\\Flagged"))
+    );
     let m1_after_add = store.get_message(&stored_m1.id).await.unwrap().unwrap();
     assert!(!m1_after_add.label_ids.contains(&LABEL_UNREAD.to_string()));
     assert!(m1_after_add.label_ids.contains(&LABEL_STARRED.to_string()));
@@ -475,7 +493,12 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
     assert!(copy.last().unwrap().contains("[COPYUID "));
 
     // Mark msg 2 \Deleted and EXPUNGE in INBOX -> moves to [Gmail]/Trash
-    let _ = imap_cmd(&mut reader, "A15", r#"UID STORE 2 +FLAGS.SILENT (\Deleted)"#).await;
+    let _ = imap_cmd(
+        &mut reader,
+        "A15",
+        r#"UID STORE 2 +FLAGS.SILENT (\Deleted)"#,
+    )
+    .await;
     let exp = imap_cmd(&mut reader, "A16", "EXPUNGE").await;
     assert!(exp.iter().any(|l| l.trim() == "* 2 EXPUNGE"));
     assert!(exp.last().unwrap().starts_with("A16 OK"));
@@ -616,7 +639,10 @@ async fn e2e_imap_cross_protocol_live_idle_gmail_insert_and_resend_ingest() {
     reader.get_mut().write_all(b"I3 IDLE\r\n").await.unwrap();
     let mut cont = String::new();
     reader.read_line(&mut cont).await.unwrap();
-    assert!(cont.starts_with("+ idling"), "expected '+ idling', got {cont}");
+    assert!(
+        cont.starts_with("+ idling"),
+        "expected '+ idling', got {cont}"
+    );
 
     // Event 1: Email arrives via Gmail REST API `messages.insert`
     let raw1 = b"From: gmail-api@example.com\r\nTo: agent@example.com\r\nSubject: Live via Gmail Insert\r\nMessage-ID: <idle-gmail-1@example.com>\r\n\r\nInserted via Gmail REST API.";
@@ -1039,12 +1065,16 @@ async fn e2e_gmail_api_sync_backfill_incremental_404_fallback_and_resend_dedup()
     let mut cfg_404 = (*state.config).clone();
     cfg_404.gmail_api_base_url = mock_404.uri();
     cfg_404.gmail_access_token = Some("e2e-fallback-token".to_string());
-    let state_404 = AppState::with_backends(cfg_404, store.clone(), Arc::new(StubResendClient::noop()));
+    let state_404 =
+        AppState::with_backends(cfg_404, store.clone(), Arc::new(StubResendClient::noop()));
 
     let r3 = run_gmail_sync(&state_404, SyncRunOptions::default())
         .await
         .unwrap();
-    assert!(r3.full_resync, "HTTP 404 on history.list must trigger full resync");
+    assert!(
+        r3.full_resync,
+        "HTTP 404 on history.list must trigger full resync"
+    );
     assert_eq!(r3.messages_deduplicated, 3);
     assert_eq!(r3.messages_added, 1);
     assert_eq!(r3.history_id.as_deref(), Some("2000"));
@@ -1071,7 +1101,8 @@ async fn e2e_gmail_imap_sync_against_second_embedded_nogml_imap_server() {
     let up_addr = pick_ephemeral_addr().await;
     let up_cfg = make_sqlite_config(up_dir.path(), Some(up_addr));
     let up_store = Arc::new(SqliteStore::open(&up_cfg.db_path, &up_cfg.user_email).unwrap());
-    let up_state = AppState::with_backends(up_cfg, up_store.clone(), Arc::new(StubResendClient::noop()));
+    let up_state =
+        AppState::with_backends(up_cfg, up_store.clone(), Arc::new(StubResendClient::noop()));
 
     // Create a custom user label on upstream server and seed 2 initial messages
     let receipts_lbl = up_store
@@ -1351,7 +1382,11 @@ async fn verify_mail_store_state(
 
     let atts = store.list_attachment_meta(msg_id).await.unwrap();
     assert_eq!(atts.len(), 1);
-    let att_data = store.get_attachment(msg_id, &atts[0].id).await.unwrap().unwrap();
+    let att_data = store
+        .get_attachment(msg_id, &atts[0].id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(att_data.data, b"quarter,revenue\nQ4,99000\n");
 
     let lbl = store.get_label(label_id).await.unwrap().unwrap();
@@ -1510,7 +1545,11 @@ async fn e2e_fs_blob_store_lifecycle_disk_files_serving_and_delete_cleanup() {
     let loaded_raw = state.load_raw_rfc2822(&empty_raw_msg).await.unwrap();
     assert_eq!(loaded_raw, raw_bytes);
 
-    let mut stored_att = store.get_attachment(&msg_id, &att_id).await.unwrap().unwrap();
+    let mut stored_att = store
+        .get_attachment(&msg_id, &att_id)
+        .await
+        .unwrap()
+        .unwrap();
     stored_att.data = Vec::new();
     let loaded_att = state.load_attachment_bytes(&stored_att).await.unwrap();
     assert_eq!(loaded_att, binary_payload);
@@ -1524,7 +1563,11 @@ async fn e2e_fs_blob_store_lifecycle_disk_files_serving_and_delete_cleanup() {
         None,
     )
     .await;
-    assert_eq!(att_status, StatusCode::OK, "attachment GET failed: {att_body}");
+    assert_eq!(
+        att_status,
+        StatusCode::OK,
+        "attachment GET failed: {att_body}"
+    );
     let decoded_att = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(att_body["data"].as_str().unwrap())
         .unwrap();
@@ -1821,7 +1864,10 @@ async fn e2e_inbound_filter_chain_across_all_four_ingest_paths() {
     let sync_report = run_gmail_sync(&state, SyncRunOptions::default())
         .await
         .unwrap();
-    assert_eq!(sync_report.messages_added, 2, "rejected sync msg must not be stored");
+    assert_eq!(
+        sync_report.messages_added, 2,
+        "rejected sync msg must not be stored"
+    );
     assert!(
         store
             .find_message_by_upstream_id("sync_rej")
@@ -2121,7 +2167,9 @@ impl AuthProvider for ScopedCustomAuth {
                 agent_policy: None,
             })
         } else {
-            Err(AppError::Unauthorized("invalid custom IMAP credentials".to_string()))
+            Err(AppError::Unauthorized(
+                "invalid custom IMAP credentials".to_string(),
+            ))
         }
     }
 

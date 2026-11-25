@@ -272,14 +272,11 @@ pub fn format_envelope(raw: &[u8]) -> String {
 }
 
 fn format_envelope_ref(msg: MessageRef<'_>) -> String {
-    let date = msg
-        .date()
-        .map(|d| d.to_rfc822())
-        .or_else(|| {
-            msg.headers()
-                .get(mail_parser::HeaderName::Date)
-                .map(|h| String::from_utf8_lossy(h.raw_value()).trim().to_string())
-        });
+    let date = msg.date().map(|d| d.to_rfc822()).or_else(|| {
+        msg.headers()
+            .get(mail_parser::HeaderName::Date)
+            .map(|h| String::from_utf8_lossy(h.raw_value()).trim().to_string())
+    });
     let subject = msg.subject();
     let from = format_addr_list(msg.from());
     let sender = msg
@@ -374,7 +371,10 @@ fn format_part_bodystructure(part: MessagePart<'_>, extended: bool) -> String {
         }
         let params = format_ct_params(part.content_type());
         let disp = format_disposition(part.content_disposition());
-        return format!("({children_str} {} {params} {disp} NIL NIL)", imap_quote(&subtype));
+        return format!(
+            "({children_str} {} {params} {disp} NIL NIL)",
+            imap_quote(&subtype)
+        );
     }
 
     let (ctype, subtype) = match part.content_type() {
@@ -453,7 +453,10 @@ fn format_disposition(cd: Option<mail_parser::ContentType<'_>>) -> String {
         return "NIL".to_string();
     };
     let params = format_ct_params(Some(cd));
-    format!("({} {params})", imap_quote(&cd.ctype().to_ascii_uppercase()))
+    format!(
+        "({} {params})",
+        imap_quote(&cd.ctype().to_ascii_uppercase())
+    )
 }
 
 /// Parse raw RFC 2822 bytes into a [`NewMessageInput`] suitable for `MailStore::imap_append` or sync upsert.
@@ -532,12 +535,9 @@ pub fn parse_raw_to_new_message_input(
         .in_reply_to()
         .and_then(|l| l.first())
         .map(normalize_msg_id);
-    let references_header = msg.references().map(|l| {
-        l.iter()
-            .map(normalize_msg_id)
-            .collect::<Vec<_>>()
-            .join(" ")
-    });
+    let references_header = msg
+        .references()
+        .map(|l| l.iter().map(normalize_msg_id).collect::<Vec<_>>().join(" "));
 
     let mut attachments = Vec::new();
     for (idx, att) in msg.attachments().enumerate() {

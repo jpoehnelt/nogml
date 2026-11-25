@@ -3,7 +3,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -195,7 +198,14 @@ impl MailStore for TestMailStore {
     }
 
     async fn list_messages(&self, _query: &MessageListQuery) -> AppResult<MessageListPage> {
-        let msgs: Vec<StoredMessage> = self.data.read().unwrap().messages.values().cloned().collect();
+        let msgs: Vec<StoredMessage> = self
+            .data
+            .read()
+            .unwrap()
+            .messages
+            .values()
+            .cloned()
+            .collect();
         let est = msgs.len() as u32;
         Ok(MessageListPage {
             messages: msgs,
@@ -245,12 +255,8 @@ impl MailStore for TestMailStore {
     }
 
     async fn trash_message(&self, id: &str) -> AppResult<StoredMessage> {
-        self.modify_message_labels(
-            id,
-            &[LABEL_TRASH.to_string()],
-            &[LABEL_INBOX.to_string()],
-        )
-        .await
+        self.modify_message_labels(id, &[LABEL_TRASH.to_string()], &[LABEL_INBOX.to_string()])
+            .await
     }
 
     async fn untrash_message(&self, id: &str) -> AppResult<StoredMessage> {
@@ -534,7 +540,10 @@ impl MailStore for TestMailStore {
                     }
                 }
                 if let Some(from) = &query.from
-                    && !m.from_addr.to_ascii_lowercase().contains(&from.to_ascii_lowercase())
+                    && !m
+                        .from_addr
+                        .to_ascii_lowercase()
+                        .contains(&from.to_ascii_lowercase())
                 {
                     return false;
                 }
@@ -585,7 +594,10 @@ impl MailStore for TestMailStore {
         let mut by_thread: HashMap<String, Vec<&StoredMessage>> = HashMap::new();
         for msg in data.messages.values() {
             if !query.include_spam_trash
-                && msg.label_ids.iter().any(|l| l == LABEL_TRASH || l == "SPAM")
+                && msg
+                    .label_ids
+                    .iter()
+                    .any(|l| l == LABEL_TRASH || l == "SPAM")
             {
                 continue;
             }
@@ -629,10 +641,7 @@ impl MailStore for TestMailStore {
                 }
             }
 
-            let subject = msgs
-                .first()
-                .map(|m| m.subject.clone())
-                .unwrap_or_default();
+            let subject = msgs.first().map(|m| m.subject.clone()).unwrap_or_default();
             let snippet = msgs.last().map(|m| m.snippet.clone()).unwrap_or_default();
             let last_ms = msgs.iter().map(|m| m.internal_date_ms).max().unwrap_or(0);
             let participants = msgs
@@ -649,8 +658,7 @@ impl MailStore for TestMailStore {
                 unread,
                 has_attachments: msgs.iter().any(|m| m.has_attachments),
                 message_count: msgs.len(),
-                last_message_at: DateTime::from_timestamp_millis(last_ms)
-                    .unwrap_or_else(Utc::now),
+                last_message_at: DateTime::from_timestamp_millis(last_ms).unwrap_or_else(Utc::now),
             });
         }
 
@@ -665,11 +673,7 @@ impl MailStore for TestMailStore {
         })
     }
 
-    async fn triage_thread(
-        &self,
-        thread_id: &str,
-        patch: &TriagePatch,
-    ) -> AppResult<TriageResult> {
+    async fn triage_thread(&self, thread_id: &str, patch: &TriagePatch) -> AppResult<TriageResult> {
         let mut data = self.data.write().unwrap();
         let mut affected = Vec::new();
         let mut combined_labels = Vec::new();
@@ -690,7 +694,9 @@ impl MailStore for TestMailStore {
             }
         }
         if affected.is_empty() {
-            return Err(AppError::NotFound(format!("Thread '{thread_id}' not found")));
+            return Err(AppError::NotFound(format!(
+                "Thread '{thread_id}' not found"
+            )));
         }
         affected.sort();
         Ok(TriageResult {
@@ -700,7 +706,10 @@ impl MailStore for TestMailStore {
         })
     }
 
-    async fn find_message_by_resend_id(&self, _resend_id: &str) -> AppResult<Option<StoredMessage>> {
+    async fn find_message_by_resend_id(
+        &self,
+        _resend_id: &str,
+    ) -> AppResult<Option<StoredMessage>> {
         Ok(None)
     }
 
@@ -791,7 +800,13 @@ impl MailStore for TestMailStore {
     }
 
     async fn get_sync_state(&self, account_key: &str) -> AppResult<Option<SyncState>> {
-        Ok(self.data.read().unwrap().sync_states.get(account_key).cloned())
+        Ok(self
+            .data
+            .read()
+            .unwrap()
+            .sync_states
+            .get(account_key)
+            .cloned())
     }
 
     async fn save_sync_state(&self, state: SyncState) -> AppResult<()> {
@@ -888,7 +903,9 @@ impl ResendClient for MockResendClient {
     }
 }
 
-pub(crate) fn make_test_state(config: Config) -> (AppState, Arc<TestMailStore>, Arc<MockResendClient>) {
+pub(crate) fn make_test_state(
+    config: Config,
+) -> (AppState, Arc<TestMailStore>, Arc<MockResendClient>) {
     let store = Arc::new(TestMailStore::new(&config.user_email));
     let resend = Arc::new(MockResendClient::default());
     let state = AppState::with_backends(config, store.clone(), resend.clone());
@@ -998,8 +1015,8 @@ fn allowed_recipients_supports_exact_domain_and_wildcard() {
     );
 
     // Subdomain does not match bare @company.com
-    let err = check_recipients_policy(&cfg, &["x@sub.company.com".to_string()], &[], &[])
-        .unwrap_err();
+    let err =
+        check_recipients_policy(&cfg, &["x@sub.company.com".to_string()], &[], &[]).unwrap_err();
     match err {
         AppError::RecipientNotAllowed { disallowed } => {
             assert_eq!(disallowed, vec!["x@sub.company.com"]);
@@ -1077,7 +1094,12 @@ fn untrusted_content_guard_sanitizes_and_tags_meta() {
     assert!(compact.text_truncated);
     assert_eq!(compact.text_total_chars, "Top reply".len());
     assert!(compact.unread);
-    assert!(compact.meta.as_ref().is_some_and(|m| m.untrusted_external_content));
+    assert!(
+        compact
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.untrusted_external_content)
+    );
 
     let mut cfg_off = Config::for_test();
     cfg_off.untrusted_content_guard = false;
@@ -1114,9 +1136,21 @@ async fn send_email_respects_draft_only_block_downgrade_and_dry_run() {
     .unwrap();
     assert!(dry.dry_run);
     assert!(!dry.would_succeed);
-    assert!(dry.policy_checks.iter().any(|c| c.rule == "draft_only" && !c.passed));
+    assert!(
+        dry.policy_checks
+            .iter()
+            .any(|c| c.rule == "draft_only" && !c.passed)
+    );
     assert_eq!(resend.sent_count(), 0);
-    assert_eq!(store.list_drafts(&MessageListQuery::default()).await.unwrap().drafts.len(), 0);
+    assert_eq!(
+        store
+            .list_drafts(&MessageListQuery::default())
+            .await
+            .unwrap()
+            .drafts
+            .len(),
+        0
+    );
 
     // real send returns DraftOnlyBlocked
     let err = execute_send_email(
@@ -1476,7 +1510,10 @@ async fn rest_v1_endpoints_fields_mask_attachments_and_errors() {
     let body: Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["error"]["code"], "recipient_not_allowed");
-    assert_eq!(body["error"]["details"]["disallowed"][0], "intruder@outside.org");
+    assert_eq!(
+        body["error"]["details"]["disallowed"][0],
+        "intruder@outside.org"
+    );
 
     // GET /v1/labels
     let resp = app
@@ -1552,7 +1589,10 @@ async fn sse_events_replays_last_event_id_filters_and_streams_live() {
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(ct.starts_with("text/event-stream"), "unexpected content-type: {ct}");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "unexpected content-type: {ct}"
+    );
 
     // Publish a live event matching the filter after stream creation
     let state_clone = state.clone();

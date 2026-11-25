@@ -14,11 +14,7 @@ use serde_json::json;
 use tokio::sync::{broadcast::error::RecvError, watch};
 use tracing::{debug, info, warn};
 
-use crate::{
-    AppState,
-    events::MailEvent,
-    storage::WatchSubscription,
-};
+use crate::{AppState, events::MailEvent, storage::WatchSubscription};
 
 fn event_labels(event: &MailEvent) -> Option<Vec<&str>> {
     match event {

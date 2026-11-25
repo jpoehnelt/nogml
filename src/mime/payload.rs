@@ -94,8 +94,7 @@ pub(crate) fn extract_header_value(header: &Header<'_>) -> String {
         match header.value() {
             HeaderValue::Text(decoded) => return decoded.trim().to_string(),
             HeaderValue::Address(list) => {
-                let formatted: Vec<String> =
-                    list.mailboxes().filter_map(format_mailbox).collect();
+                let formatted: Vec<String> = list.mailboxes().filter_map(format_mailbox).collect();
                 if !formatted.is_empty() {
                     return formatted.join(", ");
                 }
@@ -146,7 +145,11 @@ fn collect_attachments_rec(
         let filename = part.attachment_name().map(str::to_string);
         let content_id = part
             .content_id()
-            .map(|cid| cid.trim().trim_matches(|c| c == '<' || c == '>').to_string())
+            .map(|cid| {
+                cid.trim()
+                    .trim_matches(|c| c == '<' || c == '>')
+                    .to_string()
+            })
             .filter(|s| !s.is_empty());
 
         out.push(NewAttachmentInput {
@@ -290,7 +293,11 @@ pub fn build_gmail_payload(
             let message = MessageParser::new()
                 .parse(raw)
                 .ok_or_else(|| AppError::Mime("Failed to parse RFC 2822 message".to_string()))?;
-            Ok(Some(build_part_tree(message.root_part(), "", attachment_ids)))
+            Ok(Some(build_part_tree(
+                message.root_part(),
+                "",
+                attachment_ids,
+            )))
         }
     }
 }

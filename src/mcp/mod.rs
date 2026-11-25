@@ -341,7 +341,8 @@ impl McpServer {
                     )
                     .await
                     .map_err(RpcError::from_app)?;
-                    serde_json::to_value(projected).map_err(|e| RpcError::new(-32603, e.to_string(), None))
+                    serde_json::to_value(projected)
+                        .map_err(|e| RpcError::new(-32603, e.to_string(), None))
                 } else if let Some(message_id) = uri.strip_prefix("nogml://message/") {
                     ai::validate_resource_id(message_id).map_err(RpcError::from_app)?;
                     let msg = self
@@ -368,7 +369,8 @@ impl McpServer {
                     )
                     .await
                     .map_err(RpcError::from_app)?;
-                    serde_json::to_value(compact).map_err(|e| RpcError::new(-32603, e.to_string(), None))
+                    serde_json::to_value(compact)
+                        .map_err(|e| RpcError::new(-32603, e.to_string(), None))
                 } else if let Some(label) = uri.strip_prefix("nogml://label/") {
                     ai::validate_resource_id(label).map_err(RpcError::from_app)?;
                     let page = self
@@ -533,7 +535,9 @@ impl McpServer {
             .store
             .get_thread(&parsed.thread_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Thread '{}' not found", parsed.thread_id)))?;
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Thread '{}' not found", parsed.thread_id))
+            })?;
 
         let max_body_chars = ai::clamp_max_body_chars(parsed.max_body_chars, &self.state.config);
         let strip_quotes = parsed.strip_quotes.unwrap_or(true);
@@ -801,12 +805,8 @@ async fn mcp_http_post(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
-            let payload = jsonrpc_error(
-                Value::Null,
-                ERR_PARSE,
-                format!("Parse error: {err}"),
-                None,
-            );
+            let payload =
+                jsonrpc_error(Value::Null, ERR_PARSE, format!("Parse error: {err}"), None);
             return (
                 StatusCode::BAD_REQUEST,
                 resp_headers,
@@ -831,12 +831,9 @@ async fn mcp_http_post(
                     match server.handle_request(item).await {
                         Ok(Some(r)) => results.push(r),
                         Ok(None) => {}
-                        Err(err) => results.push(jsonrpc_error(
-                            Value::Null,
-                            -32603,
-                            err.to_string(),
-                            None,
-                        )),
+                        Err(err) => {
+                            results.push(jsonrpc_error(Value::Null, -32603, err.to_string(), None))
+                        }
                     }
                 }
                 if results.is_empty() {
@@ -1477,7 +1474,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(resp["result"]["structuredContent"]["subject"], "Launch Plan");
+        assert_eq!(
+            resp["result"]["structuredContent"]["subject"],
+            "Launch Plan"
+        );
 
         // create_draft + send_draft
         let draft_resp = server
@@ -1515,7 +1515,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(send_draft_resp["result"]["isError"], false);
-        assert_eq!(send_draft_resp["result"]["structuredContent"]["status"], "sent");
+        assert_eq!(
+            send_draft_resp["result"]["structuredContent"]["status"],
+            "sent"
+        );
         assert_eq!(resend.sent_count(), 1);
 
         // send_email with dry_run=true
@@ -1584,7 +1587,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!labels_resp["result"]["structuredContent"]["labels"].as_array().unwrap().is_empty());
+        assert!(
+            !labels_resp["result"]["structuredContent"]["labels"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         // resources/list & resources/templates/list
         let rlist = server

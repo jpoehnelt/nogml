@@ -82,7 +82,9 @@ pub async fn webhook_handler(
         "email.received" => handle_email_received(&state, &event, state.filter.as_ref()).await,
         "email.sent" => handle_delivery_status(&state, &event, "sent").await,
         "email.delivered" => handle_delivery_status(&state, &event, "delivered").await,
-        "email.delivery_delayed" => handle_delivery_status(&state, &event, "delivery_delayed").await,
+        "email.delivery_delayed" => {
+            handle_delivery_status(&state, &event, "delivery_delayed").await
+        }
         "email.bounced" => handle_delivery_status(&state, &event, "bounced").await,
         "email.complained" => handle_delivery_status(&state, &event, "complained").await,
         "email.opened" => handle_delivery_status(&state, &event, "opened").await,
@@ -123,10 +125,20 @@ fn parse_timestamp_ms(candidates: &[Option<&str>]) -> Option<i64> {
 fn format_bounce_detail(bounce: Option<&ResendBounceInfo>) -> Option<String> {
     let bounce = bounce?;
     let mut prefix_parts = Vec::new();
-    if let Some(bt) = bounce.bounce_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(bt) = bounce
+        .bounce_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         prefix_parts.push(bt);
     }
-    if let Some(st) = bounce.sub_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(st) = bounce
+        .sub_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         prefix_parts.push(st);
     }
     let msg = bounce
@@ -148,7 +160,10 @@ fn format_bounce_detail(bounce: Option<&ResendBounceInfo>) -> Option<String> {
 fn build_minimal_rfc2822_fallback(input: &ComposeEmailInput) -> Vec<u8> {
     let mut out = String::new();
     if !input.from.is_empty() {
-        out.push_str(&format!("From: {}\r\n", input.from.replace(['\r', '\n'], " ")));
+        out.push_str(&format!(
+            "From: {}\r\n",
+            input.from.replace(['\r', '\n'], " ")
+        ));
     }
     if !input.to.is_empty() {
         out.push_str(&format!(
@@ -167,13 +182,22 @@ fn build_minimal_rfc2822_fallback(input: &ComposeEmailInput) -> Vec<u8> {
         input.subject.replace(['\r', '\n'], " ")
     ));
     if let Some(mid) = &input.message_id {
-        out.push_str(&format!("Message-ID: {}\r\n", mid.replace(['\r', '\n'], "")));
+        out.push_str(&format!(
+            "Message-ID: {}\r\n",
+            mid.replace(['\r', '\n'], "")
+        ));
     }
     if let Some(irt) = &input.in_reply_to {
-        out.push_str(&format!("In-Reply-To: {}\r\n", irt.replace(['\r', '\n'], "")));
+        out.push_str(&format!(
+            "In-Reply-To: {}\r\n",
+            irt.replace(['\r', '\n'], "")
+        ));
     }
     if let Some(refs) = &input.references {
-        out.push_str(&format!("References: {}\r\n", refs.replace(['\r', '\n'], " ")));
+        out.push_str(&format!(
+            "References: {}\r\n",
+            refs.replace(['\r', '\n'], " ")
+        ));
     }
     out.push_str("MIME-Version: 1.0\r\n");
     out.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
@@ -273,9 +297,7 @@ pub async fn handle_email_received(
     }
 
     // Fetch & download attachments when raw RFC 2822 wasn't downloaded and attachments are indicated.
-    let has_attachments_hint = fetched
-        .as_ref()
-        .is_some_and(|e| !e.attachments.is_empty())
+    let has_attachments_hint = fetched.as_ref().is_some_and(|e| !e.attachments.is_empty())
         || event
             .data
             .attachments
@@ -588,9 +610,9 @@ mod tests {
             AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage,
             HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry, MailStore,
             MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment,
-            StoredDraft, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-            ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-            UserSettings, WatchSubscription,
+            StoredDraft, StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage,
+            TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome, UserSettings,
+            WatchSubscription,
         },
     };
     use wiremock::{
@@ -839,10 +861,16 @@ mod tests {
         async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
             unreachable!()
         }
-        async fn imap_mailbox_info(&self, _mailbox_name: &str) -> AppResult<Option<ImapMailboxInfo>> {
+        async fn imap_mailbox_info(
+            &self,
+            _mailbox_name: &str,
+        ) -> AppResult<Option<ImapMailboxInfo>> {
             unreachable!()
         }
-        async fn imap_list_messages(&self, _mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {
+        async fn imap_list_messages(
+            &self,
+            _mailbox_name: &str,
+        ) -> AppResult<Vec<ImapMessageEntry>> {
             unreachable!()
         }
         async fn imap_set_flags(
@@ -1013,8 +1041,8 @@ mod tests {
         .to_string();
 
         let now = Utc::now().timestamp();
-        let sig = sign_svix_payload("msg_bounce_1", now, payload.as_bytes(), WEBHOOK_SECRET)
-            .unwrap();
+        let sig =
+            sign_svix_payload("msg_bounce_1", now, payload.as_bytes(), WEBHOOK_SECRET).unwrap();
 
         let resp = app
             .oneshot(
@@ -1040,7 +1068,9 @@ mod tests {
         let stored = store.all_messages();
         assert_eq!(stored[0].delivery_status.as_deref(), Some("bounced"));
 
-        let env = rx.try_recv().expect("DeliveryStatus event should be published");
+        let env = rx
+            .try_recv()
+            .expect("DeliveryStatus event should be published");
         assert_eq!(env.source, EventSource::ResendWebhook);
         match env.event {
             MailEvent::DeliveryStatus {
@@ -1329,7 +1359,9 @@ mod tests {
         assert!(stored.text_body.contains("Looks great"));
         assert!(!stored.raw_rfc2822.is_empty());
 
-        let env = rx.try_recv().expect("MessageReceived event should be published");
+        let env = rx
+            .try_recv()
+            .expect("MessageReceived event should be published");
         assert_eq!(env.source, EventSource::ResendInbound);
         match env.event {
             MailEvent::MessageReceived {

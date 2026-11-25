@@ -222,7 +222,10 @@ pub async fn handle_connection(
 
         // Special-case IDLE because it listens to both EventBus and client DONE line.
         if cmd.name == "IDLE" {
-            if !matches!(session.auth, AuthState::Authenticated | AuthState::Selected(_)) {
+            if !matches!(
+                session.auth,
+                AuthState::Authenticated | AuthState::Selected(_)
+            ) {
                 let _ = write_flush(
                     &mut reader,
                     format!("{} NO Authenticate first\r\n", cmd.tag).as_bytes(),
@@ -230,7 +233,10 @@ pub async fn handle_connection(
                 .await;
                 continue;
             }
-            match session.handle_idle(&cmd.tag, &mut reader, &mut shutdown).await {
+            match session
+                .handle_idle(&cmd.tag, &mut reader, &mut shutdown)
+                .await
+            {
                 Ok(true) => continue,
                 Ok(false) | Err(_) => break,
             }
@@ -317,11 +323,16 @@ impl ImapSession {
             }
             "NAMESPACE" => {
                 if !self.is_authenticated() {
-                    write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes())
-                        .await?;
+                    write_flush(
+                        stream,
+                        format!("{tag} NO Authenticate first\r\n").as_bytes(),
+                    )
+                    .await?;
                     return Ok(true);
                 }
-                let resp = format!("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n{tag} OK NAMESPACE completed\r\n");
+                let resp = format!(
+                    "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n{tag} OK NAMESPACE completed\r\n"
+                );
                 write_flush(stream, resp.as_bytes()).await?;
                 Ok(true)
             }
@@ -372,8 +383,11 @@ impl ImapSession {
             }
             "CHECK" => {
                 if !self.is_selected() {
-                    write_flush(stream, format!("{tag} NO Select a mailbox first\r\n").as_bytes())
-                        .await?;
+                    write_flush(
+                        stream,
+                        format!("{tag} NO Select a mailbox first\r\n").as_bytes(),
+                    )
+                    .await?;
                     return Ok(true);
                 }
                 self.flush_selected_updates(stream).await?;
@@ -572,7 +586,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         if args.len() < 2 {
@@ -617,10 +635,7 @@ impl ImapSession {
         }
 
         for mbx in &mailboxes {
-            if is_lsub
-                && !self.subscribed.is_empty()
-                && !self.subscribed.contains(&mbx.name)
-            {
+            if is_lsub && !self.subscribed.is_empty() && !self.subscribed.contains(&mbx.name) {
                 continue;
             }
             if !imap_wildcard_match(&full_pattern, &mbx.name, '/') {
@@ -656,7 +671,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         if args.len() < 2 {
@@ -717,7 +736,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         let Some(raw_mbx) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -747,7 +770,9 @@ impl ImapSession {
         out.push_str(&format!("* {} EXISTS\r\n", entries.len()));
         out.push_str("* 0 RECENT\r\n");
         if let Some(seq) = first_unseen {
-            out.push_str(&format!("* OK [UNSEEN {seq}] Message {seq} is first unseen\r\n"));
+            out.push_str(&format!(
+                "* OK [UNSEEN {seq}] Message {seq} is first unseen\r\n"
+            ));
         }
         out.push_str(&format!(
             "* OK [UIDVALIDITY {}] UIDs valid\r\n",
@@ -784,7 +809,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         let Some(name) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -829,7 +858,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         let Some(name) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -879,7 +912,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         if args.len() < 2 {
@@ -946,7 +983,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         let Some(raw_name) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -960,7 +1001,11 @@ impl ImapSession {
         let name = normalize_mailbox_name(&raw_name);
         if subscribe {
             self.subscribed.insert(name);
-            write_flush(stream, format!("{tag} OK SUBSCRIBE completed\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} OK SUBSCRIBE completed\r\n").as_bytes(),
+            )
+            .await?;
         } else {
             self.subscribed.remove(&name);
             write_flush(
@@ -979,7 +1024,11 @@ impl ImapSession {
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         if !self.is_authenticated() {
-            write_flush(stream, format!("{tag} NO Authenticate first\r\n").as_bytes()).await?;
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
             return Ok(());
         }
         if args.len() < 2 {
@@ -1114,11 +1163,7 @@ impl ImapSession {
                 .await?;
             }
             Err(AppError::NotFound(msg)) => {
-                write_flush(
-                    stream,
-                    format!("{tag} NO [TRYCREATE] {msg}\r\n").as_bytes(),
-                )
-                .await?;
+                write_flush(stream, format!("{tag} NO [TRYCREATE] {msg}\r\n").as_bytes()).await?;
             }
             Err(err) => {
                 write_flush(stream, format!("{tag} NO {err}\r\n").as_bytes()).await?;
@@ -1135,7 +1180,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1155,7 +1204,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1220,8 +1273,14 @@ impl ImapSession {
             "FETCH" => self.handle_fetch(tag, rest, true, stream).await,
             "SEARCH" => self.handle_search(tag, rest, true, stream).await,
             "STORE" => self.handle_store(tag, rest, true, stream).await,
-            "COPY" => self.handle_copy_or_move(tag, rest, true, false, stream).await,
-            "MOVE" => self.handle_copy_or_move(tag, rest, true, true, stream).await,
+            "COPY" => {
+                self.handle_copy_or_move(tag, rest, true, false, stream)
+                    .await
+            }
+            "MOVE" => {
+                self.handle_copy_or_move(tag, rest, true, true, stream)
+                    .await
+            }
             "EXPUNGE" => self.handle_expunge(tag, stream).await,
             other => {
                 write_flush(
@@ -1243,7 +1302,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1290,7 +1353,10 @@ impl ImapSession {
         let line = if nums.is_empty() {
             format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n")
         } else {
-            format!("* SEARCH {}\r\n{tag} OK SEARCH completed\r\n", nums.join(" "))
+            format!(
+                "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
+                nums.join(" ")
+            )
         };
         write_flush(stream, line.as_bytes()).await?;
         Ok(())
@@ -1306,7 +1372,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1343,9 +1413,7 @@ impl ImapSession {
             items.insert(0, "UID".to_string());
         }
 
-        let needs_labels_map = items
-            .iter()
-            .any(|i| i.eq_ignore_ascii_case("X-GM-LABELS"));
+        let needs_labels_map = items.iter().any(|i| i.eq_ignore_ascii_case("X-GM-LABELS"));
         let label_name_map: HashMap<String, String> = if needs_labels_map {
             self.state
                 .store
@@ -1380,7 +1448,9 @@ impl ImapSession {
                     mark_seen = true;
                 }
             }
-            if mark_seen && !sel.read_only && current_entry.label_ids.iter().any(|l| l == LABEL_UNREAD)
+            if mark_seen
+                && !sel.read_only
+                && current_entry.label_ids.iter().any(|l| l == LABEL_UNREAD)
             {
                 let is_flagged = current_entry.label_ids.iter().any(|l| l == LABEL_STARRED);
                 let is_draft = current_entry.label_ids.iter().any(|l| l == LABEL_DRAFT);
@@ -1415,13 +1485,7 @@ impl ImapSession {
                 if item.eq_ignore_ascii_case("FLAGS") {
                     emitted_flags = true;
                 }
-                write_fetch_item(
-                    &mut resp,
-                    item,
-                    &current_entry,
-                    &msg,
-                    &label_name_map,
-                );
+                write_fetch_item(&mut resp, item, &current_entry, &msg, &label_name_map);
             }
 
             if mark_seen && !sel.read_only && !emitted_flags {
@@ -1454,7 +1518,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1635,7 +1703,11 @@ impl ImapSession {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => {
-                write_flush(stream, format!("{tag} NO No mailbox selected\r\n").as_bytes()).await?;
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1803,7 +1875,10 @@ impl ImapSession {
     }
 
     /// Diff the selected mailbox against its cached snapshot and emit untagged `EXPUNGE`, `EXISTS`, and `FETCH (FLAGS ...)` responses.
-    async fn flush_selected_updates(&mut self, stream: &mut BufReader<ImapStream>) -> AppResult<()> {
+    async fn flush_selected_updates(
+        &mut self,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
         let sel = match &self.auth {
             AuthState::Selected(s) => s.clone(),
             _ => return Ok(()),
@@ -1844,10 +1919,7 @@ impl ImapSession {
                 let old_flags = format_imap_flags(old);
                 let new_flags = format_imap_flags(entry);
                 if old_flags != new_flags {
-                    out.push_str(&format!(
-                        "* {} FETCH (FLAGS ({new_flags}))\r\n",
-                        entry.seq
-                    ));
+                    out.push_str(&format!("* {} FETCH (FLAGS ({new_flags}))\r\n", entry.seq));
                 }
             }
         }
@@ -2373,9 +2445,9 @@ fn eval_search_criteria(
         SearchKey::SentOn(d) => sent_date(msg).or(internal_date).is_some_and(|md| md == *d),
         SearchKey::Larger(n) => (entry.size_estimate as usize) > *n,
         SearchKey::Smaller(n) => (entry.size_estimate as usize) < *n,
-        SearchKey::XGmMsgId(target) => msg.is_some_and(|m| {
-            derive_xgm_u64(m.upstream_gmail_id.as_deref(), &m.id) == *target
-        }),
+        SearchKey::XGmMsgId(target) => {
+            msg.is_some_and(|m| derive_xgm_u64(m.upstream_gmail_id.as_deref(), &m.id) == *target)
+        }
         SearchKey::XGmThrId(target) => msg.is_some_and(|m| {
             derive_xgm_u64(m.upstream_thread_id.as_deref(), &m.thread_id) == *target
         }),

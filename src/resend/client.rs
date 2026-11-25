@@ -150,10 +150,7 @@ pub(crate) fn map_resend_error(http_status: StatusCode, body: &[u8]) -> AppError
                 AppError::Forbidden(formatted)
             }
             ("not_found", _) | (_, 404) => AppError::NotFound(formatted),
-            (
-                "rate_limit_exceeded" | "daily_quota_exceeded" | "monthly_quota_exceeded",
-                _,
-            )
+            ("rate_limit_exceeded" | "daily_quota_exceeded" | "monthly_quota_exceeded", _)
             | (_, 429) => AppError::RateLimited(formatted),
             (
                 "concurrent_idempotent_requests"
@@ -185,7 +182,11 @@ pub(crate) fn map_resend_error(http_status: StatusCode, body: &[u8]) -> AppError
     }
 
     let raw_text = String::from_utf8_lossy(body);
-    let snippet: String = raw_text.trim().chars().take(MAX_RAW_ERROR_SNIPPET_CHARS).collect();
+    let snippet: String = raw_text
+        .trim()
+        .chars()
+        .take(MAX_RAW_ERROR_SNIPPET_CHARS)
+        .collect();
     let message = if snippet.is_empty() {
         format!("Resend returned HTTP {}", http_status.as_u16())
     } else {
@@ -293,12 +294,15 @@ impl ResendClient for HttpResendClient {
             return Err(map_resend_error(status, &body));
         }
 
-        let parsed = serde_json::from_slice::<ResendReceivedAttachmentsResponse>(&body).map_err(
-            |err| AppError::Upstream {
-                status: StatusCode::BAD_GATEWAY.as_u16(),
-                message: format!("Failed to decode Resend received attachments response: {err}"),
-            },
-        )?;
+        let parsed =
+            serde_json::from_slice::<ResendReceivedAttachmentsResponse>(&body).map_err(|err| {
+                AppError::Upstream {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    message: format!(
+                        "Failed to decode Resend received attachments response: {err}"
+                    ),
+                }
+            })?;
 
         Ok(parsed.data)
     }
@@ -421,10 +425,30 @@ mod tests {
             (401, "missing_api_key", "Missing API key", "unauthorized"),
             (403, "restricted_api_key", "Restricted key", "forbidden"),
             (404, "not_found", "Not found", "not_found"),
-            (409, "concurrent_idempotent_requests", "Duplicate", "conflict"),
-            (422, "validation_error", "Invalid to field", "validation_error"),
-            (429, "rate_limit_exceeded", "Too many requests", "rate_limited"),
-            (500, "application_error", "Internal failure", "upstream_error"),
+            (
+                409,
+                "concurrent_idempotent_requests",
+                "Duplicate",
+                "conflict",
+            ),
+            (
+                422,
+                "validation_error",
+                "Invalid to field",
+                "validation_error",
+            ),
+            (
+                429,
+                "rate_limit_exceeded",
+                "Too many requests",
+                "rate_limited",
+            ),
+            (
+                500,
+                "application_error",
+                "Internal failure",
+                "upstream_error",
+            ),
         ];
 
         for (status, name, msg, expected_code) in cases {
@@ -531,7 +555,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/downloads/raw-eml"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"From: sender@external.com\r\n\r\nRaw body"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"From: sender@external.com\r\n\r\nRaw body"),
+            )
             .expect(1)
             .mount(&server)
             .await;

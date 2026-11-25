@@ -55,20 +55,18 @@ impl QueryParams {
     pub fn get_usize(&self, key: &str) -> AppResult<Option<usize>> {
         match self.get(key) {
             None => Ok(None),
-            Some(v) => v
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|_| AppError::BadRequest(format!("Invalid integer value '{v}' for '{key}'"))),
+            Some(v) => v.parse::<usize>().map(Some).map_err(|_| {
+                AppError::BadRequest(format!("Invalid integer value '{v}' for '{key}'"))
+            }),
         }
     }
 
     pub fn get_u64(&self, key: &str) -> AppResult<Option<u64>> {
         match self.get(key) {
             None => Ok(None),
-            Some(v) => v
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| AppError::BadRequest(format!("Invalid uint64 value '{v}' for '{key}'"))),
+            Some(v) => v.parse::<u64>().map(Some).map_err(|_| {
+                AppError::BadRequest(format!("Invalid uint64 value '{v}' for '{key}'"))
+            }),
         }
     }
 
@@ -114,7 +112,10 @@ impl QueryParams {
             .get("pageToken")
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
-        let q = self.get("q").filter(|s| !s.is_empty()).map(ToOwned::to_owned);
+        let q = self
+            .get("q")
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         let include_spam_trash = self.get_bool("includeSpamTrash", false)?;
 
         Ok(MessageListQuery {
@@ -129,9 +130,9 @@ impl QueryParams {
     /// Parse Gmail `history.list` query parameters (`startHistoryId`, `maxResults`, `pageToken`,
     /// `labelId`, repeatable `historyTypes`).
     pub fn parse_history_list_query(&self) -> AppResult<HistoryListQuery> {
-        let start_history_id = self
-            .get_u64("startHistoryId")?
-            .ok_or_else(|| AppError::BadRequest("Missing required parameter 'startHistoryId'".to_string()))?;
+        let start_history_id = self.get_u64("startHistoryId")?.ok_or_else(|| {
+            AppError::BadRequest("Missing required parameter 'startHistoryId'".to_string())
+        })?;
 
         let max_results = match self.get_usize("maxResults")? {
             Some(0) => {

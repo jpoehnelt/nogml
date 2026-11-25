@@ -30,7 +30,9 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> AppResult<TlsAcc
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .map_err(|e| AppError::Config(format!("Failed to open IMAP TLS cert {cert_path:?}: {e}")))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AppError::Config(format!("Failed to parse IMAP TLS cert {cert_path:?}: {e}")))?;
+        .map_err(|e| {
+            AppError::Config(format!("Failed to parse IMAP TLS cert {cert_path:?}: {e}"))
+        })?;
     if certs.is_empty() {
         return Err(AppError::Config(format!(
             "No certificates found in {cert_path:?}"
@@ -73,9 +75,9 @@ pub async fn serve_imap(state: AppState, shutdown: watch::Receiver<bool>) -> App
 
     let plain_listener = match state.config.imap_bind {
         Some(addr) => {
-            let l = TcpListener::bind(addr).await.map_err(|e| {
-                AppError::Internal(format!("Failed to bind IMAP TCP {addr}: {e}"))
-            })?;
+            let l = TcpListener::bind(addr)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to bind IMAP TCP {addr}: {e}")))?;
             info!(%addr, starttls = tls_acceptor.is_some(), "nogml IMAP4rev1 listener started");
             Some(l)
         }
@@ -84,9 +86,9 @@ pub async fn serve_imap(state: AppState, shutdown: watch::Receiver<bool>) -> App
 
     let tls_listener = match state.config.imap_tls_bind {
         Some(addr) => {
-            let l = TcpListener::bind(addr).await.map_err(|e| {
-                AppError::Internal(format!("Failed to bind IMAP TLS {addr}: {e}"))
-            })?;
+            let l = TcpListener::bind(addr)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to bind IMAP TLS {addr}: {e}")))?;
             info!(%addr, "nogml IMAP4rev1 implicit TLS listener started");
             Some(l)
         }

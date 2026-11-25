@@ -163,10 +163,9 @@ impl AppError {
             Self::NotFound(_) => ("NOT_FOUND", "notFound"),
             Self::Conflict(_) => ("ALREADY_EXISTS", "conflict"),
             Self::RateLimited(_) => ("RESOURCE_EXHAUSTED", "rateLimitExceeded"),
-            Self::Upstream { .. }
-            | Self::Storage(_)
-            | Self::Config(_)
-            | Self::Internal(_) => ("INTERNAL", "backendError"),
+            Self::Upstream { .. } | Self::Storage(_) | Self::Config(_) | Self::Internal(_) => {
+                ("INTERNAL", "backendError")
+            }
         }
     }
 

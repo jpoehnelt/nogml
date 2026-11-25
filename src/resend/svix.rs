@@ -193,7 +193,9 @@ mod tests {
     fn build_headers(prefix: &str, id: &str, ts: &str, sig: &str) -> HeaderMap {
         let mut map = HeaderMap::new();
         map.insert(
-            format!("{prefix}-id").parse::<axum::http::HeaderName>().unwrap(),
+            format!("{prefix}-id")
+                .parse::<axum::http::HeaderName>()
+                .unwrap(),
             HeaderValue::from_str(id).unwrap(),
         );
         map.insert(

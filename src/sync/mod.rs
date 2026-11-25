@@ -38,12 +38,20 @@ pub(crate) async fn apply_sync_inbound_filter(
     input: &mut NewMessageInput,
 ) -> AppResult<bool> {
     if let Some(ref uid) = input.upstream_gmail_id
-        && state.store.find_message_by_upstream_id(uid).await?.is_some()
+        && state
+            .store
+            .find_message_by_upstream_id(uid)
+            .await?
+            .is_some()
     {
         return Ok(true);
     }
     if let Some(ref mid) = input.rfc822_message_id
-        && state.store.find_message_by_rfc_message_id(mid).await?.is_some()
+        && state
+            .store
+            .find_message_by_rfc_message_id(mid)
+            .await?
+            .is_some()
     {
         return Ok(true);
     }
@@ -251,7 +259,10 @@ pub async fn run_background_sync(state: AppState, mut shutdown: watch::Receiver<
         return;
     }
 
-    info!(interval_secs, "Starting background upstream Gmail sync loop");
+    info!(
+        interval_secs,
+        "Starting background upstream Gmail sync loop"
+    );
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

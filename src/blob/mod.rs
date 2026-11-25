@@ -37,10 +37,7 @@ pub fn attachment_blob_key(message_id: &str, attachment_id: &str) -> String {
 pub fn sanitize_blob_key(key: &str) -> AppResult<PathBuf> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
-        return Err(AppError::validation(
-            "Blob key must not be empty",
-            None,
-        ));
+        return Err(AppError::validation("Blob key must not be empty", None));
     }
     if trimmed.starts_with('/') || trimmed.contains('\\') {
         return Err(AppError::validation(
@@ -84,7 +81,10 @@ pub fn sanitize_blob_key(key: &str) -> AppResult<PathBuf> {
     }
 
     if segment_count == 0 {
-        return Err(AppError::validation("Blob key must contain at least one segment", None));
+        return Err(AppError::validation(
+            "Blob key must contain at least one segment",
+            None,
+        ));
     }
 
     Ok(rel)
@@ -212,7 +212,10 @@ impl BlobStore for FsBlobStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> AppResult<()> {
         let target = self.resolve_path(key)?;
         let parent = target.parent().ok_or_else(|| {
-            AppError::Storage(format!("Blob path '{}' has no parent directory", target.display()))
+            AppError::Storage(format!(
+                "Blob path '{}' has no parent directory",
+                target.display()
+            ))
         })?;
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             AppError::Storage(format!(
@@ -324,7 +327,10 @@ mod tests {
         assert_eq!(store.get(&key).await.unwrap(), None);
 
         store.put(&key, b"raw-email-bytes").await.unwrap();
-        assert_eq!(store.get(&key).await.unwrap(), Some(b"raw-email-bytes".to_vec()));
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            Some(b"raw-email-bytes".to_vec())
+        );
 
         store.delete(&key).await.unwrap();
         assert_eq!(store.get(&key).await.unwrap(), None);
