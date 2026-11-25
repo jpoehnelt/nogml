@@ -37,6 +37,7 @@ use crate::{
     error::AppResult,
     events::EventBus,
     filter::{InboundFilter, open_filter},
+    gmail::upload::ResumableUploadStore,
     resend::{HttpResendClient, ResendClient, ResendTransport},
     search_index::{SearchIndex, StoreSearchIndex, open_search_index},
     storage::{MailStore, StoredAttachment, StoredMessage, open_store},
@@ -76,6 +77,7 @@ pub struct AppState {
     pub resend: Arc<dyn ResendClient>,
     pub events: EventBus,
     pub sync_lock: Arc<Mutex<()>>,
+    pub resumable_uploads: Arc<ResumableUploadStore>,
 }
 
 impl AppState {
@@ -105,6 +107,7 @@ impl AppState {
             resend,
             events: EventBus::new(),
             sync_lock: Arc::new(Mutex::new(())),
+            resumable_uploads: Arc::new(ResumableUploadStore::new()),
         })
     }
 
@@ -149,6 +152,7 @@ impl AppState {
             resend,
             events: EventBus::new(),
             sync_lock: Arc::new(Mutex::new(())),
+            resumable_uploads: Arc::new(ResumableUploadStore::new()),
         }
     }
 
