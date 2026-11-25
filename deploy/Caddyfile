@@ -1,0 +1,16 @@
+{$NOGML_DOMAIN:mail.example.com} {
+	encode zstd gzip
+
+	request_body {
+		max_size 40MB
+	}
+
+	reverse_proxy nogml:8080 {
+		# Disable response buffering so SSE (/v1/events) and MCP Streamable HTTP (/mcp)
+		# flush frames immediately.
+		flush_interval -1
+
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

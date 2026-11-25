@@ -17,6 +17,7 @@ pub mod oauth2;
 pub mod resend;
 pub mod search;
 pub mod search_index;
+pub mod secrets;
 pub mod server;
 pub mod storage;
 pub mod sync;

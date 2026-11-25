@@ -1,0 +1,54 @@
+[Unit]
+Description=nogml AI-first headless email server
+Documentation=https://github.com/jpoehnelt/nogml/blob/main/docs/self-hosting.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=nogml
+StateDirectoryMode=0700
+ConfigurationDirectory=nogml
+WorkingDirectory=/var/lib/nogml
+
+# Load secrets into a private tmpfs mounted at $CREDENTIALS_DIRECTORY (%d).
+# Plaintext secrets stay owned by root:root (mode 0600) in /etc/nogml/secrets/
+# and are never placed in environment variables or readable by other users.
+LoadCredential=auth_tokens:/etc/nogml/secrets/auth_tokens
+LoadCredential=resend_api_key:/etc/nogml/secrets/resend_api_key
+LoadCredential=resend_webhook_secret:/etc/nogml/secrets/resend_webhook_secret
+# Optional IMAP TLS private key or password:
+# LoadCredential=imap_password:/etc/nogml/secrets/imap_password
+
+Environment=RUST_LOG=info
+Environment=NOGML_CONFIG=/etc/nogml/nogml.toml
+Environment=NOGML_AUTH_TOKENS_FILE=%d/auth_tokens
+Environment=RESEND_API_KEY_FILE=%d/resend_api_key
+Environment=RESEND_WEBHOOK_SECRET_FILE=%d/resend_webhook_secret
+
+# Validate configuration and secret references before starting the server.
+ExecStartPre=/usr/local/bin/nogml config check --config /etc/nogml/nogml.toml
+ExecStart=/usr/local/bin/nogml serve --config /etc/nogml/nogml.toml
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Sandboxing and filesystem hardening.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/nogml
+
+[Install]
+WantedBy=multi-user.target
