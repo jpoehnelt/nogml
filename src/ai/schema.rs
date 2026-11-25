@@ -155,6 +155,21 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "description": "List all system and user labels with message/thread counts.",
             "inputSchema": { "type": "object", "properties": {} }
         },
+        "mail.approvals": {
+            "endpoint": "GET /v1/approvals | GET /v1/approvals/{id} | POST /v1/approvals/{id}/approve | POST /v1/approvals/{id}/reject",
+            "description": "List, inspect, approve, or reject outbound emails held for human approval.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "approve", "reject"] },
+                    "id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "approved", "rejected", "expired", "all"], "default": "pending" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                    "decided_by": { "type": "string" },
+                    "note": { "type": "string" }
+                }
+            }
+        },
         "mail.watch": {
             "endpoint": "GET /v1/events",
             "description": "Stream real-time mail events via SSE (HTTP) or NDJSON (CLI).",
@@ -203,6 +218,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "triage" | "triage_thread" => "mail.triage",
             "modify" | "modify_labels" => "mail.modify_labels",
             "labels" | "list_labels" => "mail.labels",
+            "approvals" | "approve" | "reject" => "mail.approvals",
             "watch" | "events" => "mail.watch",
             "sync" | "sync_gmail" => "sync.gmail",
             "sync_status" | "status" => "sync.status",
@@ -241,6 +257,10 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "POST /v1/drafts",
             "POST /v1/drafts/{id}/send",
             "DELETE /v1/drafts/{id}",
+            "GET /v1/approvals",
+            "GET /v1/approvals/{id}",
+            "POST /v1/approvals/{id}/approve",
+            "POST /v1/approvals/{id}/reject",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",

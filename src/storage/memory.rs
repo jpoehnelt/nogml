@@ -19,10 +19,11 @@ use crate::{
         ThreadSummary, is_system_label,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage, HistoryEventKind,
-        HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry, MailStore,
-        MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment,
-        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, DraftListPage,
+        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
+        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, WatchSubscription, parse_simple_email_address,
     },
@@ -82,6 +83,7 @@ struct MemoryState {
     sync_states: HashMap<String, SyncState>,
     watch: Option<WatchSubscription>,
     settings: UserSettings,
+    pending_approvals: HashMap<String, PendingApproval>,
 }
 
 impl MemoryState {
@@ -132,6 +134,7 @@ impl MemoryState {
             sync_states: HashMap::new(),
             watch: None,
             settings: UserSettings::default_for_email(default_email),
+            pending_approvals: HashMap::new(),
         }
     }
 
@@ -2728,6 +2731,130 @@ impl MailStore for MemoryStore {
         state.settings = settings.clone();
         Ok(settings)
     }
+
+    async fn create_pending_approval(
+        &self,
+        input: NewPendingApprovalInput,
+    ) -> AppResult<PendingApproval> {
+        let mut state = self.write_state()?;
+        let id = input
+            .id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("apr_{}", Uuid::new_v4().simple()));
+        if state.pending_approvals.contains_key(&id) {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' already exists"
+            )));
+        }
+        let item = PendingApproval {
+            id: id.clone(),
+            status: ApprovalStatus::Pending,
+            reason: input.reason,
+            requester: input.requester,
+            outbound_message: input.outbound_message,
+            reply_to_message_id: input.reply_to_message_id,
+            thread_id: input.thread_id,
+            draft_id: input.draft_id,
+            sent_message_id: None,
+            provider_message_id: None,
+            decided_by: None,
+            decision_note: None,
+            created_at_ms: input.created_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            decided_at_ms: None,
+        };
+        state.pending_approvals.insert(id, item.clone());
+        Ok(item)
+    }
+
+    async fn get_pending_approval(&self, id: &str) -> AppResult<Option<PendingApproval>> {
+        let state = self.read_state()?;
+        let now_ms = Utc::now().timestamp_millis();
+        Ok(state.pending_approvals.get(id).cloned().map(|mut item| {
+            if item.status == ApprovalStatus::Pending && item.expires_at_ms <= now_ms {
+                item.status = ApprovalStatus::Expired;
+            }
+            item
+        }))
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        status: Option<ApprovalStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<PendingApproval>> {
+        let state = self.read_state()?;
+        let limit = if limit == 0 { 20 } else { limit };
+        let now_ms = Utc::now().timestamp_millis();
+
+        let mut items: Vec<PendingApproval> = state
+            .pending_approvals
+            .values()
+            .cloned()
+            .map(|mut item| {
+                if item.status == ApprovalStatus::Pending && item.expires_at_ms <= now_ms {
+                    item.status = ApprovalStatus::Expired;
+                }
+                item
+            })
+            .filter(|item| status.is_none_or(|wanted| item.status == wanted))
+            .collect();
+
+        items.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn resolve_pending_approval(
+        &self,
+        id: &str,
+        status: ApprovalStatus,
+        decided_by: Option<String>,
+        note: Option<String>,
+        sent_message_id: Option<String>,
+        provider_message_id: Option<String>,
+    ) -> AppResult<PendingApproval> {
+        if !matches!(status, ApprovalStatus::Approved | ApprovalStatus::Rejected) {
+            return Err(AppError::BadRequest(
+                "Target approval resolution status must be 'approved' or 'rejected'".to_string(),
+            ));
+        }
+
+        let mut state = self.write_state()?;
+        let now_ms = Utc::now().timestamp_millis();
+        let entry = state
+            .pending_approvals
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+
+        if entry.status != ApprovalStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' is already {}",
+                entry.status
+            )));
+        }
+
+        if entry.expires_at_ms <= now_ms {
+            entry.status = ApprovalStatus::Expired;
+            if entry.decided_at_ms.is_none() {
+                entry.decided_at_ms = Some(now_ms);
+            }
+            return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+        }
+
+        entry.status = status;
+        entry.decided_by = decided_by;
+        entry.decision_note = note;
+        entry.sent_message_id = sent_message_id;
+        entry.provider_message_id = provider_message_id;
+        entry.decided_at_ms = Some(now_ms);
+
+        Ok(entry.clone())
+    }
 }
 
 #[cfg(test)]
@@ -3221,6 +3348,190 @@ mod tests {
 
         assert!(store.delete_thread(&s1.thread_id).await.unwrap());
         assert!(store.get_thread(&s1.thread_id).await.unwrap().is_none());
+
+        // 10. Pending approval queue parity (create, get, list, atomic resolve, expiration, 409 conflict)
+        let now_ms = Utc::now().timestamp_millis();
+        let mut outbound = crate::transport::OutboundMessage {
+            from: "user@example.com".to_string(),
+            to: vec!["partner@example.org".to_string()],
+            cc: vec!["cc@example.org".to_string()],
+            bcc: vec!["bcc@example.org".to_string()],
+            subject: "Approval contract check".to_string(),
+            text: Some("Please approve".to_string()),
+            raw_rfc2822: b"From: user@example.com\r\nTo: partner@example.org\r\nSubject: Approval contract check\r\n\r\nPlease approve".to_vec(),
+            ..Default::default()
+        };
+        outbound
+            .headers
+            .insert("Message-ID".to_string(), "<apr-1@example.com>".to_string());
+
+        let a1 = store
+            .create_pending_approval(NewPendingApprovalInput {
+                id: None,
+                reason: "manager signoff".to_string(),
+                requester: Some(crate::auth::Principal::full_access("agent@example.com")),
+                outbound_message: outbound.clone(),
+                reply_to_message_id: Some("parent_1".to_string()),
+                thread_id: Some("thr_apr_1".to_string()),
+                draft_id: Some("drf_apr_1".to_string()),
+                created_at_ms: now_ms - 10_000,
+                expires_at_ms: now_ms + 3_600_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(a1.status, ApprovalStatus::Pending);
+        assert_eq!(a1.outbound_message, outbound);
+        assert_eq!(
+            a1.requester.as_ref().map(|p| p.mailbox_id.as_str()),
+            Some("agent@example.com")
+        );
+
+        let a2 = store
+            .create_pending_approval(NewPendingApprovalInput {
+                id: None,
+                reason: "second approval".to_string(),
+                requester: None,
+                outbound_message: outbound.clone(),
+                reply_to_message_id: None,
+                thread_id: None,
+                draft_id: None,
+                created_at_ms: now_ms - 5_000,
+                expires_at_ms: now_ms + 3_600_000,
+            })
+            .await
+            .unwrap();
+
+        let a_expired = store
+            .create_pending_approval(NewPendingApprovalInput {
+                id: None,
+                reason: "already expired".to_string(),
+                requester: None,
+                outbound_message: outbound,
+                reply_to_message_id: None,
+                thread_id: None,
+                draft_id: None,
+                created_at_ms: now_ms - 20_000,
+                expires_at_ms: now_ms - 1_000,
+            })
+            .await
+            .unwrap();
+
+        // Expired item reports Expired on get and is excluded from Pending list
+        let fetched_exp = store
+            .get_pending_approval(&a_expired.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_exp.status, ApprovalStatus::Expired);
+
+        let pending = store
+            .list_pending_approvals(Some(ApprovalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, a2.id); // newest first
+        assert_eq!(pending[1].id, a1.id);
+
+        let expired_list = store
+            .list_pending_approvals(Some(ApprovalStatus::Expired), 10)
+            .await
+            .unwrap();
+        assert_eq!(expired_list.len(), 1);
+        assert_eq!(expired_list[0].id, a_expired.id);
+
+        // Resolving expired returns 409 Conflict
+        assert!(matches!(
+            store
+                .resolve_pending_approval(
+                    &a_expired.id,
+                    ApprovalStatus::Approved,
+                    Some("human".to_string()),
+                    None,
+                    Some("msg_x".to_string()),
+                    Some("prov_x".to_string()),
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        // Resolve a1 -> Approved
+        let approved = store
+            .resolve_pending_approval(
+                &a1.id,
+                ApprovalStatus::Approved,
+                Some("alice@example.com".to_string()),
+                Some("Approved!".to_string()),
+                Some("sent_msg_1".to_string()),
+                Some("prov_1".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status, ApprovalStatus::Approved);
+        assert_eq!(approved.decided_by.as_deref(), Some("alice@example.com"));
+        assert_eq!(approved.decision_note.as_deref(), Some("Approved!"));
+        assert_eq!(approved.sent_message_id.as_deref(), Some("sent_msg_1"));
+        assert_eq!(approved.provider_message_id.as_deref(), Some("prov_1"));
+        assert!(approved.decided_at_ms.is_some());
+
+        // Second resolve on a1 -> 409 Conflict
+        assert!(matches!(
+            store
+                .resolve_pending_approval(
+                    &a1.id,
+                    ApprovalStatus::Approved,
+                    Some("bob@example.com".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        // Resolve a2 -> Rejected
+        let rejected = store
+            .resolve_pending_approval(
+                &a2.id,
+                ApprovalStatus::Rejected,
+                Some("reviewer@example.com".to_string()),
+                Some("Do not send".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, ApprovalStatus::Rejected);
+        assert_eq!(rejected.decision_note.as_deref(), Some("Do not send"));
+        assert!(matches!(
+            store
+                .resolve_pending_approval(&a2.id, ApprovalStatus::Approved, None, None, None, None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        // Missing ID -> NotFound; Pending target -> BadRequest
+        assert!(matches!(
+            store
+                .resolve_pending_approval(
+                    "nonexistent",
+                    ApprovalStatus::Approved,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .resolve_pending_approval(&a1.id, ApprovalStatus::Pending, None, None, None, None)
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+
+        let all_approvals = store.list_pending_approvals(None, 10).await.unwrap();
+        assert_eq!(all_approvals.len(), 3);
     }
 
     #[tokio::test]

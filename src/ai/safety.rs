@@ -78,11 +78,12 @@ pub trait OutboundPolicy: Send + Sync {
 }
 
 /// Default [`OutboundPolicy`] driven by [`Config`] (`draft_only`, `draft_only_action`,
-/// `allowed_recipients`, `max_send_recipients`).
+/// `require_approval`, `allowed_recipients`, `max_send_recipients`).
 #[derive(Debug, Clone)]
 pub struct ConfigOutboundPolicy {
     draft_only: bool,
     draft_only_action: DraftOnlyAction,
+    require_approval: bool,
     allowed_recipients: Vec<String>,
     max_send_recipients: usize,
 }
@@ -92,6 +93,7 @@ impl ConfigOutboundPolicy {
         Self {
             draft_only: config.draft_only,
             draft_only_action: config.draft_only_action,
+            require_approval: config.require_approval,
             allowed_recipients: config.allowed_recipients.clone(),
             max_send_recipients: config.max_send_recipients,
         }
@@ -151,6 +153,13 @@ impl OutboundPolicy for ConfigOutboundPolicy {
                     reason: "Server is in draft_only mode (action=downgrade)".to_string(),
                 }),
             };
+        }
+
+        if self.require_approval {
+            return Ok(OutboundDecision::HoldForApproval {
+                reason: "Server requires human approval for outbound sends (require_approval=true)"
+                    .to_string(),
+            });
         }
 
         Ok(OutboundDecision::Allow)
@@ -214,6 +223,14 @@ impl OutboundPolicy for ConfigOutboundPolicy {
                     });
                 }
             }
+        }
+
+        if self.require_approval {
+            checks.push(PolicyCheck {
+                rule: "require_approval".to_string(),
+                passed: true,
+                detail: "require_approval is enabled; outbound send will be queued for human approval (HTTP 202)".to_string(),
+            });
         }
 
         checks
@@ -714,6 +731,12 @@ pub async fn evaluate_resolved_dry_run(
     if state.config.draft_only && state.config.draft_only_action == DraftOnlyAction::Downgrade {
         warnings.push(
             "draft_only=true with action=downgrade: executing this send will create/retain a draft instead of sending externally.".to_string(),
+        );
+    }
+
+    if state.config.require_approval && !state.config.draft_only {
+        warnings.push(
+            "require_approval=true: executing this send will hold the email in the pending approval queue until a human approves it.".to_string(),
         );
     }
 

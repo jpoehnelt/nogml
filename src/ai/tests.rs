@@ -861,6 +861,40 @@ impl MailStore for TestMailStore {
         self.data.write().unwrap().settings = Some(settings.clone());
         Ok(settings)
     }
+
+    async fn create_pending_approval(
+        &self,
+        _input: crate::storage::NewPendingApprovalInput,
+    ) -> AppResult<crate::storage::PendingApproval> {
+        unimplemented!()
+    }
+
+    async fn get_pending_approval(
+        &self,
+        _id: &str,
+    ) -> AppResult<Option<crate::storage::PendingApproval>> {
+        Ok(None)
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        _status: Option<crate::storage::ApprovalStatus>,
+        _limit: usize,
+    ) -> AppResult<Vec<crate::storage::PendingApproval>> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve_pending_approval(
+        &self,
+        _id: &str,
+        _status: crate::storage::ApprovalStatus,
+        _decided_by: Option<String>,
+        _note: Option<String>,
+        _sent_message_id: Option<String>,
+        _provider_message_id: Option<String>,
+    ) -> AppResult<crate::storage::PendingApproval> {
+        unimplemented!()
+    }
 }
 
 #[derive(Default)]

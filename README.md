@@ -13,7 +13,7 @@ Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME 
 
 ## Features
 
-- **AI REST API (`/v1`) and SSE (`/v1/events`)**: Returns parsed text and HTML bodies without base64 decoding. Supports quote stripping, body character limits, `?fields=` projection masks, `dry_run` send previews, `draft_only` and `allowed_recipients` guardrails, control and BiDi character stripping, and `Last-Event-ID` event replay.
+- **AI REST API (`/v1`) and SSE (`/v1/events`)**: Returns parsed text and HTML bodies without base64 decoding. Supports quote stripping, body character limits, `?fields=` projection masks, `dry_run` send previews, `draft_only`, `allowed_recipients`, and persistent human-in-the-loop send approvals (`/v1/approvals` with optional webhook notifications), control and BiDi character stripping, and `Last-Event-ID` event replay.
 - **Built-in MCP server (`nogml mcp` and `POST /mcp`)**: Implements JSON-RPC 2.0 over stdio (logging strictly to stderr) and Streamable HTTP. Exposes 12 tools (`search_emails`, `list_threads`, `read_thread`, `read_email`, `send_email`, `create_draft`, `send_draft`, `triage_thread`, `modify_labels`, `list_labels`, `sync_gmail`, `sync_status`) and `nogml://` resources.
 - **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...` (`media`, `multipart`, and chunked `resumable` uploads), `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
 - **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS. Maps Gmail labels to folders including `[Gmail]/All Mail`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-LABELS`, and pushes updates over `IDLE`.
@@ -41,13 +41,13 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 
 | Trait | Module | Built-in implementations | Role |
 | --- | --- | --- | --- |
-| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, history, IMAP UIDs, watch state, and sync state |
+| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, pending approvals, history, IMAP UIDs, watch state, and sync state |
 | `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
 | `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
 | `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
-| `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202, `Deny` returning 403) and `dry_run` checks |
+| `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202 and queueing for `/v1/approvals`, `Deny` returning 403) and `dry_run` checks |
 | `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | Pluggable upstream pull and optional bidirectional pushback sharing single-flight locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
 
 Query `GET /v1/capabilities` to see the active backend names under `.backends`.
@@ -108,6 +108,8 @@ nogml mail --url http://127.0.0.1:8080 threads --unread-only --limit 10
 nogml mail --url http://127.0.0.1:8080 search --q "invoice" --fields "messages(id,subject,from)"
 nogml mail --url http://127.0.0.1:8080 read <thread_id> --thread --strip-quotes
 nogml mail --url http://127.0.0.1:8080 send --to alice@example.com --subject "Update" --text "Ready." --dry-run
+nogml mail --url http://127.0.0.1:8080 approvals list --status pending
+nogml mail --url http://127.0.0.1:8080 approvals approve <approval_id> --note "Looks good"
 nogml mail --url http://127.0.0.1:8080 triage <thread_id> --archive true --mark-read true
 nogml mail --url http://127.0.0.1:8080 watch
 nogml schema --command send
@@ -193,6 +195,9 @@ Every CLI flag has a matching environment variable:
 | `NOGML_SMTP_HELO_DOMAIN` | `--smtp-helo-domain` | `NOGML_DEFAULT_DOMAIN` | Domain advertised in `EHLO` |
 | `NOGML_DRAFT_ONLY` | `--draft-only` | `false` | Prevent direct outbound sends |
 | `NOGML_DRAFT_ONLY_ACTION` | `--draft-only-action` | `block` | Action when `draft_only=true` (`block` or `downgrade`) |
+| `NOGML_REQUIRE_APPROVAL` | `--require-approval` | `false` | Hold outbound sends in the persistent approval queue until approved via `/v1/approvals` or CLI |
+| `NOGML_APPROVAL_TTL_SECS` | `--approval-ttl-secs` | `86400` | Time-to-live in seconds for pending outbound approval requests |
+| `NOGML_APPROVAL_WEBHOOK_URL` | `--approval-webhook-url` | *(none)* | Optional HTTP POST webhook URL (generic JSON and Slack-compatible `text`) notified when a send enters approval |
 | `NOGML_ALLOWED_RECIPIENTS` | `--allowed-recipients` | *(unrestricted)* | Comma-separated allowlist (`a@b.com`, `@domain.com`, `*.domain.com`) |
 | `NOGML_MAX_SEND_RECIPIENTS` | `--max-send-recipients` | `50` | Maximum recipients across `to`, `cc`, and `bcc` |
 | `NOGML_DEFAULT_MAX_BODY_CHARS` | `--default-max-body-chars` | `4000` | Default body character limit on AI and MCP reads (cap `100000`) |

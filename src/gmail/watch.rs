@@ -36,7 +36,9 @@ fn event_labels(event: &MailEvent) -> Option<Vec<&str>> {
         ),
         MailEvent::DraftCreated { .. }
         | MailEvent::DeliveryStatus { .. }
-        | MailEvent::SyncCompleted { .. } => None,
+        | MailEvent::SyncCompleted { .. }
+        | MailEvent::ApprovalRequested { .. }
+        | MailEvent::ApprovalResolved { .. } => None,
     }
 }
 

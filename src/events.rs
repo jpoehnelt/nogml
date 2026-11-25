@@ -78,6 +78,21 @@ pub enum MailEvent {
         messages_deleted: u64,
         history_id: Option<String>,
     },
+    ApprovalRequested {
+        approval_id: String,
+        reason: String,
+        to: Vec<String>,
+        subject: String,
+        thread_id: Option<String>,
+        draft_id: Option<String>,
+        expires_at: DateTime<Utc>,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        status: String,
+        decided_by: Option<String>,
+        sent_message_id: Option<String>,
+    },
 }
 
 impl MailEvent {
@@ -91,6 +106,8 @@ impl MailEvent {
             Self::DraftCreated { .. } => "draft_created",
             Self::DeliveryStatus { .. } => "delivery_status",
             Self::SyncCompleted { .. } => "sync_completed",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalResolved { .. } => "approval_resolved",
         }
     }
 
@@ -102,7 +119,10 @@ impl MailEvent {
             | Self::MessageUpdated { thread_id, .. }
             | Self::MessageDeleted { thread_id, .. }
             | Self::DraftCreated { thread_id, .. } => Some(thread_id.as_str()),
-            Self::DeliveryStatus { .. } | Self::SyncCompleted { .. } => None,
+            Self::ApprovalRequested { thread_id, .. } => thread_id.as_deref(),
+            Self::DeliveryStatus { .. }
+            | Self::SyncCompleted { .. }
+            | Self::ApprovalResolved { .. } => None,
         }
     }
 }

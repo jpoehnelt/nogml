@@ -21,7 +21,10 @@ pub mod storage;
 pub mod sync;
 pub mod transport;
 
-use std::sync::{Arc, Once};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex as StdMutex, Once},
+};
 
 use axum::Router;
 use tokio::sync::Mutex;
@@ -78,6 +81,8 @@ pub struct AppState {
     pub events: EventBus,
     pub sync_lock: Arc<Mutex<()>>,
     pub resumable_uploads: Arc<ResumableUploadStore>,
+    /// Tracks approval IDs currently being approved/rejected to prevent concurrent double-sends.
+    pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -108,6 +113,7 @@ impl AppState {
             events: EventBus::new(),
             sync_lock: Arc::new(Mutex::new(())),
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
+            approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 
@@ -153,6 +159,7 @@ impl AppState {
             events: EventBus::new(),
             sync_lock: Arc::new(Mutex::new(())),
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
+            approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 

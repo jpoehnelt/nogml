@@ -163,6 +163,12 @@ pub struct Config {
     // --- AI-first safety guardrails ---
     pub draft_only: bool,
     pub draft_only_action: DraftOnlyAction,
+    /// When `true`, `ConfigOutboundPolicy` holds all outbound sends for human approval (HTTP `202`).
+    pub require_approval: bool,
+    /// Time-to-live in seconds for pending human approval requests (default 86400s / 24h).
+    pub approval_ttl_secs: u64,
+    /// Optional webhook URL notified via HTTP POST whenever a send enters `HoldForApproval`.
+    pub approval_webhook_url: Option<String>,
     /// Empty = allow all recipients. Entries match exact email (case-insensitive) or `@domain` / `*.domain`.
     pub allowed_recipients: Vec<String>,
     pub max_send_recipients: usize,
@@ -296,6 +302,9 @@ impl Default for Config {
 
             draft_only: false,
             draft_only_action: DraftOnlyAction::Block,
+            require_approval: false,
+            approval_ttl_secs: 86_400,
+            approval_webhook_url: None,
             allowed_recipients: Vec::new(),
             max_send_recipients: 50,
             default_max_body_chars: 4000,

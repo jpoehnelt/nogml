@@ -13,12 +13,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    auth::Principal,
     config::{Config, StorageBackend},
     error::AppResult,
     models::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LabelColor, PopSettings,
         Profile, SendAs, ThreadSummary, VacationSettings,
     },
+    transport::OutboundMessage,
 };
 
 pub use memory::MemoryStore;
@@ -387,6 +389,90 @@ pub struct WatchSubscription {
     pub expiration_ms: i64,
 }
 
+// ============================================================================
+// Human-in-the-Loop Outbound Approval Queue Types
+// ============================================================================
+
+/// Lifecycle status of a held outbound email awaiting human approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl ApprovalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Persistent record for an outbound send held by `OutboundPolicy::HoldForApproval`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub id: String,
+    pub status: ApprovalStatus,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Principal>,
+    pub outbound_message: OutboundMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_note: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at_ms: Option<i64>,
+}
+
+/// Input used to enqueue a new pending human-in-the-loop approval.
+#[derive(Debug, Clone)]
+pub struct NewPendingApprovalInput {
+    pub id: Option<String>,
+    pub reason: String,
+    pub requester: Option<Principal>,
+    pub outbound_message: OutboundMessage,
+    pub reply_to_message_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub draft_id: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -611,6 +697,29 @@ pub trait MailStore: Send + Sync {
     async fn clear_watch(&self) -> AppResult<()>;
     async fn get_settings(&self) -> AppResult<UserSettings>;
     async fn save_settings(&self, settings: UserSettings) -> AppResult<UserSettings>;
+
+    // --- Human-in-the-Loop Outbound Approval Queue ---
+    async fn create_pending_approval(
+        &self,
+        input: NewPendingApprovalInput,
+    ) -> AppResult<PendingApproval>;
+    async fn get_pending_approval(&self, id: &str) -> AppResult<Option<PendingApproval>>;
+    async fn list_pending_approvals(
+        &self,
+        status: Option<ApprovalStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<PendingApproval>>;
+    /// Atomically transition a `Pending` approval to `Approved` or `Rejected`.
+    /// Returns `AppError::NotFound` if missing, or `AppError::Conflict` if already decided or expired.
+    async fn resolve_pending_approval(
+        &self,
+        id: &str,
+        status: ApprovalStatus,
+        decided_by: Option<String>,
+        note: Option<String>,
+        sent_message_id: Option<String>,
+        provider_message_id: Option<String>,
+    ) -> AppResult<PendingApproval>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite` or `memory`).
