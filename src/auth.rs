@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, Method, header},
     middleware::Next,
     response::Response,
 };
@@ -16,10 +16,19 @@ use crate::{
     AppState,
     config::Config,
     error::{AppError, AppResult},
+    oauth2::OAuth2Verifier,
 };
 
 /// Paths that are always exempt from bearer token authentication.
-const AUTH_EXEMPT_PATHS: &[&str] = &["/healthz", "/readyz", "/webhooks/resend", "/webhooks/ses"];
+const AUTH_EXEMPT_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/webhooks/resend",
+    "/webhooks/ses",
+    "/oauth2/token",
+    "/oauth2/authorize",
+    "/.well-known/oauth-authorization-server",
+];
 
 /// Maximum permitted length for resource identifiers (`message_id`, `thread_id`, `draft_id`, `label_id`).
 const MAX_RESOURCE_ID_LEN: usize = 256;
@@ -34,6 +43,18 @@ pub enum AuthScope {
     Admin,
 }
 
+impl AuthScope {
+    /// Canonical lowercase scope string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Send => "send",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 /// Optional per-principal agent safety overrides (e.g. from JWT claims or API key metadata).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentPolicyOverride {
@@ -43,6 +64,55 @@ pub struct AgentPolicyOverride {
     pub allowed_recipients: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_send_recipients: Option<usize>,
+}
+
+/// Configuration entry for a least-privilege scoped API key parsed from
+/// `NOGML_SCOPED_TOKENS` / `--scoped-tokens`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedTokenConfig {
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<AuthScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_recipients: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_send_recipients: Option<usize>,
+}
+
+impl ScopedTokenConfig {
+    /// Project this token definition into an authenticated [`Principal`].
+    pub fn to_principal(&self, default_mailbox: &str) -> Principal {
+        let mailbox_id = self
+            .mailbox_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default_mailbox)
+            .to_string();
+
+        let agent_policy = if self.draft_only.is_some()
+            || self.allowed_recipients.is_some()
+            || self.max_send_recipients.is_some()
+        {
+            Some(AgentPolicyOverride {
+                draft_only: self.draft_only,
+                allowed_recipients: self.allowed_recipients.clone(),
+                max_send_recipients: self.max_send_recipients,
+            })
+        } else {
+            None
+        };
+
+        Principal {
+            mailbox_id,
+            scopes: self.scopes.clone(),
+            agent_policy,
+        }
+    }
 }
 
 /// Authenticated caller identity inserted into HTTP request extensions and IMAP sessions.
@@ -72,6 +142,18 @@ impl Principal {
     pub fn has_scope(&self, scope: AuthScope) -> bool {
         self.scopes.contains(&AuthScope::Admin) || self.scopes.contains(&scope)
     }
+
+    /// Return `Ok(())` if the principal holds `scope` (or `Admin`), otherwise `403 Forbidden`.
+    pub fn require_scope(&self, scope: AuthScope) -> AppResult<()> {
+        if self.has_scope(scope) {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden(format!(
+                "Insufficient scope: '{}' scope required",
+                scope.as_str()
+            )))
+        }
+    }
 }
 
 /// Pluggable authentication provider for HTTP bearer tokens and IMAP credentials.
@@ -82,17 +164,44 @@ impl Principal {
 pub trait AuthProvider: Send + Sync {
     async fn authenticate_bearer(&self, token: Option<&str>) -> AppResult<Principal>;
     async fn authenticate_imap(&self, username: &str, password: &str) -> AppResult<Principal>;
+
+    /// Authenticate an IMAP `AUTHENTICATE XOAUTH2` exchange (`user=<user>\x01auth=Bearer <token>\x01\x01`).
+    ///
+    /// Defaults to validating `access_token` via [`Self::authenticate_bearer`] and verifying
+    /// `username` matches the resolved [`Principal::mailbox_id`].
+    async fn authenticate_xoauth2(
+        &self,
+        username: &str,
+        access_token: &str,
+    ) -> AppResult<Principal> {
+        if access_token.trim().is_empty() {
+            return Err(AppError::Unauthorized(
+                "Missing XOAUTH2 access token".to_string(),
+            ));
+        }
+        let principal = self.authenticate_bearer(Some(access_token)).await?;
+        if !username.eq_ignore_ascii_case(&principal.mailbox_id) {
+            return Err(AppError::Unauthorized(
+                "XOAUTH2 username does not match token mailbox".to_string(),
+            ));
+        }
+        Ok(principal)
+    }
+
     fn backend_name(&self) -> &'static str;
 }
 
-/// Default [`AuthProvider`] backed by static tokens and IMAP credentials from [`Config`].
+/// Default [`AuthProvider`] backed by static tokens, scoped API keys, optional local OAuth2
+/// HS256 JWTs, and IMAP credentials from [`Config`].
 ///
-/// Preserves constant-time SHA-256 token verification, open dev mode when `auth_tokens`
-/// is empty, and IMAP username/password fallback rules.
+/// Preserves constant-time SHA-256 token verification, open dev mode when no tokens or OAuth2
+/// settings are configured, and IMAP username/password fallback rules.
 #[derive(Debug, Clone)]
 pub struct StaticTokenAuthProvider {
     mailbox_id: String,
     auth_tokens: Vec<String>,
+    scoped_tokens: Vec<ScopedTokenConfig>,
+    oauth2: Option<OAuth2Verifier>,
     imap_username: String,
     imap_password: Option<String>,
 }
@@ -102,32 +211,76 @@ impl StaticTokenAuthProvider {
         Self {
             mailbox_id: config.user_email.clone(),
             auth_tokens: config.auth_tokens.clone(),
+            scoped_tokens: config.scoped_tokens.clone(),
+            oauth2: OAuth2Verifier::from_config(config),
             imap_username: config.effective_imap_username().to_string(),
             imap_password: config.effective_imap_password().map(str::to_string),
         }
+    }
+
+    fn auth_required(&self) -> bool {
+        !self.auth_tokens.is_empty() || !self.scoped_tokens.is_empty() || self.oauth2.is_some()
+    }
+
+    /// Compare `candidate` against all configured scoped tokens in constant time.
+    fn match_scoped_token(&self, candidate: &str) -> Option<Principal> {
+        if candidate.is_empty() || self.scoped_tokens.is_empty() {
+            return None;
+        }
+        let candidate_hash = Sha256::digest(candidate.as_bytes());
+        let mut matched_idx: Option<usize> = None;
+        for (idx, entry) in self.scoped_tokens.iter().enumerate() {
+            if entry.token.is_empty() {
+                continue;
+            }
+            let token_hash = Sha256::digest(entry.token.as_bytes());
+            if bool::from(candidate_hash.as_slice().ct_eq(token_hash.as_slice())) {
+                matched_idx = Some(idx);
+            }
+        }
+        matched_idx.map(|i| self.scoped_tokens[i].to_principal(&self.mailbox_id))
     }
 }
 
 #[async_trait]
 impl AuthProvider for StaticTokenAuthProvider {
     async fn authenticate_bearer(&self, token: Option<&str>) -> AppResult<Principal> {
-        if self.auth_tokens.is_empty() {
+        if !self.auth_required() {
             return Ok(Principal::full_access(&self.mailbox_id));
         }
 
-        let authorized = token
-            .is_some_and(|candidate| constant_time_token_matches(candidate, &self.auth_tokens));
-        if authorized {
-            Ok(Principal::full_access(&self.mailbox_id))
-        } else {
-            Err(AppError::Unauthorized(
-                "Invalid or missing credentials. Provide 'Authorization: Bearer <token>', 'X-API-Key', or '?access_token='."
-                    .to_string(),
-            ))
+        if let Some(candidate) = token {
+            if constant_time_token_matches(candidate, &self.auth_tokens) {
+                return Ok(Principal::full_access(&self.mailbox_id));
+            }
+            if let Some(principal) = self.match_scoped_token(candidate) {
+                return Ok(principal);
+            }
+            if let Some(ref verifier) = self.oauth2
+                && let Ok(principal) = verifier.verify_access_token(candidate)
+            {
+                return Ok(principal);
+            }
         }
+
+        Err(AppError::Unauthorized(
+            "Invalid or missing credentials. Provide 'Authorization: Bearer <token>', 'X-API-Key', or '?access_token='."
+                .to_string(),
+        ))
     }
 
     async fn authenticate_imap(&self, username: &str, password: &str) -> AppResult<Principal> {
+        if let Some(principal) = self.match_scoped_token(password) {
+            if username.eq_ignore_ascii_case(&principal.mailbox_id)
+                || username.eq_ignore_ascii_case(&self.imap_username)
+            {
+                return Ok(principal);
+            }
+            return Err(AppError::Unauthorized(
+                "Invalid IMAP credentials".to_string(),
+            ));
+        }
+
         if !username.eq_ignore_ascii_case(&self.imap_username) {
             return Err(AppError::Unauthorized(
                 "Invalid IMAP credentials".to_string(),
@@ -140,7 +293,7 @@ impl AuthProvider for StaticTokenAuthProvider {
                 let candidate_hash = Sha256::digest(password.as_bytes());
                 bool::from(expected_hash.as_slice().ct_eq(candidate_hash.as_slice()))
             }
-            None => self.auth_tokens.is_empty(),
+            None => !self.auth_required(),
         };
 
         if valid {
@@ -152,8 +305,34 @@ impl AuthProvider for StaticTokenAuthProvider {
         }
     }
 
+    async fn authenticate_xoauth2(
+        &self,
+        username: &str,
+        access_token: &str,
+    ) -> AppResult<Principal> {
+        if access_token.trim().is_empty() {
+            return Err(AppError::Unauthorized(
+                "Missing XOAUTH2 access token".to_string(),
+            ));
+        }
+        let principal = self.authenticate_bearer(Some(access_token)).await?;
+        if username.eq_ignore_ascii_case(&principal.mailbox_id)
+            || username.eq_ignore_ascii_case(&self.imap_username)
+        {
+            Ok(principal)
+        } else {
+            Err(AppError::Unauthorized(
+                "XOAUTH2 username does not match token mailbox".to_string(),
+            ))
+        }
+    }
+
     fn backend_name(&self) -> &'static str {
-        "static_token"
+        if self.oauth2.is_some() {
+            "oauth2"
+        } else {
+            "static_token"
+        }
     }
 }
 
@@ -221,11 +400,55 @@ pub fn extract_request_token(headers: &HeaderMap, query: Option<&str>) -> Option
     None
 }
 
-/// Axum middleware authenticating requests via `state.auth` (`Authorization: Bearer <token>`,
-/// `X-API-Key`, or `?access_token=`) and inserting the resolved [`Principal`] into request
-/// extensions.
+/// Determine the minimum [`AuthScope`] required for an HTTP `method` + `path`.
 ///
-/// Always exempts `/healthz`, `/readyz`, `/webhooks/resend`, and `/webhooks/ses`.
+/// Returns `None` for endpoints that enforce per-operation scopes internally
+/// (`/mcp` tools/resources, `/batch/gmail/v1` sub-requests) or CORS preflight (`OPTIONS`).
+pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
+    if method == Method::OPTIONS {
+        return None;
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+
+    if normalized == "/mcp" || normalized == "/batch/gmail/v1" {
+        return None;
+    }
+
+    if method == Method::GET || method == Method::HEAD {
+        return Some(AuthScope::Read);
+    }
+
+    // Outbound send endpoints require `Send`.
+    if normalized == "/v1/messages/send"
+        || (normalized.starts_with("/v1/drafts/") && normalized.ends_with("/send"))
+        || ((normalized.starts_with("/gmail/v1/users/")
+            || normalized.starts_with("/upload/gmail/v1/users/"))
+            && (normalized.ends_with("/messages/send") || normalized.ends_with("/drafts/send")))
+    {
+        return Some(AuthScope::Send);
+    }
+
+    // Account settings mutations and human-in-the-loop approval decisions require `Admin`.
+    if (normalized.starts_with("/gmail/v1/users/") && normalized.contains("/settings/"))
+        || (normalized.starts_with("/v1/approvals/")
+            && (normalized.ends_with("/approve") || normalized.ends_with("/reject")))
+    {
+        return Some(AuthScope::Admin);
+    }
+
+    // All other mutating endpoints (drafts, labels, triage, modify, insert/import,
+    // delete, watch/stop, sync) require `Write` (satisfied by `Write` or `Admin`).
+    Some(AuthScope::Write)
+}
+
+/// Axum middleware authenticating requests via `state.auth` (`Authorization: Bearer <token>`,
+/// `X-API-Key`, or `?access_token=`), enforcing [`required_http_scope`] (`403 Forbidden` on
+/// insufficient scope), and inserting the resolved [`Principal`] into request extensions.
+///
+/// Always exempts `/healthz`, `/readyz`, `/webhooks/resend`, `/webhooks/ses`,
+/// `/oauth2/token`, `/oauth2/authorize`, and `/.well-known/oauth-authorization-server`.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -237,18 +460,33 @@ pub async fn require_auth(
     }
 
     let token = extract_request_token(req.headers(), req.uri().query());
-    match state.auth.authenticate_bearer(token.as_deref()).await {
-        Ok(principal) => {
-            req.extensions_mut().insert(principal);
-            Ok(next.run(req).await)
-        }
-        Err(err) => {
-            if path == "/v1" || path.starts_with("/v1/") {
-                return Ok(err.into_ai_response());
+    let principal = if token.is_none()
+        && let Some(existing) = req.extensions().get::<Principal>().cloned()
+    {
+        existing
+    } else {
+        match state.auth.authenticate_bearer(token.as_deref()).await {
+            Ok(p) => p,
+            Err(err) => {
+                if path == "/v1" || path.starts_with("/v1/") {
+                    return Ok(err.into_ai_response());
+                }
+                return Err(err);
             }
-            Err(err)
         }
+    };
+
+    if let Some(required_scope) = required_http_scope(req.method(), &path)
+        && let Err(err) = principal.require_scope(required_scope)
+    {
+        if path == "/v1" || path.starts_with("/v1/") {
+            return Ok(err.into_ai_response());
+        }
+        return Err(err);
     }
+
+    req.extensions_mut().insert(principal);
+    Ok(next.run(req).await)
 }
 
 /// Reject control chars (`0x00..=0x1f`, `0x7f`), Unicode control chars, `..`, `/`, `\`,
@@ -519,6 +757,20 @@ mod tests {
         let app = test_router(test_state(vec!["tok-123", "tok-456"]));
 
         // Exempt endpoints bypass auth
+        for path in [
+            "/healthz",
+            "/readyz",
+            "/webhooks/resend",
+            "/webhooks/ses",
+            "/oauth2/token",
+            "/oauth2/authorize",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            assert!(
+                is_auth_exempt_path(path),
+                "path {path} should be marked auth-exempt"
+            );
+        }
         for path in ["/healthz", "/readyz", "/webhooks/resend", "/webhooks/ses"] {
             let res = app
                 .clone()
@@ -618,5 +870,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn required_http_scope_classification() {
+        assert_eq!(
+            required_http_scope(&Method::GET, "/v1/messages"),
+            Some(AuthScope::Read)
+        );
+        assert_eq!(
+            required_http_scope(&Method::GET, "/gmail/v1/users/me/messages"),
+            Some(AuthScope::Read)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/v1/messages/send"),
+            Some(AuthScope::Send)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/v1/drafts/dr_1/send"),
+            Some(AuthScope::Send)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/gmail/v1/users/me/messages/send"),
+            Some(AuthScope::Send)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/upload/gmail/v1/users/me/drafts/send"),
+            Some(AuthScope::Send)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/v1/drafts"),
+            Some(AuthScope::Write)
+        );
+        assert_eq!(
+            required_http_scope(&Method::POST, "/gmail/v1/users/me/messages/m1/modify"),
+            Some(AuthScope::Write)
+        );
+        assert_eq!(
+            required_http_scope(&Method::PUT, "/gmail/v1/users/me/settings/vacation"),
+            Some(AuthScope::Admin)
+        );
+        assert_eq!(
+            required_http_scope(&Method::GET, "/gmail/v1/users/me/settings/vacation"),
+            Some(AuthScope::Read)
+        );
+        assert_eq!(required_http_scope(&Method::POST, "/mcp"), None);
+        assert_eq!(required_http_scope(&Method::POST, "/batch/gmail/v1"), None);
+    }
+
+    #[tokio::test]
+    async fn scoped_tokens_and_xoauth2_provider_checks() {
+        let mut cfg = Config::for_test();
+        cfg.scoped_tokens = vec![ScopedTokenConfig {
+            token: "ro-tok".to_string(),
+            mailbox_id: None,
+            scopes: vec![AuthScope::Read],
+            draft_only: Some(true),
+            allowed_recipients: Some(vec!["@example.com".to_string()]),
+            max_send_recipients: Some(3),
+        }];
+        let provider = StaticTokenAuthProvider::from_config(&cfg);
+
+        // Missing token rejected when scoped_tokens is non-empty
+        assert!(provider.authenticate_bearer(None).await.is_err());
+
+        // Scoped token resolves Principal + agent_policy
+        let p = provider.authenticate_bearer(Some("ro-tok")).await.unwrap();
+        assert_eq!(p.mailbox_id, "agent@example.com");
+        assert!(p.has_scope(AuthScope::Read));
+        assert!(!p.has_scope(AuthScope::Write));
+        assert!(!p.has_scope(AuthScope::Send));
+        assert_eq!(p.agent_policy.as_ref().unwrap().draft_only, Some(true));
+        assert_eq!(
+            p.agent_policy.as_ref().unwrap().max_send_recipients,
+            Some(3)
+        );
+
+        // XOAUTH2 delegates to bearer auth and checks username
+        let xp = provider
+            .authenticate_xoauth2("agent@example.com", "ro-tok")
+            .await
+            .unwrap();
+        assert_eq!(xp, p);
+        assert!(
+            provider
+                .authenticate_xoauth2("wrong@example.com", "ro-tok")
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .authenticate_xoauth2("agent@example.com", "bad-tok")
+                .await
+                .is_err()
+        );
     }
 }

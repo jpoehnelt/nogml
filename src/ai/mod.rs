@@ -141,15 +141,18 @@ pub async fn execute_send_email_with_source(
     execute_send_email_with_context(state, req, None, source).await
 }
 
-/// Variant accepting the authenticated [`Principal`] (used by HTTP handlers for approval requester attribution).
+/// Variant accepting the authenticated [`Principal`] for approval requester attribution
+/// and per-agent [`crate::auth::AgentPolicyOverride`] enforcement.
 pub async fn execute_send_email_with_context(
     state: &AppState,
     req: AiSendEmailRequest,
     principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
+    let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());
     if req.dry_run {
-        let preview = evaluate_send_dry_run(state, &req).await?;
+        let preview =
+            safety::evaluate_send_dry_run_with_policy(state, &req, agent_policy.as_ref()).await?;
         return Ok(serde_json::to_value(preview)?);
     }
 
@@ -193,6 +196,7 @@ pub async fn execute_send_email_with_context(
         html: resolved.html.clone(),
         thread_id: resolved.thread_id.clone(),
         is_draft_send: false,
+        agent_policy,
     };
     let decision = state.outbound_policy.evaluate(&policy_check).await?;
 
@@ -491,7 +495,8 @@ pub async fn execute_send_draft_with_source(
     execute_send_draft_with_context(state, draft_id, req, None, source).await
 }
 
-/// Variant accepting the authenticated [`Principal`] for approval requester attribution.
+/// Variant accepting the authenticated [`Principal`] for approval requester attribution
+/// and per-agent [`crate::auth::AgentPolicyOverride`] enforcement.
 pub async fn execute_send_draft_with_context(
     state: &AppState,
     draft_id: &str,
@@ -499,6 +504,7 @@ pub async fn execute_send_draft_with_context(
     principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
+    let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());
     validate_resource_id(draft_id)?;
 
     let draft = state
@@ -523,6 +529,7 @@ pub async fn execute_send_draft_with_context(
             msg.in_reply_to.as_deref(),
             msg.references_header.as_deref(),
             Some(msg.raw_rfc2822.len()),
+            agent_policy.as_ref(),
         )
         .await?;
         return Ok(serde_json::to_value(preview)?);
@@ -565,6 +572,7 @@ pub async fn execute_send_draft_with_context(
         html: resolved.html.clone(),
         thread_id: resolved.thread_id.clone(),
         is_draft_send: true,
+        agent_policy,
     };
     match state.outbound_policy.evaluate(&policy_check).await? {
         OutboundDecision::Deny { code, reason, hint } => {
@@ -1988,6 +1996,7 @@ async fn get_capabilities(
         "sync_enabled": cfg.gmail_sync_configured(),
         "sync_mode": cfg.sync_mode,
         "imap_enabled": cfg.imap_bind.is_some() || cfg.imap_tls_bind.is_some(),
+        "oauth2_enabled": cfg.oauth2_enabled(),
         "active_filters": active_filters,
         "backends": {
             "storage": state.store.backend_name(),

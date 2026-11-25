@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::{
     AppState,
+    auth::AgentPolicyOverride,
     config::{Config, DraftOnlyAction},
     error::{AppError, AppResult},
     mime::{ComposeEmailInput, build_rfc2822},
@@ -30,6 +31,7 @@ pub struct OutboundCheck {
     pub html: Option<String>,
     pub thread_id: Option<String>,
     pub is_draft_send: bool,
+    pub agent_policy: Option<AgentPolicyOverride>,
 }
 
 impl OutboundCheck {
@@ -99,17 +101,41 @@ impl ConfigOutboundPolicy {
         }
     }
 
-    fn find_disallowed(&self, recipients: &[String]) -> Vec<String> {
-        if self.allowed_recipients.is_empty() {
+    fn effective_draft_only(&self, policy: Option<&AgentPolicyOverride>) -> bool {
+        self.draft_only || policy.and_then(|p| p.draft_only).unwrap_or(false)
+    }
+
+    fn effective_max_send_recipients(&self, policy: Option<&AgentPolicyOverride>) -> usize {
+        match policy.and_then(|p| p.max_send_recipients) {
+            Some(override_max) => self.max_send_recipients.min(override_max),
+            None => self.max_send_recipients,
+        }
+    }
+
+    fn find_disallowed(
+        &self,
+        recipients: &[String],
+        policy: Option<&AgentPolicyOverride>,
+    ) -> Vec<String> {
+        let token_rules = policy
+            .and_then(|p| p.allowed_recipients.as_deref())
+            .filter(|rules| !rules.is_empty());
+
+        if self.allowed_recipients.is_empty() && token_rules.is_none() {
             return Vec::new();
         }
         recipients
             .iter()
             .filter(|addr| {
-                !self
-                    .allowed_recipients
-                    .iter()
-                    .any(|rule| recipient_matches_rule(addr, rule))
+                let allowed_by_global = self.allowed_recipients.is_empty()
+                    || self
+                        .allowed_recipients
+                        .iter()
+                        .any(|rule| recipient_matches_rule(addr, rule));
+                let allowed_by_token = token_rules.is_none_or(|rules| {
+                    rules.iter().any(|rule| recipient_matches_rule(addr, rule))
+                });
+                !(allowed_by_global && allowed_by_token)
             })
             .cloned()
             .collect()
@@ -119,14 +145,13 @@ impl ConfigOutboundPolicy {
 #[async_trait]
 impl OutboundPolicy for ConfigOutboundPolicy {
     async fn evaluate(&self, check: &OutboundCheck) -> AppResult<OutboundDecision> {
+        let policy = check.agent_policy.as_ref();
         let all = check.all_recipients();
         let total = all.len();
-        if total > self.max_send_recipients {
+        let max_recipients = self.effective_max_send_recipients(policy);
+        if total > max_recipients {
             return Err(AppError::validation(
-                format!(
-                    "Recipient count ({total}) exceeds max_send_recipients ({})",
-                    self.max_send_recipients
-                ),
+                format!("Recipient count ({total}) exceeds max_send_recipients ({max_recipients})"),
                 Some(
                     "Reduce total recipients across to/cc/bcc or adjust NOGML_MAX_SEND_RECIPIENTS."
                         .to_string(),
@@ -134,23 +159,28 @@ impl OutboundPolicy for ConfigOutboundPolicy {
             ));
         }
 
-        let disallowed = self.find_disallowed(&all);
+        let disallowed = self.find_disallowed(&all, policy);
         if !disallowed.is_empty() {
             return Err(AppError::RecipientNotAllowed { disallowed });
         }
 
-        if self.draft_only {
+        if self.effective_draft_only(policy) {
+            let reason = if !self.draft_only {
+                "Outbound send blocked: token policy enforces draft_only mode".to_string()
+            } else {
+                "Outbound send blocked: server is in draft_only mode".to_string()
+            };
             return match self.draft_only_action {
                 DraftOnlyAction::Block => Ok(OutboundDecision::Deny {
                     code: "draft_only_mode".to_string(),
-                    reason: "Outbound send blocked: server is in draft_only mode".to_string(),
+                    reason,
                     hint: Some(
-                        "Server is in draft_only mode. Call create_draft instead, or pass dry_run: true to preview."
+                        "Direct send is blocked by draft_only policy. Call create_draft instead, or pass dry_run: true to preview."
                             .to_string(),
                     ),
                 }),
                 DraftOnlyAction::Downgrade => Ok(OutboundDecision::DowngradeToDraft {
-                    reason: "Server is in draft_only mode (action=downgrade)".to_string(),
+                    reason: "draft_only mode (action=downgrade)".to_string(),
                 }),
             };
         }
@@ -166,10 +196,17 @@ impl OutboundPolicy for ConfigOutboundPolicy {
     }
 
     fn policy_checks(&self, check: &OutboundCheck) -> Vec<PolicyCheck> {
+        let policy = check.agent_policy.as_ref();
         let all_recipients = check.all_recipients();
         let total_recipients = all_recipients.len();
-        let within_limit = total_recipients <= self.max_send_recipients;
-        let disallowed = self.find_disallowed(&all_recipients);
+        let max_recipients = self.effective_max_send_recipients(policy);
+        let within_limit = total_recipients <= max_recipients;
+        let disallowed = self.find_disallowed(&all_recipients, policy);
+        let allowlist_active = !self.allowed_recipients.is_empty()
+            || policy
+                .and_then(|p| p.allowed_recipients.as_deref())
+                .is_some_and(|r| !r.is_empty());
+        let draft_only = self.effective_draft_only(policy);
 
         let mut checks = vec![
             PolicyCheck {
@@ -177,20 +214,18 @@ impl OutboundPolicy for ConfigOutboundPolicy {
                 passed: within_limit,
                 detail: if within_limit {
                     format!(
-                        "{total_recipients} recipient(s) within max_send_recipients ({})",
-                        self.max_send_recipients
+                        "{total_recipients} recipient(s) within max_send_recipients ({max_recipients})"
                     )
                 } else {
                     format!(
-                        "{total_recipients} recipients exceed max_send_recipients ({})",
-                        self.max_send_recipients
+                        "{total_recipients} recipients exceed max_send_recipients ({max_recipients})"
                     )
                 },
             },
             PolicyCheck {
                 rule: "allowed_recipients".to_string(),
                 passed: disallowed.is_empty(),
-                detail: if self.allowed_recipients.is_empty() {
+                detail: if !allowlist_active {
                     "Recipient allowlist is disabled (all recipients permitted)".to_string()
                 } else if disallowed.is_empty() {
                     "All recipients match allowed_recipients policy".to_string()
@@ -200,7 +235,7 @@ impl OutboundPolicy for ConfigOutboundPolicy {
             },
         ];
 
-        if !self.draft_only {
+        if !draft_only {
             checks.push(PolicyCheck {
                 rule: "draft_only".to_string(),
                 passed: true,
@@ -212,14 +247,14 @@ impl OutboundPolicy for ConfigOutboundPolicy {
                     checks.push(PolicyCheck {
                         rule: "draft_only".to_string(),
                         passed: false,
-                        detail: "Server is in draft_only mode (action=block); outbound send would be rejected with 403 draft_only_mode".to_string(),
+                        detail: "draft_only mode is active (action=block); outbound send would be rejected with 403 draft_only_mode".to_string(),
                     });
                 }
                 DraftOnlyAction::Downgrade => {
                     checks.push(PolicyCheck {
                         rule: "draft_only".to_string(),
                         passed: true,
-                        detail: "Server is in draft_only mode (action=downgrade); send would be saved as a draft instead of sent".to_string(),
+                        detail: "draft_only mode is active (action=downgrade); send would be saved as a draft instead of sent".to_string(),
                     });
                 }
             }
@@ -583,6 +618,15 @@ pub async fn evaluate_send_dry_run(
     state: &AppState,
     req: &AiSendEmailRequest,
 ) -> AppResult<DryRunResponse> {
+    evaluate_send_dry_run_with_policy(state, req, None).await
+}
+
+/// Evaluate send dry-run with an optional per-principal [`AgentPolicyOverride`].
+pub async fn evaluate_send_dry_run_with_policy(
+    state: &AppState,
+    req: &AiSendEmailRequest,
+    agent_policy: Option<&AgentPolicyOverride>,
+) -> AppResult<DryRunResponse> {
     evaluate_resolved_dry_run(
         state,
         &req.to,
@@ -596,6 +640,7 @@ pub async fn evaluate_send_dry_run(
         None,
         None,
         None,
+        agent_policy,
     )
     .await
 }
@@ -614,6 +659,7 @@ pub async fn evaluate_resolved_dry_run(
     existing_in_reply_to: Option<&str>,
     existing_references: Option<&str>,
     existing_raw_len: Option<usize>,
+    agent_policy: Option<&AgentPolicyOverride>,
 ) -> AppResult<DryRunResponse> {
     let mut checks = Vec::new();
     let mut warnings = Vec::new();
@@ -725,10 +771,13 @@ pub async fn evaluate_resolved_dry_run(
         html: resolved.html.clone(),
         thread_id: resolved.thread_id.clone(),
         is_draft_send: existing_raw_len.is_some(),
+        agent_policy: agent_policy.cloned(),
     };
     checks.extend(state.outbound_policy.policy_checks(&outbound_check));
 
-    if state.config.draft_only && state.config.draft_only_action == DraftOnlyAction::Downgrade {
+    let effective_draft_only =
+        state.config.draft_only || agent_policy.and_then(|p| p.draft_only).unwrap_or(false);
+    if effective_draft_only && state.config.draft_only_action == DraftOnlyAction::Downgrade {
         warnings.push(
             "draft_only=true with action=downgrade: executing this send will create/retain a draft instead of sending externally.".to_string(),
         );

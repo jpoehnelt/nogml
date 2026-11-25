@@ -13,6 +13,7 @@ pub mod imap;
 pub mod mcp;
 pub mod mime;
 pub mod models;
+pub mod oauth2;
 pub mod resend;
 pub mod search;
 pub mod search_index;
@@ -83,6 +84,8 @@ pub struct AppState {
     pub resumable_uploads: Arc<ResumableUploadStore>,
     /// Tracks approval IDs currently being approved/rejected to prevent concurrent double-sends.
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
+    /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
+    pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -114,6 +117,7 @@ impl AppState {
             sync_lock: Arc::new(Mutex::new(())),
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -160,6 +164,7 @@ impl AppState {
             sync_lock: Arc::new(Mutex::new(())),
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -368,7 +373,7 @@ mod pluggable_seam_tests {
             if token == Some("jwt-valid") {
                 Ok(Principal {
                     mailbox_id: "agent@example.com".to_string(),
-                    scopes: vec![AuthScope::Read, AuthScope::Send],
+                    scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
                     agent_policy: None,
                 })
             } else {

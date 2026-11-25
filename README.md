@@ -7,7 +7,7 @@ It exposes four protocols against one mailbox store:
 - An MCP server over stdio (`nogml mcp`) and Streamable HTTP (`POST /mcp`).
 - A JSON REST API (`/v1`) with real-time Server-Sent Events (`/v1/events`) and outbound safety checks.
 - A Gmail REST API v1 server (`/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`) for clients such as Superhuman and official Google SDKs.
-- An IMAP4rev1 server with `IDLE`, `MOVE`, `UIDPLUS`, `SPECIAL-USE`, `STARTTLS`, and Gmail `X-GM-EXT-1` extensions.
+- An IMAP4rev1 server with `IDLE`, `MOVE`, `UIDPLUS`, `SPECIAL-USE`, `STARTTLS`, `AUTH=XOAUTH2`, and Gmail `X-GM-EXT-1` extensions.
 
 Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME and SMTP submission backends (`NOGML_TRANSPORT=resend|ses|smtp`). Inbound mail arrives through Svix-verified Resend webhooks (`POST /webhooks/resend`), AWS SNS/SES webhooks (`POST /webhooks/ses` with inline base64 or SigV4 S3 `.eml` fetches), or upstream Gmail sync (REST API or IMAP).
 
@@ -45,7 +45,7 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
 | `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
-| `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
+| `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` (static tokens, scoped API keys, local OAuth2 HS256 JWTs) | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP (`LOGIN`, `PLAIN`, `XOAUTH2`) authentication returning `Principal`, scopes, and per-agent safety overrides |
 | `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
 | `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202 and queueing for `/v1/approvals`, `Deny` returning 403) and `dry_run` checks |
 | `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | Pluggable upstream pull and optional bidirectional pushback sharing single-flight locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
@@ -177,7 +177,11 @@ Every CLI flag has a matching environment variable:
 | `NOGML_BLOB_S3_SECRET_ACCESS_KEY` | `--blob-s3-secret-access-key` | *(none)* | S3 secret access key |
 | `NOGML_BLOB_S3_SESSION_TOKEN` | `--blob-s3-session-token` | *(none)* | Optional S3 STS session token |
 | `NOGML_BLOB_S3_FORCE_PATH_STYLE` | `--blob-s3-force-path-style` | *(true with endpoint)* | Use path-style URLs (`/{bucket}/{key}`) instead of virtual-host URLs |
-| `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens |
+| `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens with full scopes |
+| `NOGML_SCOPED_TOKENS` | `--scoped-tokens` | *(none)* | JSON array of scoped API keys (`token`, `mailbox_id`, `scopes`, `draft_only`, `allowed_recipients`, `max_send_recipients`) |
+| `NOGML_OAUTH2_CLIENT_ID` | `--oauth2-client-id` | *(disabled)* | Local OAuth2 client ID (enables `/oauth2/*` and `/.well-known/oauth-authorization-server` when paired with `NOGML_OAUTH2_SIGNING_SECRET`) |
+| `NOGML_OAUTH2_CLIENT_SECRET` | `--oauth2-client-secret` | *(none)* | Optional local OAuth2 client secret verified on `POST /oauth2/token` |
+| `NOGML_OAUTH2_SIGNING_SECRET` | `--oauth2-signing-secret` | *(disabled)* | HMAC-SHA256 signing secret for local OAuth2 JWT access and refresh tokens |
 | `NOGML_USER_EMAIL` | `--user-email` | `me@localhost` | Primary mailbox address |
 | `NOGML_DEFAULT_DOMAIN` | `--default-domain` | `localhost` | Default domain for generated `Message-ID` headers |
 | `NOGML_TRANSPORT` | `--transport` | `resend` | `MailTransport` backend (`resend`, `ses`, or `smtp`) |
@@ -295,9 +299,20 @@ service = build(
 
 Superhuman-style and custom HTTP clients: override the Gmail REST root from `https://gmail.googleapis.com` to `http://127.0.0.1:8080` (or your HTTPS reverse proxy URL). Keep the standard `/gmail/v1/...`, `/upload/gmail/v1/...`, and `/batch/gmail/v1` paths intact and pass your configured `NOGML_AUTH_TOKENS` value in `Authorization: Bearer <token>` (or `X-API-Key`). When serving behind TLS termination, forward `Host` and `X-Forwarded-Proto: https` so `uploadType=resumable` `Location` headers use your public HTTPS origin.
 
+### Scoped API keys and local OAuth2
+
+Use `NOGML_SCOPED_TOKENS` to issue least-privilege keys with explicit scopes (`read`, `write`, `send`, `admin`) and optional per-agent outbound overrides (`draft_only`, `allowed_recipients`, `max_send_recipients`). Scopes are enforced across `/v1`, `/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`, `/mcp`, and IMAP (`STORE`, `COPY`, `MOVE`, `EXPUNGE`, `APPEND`, `CREATE`, `DELETE`, and `RENAME` require `write`). Legacy `NOGML_AUTH_TOKENS` entries keep full scopes.
+
+```bash
+NOGML_SCOPED_TOKENS='[{"token":"tok_ro","scopes":["read"]},{"token":"tok_draft","scopes":["read","write","send"],"draft_only":true,"allowed_recipients":["@example.com"],"max_send_recipients":5}]' \
+nogml serve --user-email agent@example.com
+```
+
+To support Gmail API SDKs and IMAP clients that expect OAuth2 token exchange, set `NOGML_OAUTH2_CLIENT_ID`, `NOGML_OAUTH2_SIGNING_SECRET`, and optionally `NOGML_OAUTH2_CLIENT_SECRET`. `nogml` then exposes `GET /.well-known/oauth-authorization-server`, `GET /oauth2/authorize` (with PKCE `S256` and `plain`), and `POST /oauth2/token` (`authorization_code`, `refresh_token`, and `client_credentials`), minting HS256 JWT bearer tokens accepted on HTTP endpoints and IMAP `AUTHENTICATE XOAUTH2`.
+
 ### IMAP clients
 
-Set `--imap-bind 127.0.0.1:1143` (or `--imap-tls-bind 127.0.0.1:1993` with a TLS certificate and key). Log in with `--user-email` (or `NOGML_IMAP_USERNAME`) and your bearer token (or `NOGML_IMAP_PASSWORD`).
+Set `--imap-bind 127.0.0.1:1143` (or `--imap-tls-bind 127.0.0.1:1993` with a TLS certificate and key). Authenticate with `--user-email` (or `NOGML_IMAP_USERNAME`) and your bearer token or `NOGML_IMAP_PASSWORD` via `LOGIN` or `AUTHENTICATE PLAIN`, or use `AUTHENTICATE XOAUTH2` with a scoped API key or local OAuth2 access token.
 
 ### Resend and AWS SES webhooks
 

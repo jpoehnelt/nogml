@@ -2,9 +2,11 @@
 //! `application/http` batch protocol for Superhuman and Google API client compatibility.
 
 use axum::{
+    Extension,
     body::{Body, Bytes, to_bytes},
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
 };
 use tower::ServiceExt;
@@ -12,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    auth::{self, Principal},
     error::{AppError, AppResult},
     gmail::{
         gmail_api_routes,
@@ -28,6 +31,7 @@ const MAX_SUB_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// `POST /batch/gmail/v1`
 pub async fn batch_handler(
     State(state): State<AppState>,
+    outer_principal: Option<Extension<Principal>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
@@ -53,8 +57,14 @@ pub async fn batch_handler(
 
     let outer_auth = headers.get(header::AUTHORIZATION).cloned();
     let outer_api_key = headers.get("x-api-key").cloned();
+    let outer_principal = outer_principal.map(|Extension(p)| p);
 
-    let sub_router = gmail_api_routes().with_state(state);
+    let sub_router = gmail_api_routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .with_state(state);
     let response_boundary = format!("batch_{}", Uuid::new_v4().simple());
     let mut out = Vec::with_capacity(body.len() + 1024);
 
@@ -63,10 +73,15 @@ pub async fn batch_handler(
 
         let sub_response =
             match build_embedded_request(&part.body, outer_auth.as_ref(), outer_api_key.as_ref()) {
-                Ok(req) => match sub_router.clone().oneshot(req).await {
-                    Ok(resp) => resp,
-                    Err(infallible) => match infallible {},
-                },
+                Ok(mut req) => {
+                    if let Some(ref p) = outer_principal {
+                        req.extensions_mut().insert(p.clone());
+                    }
+                    match sub_router.clone().oneshot(req).await {
+                        Ok(resp) => resp,
+                        Err(infallible) => match infallible {},
+                    }
+                }
                 Err(err) => err.into_response(),
             };
 
