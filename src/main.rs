@@ -179,7 +179,7 @@ enum Command {
         command: Option<String>,
     },
 
-    /// Agent-DX mail operations (auto-JSON when piped or `--json` is passed).
+    /// Mail operations (auto-JSON when piped or `--json` is passed).
     Mail {
         /// Target a running `nogml` server instead of opening the local store directly.
         #[arg(long, env = "NOGML_URL")]

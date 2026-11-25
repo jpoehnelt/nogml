@@ -1,5 +1,5 @@
-//! `nogml` — AI-first headless Rust email server with MCP, Gmail REST API v1,
-//! embedded IMAP4rev1, Resend delivery/webhooks, and upstream Gmail sync.
+//! `nogml`: headless Rust email server with MCP, Gmail REST API v1,
+//! embedded IMAP4rev1, Resend delivery and webhooks, and upstream Gmail sync.
 
 pub mod ai;
 pub mod auth;
@@ -60,7 +60,7 @@ pub fn ensure_crypto_provider() {
 /// - [`MailTransport`]: outbound email delivery (`ResendTransport`, SES, SMTP, etc.)
 /// - [`InboundFilter`]: inbound spam/auth/routing pipeline across all ingest paths
 /// - [`AuthProvider`]: HTTP bearer & IMAP authentication returning [`auth::Principal`]
-/// - [`SearchIndex`]: full-text / semantic search powering `/v1/search` and MCP `search_emails`
+/// - [`SearchIndex`]: full-text or semantic search used by `/v1/search` and MCP `search_emails`
 /// - [`OutboundPolicy`]: agent send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval`, `Deny`)
 #[derive(Clone)]
 pub struct AppState {
