@@ -12,6 +12,19 @@ pub enum StorageBackend {
     Memory,
 }
 
+/// Selectable blob storage backend behind `BlobStore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobBackend {
+    /// Store raw RFC 2822 and attachments inline inside `MailStore`.
+    #[default]
+    Inline,
+    /// Mirror and serve raw RFC 2822 and attachments from local filesystem (`blob_dir`).
+    Fs,
+    /// Mirror and serve raw RFC 2822 and attachments from an in-memory blob store.
+    Memory,
+}
+
 /// Behavior when `draft_only` is enabled and an agent attempts to send mail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +54,8 @@ pub struct Config {
     // --- Pluggable storage ---
     pub storage: StorageBackend,
     pub db_path: PathBuf,
+    pub blob_backend: BlobBackend,
+    pub blob_dir: PathBuf,
 
     // --- Auth & mailbox identity ---
     /// Allowed bearer tokens. Empty means dev unauthenticated mode.
@@ -104,6 +119,8 @@ impl Default for Config {
 
             storage: StorageBackend::Sqlite,
             db_path: PathBuf::from("nogml.db"),
+            blob_backend: BlobBackend::Inline,
+            blob_dir: PathBuf::from("nogml-blobs"),
 
             auth_tokens: Vec::new(),
             user_email: "me@localhost".to_string(),

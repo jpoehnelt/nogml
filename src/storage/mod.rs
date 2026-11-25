@@ -439,6 +439,11 @@ pub fn parse_simple_email_address(raw: &str) -> EmailAddress {
 
 #[async_trait]
 pub trait MailStore: Send + Sync {
+    /// Short backend identifier reported by `GET /v1/capabilities`.
+    fn backend_name(&self) -> &'static str {
+        "custom"
+    }
+
     // --- Profile & History ---
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile>;
     async fn current_history_id(&self) -> AppResult<u64>;

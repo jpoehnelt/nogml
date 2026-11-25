@@ -2,8 +2,13 @@
 name = "nogml"
 version = "0.1.0"
 edition = "2024"
-description = "AI-first headless Rust email server with MCP, Gmail REST API v1, IMAP4rev1, Resend, and upstream Gmail sync"
-license = "MIT OR Apache-2.0"
+description = "AI-first headless Rust email server with MCP, AI REST /v1, Gmail REST API v1, embedded IMAP4rev1, Resend delivery/webhooks, and upstream Gmail sync"
+license = "Apache-2.0"
+repository = "https://github.com/jpoehnelt/nogml"
+homepage = "https://github.com/jpoehnelt/nogml"
+readme = "README.md"
+keywords = ["email", "mcp", "ai-agent", "gmail-api", "imap"]
+categories = ["email", "web-programming::http-server", "command-line-utilities"]
 
 [dependencies]
 # Async runtime & HTTP server

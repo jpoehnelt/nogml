@@ -3,20 +3,21 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use nogml::{
     AppState, ai, build_router,
-    config::{Config, DraftOnlyAction, StorageBackend, SyncMode},
+    config::{BlobBackend, Config, DraftOnlyAction, StorageBackend, SyncMode},
     ensure_crypto_provider,
     error::{AppError, AppResult},
-    imap, mcp,
+    gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     storage::{AiSearchQuery, AiThreadQuery},
     sync::{self, SyncRunOptions},
@@ -50,6 +51,14 @@ struct CommonConfigArgs {
     /// SQLite database file path (when `--storage=sqlite`).
     #[arg(long, env = "NOGML_DB_PATH", default_value = "nogml.db", global = true)]
     db_path: PathBuf,
+
+    /// Blob storage backend (`inline`, `fs`, or `memory`).
+    #[arg(long, env = "NOGML_BLOB_BACKEND", default_value = "inline", global = true)]
+    blob_backend: BlobBackend,
+
+    /// Filesystem blob directory (when `--blob-backend=fs`).
+    #[arg(long, env = "NOGML_BLOB_DIR", default_value = "nogml-blobs", global = true)]
+    blob_dir: PathBuf,
 
     /// Primary mailbox email address.
     #[arg(long, env = "NOGML_USER_EMAIL", default_value = "me@localhost", global = true)]
@@ -374,6 +383,8 @@ impl CommonConfigArgs {
         let mut cfg = Config {
             storage: self.storage,
             db_path: self.db_path,
+            blob_backend: self.blob_backend,
+            blob_dir: self.blob_dir,
             user_email: self.user_email,
             default_domain: self.default_domain,
             resend_api_key: self.resend_api_key,
@@ -495,6 +506,332 @@ fn emit_output(value: Value, fields: Option<&str>, json_mode: bool) -> AppResult
     Ok(())
 }
 
+fn map_remote_http_error(status: reqwest::StatusCode, body: &str) -> AppError {
+    if let Ok(parsed) = serde_json::from_str::<Value>(body)
+        && let Some(err_obj) = parsed.get("error").and_then(Value::as_object)
+    {
+        let code = err_obj
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream_error")
+            .to_string();
+        let message = err_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(body)
+            .to_string();
+        let hint = err_obj
+            .get("hint")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let details = err_obj.get("details").cloned();
+
+        return match status.as_u16() {
+            400 => AppError::Validation { message, hint },
+            401 => AppError::Unauthorized(message),
+            403 => AppError::PolicyDenied {
+                code,
+                message,
+                hint,
+                details,
+            },
+            404 => AppError::NotFound(message),
+            409 => AppError::Conflict(message),
+            413 => AppError::PayloadTooLarge(message),
+            429 => AppError::RateLimited(message),
+            code_num => AppError::Upstream {
+                status: code_num,
+                message,
+            },
+        };
+    }
+
+    match status.as_u16() {
+        400 => AppError::BadRequest(body.to_string()),
+        401 => AppError::Unauthorized(body.to_string()),
+        403 => AppError::Forbidden(body.to_string()),
+        404 => AppError::NotFound(body.to_string()),
+        429 => AppError::RateLimited(body.to_string()),
+        code_num => AppError::Upstream {
+            status: code_num,
+            message: body.to_string(),
+        },
+    }
+}
+
+async fn parse_remote_json(resp: reqwest::Response) -> AppResult<Value> {
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(map_remote_http_error(status, &body));
+    }
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+fn with_optional_bearer(
+    req: reqwest::RequestBuilder,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
+async fn run_remote_mail(
+    base_url: &str,
+    bearer_token: Option<&str>,
+    action: MailAction,
+    fields: Option<&str>,
+    json_flag: bool,
+    ndjson: bool,
+) -> AppResult<()> {
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
+
+    match action {
+        MailAction::Search {
+            q,
+            labels,
+            limit,
+            include_body,
+            max_chars,
+        } => {
+            let mut params: Vec<(String, String)> = vec![
+                ("limit".to_string(), limit.to_string()),
+                ("include_body".to_string(), include_body.to_string()),
+                ("max_body_chars".to_string(), max_chars.to_string()),
+            ];
+            if let Some(q) = q {
+                params.push(("q".to_string(), q));
+            }
+            if !labels.is_empty() {
+                params.push(("labels".to_string(), labels.join(",")));
+            }
+            let resp = with_optional_bearer(
+                client.get(format!("{base}/v1/search")).query(&params),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            if ndjson && let Some(items) = val.get("messages").and_then(Value::as_array) {
+                for item in items {
+                    emit_output(item.clone(), fields, true)?;
+                }
+                Ok(())
+            } else {
+                emit_output(val, fields, json_flag)
+            }
+        }
+        MailAction::Threads {
+            q,
+            label,
+            unread_only,
+            limit,
+        } => {
+            let mut params: Vec<(String, String)> = vec![
+                ("limit".to_string(), limit.to_string()),
+                ("unread_only".to_string(), unread_only.to_string()),
+            ];
+            if let Some(q) = q {
+                params.push(("q".to_string(), q));
+            }
+            if let Some(label) = label {
+                params.push(("label".to_string(), label));
+            }
+            let resp = with_optional_bearer(
+                client.get(format!("{base}/v1/threads")).query(&params),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            if ndjson && let Some(items) = val.get("threads").and_then(Value::as_array) {
+                for item in items {
+                    emit_output(item.clone(), fields, true)?;
+                }
+                Ok(())
+            } else {
+                emit_output(val, fields, json_flag)
+            }
+        }
+        MailAction::Read {
+            id,
+            thread,
+            max_chars,
+            strip_quotes,
+            include_html,
+        } => {
+            let encoded_id: String =
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+            let path = if thread {
+                format!("{base}/v1/threads/{encoded_id}")
+            } else {
+                format!("{base}/v1/messages/{encoded_id}")
+            };
+            let params = [
+                ("max_body_chars", max_chars.to_string()),
+                ("strip_quotes", strip_quotes.to_string()),
+                ("include_html", include_html.to_string()),
+            ];
+            let resp = with_optional_bearer(client.get(path).query(&params), bearer_token)
+                .send()
+                .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Send {
+            payload,
+            to,
+            cc,
+            bcc,
+            subject,
+            text,
+            html,
+            reply_to,
+            dry_run,
+        } => {
+            let mut req: AiSendEmailRequest = match payload {
+                Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
+                None => AiSendEmailRequest {
+                    to,
+                    cc,
+                    bcc,
+                    subject,
+                    text,
+                    html,
+                    reply_to_message_id: reply_to,
+                    dry_run,
+                },
+            };
+            if dry_run {
+                req.dry_run = true;
+            }
+            let resp = with_optional_bearer(
+                client.post(format!("{base}/v1/messages/send")).json(&req),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Draft {
+            payload,
+            to,
+            cc,
+            bcc,
+            subject,
+            text,
+            html,
+            reply_to,
+        } => {
+            let req: AiCreateDraftRequest = match payload {
+                Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
+                None => AiCreateDraftRequest {
+                    to,
+                    cc,
+                    bcc,
+                    subject,
+                    text,
+                    html,
+                    reply_to_message_id: reply_to,
+                },
+            };
+            let resp = with_optional_bearer(
+                client.post(format!("{base}/v1/drafts")).json(&req),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Triage {
+            thread_id,
+            archive,
+            mark_read,
+            mark_unread,
+            star,
+            trash,
+            add_labels,
+            remove_labels,
+            dry_run,
+        } => {
+            let encoded_tid: String =
+                url::form_urlencoded::byte_serialize(thread_id.as_bytes()).collect();
+            let req = AiTriageRequest {
+                archive,
+                mark_read,
+                mark_unread,
+                star,
+                trash,
+                add_labels,
+                remove_labels,
+                dry_run,
+            };
+            let resp = with_optional_bearer(
+                client
+                    .post(format!("{base}/v1/threads/{encoded_tid}/triage"))
+                    .json(&req),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Labels => {
+            let resp = with_optional_bearer(client.get(format!("{base}/v1/labels")), bearer_token)
+                .send()
+                .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Watch => {
+            // Stream `/v1/events` SSE frames and emit each `data:` payload as NDJSON.
+            let stream_client = reqwest::Client::builder()
+                .build()
+                .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
+            let mut resp = with_optional_bearer(
+                stream_client
+                    .get(format!("{base}/v1/events"))
+                    .header("accept", "text/event-stream"),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(map_remote_http_error(status, &body));
+            }
+            let mut buf = String::new();
+            while let Some(chunk) = resp.chunk().await? {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                    buf.drain(..=pos);
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let trimmed = data.trim();
+                        if !trimmed.is_empty() {
+                            println!("{trimmed}");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn run(cli: Cli) -> AppResult<()> {
     ensure_crypto_provider();
 
@@ -505,6 +842,10 @@ async fn run(cli: Cli) -> AppResult<()> {
             let bind = config.bind;
             let has_imap = config.imap_bind.is_some() || config.imap_tls_bind.is_some();
             let has_bg_sync = config.sync_interval_secs > 0;
+            let has_watch_webhook = config
+                .watch_webhook_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty());
             let state = AppState::from_config(config)?;
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -531,6 +872,16 @@ async fn run(cli: Cli) -> AppResult<()> {
                 None
             };
 
+            let watch_handle = if has_watch_webhook {
+                let watch_state = state.clone();
+                let watch_rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move {
+                    gmail::run_watch_webhook_listener(watch_state, watch_rx).await;
+                }))
+            } else {
+                None
+            };
+
             let router = build_router(state);
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -549,6 +900,9 @@ async fn run(cli: Cli) -> AppResult<()> {
                 let _ = h.await;
             }
             if let Some(h) = sync_handle {
+                let _ = h.await;
+            }
+            if let Some(h) = watch_handle {
                 let _ = h.await;
             }
 
@@ -604,10 +958,16 @@ async fn run(cli: Cli) -> AppResult<()> {
         } => {
             init_tracing(cli.log_json, true);
             if let Some(remote_url) = url {
-                warn!(%remote_url, "Remote --url mode not yet wired; falling back or returning error");
-                return Err(AppError::BadRequest(format!(
-                    "Remote --url ({remote_url}) client mode is implemented by the ai-mcp worker"
-                )));
+                let token = cli.common.auth_tokens.first().cloned();
+                return run_remote_mail(
+                    &remote_url,
+                    token.as_deref(),
+                    action,
+                    fields.as_deref(),
+                    json_flag,
+                    ndjson,
+                )
+                .await;
             }
 
             let config = cli.common.into_config(None);
@@ -622,8 +982,8 @@ async fn run(cli: Cli) -> AppResult<()> {
                     max_chars,
                 } => {
                     let page = state
-                        .store
-                        .search_messages_ai(&AiSearchQuery {
+                        .search
+                        .search(&AiSearchQuery {
                             q,
                             labels,
                             limit,

@@ -73,6 +73,14 @@ pub enum AppError {
     #[error("One or more recipients are not permitted by allowed_recipients policy")]
     RecipientNotAllowed { disallowed: Vec<String> },
 
+    #[error("{message}")]
+    PolicyDenied {
+        code: String,
+        message: String,
+        hint: Option<String>,
+        details: Option<Value>,
+    },
+
     #[error("{0}")]
     NotFound(String),
 
@@ -125,7 +133,8 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_)
             | Self::DraftOnlyBlocked { .. }
-            | Self::RecipientNotAllowed { .. } => StatusCode::FORBIDDEN,
+            | Self::RecipientNotAllowed { .. }
+            | Self::PolicyDenied { .. } => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -149,7 +158,8 @@ impl AppError {
             Self::Unauthorized(_) => ("UNAUTHENTICATED", "authError"),
             Self::Forbidden(_)
             | Self::DraftOnlyBlocked { .. }
-            | Self::RecipientNotAllowed { .. } => ("PERMISSION_DENIED", "forbidden"),
+            | Self::RecipientNotAllowed { .. }
+            | Self::PolicyDenied { .. } => ("PERMISSION_DENIED", "forbidden"),
             Self::NotFound(_) => ("NOT_FOUND", "notFound"),
             Self::Conflict(_) => ("ALREADY_EXISTS", "conflict"),
             Self::RateLimited(_) => ("RESOURCE_EXHAUSTED", "rateLimitExceeded"),
@@ -161,7 +171,7 @@ impl AppError {
     }
 
     /// Machine-readable AI `/v1` & MCP error code.
-    pub fn ai_code(&self) -> &'static str {
+    pub fn ai_code(&self) -> &str {
         match self {
             Self::BadRequest(_) => "bad_request",
             Self::Validation { .. } => "validation_error",
@@ -169,6 +179,7 @@ impl AppError {
             Self::Forbidden(_) => "forbidden",
             Self::DraftOnlyBlocked { .. } => "draft_only_mode",
             Self::RecipientNotAllowed { .. } => "recipient_not_allowed",
+            Self::PolicyDenied { code, .. } => code.as_str(),
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge(_) => "payload_too_large",
@@ -195,7 +206,8 @@ impl AppError {
             | Self::Config(_) => 2,
             Self::Forbidden(_)
             | Self::DraftOnlyBlocked { .. }
-            | Self::RecipientNotAllowed { .. } => 3,
+            | Self::RecipientNotAllowed { .. }
+            | Self::PolicyDenied { .. } => 3,
             Self::Unauthorized(_) | Self::RateLimited(_) | Self::Upstream { .. } => 4,
             Self::NotFound(_) | Self::Conflict(_) | Self::Storage(_) | Self::Internal(_) => 1,
         }
@@ -229,6 +241,7 @@ impl AppError {
                 Some("Adjust recipients to match allowed_recipients policy or run with dry_run: true.".to_string()),
                 Some(json!({ "disallowed": disallowed })),
             ),
+            Self::PolicyDenied { hint, details, .. } => (hint.clone(), details.clone()),
             Self::Upstream { status, .. } => (None, Some(json!({ "upstream_status": status }))),
             _ => (None, None),
         };
