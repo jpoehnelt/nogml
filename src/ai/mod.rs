@@ -12,11 +12,12 @@ pub(crate) mod tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -28,13 +29,15 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     AppState,
+    auth::Principal,
     config::{Config, SyncMode},
     error::{AiError, AppError, AppResult},
     events::{EventEnvelope, EventSource, MailEvent},
@@ -47,11 +50,12 @@ use crate::{
         LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest, ThreadDetail,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, MessageListQuery, NewMessageInput, StoredMessage,
+        AiSearchQuery, AiThreadQuery, ApprovalStatus, MessageListQuery, NewAttachmentInput,
+        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredMessage,
         StoredThreadDetail, TriagePatch, parse_simple_email_address,
     },
     sync::{self, SyncRunOptions},
-    transport::OutboundMessage,
+    transport::{OutboundAttachment, OutboundMessage},
 };
 
 pub use safety::{
@@ -77,6 +81,7 @@ pub fn router() -> Router<AppState> {
 /// - `GET /v1/messages`, `GET /v1/messages/{id}`, `GET /v1/messages/{id}/attachments/{attachment_id}`
 /// - `POST /v1/messages/send`, `POST /v1/messages/modify`
 /// - `GET /v1/drafts`, `POST /v1/drafts`, `POST /v1/drafts/{id}/send`, `DELETE /v1/drafts/{id}`
+/// - `GET /v1/approvals`, `GET /v1/approvals/{id}`, `POST /v1/approvals/{id}/approve`, `POST /v1/approvals/{id}/reject`
 /// - `GET /v1/labels`
 /// - `GET /v1/search`
 /// - `GET /v1/events` (SSE)
@@ -98,6 +103,10 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/drafts", get(list_drafts).post(create_draft_handler))
         .route("/v1/drafts/{id}", delete(delete_draft_handler))
         .route("/v1/drafts/{id}/send", post(send_draft_handler))
+        .route("/v1/approvals", get(list_approvals_handler))
+        .route("/v1/approvals/{id}", get(get_approval_handler))
+        .route("/v1/approvals/{id}/approve", post(approve_approval_handler))
+        .route("/v1/approvals/{id}/reject", post(reject_approval_handler))
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
         .route("/v1/events", get(events_sse_handler))
@@ -109,15 +118,34 @@ pub fn ai_router() -> Router<AppState> {
 // Shared Operations (used by REST `/v1`, MCP tools/resources, and CLI)
 // ============================================================================
 
+/// Optional JSON request body for `POST /v1/approvals/{id}/approve` and `/reject`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// Execute an AI-first send (shared across `/v1/messages/send`, MCP `send_email`, and CLI `nogml mail send`).
 pub async fn execute_send_email(state: &AppState, req: AiSendEmailRequest) -> AppResult<Value> {
-    execute_send_email_with_source(state, req, EventSource::Api).await
+    execute_send_email_with_context(state, req, None, EventSource::Api).await
 }
 
 /// Internal variant allowing callers (REST vs MCP) to tag the published [`EventSource`].
 pub async fn execute_send_email_with_source(
     state: &AppState,
     req: AiSendEmailRequest,
+    source: EventSource,
+) -> AppResult<Value> {
+    execute_send_email_with_context(state, req, None, source).await
+}
+
+/// Variant accepting the authenticated [`Principal`] (used by HTTP handlers for approval requester attribution).
+pub async fn execute_send_email_with_context(
+    state: &AppState,
+    req: AiSendEmailRequest,
+    principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
     if req.dry_run {
@@ -225,12 +253,13 @@ pub async fn execute_send_email_with_source(
             }));
         }
         OutboundDecision::HoldForApproval { reason } => {
+            let outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
             let draft_input = NewMessageInput {
                 id: None,
                 thread_id: resolved.thread_id.clone(),
                 label_ids: vec![LABEL_DRAFT.to_string()],
                 raw_rfc2822,
-                snippet,
+                snippet: snippet.clone(),
                 internal_date_ms: now_ms,
                 subject: resolved.subject.clone(),
                 from_addr: resolved.from.clone(),
@@ -260,16 +289,28 @@ pub async fn execute_send_email_with_source(
                     thread_id: draft.message.thread_id.clone(),
                 },
             );
-            return Ok(json!({
-                "status": "pending_approval",
-                "held_for_approval": true,
-                "reason": reason,
-                "draft_id": draft.id,
-                "message_id": draft.message.id,
-                "thread_id": draft.message.thread_id,
-                "to": draft.message.to_addrs,
-                "subject": draft.message.subject,
-            }));
+
+            let approval = enqueue_pending_approval(
+                state,
+                reason,
+                principal,
+                outbound_msg,
+                req.reply_to_message_id.clone(),
+                Some(draft.message.thread_id.clone()),
+                Some(draft.id.clone()),
+                now_ms,
+                &snippet,
+                source,
+            )
+            .await?;
+
+            return Ok(build_hold_response(
+                &approval,
+                Some(&draft.id),
+                Some(&draft.message.id),
+                Some(&draft.message.thread_id),
+                &snippet,
+            ));
         }
         OutboundDecision::Allow => {}
     }
@@ -437,7 +478,7 @@ pub async fn execute_send_draft(
     draft_id: &str,
     req: AiSendDraftRequest,
 ) -> AppResult<Value> {
-    execute_send_draft_with_source(state, draft_id, req, EventSource::Api).await
+    execute_send_draft_with_context(state, draft_id, req, None, EventSource::Api).await
 }
 
 /// Internal variant allowing callers to tag the published [`EventSource`].
@@ -445,6 +486,17 @@ pub async fn execute_send_draft_with_source(
     state: &AppState,
     draft_id: &str,
     req: AiSendDraftRequest,
+    source: EventSource,
+) -> AppResult<Value> {
+    execute_send_draft_with_context(state, draft_id, req, None, source).await
+}
+
+/// Variant accepting the authenticated [`Principal`] for approval requester attribution.
+pub async fn execute_send_draft_with_context(
+    state: &AppState,
+    draft_id: &str,
+    req: AiSendDraftRequest,
+    principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
     validate_resource_id(draft_id)?;
@@ -530,16 +582,56 @@ pub async fn execute_send_draft_with_source(
             }));
         }
         OutboundDecision::HoldForApproval { reason } => {
-            return Ok(json!({
-                "status": "pending_approval",
-                "held_for_approval": true,
-                "reason": reason,
-                "draft_id": draft.id,
-                "message_id": msg.id,
-                "thread_id": msg.thread_id,
-                "to": msg.to_addrs,
-                "subject": msg.subject,
-            }));
+            let rfc_message_id = msg
+                .rfc822_message_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("<{}@{}>", Uuid::new_v4(), state.config.default_domain));
+
+            let raw_rfc2822 = if msg.raw_rfc2822.is_empty() {
+                build_outbound_rfc2822(&resolved, &rfc_message_id)?
+            } else {
+                state.load_raw_rfc2822(msg).await?
+            };
+
+            let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+            if msg.has_attachments {
+                let metas = state.store.list_attachment_meta(&msg.id).await?;
+                for meta in metas {
+                    if let Some(att) = state.store.get_attachment(&msg.id, &meta.id).await? {
+                        let data = state.load_attachment_bytes(&att).await?;
+                        outbound_msg.attachments.push(OutboundAttachment {
+                            filename: att.filename,
+                            content_type: att.content_type,
+                            content_id: att.content_id,
+                            data,
+                        });
+                    }
+                }
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            let approval = enqueue_pending_approval(
+                state,
+                reason,
+                principal,
+                outbound_msg,
+                None,
+                Some(msg.thread_id.clone()),
+                Some(draft.id.clone()),
+                now_ms,
+                &msg.snippet,
+                source,
+            )
+            .await?;
+
+            return Ok(build_hold_response(
+                &approval,
+                Some(&draft.id),
+                Some(&msg.id),
+                Some(&msg.thread_id),
+                &msg.snippet,
+            ));
         }
         OutboundDecision::Allow => {}
     }
@@ -831,6 +923,271 @@ pub async fn execute_modify_labels_with_source(
     }))
 }
 
+/// Parse an approval status query string (`pending`, `approved`, `rejected`, `expired`, `all`, or empty).
+pub fn parse_approval_status_filter(raw: Option<&str>) -> AppResult<Option<ApprovalStatus>> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
+        Some(s) => ApprovalStatus::parse_str(s).map(Some).ok_or_else(|| {
+            AppError::validation(
+                format!("Invalid approval status filter '{s}'"),
+                Some("Use one of: pending, approved, rejected, expired, or all.".to_string()),
+            )
+        }),
+    }
+}
+
+/// List pending or decided approval requests (shared across `/v1/approvals` and CLI).
+pub async fn execute_list_approvals(
+    state: &AppState,
+    status: Option<&str>,
+    limit: usize,
+) -> AppResult<Value> {
+    let filter = parse_approval_status_filter(status)?;
+    let clamped = limit.clamp(1, MAX_LIST_LIMIT);
+    let approvals = state.store.list_pending_approvals(filter, clamped).await?;
+    Ok(json!({
+        "approvals": approvals,
+        "count": approvals.len(),
+    }))
+}
+
+/// Get a single approval request by ID (shared across `/v1/approvals/{id}` and CLI).
+pub async fn execute_get_approval(state: &AppState, id: &str) -> AppResult<Value> {
+    validate_resource_id(id)?;
+    let approval = state
+        .store
+        .get_pending_approval(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+    Ok(serde_json::to_value(approval)?)
+}
+
+/// Approve and dispatch a pending outbound email exactly once (shared across `/v1/approvals/{id}/approve` and CLI).
+pub async fn execute_approve_approval(
+    state: &AppState,
+    id: &str,
+    req: ApprovalDecisionRequest,
+    principal: Option<&Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    validate_resource_id(id)?;
+    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, id)?;
+
+    let approval = state
+        .store
+        .get_pending_approval(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+
+    let now_ms = Utc::now().timestamp_millis();
+    if approval.status == ApprovalStatus::Expired || approval.expires_at_ms <= now_ms {
+        // Persist expired status atomically in the store and return 409 Conflict.
+        let _ = state
+            .store
+            .resolve_pending_approval(id, ApprovalStatus::Approved, None, None, None, None)
+            .await;
+        return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+    }
+
+    if approval.status != ApprovalStatus::Pending {
+        return Err(AppError::Conflict(format!(
+            "Approval '{id}' is already {}",
+            approval.status
+        )));
+    }
+
+    let outbound = &approval.outbound_message;
+    let idempotency_key = format!("approval-{id}");
+    let send_outcome = state
+        .transport
+        .send(outbound, Some(&idempotency_key))
+        .await?;
+
+    let raw_rfc2822 = crate::transport::ensure_raw_rfc2822(outbound, &state.config.user_email)?;
+    let text_body = outbound.text.clone().unwrap_or_default();
+    let snippet = generate_snippet(&text_body, outbound.html.as_deref());
+    let rfc822_message_id = outbound
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("message-id"))
+        .map(|(_, v)| v.clone());
+    let in_reply_to = outbound
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("in-reply-to"))
+        .map(|(_, v)| v.clone());
+    let references_header = outbound
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("references"))
+        .map(|(_, v)| v.clone());
+    let attachments: Vec<NewAttachmentInput> = outbound
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(idx, att)| NewAttachmentInput {
+            part_id: format!("att_{}", idx + 1),
+            filename: att.filename.clone(),
+            content_type: att.content_type.clone(),
+            content_id: att.content_id.clone(),
+            data: att.data.clone(),
+        })
+        .collect();
+
+    if let Some(ref draft_id) = approval.draft_id {
+        let draft_msg_id = state
+            .store
+            .get_draft(draft_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.message.id);
+        let _ = state.store.delete_draft(draft_id).await;
+        if let Some(mid) = draft_msg_id {
+            let _ = state.post_delete_message(&mid, &[]).await;
+        }
+    }
+
+    let stored = state
+        .store
+        .insert_message(NewMessageInput {
+            id: None,
+            thread_id: approval.thread_id.clone(),
+            label_ids: vec![LABEL_SENT.to_string()],
+            raw_rfc2822,
+            snippet,
+            internal_date_ms: Utc::now().timestamp_millis(),
+            subject: outbound.subject.clone(),
+            from_addr: if outbound.from.trim().is_empty() {
+                state.config.user_email.clone()
+            } else {
+                outbound.from.clone()
+            },
+            to_addrs: outbound.to.clone(),
+            cc_addrs: outbound.cc.clone(),
+            bcc_addrs: outbound.bcc.clone(),
+            text_body,
+            html_body: outbound.html.clone(),
+            rfc822_message_id,
+            in_reply_to,
+            references_header,
+            resend_id: Some(send_outcome.provider_message_id.clone()),
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "local".to_string(),
+            is_answered: false,
+            is_deleted: false,
+            attachments,
+        })
+        .await?;
+
+    state.post_store_message(&stored).await?;
+
+    let decided_by = req
+        .decided_by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| principal.map(|p| p.mailbox_id.clone()));
+
+    let resolved = state
+        .store
+        .resolve_pending_approval(
+            id,
+            ApprovalStatus::Approved,
+            decided_by.clone(),
+            req.note.clone(),
+            Some(stored.id.clone()),
+            Some(send_outcome.provider_message_id.clone()),
+        )
+        .await?;
+
+    state.events.publish(
+        source,
+        MailEvent::MessageSent {
+            message_id: stored.id.clone(),
+            thread_id: stored.thread_id.clone(),
+            to: stored.to_addrs.clone(),
+            subject: stored.subject.clone(),
+            resend_id: Some(send_outcome.provider_message_id.clone()),
+            labels: stored.label_ids.clone(),
+        },
+    );
+    state.events.publish(
+        source,
+        MailEvent::ApprovalResolved {
+            approval_id: resolved.id.clone(),
+            status: resolved.status.as_str().to_string(),
+            decided_by,
+            sent_message_id: Some(stored.id.clone()),
+        },
+    );
+
+    let compact = to_compact_message(
+        &stored,
+        &state.config,
+        true,
+        state.config.default_max_body_chars,
+        false,
+        false,
+    );
+
+    Ok(json!({
+        "status": "approved",
+        "approval": resolved,
+        "provider": send_outcome.provider,
+        "provider_message_id": send_outcome.provider_message_id,
+        "sent_message_id": stored.id,
+        "thread_id": stored.thread_id,
+        "message": compact,
+    }))
+}
+
+/// Reject a pending outbound email without ever invoking `MailTransport`.
+pub async fn execute_reject_approval(
+    state: &AppState,
+    id: &str,
+    req: ApprovalDecisionRequest,
+    principal: Option<&Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    validate_resource_id(id)?;
+    let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, id)?;
+
+    let decided_by = req
+        .decided_by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| principal.map(|p| p.mailbox_id.clone()));
+
+    let resolved = state
+        .store
+        .resolve_pending_approval(
+            id,
+            ApprovalStatus::Rejected,
+            decided_by.clone(),
+            req.note.clone(),
+            None,
+            None,
+        )
+        .await?;
+
+    state.events.publish(
+        source,
+        MailEvent::ApprovalResolved {
+            approval_id: resolved.id.clone(),
+            status: resolved.status.as_str().to_string(),
+            decided_by,
+            sent_message_id: None,
+        },
+    );
+
+    Ok(json!({
+        "status": "rejected",
+        "approval": resolved,
+    }))
+}
+
 /// Project a [`StoredMessage`] into a token-efficient [`CompactMessage`].
 pub fn to_compact_message(
     msg: &StoredMessage,
@@ -1068,6 +1425,191 @@ pub fn parse_sync_trigger(req: SyncTriggerRequest) -> AppResult<SyncRunOptions> 
 // Internal Helpers
 // ============================================================================
 
+struct ApprovalInFlightGuard {
+    set: Arc<StdMutex<HashSet<String>>>,
+    id: String,
+}
+
+impl ApprovalInFlightGuard {
+    fn try_acquire(set: &Arc<StdMutex<HashSet<String>>>, id: &str) -> AppResult<Self> {
+        let mut guard = set
+            .lock()
+            .map_err(|_| AppError::Internal("Approval lock poisoned".to_string()))?;
+        if !guard.insert(id.to_string()) {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' is already being processed"
+            )));
+        }
+        Ok(Self {
+            set: Arc::clone(set),
+            id: id.to_string(),
+        })
+    }
+}
+
+impl Drop for ApprovalInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.id);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_pending_approval(
+    state: &AppState,
+    reason: String,
+    principal: Option<Principal>,
+    outbound_message: OutboundMessage,
+    reply_to_message_id: Option<String>,
+    thread_id: Option<String>,
+    draft_id: Option<String>,
+    now_ms: i64,
+    snippet: &str,
+    source: EventSource,
+) -> AppResult<PendingApproval> {
+    let ttl_ms = (state.config.approval_ttl_secs as i64).saturating_mul(1000);
+    let expires_at_ms = now_ms.saturating_add(ttl_ms);
+    let requester = principal.or_else(|| Some(Principal::full_access(&state.config.user_email)));
+
+    let approval = state
+        .store
+        .create_pending_approval(NewPendingApprovalInput {
+            id: None,
+            reason,
+            requester,
+            outbound_message,
+            reply_to_message_id,
+            thread_id,
+            draft_id,
+            created_at_ms: now_ms,
+            expires_at_ms,
+        })
+        .await?;
+
+    let expires_at =
+        DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
+
+    state.events.publish(
+        source,
+        MailEvent::ApprovalRequested {
+            approval_id: approval.id.clone(),
+            reason: approval.reason.clone(),
+            to: approval.outbound_message.to.clone(),
+            subject: approval.outbound_message.subject.clone(),
+            thread_id: approval.thread_id.clone(),
+            draft_id: approval.draft_id.clone(),
+            expires_at,
+        },
+    );
+
+    spawn_approval_webhook(&state.config, &approval, snippet);
+    Ok(approval)
+}
+
+fn build_hold_response(
+    approval: &PendingApproval,
+    draft_id: Option<&str>,
+    message_id: Option<&str>,
+    thread_id: Option<&str>,
+    snippet: &str,
+) -> Value {
+    let expires_at =
+        DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
+    json!({
+        "status": "pending_approval",
+        "held_for_approval": true,
+        "approval_id": approval.id,
+        "reason": approval.reason,
+        "expires_at": expires_at,
+        "expires_at_ms": approval.expires_at_ms,
+        "draft_id": draft_id,
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "to": approval.outbound_message.to,
+        "cc": approval.outbound_message.cc,
+        "bcc": approval.outbound_message.bcc,
+        "subject": approval.outbound_message.subject,
+        "preview": {
+            "from": approval.outbound_message.from,
+            "to": approval.outbound_message.to,
+            "cc": approval.outbound_message.cc,
+            "bcc": approval.outbound_message.bcc,
+            "subject": approval.outbound_message.subject,
+            "snippet": snippet,
+        },
+    })
+}
+
+fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: &str) {
+    let Some(webhook_url) = config
+        .approval_webhook_url
+        .clone()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+    else {
+        return;
+    };
+
+    let expires_at =
+        DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
+    let to_summary = approval.outbound_message.to.join(", ");
+    let slack_text = format!(
+        "Email approval required ({}): To: {} | Subject: {} | Reason: {}",
+        approval.id, to_summary, approval.outbound_message.subject, approval.reason
+    );
+
+    let payload = json!({
+        "event": "approval_requested",
+        "text": slack_text,
+        "approval_id": approval.id,
+        "status": approval.status,
+        "reason": approval.reason,
+        "requester": approval.requester,
+        "expires_at": expires_at,
+        "expires_at_ms": approval.expires_at_ms,
+        "draft_id": approval.draft_id,
+        "thread_id": approval.thread_id,
+        "message": {
+            "from": approval.outbound_message.from,
+            "to": approval.outbound_message.to,
+            "cc": approval.outbound_message.cc,
+            "bcc": approval.outbound_message.bcc,
+            "subject": approval.outbound_message.subject,
+            "snippet": snippet,
+        },
+    });
+    let approval_id = approval.id.clone();
+
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(%err, %approval_id, "Failed to build HTTP client for approval webhook");
+                return;
+            }
+        };
+
+        match client.post(&webhook_url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(
+                    status = %resp.status(),
+                    %webhook_url,
+                    %approval_id,
+                    "Approval webhook returned non-success status"
+                );
+            }
+            Err(err) => {
+                warn!(%err, %webhook_url, %approval_id, "Failed to deliver approval webhook");
+            }
+        }
+    });
+}
+
 fn build_outbound_rfc2822(
     resolved: &safety::ResolvedOutbound,
     rfc_message_id: &str,
@@ -1261,7 +1803,10 @@ fn event_matches_filter(
                 ..
             } => added_labels.iter().any(|l| l == lbl) || removed_labels.iter().any(|l| l == lbl),
             MailEvent::DraftCreated { .. } => lbl == LABEL_DRAFT,
-            MailEvent::DeliveryStatus { .. } | MailEvent::SyncCompleted { .. } => false,
+            MailEvent::DeliveryStatus { .. }
+            | MailEvent::SyncCompleted { .. }
+            | MailEvent::ApprovalRequested { .. }
+            | MailEvent::ApprovalResolved { .. } => false,
         };
         if !matched {
             return false;
@@ -1368,6 +1913,13 @@ struct ListDraftsParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ListApprovalsParams {
+    status: Option<String>,
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct EventsParams {
     types: Option<String>,
     label: Option<String>,
@@ -1405,6 +1957,10 @@ async fn get_capabilities(
             "POST /v1/drafts",
             "POST /v1/drafts/{id}/send",
             "DELETE /v1/drafts/{id}",
+            "GET /v1/approvals",
+            "GET /v1/approvals/{id}",
+            "POST /v1/approvals/{id}/approve",
+            "POST /v1/approvals/{id}/reject",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",
@@ -1414,6 +1970,9 @@ async fn get_capabilities(
         "safety": {
             "draft_only": cfg.draft_only,
             "draft_only_action": cfg.draft_only_action,
+            "require_approval": cfg.require_approval,
+            "approval_ttl_secs": cfg.approval_ttl_secs,
+            "approval_webhook_enabled": cfg.approval_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty()),
             "allowed_recipients_enabled": !cfg.allowed_recipients.is_empty(),
             "max_send_recipients": cfg.max_send_recipients,
             "default_max_body_chars": cfg.default_max_body_chars,
@@ -1649,10 +2208,17 @@ async fn get_attachment_handler(
 
 async fn send_message_handler(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiSendEmailRequest>,
 ) -> Result<Response, AiError> {
-    let res = execute_send_email_with_source(&state, req, EventSource::Api).await?;
+    let res = execute_send_email_with_context(
+        &state,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
     let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
         StatusCode::ACCEPTED
     } else {
@@ -1728,12 +2294,20 @@ async fn create_draft_handler(
 
 async fn send_draft_handler(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
     body: Bytes,
 ) -> Result<Response, AiError> {
     let req: AiSendDraftRequest = parse_optional_json(&body)?;
-    let res = execute_send_draft_with_source(&state, &id, req, EventSource::Api).await?;
+    let res = execute_send_draft_with_context(
+        &state,
+        &id,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
     let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
         StatusCode::ACCEPTED
     } else {
@@ -1741,6 +2315,65 @@ async fn send_draft_handler(
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())
+}
+
+async fn list_approvals_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ListApprovalsParams>,
+) -> Result<Json<Value>, AiError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let body = execute_list_approvals(&state, params.status.as_deref(), limit).await?;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn get_approval_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let body = execute_get_approval(&state, &id).await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn approve_approval_handler(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, AiError> {
+    let req: ApprovalDecisionRequest = parse_optional_json(&body)?;
+    let res = execute_approve_approval(
+        &state,
+        &id,
+        req,
+        principal.as_ref().map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn reject_approval_handler(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, AiError> {
+    let req: ApprovalDecisionRequest = parse_optional_json(&body)?;
+    let res = execute_reject_approval(
+        &state,
+        &id,
+        req,
+        principal.as_ref().map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 
 async fn delete_draft_handler(

@@ -942,6 +942,36 @@ mod tests {
         async fn save_settings(&self, _settings: UserSettings) -> AppResult<UserSettings> {
             unreachable!()
         }
+        async fn create_pending_approval(
+            &self,
+            _input: crate::storage::NewPendingApprovalInput,
+        ) -> AppResult<crate::storage::PendingApproval> {
+            unreachable!()
+        }
+        async fn get_pending_approval(
+            &self,
+            _id: &str,
+        ) -> AppResult<Option<crate::storage::PendingApproval>> {
+            unreachable!()
+        }
+        async fn list_pending_approvals(
+            &self,
+            _status: Option<crate::storage::ApprovalStatus>,
+            _limit: usize,
+        ) -> AppResult<Vec<crate::storage::PendingApproval>> {
+            unreachable!()
+        }
+        async fn resolve_pending_approval(
+            &self,
+            _id: &str,
+            _status: crate::storage::ApprovalStatus,
+            _decided_by: Option<String>,
+            _note: Option<String>,
+            _sent_message_id: Option<String>,
+            _provider_message_id: Option<String>,
+        ) -> AppResult<crate::storage::PendingApproval> {
+            unreachable!()
+        }
     }
 
     fn test_state(

@@ -901,6 +901,36 @@ impl MailStore for TestMailStore {
     async fn save_settings(&self, _: UserSettings) -> AppResult<UserSettings> {
         unimplemented!()
     }
+    async fn create_pending_approval(
+        &self,
+        _: crate::storage::NewPendingApprovalInput,
+    ) -> AppResult<crate::storage::PendingApproval> {
+        unimplemented!()
+    }
+    async fn get_pending_approval(
+        &self,
+        _: &str,
+    ) -> AppResult<Option<crate::storage::PendingApproval>> {
+        unimplemented!()
+    }
+    async fn list_pending_approvals(
+        &self,
+        _: Option<crate::storage::ApprovalStatus>,
+        _: usize,
+    ) -> AppResult<Vec<crate::storage::PendingApproval>> {
+        unimplemented!()
+    }
+    async fn resolve_pending_approval(
+        &self,
+        _: &str,
+        _: crate::storage::ApprovalStatus,
+        _: Option<String>,
+        _: Option<String>,
+        _: Option<String>,
+        _: Option<String>,
+    ) -> AppResult<crate::storage::PendingApproval> {
+        unimplemented!()
+    }
 }
 
 pub(crate) fn test_app_state(mut config: Config) -> AppState {

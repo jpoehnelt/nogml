@@ -11,7 +11,9 @@ pub mod smtp;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     config::{Config, TransportBackend},
@@ -96,12 +98,64 @@ pub(crate) fn ensure_raw_rfc2822(msg: &OutboundMessage, default_from: &str) -> A
     crate::mime::build_rfc2822(&compose)
 }
 
+mod serde_bytes_b64 {
+    use super::*;
+    use serde::de;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesOrBase64Visitor;
+
+        impl<'de> de::Visitor<'de> for BytesOrBase64Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a base64-encoded string or byte array")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                general_purpose::STANDARD
+                    .decode(v)
+                    .map_err(|e| E::custom(format!("invalid base64 bytes: {e}")))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_any(BytesOrBase64Visitor)
+    }
+}
+
 /// Attachment carried on an [`OutboundMessage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundAttachment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<String>,
+    #[serde(default, with = "serde_bytes_b64")]
     pub data: Vec<u8>,
 }
 
@@ -130,21 +184,34 @@ impl From<&NewAttachmentInput> for OutboundAttachment {
 /// Provider-agnostic outbound email payload carrying both structured fields
 /// (for REST transports like Resend) and verbatim `raw_rfc2822` bytes
 /// (for raw MIME transports like AWS SES `SendRawEmail`, SMTP, or Stalwart).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundMessage {
     pub from: String,
+    #[serde(default)]
     pub to: Vec<String>,
+    #[serde(default)]
     pub cc: Vec<String>,
+    #[serde(default)]
     pub bcc: Vec<String>,
+    #[serde(default)]
     pub reply_to: Vec<String>,
+    #[serde(default)]
     pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html: Option<String>,
+    #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default)]
     pub attachments: Vec<OutboundAttachment>,
+    #[serde(default, with = "serde_bytes_b64")]
     pub raw_rfc2822: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_at: Option<String>,
+    #[serde(default)]
     pub tags: HashMap<String, String>,
 }
 

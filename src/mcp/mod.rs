@@ -146,6 +146,8 @@ impl McpServer {
                     "draft_only=true (action=downgrade): outbound sends are downgraded into local drafts."
                 }
             }
+        } else if cfg.require_approval {
+            "require_approval=true: outbound sends are queued for human approval before delivery (review via /v1/approvals or `nogml mail approvals`)."
         } else {
             "draft_only=false: outbound sends are enabled (pass dry_run: true to preview first)."
         };
@@ -309,6 +311,8 @@ impl McpServer {
                     "safety": {
                         "draft_only": self.state.config.draft_only,
                         "draft_only_action": self.state.config.draft_only_action,
+                        "require_approval": self.state.config.require_approval,
+                        "approval_ttl_secs": self.state.config.approval_ttl_secs,
                         "allowed_recipients_enabled": !self.state.config.allowed_recipients.is_empty(),
                         "max_send_recipients": self.state.config.max_send_recipients,
                     },

@@ -25,10 +25,11 @@ use crate::{
         Profile, SYSTEM_LABEL_IDS, SendAs, ThreadSummary, VacationSettings, is_system_label,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage, HistoryEventKind,
-        HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry, MailStore,
-        MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment,
-        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, DraftListPage,
+        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
+        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, WatchSubscription, parse_simple_email_address,
     },
@@ -192,6 +193,28 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requester_json TEXT,
+    outbound_message_json TEXT NOT NULL,
+    reply_to_message_id TEXT,
+    thread_id TEXT,
+    draft_id TEXT,
+    sent_message_id TEXT,
+    provider_message_id TEXT,
+    decided_by TEXT,
+    decision_note TEXT,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    decided_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_status_created
+    ON pending_approvals (status, created_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_created
+    ON pending_approvals (created_at_ms DESC, id DESC);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`].
@@ -4137,6 +4160,361 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn create_pending_approval(
+        &self,
+        input: NewPendingApprovalInput,
+    ) -> AppResult<PendingApproval> {
+        self.run_blocking(move |conn| {
+            let id = input
+                .id
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("apr_{}", Uuid::new_v4().simple()));
+            let requester_json = input
+                .requester
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let outbound_json = serde_json::to_string(&input.outbound_message)?;
+
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let inserted = tx.execute(
+                "INSERT INTO pending_approvals (
+                    id, status, reason, requester_json, outbound_message_json,
+                    reply_to_message_id, thread_id, draft_id,
+                    sent_message_id, provider_message_id, decided_by, decision_note,
+                    created_at_ms, expires_at_ms, decided_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, ?9, ?10, NULL)",
+                params![
+                    id,
+                    ApprovalStatus::Pending.as_str(),
+                    input.reason,
+                    requester_json,
+                    outbound_json,
+                    input.reply_to_message_id,
+                    input.thread_id,
+                    input.draft_id,
+                    input.created_at_ms,
+                    input.expires_at_ms,
+                ],
+            );
+            if let Err(err) = inserted {
+                if let rusqlite::Error::SqliteFailure(ref sf, _) = err
+                    && sf.code == rusqlite::ErrorCode::ConstraintViolation
+                {
+                    return Err(AppError::Conflict(format!(
+                        "Approval '{id}' already exists"
+                    )));
+                }
+                return Err(sql_err(err));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            Ok(PendingApproval {
+                id,
+                status: ApprovalStatus::Pending,
+                reason: input.reason,
+                requester: input.requester,
+                outbound_message: input.outbound_message,
+                reply_to_message_id: input.reply_to_message_id,
+                thread_id: input.thread_id,
+                draft_id: input.draft_id,
+                sent_message_id: None,
+                provider_message_id: None,
+                decided_by: None,
+                decision_note: None,
+                created_at_ms: input.created_at_ms,
+                expires_at_ms: input.expires_at_ms,
+                decided_at_ms: None,
+            })
+        })
+        .await
+    }
+
+    async fn get_pending_approval(&self, id: &str) -> AppResult<Option<PendingApproval>> {
+        let id = id.to_string();
+        self.run_blocking(move |conn| {
+            let now_ms = Utc::now().timestamp_millis();
+            let row = conn
+                .query_row(
+                    "SELECT id, status, reason, requester_json, outbound_message_json,
+                            reply_to_message_id, thread_id, draft_id,
+                            sent_message_id, provider_message_id, decided_by, decision_note,
+                            created_at_ms, expires_at_ms, decided_at_ms
+                     FROM pending_approvals
+                     WHERE id = ?1",
+                    params![id],
+                    pending_approval_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            row.map(|parsed| normalize_pending_approval(parsed?, now_ms))
+                .transpose()
+        })
+        .await
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        status: Option<ApprovalStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<PendingApproval>> {
+        let limit = if limit == 0 { 20 } else { limit } as i64;
+        self.run_blocking(move |conn| {
+            let now_ms = Utc::now().timestamp_millis();
+            let mut results = Vec::new();
+            match status {
+                None => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, status, reason, requester_json, outbound_message_json,
+                                    reply_to_message_id, thread_id, draft_id,
+                                    sent_message_id, provider_message_id, decided_by, decision_note,
+                                    created_at_ms, expires_at_ms, decided_at_ms
+                             FROM pending_approvals
+                             ORDER BY created_at_ms DESC, id DESC
+                             LIMIT ?1",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![limit], pending_approval_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        let parsed = row.map_err(sql_err)??;
+                        results.push(normalize_pending_approval(parsed, now_ms)?);
+                    }
+                }
+                Some(ApprovalStatus::Pending) => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, status, reason, requester_json, outbound_message_json,
+                                    reply_to_message_id, thread_id, draft_id,
+                                    sent_message_id, provider_message_id, decided_by, decision_note,
+                                    created_at_ms, expires_at_ms, decided_at_ms
+                             FROM pending_approvals
+                             WHERE status = 'pending' AND expires_at_ms > ?1
+                             ORDER BY created_at_ms DESC, id DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![now_ms, limit], pending_approval_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        let parsed = row.map_err(sql_err)??;
+                        results.push(normalize_pending_approval(parsed, now_ms)?);
+                    }
+                }
+                Some(ApprovalStatus::Expired) => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, status, reason, requester_json, outbound_message_json,
+                                    reply_to_message_id, thread_id, draft_id,
+                                    sent_message_id, provider_message_id, decided_by, decision_note,
+                                    created_at_ms, expires_at_ms, decided_at_ms
+                             FROM pending_approvals
+                             WHERE status = 'expired' OR (status = 'pending' AND expires_at_ms <= ?1)
+                             ORDER BY created_at_ms DESC, id DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![now_ms, limit], pending_approval_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        let parsed = row.map_err(sql_err)??;
+                        results.push(normalize_pending_approval(parsed, now_ms)?);
+                    }
+                }
+                Some(other @ (ApprovalStatus::Approved | ApprovalStatus::Rejected)) => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, status, reason, requester_json, outbound_message_json,
+                                    reply_to_message_id, thread_id, draft_id,
+                                    sent_message_id, provider_message_id, decided_by, decision_note,
+                                    created_at_ms, expires_at_ms, decided_at_ms
+                             FROM pending_approvals
+                             WHERE status = ?1
+                             ORDER BY created_at_ms DESC, id DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![other.as_str(), limit], pending_approval_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        let parsed = row.map_err(sql_err)??;
+                        results.push(normalize_pending_approval(parsed, now_ms)?);
+                    }
+                }
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn resolve_pending_approval(
+        &self,
+        id: &str,
+        status: ApprovalStatus,
+        decided_by: Option<String>,
+        note: Option<String>,
+        sent_message_id: Option<String>,
+        provider_message_id: Option<String>,
+    ) -> AppResult<PendingApproval> {
+        if !matches!(status, ApprovalStatus::Approved | ApprovalStatus::Rejected) {
+            return Err(AppError::BadRequest(
+                "Target approval resolution status must be 'approved' or 'rejected'".to_string(),
+            ));
+        }
+
+        let id = id.to_string();
+        self.run_blocking(move |conn| {
+            let now_ms = Utc::now().timestamp_millis();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+
+            let existing = tx
+                .query_row(
+                    "SELECT id, status, reason, requester_json, outbound_message_json,
+                            reply_to_message_id, thread_id, draft_id,
+                            sent_message_id, provider_message_id, decided_by, decision_note,
+                            created_at_ms, expires_at_ms, decided_at_ms
+                     FROM pending_approvals
+                     WHERE id = ?1",
+                    params![id],
+                    pending_approval_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))??;
+
+            if existing.status != ApprovalStatus::Pending {
+                return Err(AppError::Conflict(format!(
+                    "Approval '{id}' is already {}",
+                    existing.status
+                )));
+            }
+
+            if existing.expires_at_ms <= now_ms {
+                tx.execute(
+                    "UPDATE pending_approvals
+                     SET status = 'expired', decided_at_ms = COALESCE(decided_at_ms, ?1)
+                     WHERE id = ?2 AND status = 'pending'",
+                    params![now_ms, id],
+                )
+                .map_err(sql_err)?;
+                tx.commit().map_err(sql_err)?;
+                return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+            }
+
+            let changed = tx
+                .execute(
+                    "UPDATE pending_approvals
+                     SET status = ?1,
+                         decided_by = ?2,
+                         decision_note = ?3,
+                         sent_message_id = ?4,
+                         provider_message_id = ?5,
+                         decided_at_ms = ?6
+                     WHERE id = ?7 AND status = 'pending'",
+                    params![
+                        status.as_str(),
+                        decided_by,
+                        note,
+                        sent_message_id,
+                        provider_message_id,
+                        now_ms,
+                        id,
+                    ],
+                )
+                .map_err(sql_err)?;
+
+            if changed != 1 {
+                return Err(AppError::Conflict(format!(
+                    "Approval '{id}' was already resolved"
+                )));
+            }
+
+            tx.commit().map_err(sql_err)?;
+
+            Ok(PendingApproval {
+                status,
+                decided_by,
+                decision_note: note,
+                sent_message_id,
+                provider_message_id,
+                decided_at_ms: Some(now_ms),
+                ..existing
+            })
+        })
+        .await
+    }
+}
+
+fn pending_approval_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AppResult<PendingApproval>> {
+    let id: String = row.get(0)?;
+    let status_raw: String = row.get(1)?;
+    let reason: String = row.get(2)?;
+    let requester_json: Option<String> = row.get(3)?;
+    let outbound_json: String = row.get(4)?;
+    let reply_to_message_id: Option<String> = row.get(5)?;
+    let thread_id: Option<String> = row.get(6)?;
+    let draft_id: Option<String> = row.get(7)?;
+    let sent_message_id: Option<String> = row.get(8)?;
+    let provider_message_id: Option<String> = row.get(9)?;
+    let decided_by: Option<String> = row.get(10)?;
+    let decision_note: Option<String> = row.get(11)?;
+    let created_at_ms: i64 = row.get(12)?;
+    let expires_at_ms: i64 = row.get(13)?;
+    let decided_at_ms: Option<i64> = row.get(14)?;
+
+    let parsed = (|| -> AppResult<PendingApproval> {
+        let status = ApprovalStatus::parse_str(&status_raw).ok_or_else(|| {
+            AppError::Storage(format!("Invalid approval status in DB: '{status_raw}'"))
+        })?;
+        let requester = requester_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| AppError::Storage(format!("Corrupt requester_json: {e}")))?;
+        let outbound_message = serde_json::from_str(&outbound_json)
+            .map_err(|e| AppError::Storage(format!("Corrupt outbound_message_json: {e}")))?;
+        Ok(PendingApproval {
+            id,
+            status,
+            reason,
+            requester,
+            outbound_message,
+            reply_to_message_id,
+            thread_id,
+            draft_id,
+            sent_message_id,
+            provider_message_id,
+            decided_by,
+            decision_note,
+            created_at_ms,
+            expires_at_ms,
+            decided_at_ms,
+        })
+    })();
+
+    Ok(parsed)
+}
+
+fn normalize_pending_approval(
+    mut item: PendingApproval,
+    now_ms: i64,
+) -> AppResult<PendingApproval> {
+    if item.status == ApprovalStatus::Pending && item.expires_at_ms <= now_ms {
+        item.status = ApprovalStatus::Expired;
+    }
+    Ok(item)
 }
 
 fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {

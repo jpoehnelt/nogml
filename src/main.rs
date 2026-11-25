@@ -13,7 +13,8 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use nogml::{
-    AppState, ai,
+    AppState,
+    ai::{self, ApprovalDecisionRequest},
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
@@ -22,6 +23,7 @@ use nogml::{
     },
     ensure_crypto_provider,
     error::{AppError, AppResult},
+    events::EventSource,
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
@@ -237,6 +239,28 @@ struct CommonConfigArgs {
         global = true
     )]
     draft_only_action: DraftOnlyAction,
+
+    /// Hold all outbound sends in the persistent approval queue until a human approves them.
+    #[arg(
+        long,
+        env = "NOGML_REQUIRE_APPROVAL",
+        default_value_t = false,
+        global = true
+    )]
+    require_approval: bool,
+
+    /// Time-to-live in seconds for pending outbound approval requests (default 86400s).
+    #[arg(
+        long,
+        env = "NOGML_APPROVAL_TTL_SECS",
+        default_value_t = 86_400,
+        global = true
+    )]
+    approval_ttl_secs: u64,
+
+    /// Optional webhook URL notified via HTTP POST (Slack/generic JSON) when a send enters approval.
+    #[arg(long, env = "NOGML_APPROVAL_WEBHOOK_URL", global = true)]
+    approval_webhook_url: Option<String>,
 
     /// Comma-separated recipient allowlist (exact email, `@domain`, or `*.domain`).
     #[arg(
@@ -746,8 +770,53 @@ enum MailAction {
     },
     /// List available labels.
     Labels,
+    /// Manage pending human-in-the-loop outbound approvals.
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
     /// Stream real-time mail events as NDJSON.
     Watch,
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalsAction {
+    /// List outbound approval requests.
+    List {
+        /// Filter by status (`pending`, `approved`, `rejected`, `expired`, or `all`).
+        #[arg(long, default_value = "pending")]
+        status: String,
+        /// Maximum number of approvals to return.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Fetch a single approval request by ID.
+    Get {
+        /// Approval ID.
+        id: String,
+    },
+    /// Approve and dispatch a pending outbound email once.
+    Approve {
+        /// Approval ID.
+        id: String,
+        /// Optional reviewer name or email recorded on the decision.
+        #[arg(long)]
+        decided_by: Option<String>,
+        /// Optional decision note.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject a pending outbound email without sending it.
+    Reject {
+        /// Approval ID.
+        id: String,
+        /// Optional reviewer name or email recorded on the decision.
+        #[arg(long)]
+        decided_by: Option<String>,
+        /// Optional decision note.
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 impl CommonConfigArgs {
@@ -787,6 +856,9 @@ impl CommonConfigArgs {
             auth_tokens: self.auth_tokens,
             draft_only: self.draft_only,
             draft_only_action: self.draft_only_action,
+            require_approval: self.require_approval,
+            approval_ttl_secs: self.approval_ttl_secs,
+            approval_webhook_url: self.approval_webhook_url,
             allowed_recipients: self.allowed_recipients,
             max_send_recipients: self.max_send_recipients,
             default_max_body_chars: self.default_max_body_chars,
@@ -966,6 +1038,7 @@ fn map_remote_http_error(status: reqwest::StatusCode, body: &str) -> AppError {
         401 => AppError::Unauthorized(body.to_string()),
         403 => AppError::Forbidden(body.to_string()),
         404 => AppError::NotFound(body.to_string()),
+        409 => AppError::Conflict(body.to_string()),
         429 => AppError::RateLimited(body.to_string()),
         code_num => AppError::Upstream {
             status: code_num,
@@ -1213,6 +1286,76 @@ async fn run_remote_mail(
             let val = parse_remote_json(resp).await?;
             emit_output(val, fields, json_flag)
         }
+        MailAction::Approvals { action } => match action {
+            ApprovalsAction::List { status, limit } => {
+                let params = [("status", status), ("limit", limit.to_string())];
+                let resp = with_optional_bearer(
+                    client.get(format!("{base}/v1/approvals")).query(&params),
+                    bearer_token,
+                )
+                .send()
+                .await?;
+                let val = parse_remote_json(resp).await?;
+                if ndjson && let Some(items) = val.get("approvals").and_then(Value::as_array) {
+                    for item in items {
+                        emit_output(item.clone(), fields, true)?;
+                    }
+                    Ok(())
+                } else {
+                    emit_output(val, fields, json_flag)
+                }
+            }
+            ApprovalsAction::Get { id } => {
+                let encoded_id: String =
+                    url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+                let resp = with_optional_bearer(
+                    client.get(format!("{base}/v1/approvals/{encoded_id}")),
+                    bearer_token,
+                )
+                .send()
+                .await?;
+                let val = parse_remote_json(resp).await?;
+                emit_output(val, fields, json_flag)
+            }
+            ApprovalsAction::Approve {
+                id,
+                decided_by,
+                note,
+            } => {
+                let encoded_id: String =
+                    url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+                let req = ApprovalDecisionRequest { decided_by, note };
+                let resp = with_optional_bearer(
+                    client
+                        .post(format!("{base}/v1/approvals/{encoded_id}/approve"))
+                        .json(&req),
+                    bearer_token,
+                )
+                .send()
+                .await?;
+                let val = parse_remote_json(resp).await?;
+                emit_output(val, fields, json_flag)
+            }
+            ApprovalsAction::Reject {
+                id,
+                decided_by,
+                note,
+            } => {
+                let encoded_id: String =
+                    url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+                let req = ApprovalDecisionRequest { decided_by, note };
+                let resp = with_optional_bearer(
+                    client
+                        .post(format!("{base}/v1/approvals/{encoded_id}/reject"))
+                        .json(&req),
+                    bearer_token,
+                )
+                .send()
+                .await?;
+                let val = parse_remote_json(resp).await?;
+                emit_output(val, fields, json_flag)
+            }
+        },
         MailAction::Watch => {
             // Stream `/v1/events` SSE frames and emit each `data:` payload as NDJSON.
             let stream_client = reqwest::Client::builder()
@@ -1631,6 +1774,55 @@ async fn run(cli: Cli) -> AppResult<()> {
                     let labels = state.store.list_labels().await?;
                     emit_output(json!({ "labels": labels }), fields.as_deref(), json_flag)
                 }
+                MailAction::Approvals { action } => match action {
+                    ApprovalsAction::List { status, limit } => {
+                        let val = ai::execute_list_approvals(&state, Some(&status), limit).await?;
+                        if ndjson
+                            && let Some(items) = val.get("approvals").and_then(Value::as_array)
+                        {
+                            for item in items {
+                                emit_output(item.clone(), fields.as_deref(), true)?;
+                            }
+                            Ok(())
+                        } else {
+                            emit_output(val, fields.as_deref(), json_flag)
+                        }
+                    }
+                    ApprovalsAction::Get { id } => {
+                        let val = ai::execute_get_approval(&state, &id).await?;
+                        emit_output(val, fields.as_deref(), json_flag)
+                    }
+                    ApprovalsAction::Approve {
+                        id,
+                        decided_by,
+                        note,
+                    } => {
+                        let val = ai::execute_approve_approval(
+                            &state,
+                            &id,
+                            ApprovalDecisionRequest { decided_by, note },
+                            None,
+                            EventSource::Api,
+                        )
+                        .await?;
+                        emit_output(val, fields.as_deref(), json_flag)
+                    }
+                    ApprovalsAction::Reject {
+                        id,
+                        decided_by,
+                        note,
+                    } => {
+                        let val = ai::execute_reject_approval(
+                            &state,
+                            &id,
+                            ApprovalDecisionRequest { decided_by, note },
+                            None,
+                            EventSource::Api,
+                        )
+                        .await?;
+                        emit_output(val, fields.as_deref(), json_flag)
+                    }
+                },
                 MailAction::Watch => {
                     let mut rx = state.events.subscribe();
                     while let Ok(env) = rx.recv().await {
