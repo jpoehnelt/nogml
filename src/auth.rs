@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Paths that are always exempt from bearer token authentication.
-const AUTH_EXEMPT_PATHS: &[&str] = &["/healthz", "/readyz", "/webhooks/resend"];
+const AUTH_EXEMPT_PATHS: &[&str] = &["/healthz", "/readyz", "/webhooks/resend", "/webhooks/ses"];
 
 /// Maximum permitted length for resource identifiers (`message_id`, `thread_id`, `draft_id`, `label_id`).
 const MAX_RESOURCE_ID_LEN: usize = 256;
@@ -225,7 +225,7 @@ pub fn extract_request_token(headers: &HeaderMap, query: Option<&str>) -> Option
 /// `X-API-Key`, or `?access_token=`) and inserting the resolved [`Principal`] into request
 /// extensions.
 ///
-/// Always exempts `/healthz`, `/readyz`, and `/webhooks/resend`.
+/// Always exempts `/healthz`, `/readyz`, `/webhooks/resend`, and `/webhooks/ses`.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -419,6 +419,7 @@ mod tests {
             .route("/healthz", get(|| async { "ok" }))
             .route("/readyz", get(|| async { "ready" }))
             .route("/webhooks/resend", get(|| async { "hook" }))
+            .route("/webhooks/ses", get(|| async { "ses-hook" }))
             .route("/gmail/v1/users/me/profile", get(|| async { "profile" }))
             .route("/v1/capabilities", get(|| async { "caps" }))
             .layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -518,7 +519,7 @@ mod tests {
         let app = test_router(test_state(vec!["tok-123", "tok-456"]));
 
         // Exempt endpoints bypass auth
-        for path in ["/healthz", "/readyz", "/webhooks/resend"] {
+        for path in ["/healthz", "/readyz", "/webhooks/resend", "/webhooks/ses"] {
             let res = app
                 .clone()
                 .oneshot(

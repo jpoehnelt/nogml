@@ -40,7 +40,7 @@ use crate::{
     resend::{HttpResendClient, ResendClient, ResendTransport},
     search_index::{SearchIndex, StoreSearchIndex},
     storage::{MailStore, StoredAttachment, StoredMessage, open_store},
-    transport::MailTransport,
+    transport::{MailTransport, open_transport},
 };
 
 static CRYPTO_INIT: Once = Once::new();
@@ -79,13 +79,17 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Construct application state from `Config`, opening the configured `MailStore` and `BlobStore`.
+    /// Construct application state from `Config`, opening the configured `MailStore`,
+    /// `BlobStore`, and `MailTransport`.
     pub fn from_config(config: Config) -> AppResult<Self> {
         ensure_crypto_provider();
         let store = open_store(&config)?;
         let blobs = open_blob_store(&config)?;
         let resend: Arc<dyn ResendClient> = Arc::new(HttpResendClient::from_config(&config));
-        Ok(Self::with_backends(config, store, resend).with_blobs(blobs))
+        let transport = open_transport(&config, resend.clone())?;
+        Ok(Self::with_backends(config, store, resend)
+            .with_blobs(blobs)
+            .with_transport(transport))
     }
 
     /// Construct application state with explicit `MailStore` and `ResendClient` implementations
@@ -101,10 +105,13 @@ impl AppState {
             Ok(b) => b,
             Err(_) => Arc::new(InlineBlobStore),
         };
-        let transport: Arc<dyn MailTransport> = Arc::new(ResendTransport::new(
-            resend.clone(),
-            config.user_email.clone(),
-        ));
+        let transport: Arc<dyn MailTransport> = match open_transport(&config, resend.clone()) {
+            Ok(t) => t,
+            Err(_) => Arc::new(ResendTransport::new(
+                resend.clone(),
+                config.user_email.clone(),
+            )),
+        };
         let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let search: Arc<dyn SearchIndex> = Arc::new(StoreSearchIndex::new(store.clone()));
@@ -708,5 +715,35 @@ mod pluggable_seam_tests {
             serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["error"]["code"], "dlp_blocked");
         assert_eq!(body["error"]["hint"], "Redact secrets before sending.");
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_configured_transport_backend() {
+        use crate::config::TransportBackend;
+
+        for (backend, expected_name) in [
+            (TransportBackend::Resend, "resend"),
+            (TransportBackend::Ses, "ses"),
+            (TransportBackend::Smtp, "smtp"),
+        ] {
+            let mut cfg = Config::for_test();
+            cfg.transport = backend;
+            let state = AppState::from_config(cfg).expect("from_config should succeed");
+            let app = build_router(state);
+
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/capabilities")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let caps: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(caps["backends"]["transport"], expected_name);
+        }
     }
 }

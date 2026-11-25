@@ -9,7 +9,7 @@ It exposes four protocols against one mailbox store:
 - A Gmail REST API v1 server (`/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`) for clients such as Superhuman and official Google SDKs.
 - An IMAP4rev1 server with `IDLE`, `MOVE`, `UIDPLUS`, `SPECIAL-USE`, `STARTTLS`, and Gmail `X-GM-EXT-1` extensions.
 
-Outbound mail sends through Resend by default, and inbound mail arrives through Svix-verified Resend webhooks (`POST /webhooks/resend`) or upstream Gmail sync (REST API or IMAP).
+Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME and SMTP submission backends (`NOGML_TRANSPORT=resend|ses|smtp`). Inbound mail arrives through Svix-verified Resend webhooks (`POST /webhooks/resend`), AWS SNS/SES webhooks (`POST /webhooks/ses` with inline base64 or SigV4 S3 `.eml` fetches), or upstream Gmail sync (REST API or IMAP).
 
 ## Features
 
@@ -17,7 +17,7 @@ Outbound mail sends through Resend by default, and inbound mail arrives through 
 - **Built-in MCP server (`nogml mcp` and `POST /mcp`)**: Implements JSON-RPC 2.0 over stdio (logging strictly to stderr) and Streamable HTTP. Exposes 12 tools (`search_emails`, `list_threads`, `read_thread`, `read_email`, `send_email`, `create_draft`, `send_draft`, `triage_thread`, `modify_labels`, `list_labels`, `sync_gmail`, `sync_status`) and `nogml://` resources.
 - **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...`, `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
 - **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS. Maps Gmail labels to folders including `[Gmail]/All Mail`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-LABELS`, and pushes updates over `IDLE`.
-- **Resend delivery and webhooks**: Sends outbound mail via `POST /emails` with `Idempotency-Key`. Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures in constant time, fetches inbound messages and attachments from the Resend Receiving API, and records delivery status events (`sent`, `delivered`, `bounced`, `complained`, `opened`, `clicked`, `failed`).
+- **Pluggable mail transports (Resend, AWS SES, SMTP)**: Sends outbound mail via Resend (`POST /emails` with `Idempotency-Key`), AWS SESv2 raw MIME (`POST /v2/email/outbound-emails` signed with AWS SigV4), or direct SMTP (`STARTTLS`, implicit TLS, or plain TCP with `AUTH PLAIN` / `AUTH LOGIN` and RFC 5321 dot-stuffing). Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures and handles `POST /webhooks/ses` SNS notifications (inline base64 or S3 downloads) through the same inbound ingestion and filtering pipeline.
 - **Upstream Gmail sync**: Imports existing Gmail accounts via Gmail REST API v1 (OAuth2 refresh, paginated backfill, incremental `history.list` with automatic 404 full resync) or Gmail IMAP (`X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`.
 - **CLI (`nogml mail`)**: Runs against the local store or a remote server (`--url`). Outputs JSON automatically when stdout is not a TTY, supports `--ndjson`, `--fields`, and `--payload @-`, and returns deterministic exit codes (`0` ok, `2` validation or config error, `3` policy block, `4` auth or upstream error, `1` runtime error).
 
@@ -26,15 +26,15 @@ Outbound mail sends through Resend by default, and inbound mail arrives through 
 Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?fields=` masking, HTTP batching, IMAP wire codec, and MCP JSON-RPC) is concrete. Backend storage, delivery, filtering, auth, search, and outbound policy sit behind seven async traits on `AppState`:
 
 ```text
-  HTTP (/v1, /gmail/v1, /mcp, /webhooks/resend)  |  IMAP4rev1  |  MCP stdio  |  CLI / Sync
-  -----------------------------------------------------------------------------------------
-                                         AppState
+  HTTP (/v1, /gmail/v1, /mcp, /webhooks/resend, /webhooks/ses) | IMAP4rev1 | MCP stdio | CLI / Sync
+  -------------------------------------------------------------------------------------------------
+                                              AppState
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
   | MailStore  | | BlobStore | | MailTransport | | InboundFilter | | AuthProvider | | SearchIndex | | OutboundPolicy |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
   | SqliteStore| | Inline    | | ResendTransp. | | NoopFilter    | | StaticToken  | | StoreSearch | | ConfigPolicy   |
-  | MemoryStore| | FsBlob    | | (SES / SMTP)  | | FilterChain   | | (JWT / OIDC) | | (Tantivy /  | | (Approval /    |
-  | (Postgres) | | MemoryBlob| |               | | AuthResults   | |              | |  pgvector)  | |  DLP / Budget) |
+  | MemoryStore| | FsBlob    | | SesTransport  | | FilterChain   | | (JWT / OIDC) | | (Tantivy /  | | (Approval /    |
+  | (Postgres) | | MemoryBlob| | SmtpTransport | | AuthResults   | |              | |  pgvector)  | |  DLP / Budget) |
   |            | | S3Blob    | |               | | Rspamd / LLM  | |              | |             | |                |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
 ```
@@ -43,8 +43,8 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | --- | --- | --- | --- |
 | `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, history, IMAP UIDs, watch state, and sync state |
 | `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
-| `MailTransport` | `src/transport/` | `ResendTransport` (`src/resend/`) | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
-| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
+| `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
+| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
 | `SearchIndex` | `src/search_index.rs` | `StoreSearchIndex` | Search backend used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
 | `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202, `Deny` returning 403) and `dry_run` checks |
@@ -165,9 +165,19 @@ Every CLI flag has a matching environment variable:
 | `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens |
 | `NOGML_USER_EMAIL` | `--user-email` | `me@localhost` | Primary mailbox address |
 | `NOGML_DEFAULT_DOMAIN` | `--default-domain` | `localhost` | Default domain for generated `Message-ID` headers |
+| `NOGML_TRANSPORT` | `--transport` | `resend` | `MailTransport` backend (`resend`, `ses`, or `smtp`) |
 | `RESEND_API_KEY` | `--resend-api-key` | *(none)* | Resend API key (`re_...`) for outbound sends and the Receiving API |
 | `RESEND_BASE_URL` | `--resend-base-url` | `https://api.resend.com` | Resend API base URL |
 | `RESEND_WEBHOOK_SECRET` | `--resend-webhook-secret` | *(none)* | Svix signing secret (`whsec_...`) for `POST /webhooks/resend` |
+| `NOGML_SES_REGION` | `--ses-region` | `us-east-1` | AWS region for SESv2 sends and S3 inbound downloads |
+| `NOGML_SES_ENDPOINT` | `--ses-endpoint` | `https://email.<region>.amazonaws.com` | Custom AWS SESv2 endpoint URL |
+| `NOGML_SES_ACCESS_KEY_ID` / `SECRET_ACCESS_KEY` / `SESSION_TOKEN` | `--ses-*` | *(none)* | AWS credentials for SigV4 signing of SES and S3 requests |
+| `NOGML_SES_S3_ENDPOINT` | `--ses-s3-endpoint` | `https://s3.<region>.amazonaws.com` | Custom S3 endpoint URL for SES inbound S3 objects |
+| `NOGML_SES_WEBHOOK_SECRET` | `--ses-webhook-secret` | *(none)* | Optional shared secret for `POST /webhooks/ses` (`X-Nogml-Webhook-Secret` header or `?secret=`) |
+| `NOGML_SMTP_HOST` / `PORT` | `--smtp-host` / `--smtp-port` | `127.0.0.1` / `587` | Upstream SMTP submission host and TCP port |
+| `NOGML_SMTP_TLS_MODE` | `--smtp-tls-mode` | `starttls` | SMTP TLS mode (`starttls`, `tls`, or `none`) |
+| `NOGML_SMTP_USERNAME` / `PASSWORD` | `--smtp-username` / `--smtp-password` | *(none)* | Optional SMTP AUTH credentials (`PLAIN` or `LOGIN`) |
+| `NOGML_SMTP_HELO_DOMAIN` | `--smtp-helo-domain` | `NOGML_DEFAULT_DOMAIN` | Domain advertised in `EHLO` |
 | `NOGML_DRAFT_ONLY` | `--draft-only` | `false` | Prevent direct outbound sends |
 | `NOGML_DRAFT_ONLY_ACTION` | `--draft-only-action` | `block` | Action when `draft_only=true` (`block` or `downgrade`) |
 | `NOGML_ALLOWED_RECIPIENTS` | `--allowed-recipients` | *(unrestricted)* | Comma-separated allowlist (`a@b.com`, `@domain.com`, `*.domain.com`) |
@@ -233,9 +243,11 @@ Point the Gmail API base URL at `http://127.0.0.1:8080` with `Authorization: Bea
 
 Set `--imap-bind 127.0.0.1:1143` (or `--imap-tls-bind 127.0.0.1:1993` with a TLS certificate and key). Log in with `--user-email` (or `NOGML_IMAP_USERNAME`) and your bearer token (or `NOGML_IMAP_PASSWORD`).
 
-### Resend webhooks
+### Resend and AWS SES webhooks
 
 Set your Resend webhook endpoint to `POST https://<your-host>/webhooks/resend` with `RESEND_WEBHOOK_SECRET=whsec_...`. On each request, `nogml` verifies the Svix signature in constant time, fetches the inbound message and attachments from the Resend Receiving API, runs `InboundFilter`, threads replies using `In-Reply-To` and `References`, deduplicates by `Message-ID`, and records delivery status events (`email.sent`, `email.delivered`, `email.bounced`, and others).
+
+For AWS SES inbound mail, point an SNS HTTP(S) subscription at `POST https://<your-host>/webhooks/ses` (optionally adding `?secret=<token>` or `X-Nogml-Webhook-Secret` matching `NOGML_SES_WEBHOOK_SECRET`). `nogml` logs SNS `SubscriptionConfirmation` URLs and ingests `Received` notifications from either inline base64 `content` or SigV4-signed S3 `.eml` objects through the same `ingest_inbound_rfc2822` pipeline.
 
 ## Embedding as a Rust library
 

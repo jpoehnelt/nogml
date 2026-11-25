@@ -17,7 +17,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{AppState, ai, auth, gmail, mcp, resend};
+use crate::{AppState, ai, auth, gmail, mcp, resend, transport};
 
 /// Liveness endpoint (`GET /healthz`), always unauthenticated.
 async fn healthz() -> Json<serde_json::Value> {
@@ -94,6 +94,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 /// - `GET /healthz` (unauthenticated)
 /// - `GET /readyz` (unauthenticated)
 /// - `POST /webhooks/resend` (Svix-verified, exempt from bearer auth)
+/// - `POST /webhooks/ses` (SNS/SES inbound webhook, optional shared secret, exempt from bearer auth)
 /// - `/gmail/v1/...`, `/upload/gmail/v1/...`, `/batch/gmail/v1` (bearer-protected)
 /// - `/v1/...` AI-first REST + SSE (bearer-protected)
 /// - `/mcp` Streamable HTTP MCP (bearer-protected)
@@ -120,6 +121,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .merge(resend::resend_router())
+        .merge(transport::ses::ses_router())
         .merge(protected)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(RequestBodyLimitLayer::new(max_body_bytes))

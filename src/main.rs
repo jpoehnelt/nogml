@@ -17,8 +17,8 @@ use nogml::{
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
-        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, StorageBackend,
-        SyncMode,
+        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, SmtpTlsMode,
+        StorageBackend, SyncMode, TransportBackend,
     },
     ensure_crypto_provider,
     error::{AppError, AppResult},
@@ -130,6 +130,10 @@ struct CommonConfigArgs {
     )]
     default_domain: String,
 
+    /// Outbound mail transport backend (`resend`, `ses`, or `smtp`).
+    #[arg(long, env = "NOGML_TRANSPORT", default_value = "resend", global = true)]
+    transport: TransportBackend,
+
     /// Resend API key (`re_...`).
     #[arg(long, env = "RESEND_API_KEY", global = true)]
     resend_api_key: Option<String>,
@@ -146,6 +150,75 @@ struct CommonConfigArgs {
     /// Resend Svix webhook signing secret (`whsec_...`).
     #[arg(long, env = "RESEND_WEBHOOK_SECRET", global = true)]
     resend_webhook_secret: Option<String>,
+
+    // --- AWS SES outbound & SNS/S3 inbound ---
+    /// AWS region for SESv2 outbound sends and S3 inbound fetches.
+    #[arg(
+        long,
+        env = "NOGML_SES_REGION",
+        default_value = "us-east-1",
+        global = true
+    )]
+    ses_region: String,
+
+    /// Custom AWS SESv2 API endpoint URL (defaults to `https://email.<region>.amazonaws.com`).
+    #[arg(long, env = "NOGML_SES_ENDPOINT", global = true)]
+    ses_endpoint: Option<String>,
+
+    /// AWS access key ID for SigV4 signing of SES and S3 requests.
+    #[arg(long, env = "NOGML_SES_ACCESS_KEY_ID", global = true)]
+    ses_access_key_id: Option<String>,
+
+    /// AWS secret access key for SigV4 signing of SES and S3 requests.
+    #[arg(long, env = "NOGML_SES_SECRET_ACCESS_KEY", global = true)]
+    ses_secret_access_key: Option<String>,
+
+    /// Optional AWS STS session token for SigV4 signing.
+    #[arg(long, env = "NOGML_SES_SESSION_TOKEN", global = true)]
+    ses_session_token: Option<String>,
+
+    /// Custom S3 endpoint URL for SES inbound S3 fetches (defaults to `https://s3.<region>.amazonaws.com`).
+    #[arg(long, env = "NOGML_SES_S3_ENDPOINT", global = true)]
+    ses_s3_endpoint: Option<String>,
+
+    /// Optional shared secret required by `POST /webhooks/ses` (header or query param).
+    #[arg(long, env = "NOGML_SES_WEBHOOK_SECRET", global = true)]
+    ses_webhook_secret: Option<String>,
+
+    // --- SMTP outbound submission ---
+    /// Upstream SMTP relay host.
+    #[arg(
+        long,
+        env = "NOGML_SMTP_HOST",
+        default_value = "127.0.0.1",
+        global = true
+    )]
+    smtp_host: String,
+
+    /// Upstream SMTP relay TCP port.
+    #[arg(long, env = "NOGML_SMTP_PORT", default_value_t = 587, global = true)]
+    smtp_port: u16,
+
+    /// SMTP TLS mode (`starttls`, `tls`, or `none`).
+    #[arg(
+        long,
+        env = "NOGML_SMTP_TLS_MODE",
+        default_value = "starttls",
+        global = true
+    )]
+    smtp_tls_mode: SmtpTlsMode,
+
+    /// Optional SMTP AUTH username.
+    #[arg(long, env = "NOGML_SMTP_USERNAME", global = true)]
+    smtp_username: Option<String>,
+
+    /// Optional SMTP AUTH password.
+    #[arg(long, env = "NOGML_SMTP_PASSWORD", global = true)]
+    smtp_password: Option<String>,
+
+    /// Optional `EHLO` domain name (defaults to `--default-domain`).
+    #[arg(long, env = "NOGML_SMTP_HELO_DOMAIN", global = true)]
+    smtp_helo_domain: Option<String>,
 
     /// Comma-separated bearer auth tokens (empty = dev unauthenticated mode).
     #[arg(long, env = "NOGML_AUTH_TOKENS", value_delimiter = ',', global = true)]
@@ -634,9 +707,23 @@ impl CommonConfigArgs {
             blob_s3_force_path_style: self.blob_s3_force_path_style,
             user_email: self.user_email,
             default_domain: self.default_domain,
+            transport: self.transport,
             resend_api_key: self.resend_api_key,
             resend_base_url: self.resend_base_url,
             resend_webhook_secret: self.resend_webhook_secret,
+            ses_region: self.ses_region,
+            ses_endpoint: self.ses_endpoint,
+            ses_access_key_id: self.ses_access_key_id,
+            ses_secret_access_key: self.ses_secret_access_key,
+            ses_session_token: self.ses_session_token,
+            ses_s3_endpoint: self.ses_s3_endpoint,
+            ses_webhook_secret: self.ses_webhook_secret,
+            smtp_host: self.smtp_host,
+            smtp_port: self.smtp_port,
+            smtp_tls_mode: self.smtp_tls_mode,
+            smtp_username: self.smtp_username,
+            smtp_password: self.smtp_password,
+            smtp_helo_domain: self.smtp_helo_domain,
             auth_tokens: self.auth_tokens,
             draft_only: self.draft_only,
             draft_only_action: self.draft_only_action,
