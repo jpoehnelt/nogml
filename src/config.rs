@@ -62,6 +62,7 @@ pub enum StorageBackend {
     #[default]
     Sqlite,
     Memory,
+    Postgres,
 }
 
 /// Selectable blob storage backend behind `BlobStore`.
@@ -168,6 +169,7 @@ pub struct Config {
     // --- Pluggable storage ---
     pub storage: StorageBackend,
     pub db_path: PathBuf,
+    pub database_url: Option<String>,
     pub blob_backend: BlobBackend,
     pub blob_dir: PathBuf,
     pub blob_s3_bucket: Option<String>,
@@ -329,6 +331,7 @@ impl Default for Config {
 
             storage: StorageBackend::Sqlite,
             db_path: PathBuf::from("nogml.db"),
+            database_url: None,
             blob_backend: BlobBackend::Inline,
             blob_dir: PathBuf::from("nogml-blobs"),
             blob_s3_bucket: None,

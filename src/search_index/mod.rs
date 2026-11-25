@@ -92,6 +92,7 @@ impl SearchIndex for StoreSearchIndex {
     fn backend_name(&self) -> &'static str {
         match self.store.backend_name() {
             "sqlite" => "sqlite_fts5",
+            "postgres" => "postgres_fts",
             "memory" => "memory",
             _ => "store",
         }
@@ -112,7 +113,7 @@ pub fn open_search_index(
                     &config.db_path,
                     &config.user_email,
                 )?),
-                StorageBackend::Memory => {
+                StorageBackend::Memory | StorageBackend::Postgres => {
                     Arc::new(MemoryVectorStore::for_mailbox_new(&config.user_email))
                 }
             };

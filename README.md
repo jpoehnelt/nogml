@@ -41,7 +41,7 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 
 | Trait | Module | Built-in implementations | Role |
 | --- | --- | --- | --- |
-| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, pending approvals, history, IMAP UIDs, watch state, and sync state |
+| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore`, `PostgresStore` (`--features postgres`) | Messages, threads, labels, drafts, pending approvals, history, IMAP UIDs, watch state, and sync state |
 | `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
 | `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
@@ -156,6 +156,20 @@ NOGML_EMBEDDING_MODEL=nomic-embed-text \
 nogml search reindex --db-path ./nogml.db
 ```
 
+### 7. Multi-node deployment with PostgreSQL (`--features postgres`)
+
+The default build stays a single binary with zero PostgreSQL dependencies. To run multiple `nogml` instances against one shared PostgreSQL database behind a load balancer, compile with `--features postgres` and select `NOGML_STORAGE=postgres` with `NOGML_DATABASE_URL`:
+
+```bash
+cargo build --release --features postgres
+
+NOGML_STORAGE=postgres \
+NOGML_DATABASE_URL=postgres://postgres:postgres@db.internal:5432/nogml \
+nogml serve --bind 0.0.0.0:8080 --user-email agent@example.com
+```
+
+`PostgresStore` creates its schema idempotently on startup, maintains atomic `history_id` and IMAP `uid_next` counters in PostgreSQL transactions, and uses PostgreSQL full-text search (`to_tsvector` and `plainto_tsquery` with `ILIKE` fallback). When `NOGML_STORAGE=postgres` is active, `EventBus` bridges events across nodes via PostgreSQL `LISTEN`/`NOTIFY` on the `nogml_events` channel (ignoring each node's own echoed notifications via a per-node UUID) so SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch` push hooks fan out across all replicas.
+
 ## Configuration
 
 Every CLI flag has a matching environment variable:
@@ -165,8 +179,9 @@ Every CLI flag has a matching environment variable:
 | `NOGML_BIND` | `--bind` | `127.0.0.1:8080` | HTTP listen address |
 | `NOGML_MAX_BODY_BYTES` | `--max-body-bytes` | `41943040` (40 MiB) | Max HTTP body and IMAP literal size |
 | `NOGML_CORS_ORIGINS` | `--cors-origins` | *(any)* | Comma-separated allowed CORS origins |
-| `NOGML_STORAGE` | `--storage` | `sqlite` | `MailStore` backend (`sqlite` or `memory`) |
+| `NOGML_STORAGE` | `--storage` | `sqlite` | `MailStore` backend (`sqlite`, `memory`, or `postgres`) |
 | `NOGML_DB_PATH` | `--db-path` | `nogml.db` | SQLite database file path |
+| `NOGML_DATABASE_URL` | `--database-url` | *(none)* | PostgreSQL connection URL when `NOGML_STORAGE=postgres` (requires `--features postgres`) |
 | `NOGML_BLOB_BACKEND` | `--blob-backend` | `inline` | `BlobStore` backend (`inline`, `fs`, `memory`, or `s3`) |
 | `NOGML_BLOB_DIR` | `--blob-dir` | `nogml-blobs` | Directory for the `fs` blob backend |
 | `NOGML_BLOB_S3_BUCKET` | `--blob-s3-bucket` | *(none)* | S3 bucket name for the `s3` blob backend |

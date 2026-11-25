@@ -94,6 +94,8 @@ pub struct AppState {
     primary_mailbox_id: String,
     base_blobs: Arc<dyn BlobStore>,
     sync_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
+    #[cfg(feature = "postgres")]
+    pg_event_bridge: Option<Arc<crate::storage::PostgresEventBridge>>,
 }
 
 fn scope_blobs_for_mailbox(
@@ -118,8 +120,57 @@ impl AppState {
     /// `BlobStore`, `MailTransport`, and `SearchIndex`.
     pub fn from_config(config: Config) -> AppResult<Self> {
         ensure_crypto_provider();
-        let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
+        #[cfg(feature = "postgres")]
+        let (store, pg_event_bridge) = if config.storage == crate::config::StorageBackend::Postgres
+        {
+            let (s, bridge) = crate::storage::open_postgres_with_bridge_sync(&config)?;
+            (s, Some(bridge))
+        } else {
+            (open_store(&config)?, None)
+        };
+        #[cfg(not(feature = "postgres"))]
         let store = open_store(&config)?;
+
+        Self::finish_from_config(
+            config,
+            store,
+            #[cfg(feature = "postgres")]
+            pg_event_bridge,
+        )
+    }
+
+    /// Asynchronously construct application state from `Config`, eagerly initializing
+    /// network storage backends (such as `PostgresStore`) and attaching distributed
+    /// `EventBus` bridges.
+    pub async fn from_config_async(config: Config) -> AppResult<Self> {
+        ensure_crypto_provider();
+        #[cfg(feature = "postgres")]
+        let (store, pg_event_bridge) = if config.storage == crate::config::StorageBackend::Postgres
+        {
+            let (s, bridge) = crate::storage::open_postgres_with_bridge_async(&config).await?;
+            (s, Some(bridge))
+        } else {
+            (crate::storage::open_store_async(&config).await?, None)
+        };
+        #[cfg(not(feature = "postgres"))]
+        let store = crate::storage::open_store_async(&config).await?;
+
+        Self::finish_from_config(
+            config,
+            store,
+            #[cfg(feature = "postgres")]
+            pg_event_bridge,
+        )
+    }
+
+    fn finish_from_config(
+        config: Config,
+        store: Arc<dyn MailStore>,
+        #[cfg(feature = "postgres")] pg_event_bridge: Option<
+            Arc<crate::storage::PostgresEventBridge>,
+        >,
+    ) -> AppResult<Self> {
+        let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
         let base_blobs = open_blob_store(&config)?;
         let blobs = scope_blobs_for_mailbox(
             &base_blobs,
@@ -138,6 +189,13 @@ impl AppState {
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
 
+        #[allow(unused_mut)]
+        let mut events = EventBus::with_mailbox(&primary_mailbox_id);
+        #[cfg(feature = "postgres")]
+        if let Some(ref bridge) = pg_event_bridge {
+            events = events.with_bridge(bridge.clone());
+        }
+
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -148,7 +206,7 @@ impl AppState {
             search,
             outbound_policy,
             resend,
-            events: EventBus::with_mailbox(&primary_mailbox_id),
+            events,
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
@@ -156,7 +214,28 @@ impl AppState {
             primary_mailbox_id,
             base_blobs,
             sync_locks: Arc::new(StdMutex::new(locks)),
+            #[cfg(feature = "postgres")]
+            pg_event_bridge,
         })
+    }
+
+    /// Spawn the background distributed `EventBus` listener (e.g. Postgres `LISTEN nogml_events`)
+    /// when a networked storage backend with a bridge is active.
+    pub fn spawn_event_bridge_listener(
+        &self,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        #[cfg(feature = "postgres")]
+        if let Some(ref bridge) = self.pg_event_bridge {
+            let bridge = bridge.clone();
+            let events = self.events.clone();
+            return Some(tokio::spawn(async move {
+                bridge.run_listener(events, shutdown_rx).await;
+            }));
+        }
+        #[cfg(not(feature = "postgres"))]
+        let _ = shutdown_rx;
+        None
     }
 
     /// Construct application state with explicit `MailStore` and `ResendClient` implementations
@@ -216,6 +295,8 @@ impl AppState {
             primary_mailbox_id,
             base_blobs,
             sync_locks: Arc::new(StdMutex::new(locks)),
+            #[cfg(feature = "postgres")]
+            pg_event_bridge: None,
         }
     }
 
@@ -296,6 +377,8 @@ impl AppState {
             primary_mailbox_id: self.primary_mailbox_id.clone(),
             base_blobs: self.base_blobs.clone(),
             sync_locks: self.sync_locks.clone(),
+            #[cfg(feature = "postgres")]
+            pg_event_bridge: self.pg_event_bridge.clone(),
         }
     }
 

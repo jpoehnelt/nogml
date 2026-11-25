@@ -139,6 +139,21 @@ pub struct EventEnvelope {
     pub event: MailEvent,
 }
 
+/// Pluggable outbound bridge notified whenever a local event is published on [`EventBus`].
+///
+/// Remote nodes republish incoming events via [`EventBus::publish_remote_envelope`] so they
+/// fan out locally to SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch` without re-triggering
+/// the outbound bridge.
+pub trait EventBridge: Send + Sync {
+    /// Forward a locally published event envelope to remote nodes (non-blocking).
+    fn publish(&self, envelope: &EventEnvelope);
+
+    /// Short backend identifier for diagnostics.
+    fn backend_name(&self) -> &'static str {
+        "custom"
+    }
+}
+
 /// Broadcast event bus with monotonic sequence IDs and bounded replay buffer for SSE `Last-Event-ID`.
 #[derive(Clone)]
 pub struct EventBus {
@@ -147,6 +162,7 @@ pub struct EventBus {
     replay: Arc<RwLock<VecDeque<EventEnvelope>>>,
     replay_capacity: usize,
     mailbox_id: String,
+    bridge: Option<Arc<dyn EventBridge>>,
 }
 
 impl EventBus {
@@ -168,7 +184,14 @@ impl EventBus {
             replay: Arc::new(RwLock::new(VecDeque::with_capacity(replay_capacity))),
             replay_capacity,
             mailbox_id: String::new(),
+            bridge: None,
         }
+    }
+
+    /// Attach a distributed [`EventBridge`] that forwards locally published events to peer nodes.
+    pub fn with_bridge(mut self, bridge: Arc<dyn EventBridge>) -> Self {
+        self.bridge = Some(bridge);
+        self
     }
 
     /// Return the normalized mailbox ID attached to this bus handle (empty if unscoped).
@@ -176,7 +199,7 @@ impl EventBus {
         &self.mailbox_id
     }
 
-    /// Return a lightweight handle sharing the same broadcast channel and replay buffer,
+    /// Return a lightweight handle sharing the same broadcast channel, replay buffer, and bridge,
     /// tagged and filtered to `mailbox_id`.
     pub fn for_mailbox(&self, mailbox_id: &str) -> Self {
         Self {
@@ -185,6 +208,7 @@ impl EventBus {
             replay: self.replay.clone(),
             replay_capacity: self.replay_capacity,
             mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
+            bridge: self.bridge.clone(),
         }
     }
 
@@ -193,18 +217,48 @@ impl EventBus {
         self.publish_for_mailbox(&self.mailbox_id, source, event)
     }
 
-    /// Publish an event tagged with an explicit `mailbox_id`.
+    /// Publish an event tagged with an explicit `mailbox_id` and forward to any attached bridge.
     pub fn publish_for_mailbox(
         &self,
         mailbox_id: &str,
         source: EventSource,
         event: MailEvent,
     ) -> EventEnvelope {
+        let envelope = self.deliver_local(
+            Utc::now(),
+            crate::config::normalize_mailbox_id(mailbox_id),
+            source,
+            event,
+        );
+        if let Some(ref bridge) = self.bridge {
+            bridge.publish(&envelope);
+        }
+        envelope
+    }
+
+    /// Republish an event received from a remote node into this node's local subscribers and
+    /// replay buffer without re-forwarding it to the outbound [`EventBridge`].
+    pub fn publish_remote_envelope(&self, envelope: EventEnvelope) -> EventEnvelope {
+        self.deliver_local(
+            envelope.timestamp,
+            crate::config::normalize_mailbox_id(&envelope.mailbox_id),
+            envelope.source,
+            envelope.event,
+        )
+    }
+
+    fn deliver_local(
+        &self,
+        timestamp: DateTime<Utc>,
+        mailbox_id: String,
+        source: EventSource,
+        event: MailEvent,
+    ) -> EventEnvelope {
         let id = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let envelope = EventEnvelope {
             id,
-            timestamp: Utc::now(),
-            mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
+            timestamp,
+            mailbox_id,
             source,
             event,
         };
