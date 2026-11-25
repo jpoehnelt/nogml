@@ -74,6 +74,8 @@ struct MemoryState {
     messages: HashMap<String, StoredMessage>,
     /// Per-label monotonic IMAP UIDs keyed by `(message_id, label_id)`.
     message_label_uids: HashMap<(String, String), u32>,
+    /// Expunged/removed IMAP UIDs keyed by `(mailbox_key, uid) -> modseq` for RFC 7162 `QRESYNC`.
+    imap_expunged_uids: HashMap<(String, u32), u64>,
     attachments: HashMap<String, Vec<StoredAttachment>>,
     drafts: HashMap<String, MemDraft>,
     history_events: Vec<MemHistoryEvent>,
@@ -123,6 +125,7 @@ impl MemoryState {
             labels,
             messages: HashMap::new(),
             message_label_uids: HashMap::new(),
+            imap_expunged_uids: HashMap::new(),
             attachments: HashMap::new(),
             drafts: HashMap::new(),
             history_events: Vec::new(),
@@ -378,7 +381,7 @@ impl MemoryState {
         resolved_add: &[String],
         resolved_remove: &[String],
     ) -> AppResult<StoredMessage> {
-        let (thread_id, current_labels, upstream_gmail_id) = {
+        let (thread_id, current_labels, upstream_gmail_id, all_mail_uid) = {
             let msg = self
                 .messages
                 .get(message_id)
@@ -387,6 +390,7 @@ impl MemoryState {
                 msg.thread_id.clone(),
                 msg.label_ids.clone(),
                 msg.upstream_gmail_id.clone(),
+                msg.all_mail_uid,
             )
         };
 
@@ -418,11 +422,19 @@ impl MemoryState {
                 let imap_uid = self.alloc_label_uid(lid)?;
                 self.message_label_uids
                     .insert((message_id.to_string(), lid.clone()), imap_uid);
+                self.imap_expunged_uids.remove(&(lid.clone(), imap_uid));
             }
             for lid in &actually_removed {
-                self.message_label_uids
-                    .remove(&(message_id.to_string(), lid.clone()));
+                if let Some(uid) = self
+                    .message_label_uids
+                    .remove(&(message_id.to_string(), lid.clone()))
+                {
+                    self.imap_expunged_uids.insert((lid.clone(), uid), new_hid);
+                }
             }
+
+            let was_in_all_mail =
+                !current_set.contains(LABEL_TRASH) && !current_set.contains(LABEL_SPAM);
 
             let mut new_set = current_set.clone();
             for lid in &actually_added {
@@ -430,6 +442,14 @@ impl MemoryState {
             }
             for lid in &actually_removed {
                 new_set.remove(lid);
+            }
+            let is_in_all_mail = !new_set.contains(LABEL_TRASH) && !new_set.contains(LABEL_SPAM);
+            if was_in_all_mail && !is_in_all_mail {
+                self.imap_expunged_uids
+                    .insert((ALL_MAIL_MAILBOX.to_string(), all_mail_uid), new_hid);
+            } else if !was_in_all_mail && is_in_all_mail {
+                self.imap_expunged_uids
+                    .remove(&(ALL_MAIL_MAILBOX.to_string(), all_mail_uid));
             }
             let mut new_labels: Vec<String> = new_set.into_iter().collect();
             new_labels.sort();
@@ -479,9 +499,26 @@ impl MemoryState {
     fn delete_message_inner(&mut self, id: &str) -> Option<StoredMessage> {
         let msg = self.messages.remove(id)?;
         self.attachments.remove(id);
+        let removed_label_uids: Vec<(String, u32)> = self
+            .message_label_uids
+            .iter()
+            .filter(|((mid, _), _)| mid == id)
+            .map(|((_, lid), &uid)| (lid.clone(), uid))
+            .collect();
         self.message_label_uids.retain(|(mid, _), _| mid != id);
         self.drafts.retain(|_, d| d.message_id != id);
         let hid = self.bump_history_id();
+        for (lid, uid) in removed_label_uids {
+            self.imap_expunged_uids.insert((lid, uid), hid);
+        }
+        if !msg
+            .label_ids
+            .iter()
+            .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
+        {
+            self.imap_expunged_uids
+                .insert((ALL_MAIL_MAILBOX.to_string(), msg.all_mail_uid), hid);
+        }
         self.record_history_event(
             hid,
             HistoryEventKind::MessageDeleted,
@@ -700,6 +737,7 @@ impl MemoryState {
                 uid,
                 message_id: m.id.clone(),
                 thread_id: m.thread_id.clone(),
+                history_id: m.history_id.max(1),
                 internal_date_ms: m.internal_date_ms,
                 size_estimate: m.size_estimate,
                 label_ids: m.label_ids.clone(),
@@ -2283,14 +2321,17 @@ impl MailStore for MemoryStore {
         is_deleted: bool,
     ) -> AppResult<StoredMessage> {
         let mut state = self.write_state()?;
-        {
+        let (old_hid, flags_changed) = {
             let msg = state
                 .messages
                 .get_mut(message_id)
                 .ok_or_else(|| AppError::NotFound(format!("Message not found: {message_id}")))?;
+            let changed = msg.is_answered != is_answered || msg.is_deleted != is_deleted;
+            let old_hid = msg.history_id;
             msg.is_answered = is_answered;
             msg.is_deleted = is_deleted;
-        }
+            (old_hid, changed)
+        };
         let mut add = Vec::new();
         let mut rem = Vec::new();
         if is_seen {
@@ -2308,7 +2349,15 @@ impl MailStore for MemoryStore {
         } else {
             rem.push(LABEL_DRAFT.to_string());
         }
-        state.modify_message_labels_resolved(message_id, &add, &rem)
+        let mut updated = state.modify_message_labels_resolved(message_id, &add, &rem)?;
+        if flags_changed && updated.history_id == old_hid {
+            let new_hid = state.bump_history_id();
+            if let Some(msg) = state.messages.get_mut(message_id) {
+                msg.history_id = new_hid;
+            }
+            updated.history_id = new_hid;
+        }
+        Ok(updated)
     }
 
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>> {
@@ -2460,6 +2509,30 @@ impl MailStore for MemoryStore {
             }
         };
         Ok((uid_validity, assigned_uid, msg))
+    }
+
+    async fn imap_vanished_uids(
+        &self,
+        mailbox_name: &str,
+        since_modseq: u64,
+    ) -> AppResult<Vec<u32>> {
+        let state = self.read_state()?;
+        let resolved = state
+            .resolve_imap_mailbox(mailbox_name)
+            .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
+        let mailbox_key = match &resolved {
+            ResolvedMailbox::AllMail => ALL_MAIL_MAILBOX,
+            ResolvedMailbox::Label { id, .. } => id.as_str(),
+        };
+        let mut uids: Vec<u32> = state
+            .imap_expunged_uids
+            .iter()
+            .filter_map(|((key, uid), &modseq)| {
+                (key == mailbox_key && modseq > since_modseq).then_some(*uid)
+            })
+            .collect();
+        uids.sort_unstable();
+        Ok(uids)
     }
 
     async fn upsert_synced_message(&self, input: NewMessageInput) -> AppResult<UpsertOutcome> {

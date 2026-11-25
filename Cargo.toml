@@ -58,5 +58,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+rcgen = "0.13"
 tempfile = "3"
 wiremock = "0.6"

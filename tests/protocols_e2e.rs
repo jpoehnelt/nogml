@@ -2392,3 +2392,394 @@ async fn e2e_custom_auth_provider_mail_transport_and_search_index_seams() {
     assert_eq!(del_status, StatusCode::NO_CONTENT);
     assert!(removed_ids.lock().unwrap().contains(&gm_msg_id));
 }
+
+// ============================================================================
+// 8. IMAP Implicit TLS, STARTTLS Upgrade, and RFC 7162 CONDSTORE / QRESYNC E2E
+// ============================================================================
+
+/// Generate an ephemeral self-signed PEM certificate + key for `localhost` / `127.0.0.1`,
+/// write them into `dir`, and return `(cert_path, key_path, client_tls_connector)` where the
+/// client connector strictly trusts ONLY this ephemeral certificate.
+fn make_ephemeral_imap_tls(
+    dir: &Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    tokio_rustls::TlsConnector,
+) {
+    use rustls::RootCertStore;
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+
+    nogml::ensure_crypto_provider();
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("generate ephemeral self-signed cert");
+    let cert_pem = certified.cert.pem();
+    let key_pem = certified.key_pair.serialize_pem();
+
+    let cert_path = dir.join("imap-test-cert.pem");
+    let key_path = dir.join("imap-test-key.pem");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let mut roots = RootCertStore::empty();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for cert in certs {
+        roots.add(cert).unwrap();
+    }
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    (cert_path, key_path, connector)
+}
+
+async fn wait_tcp_ready(addr: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => {
+                drop(s);
+                return;
+            }
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("TCP listener on {addr} did not become ready in time: {e}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn e2e_imap_implicit_tls_and_starttls_with_async_imap() {
+    use rustls_pki_types::ServerName;
+
+    let dir = TempDir::new().unwrap();
+    let (cert_path, key_path, tls_connector) = make_ephemeral_imap_tls(dir.path());
+    let plain_addr = pick_ephemeral_addr().await;
+    let tls_addr = pick_ephemeral_addr().await;
+
+    let mut cfg = make_sqlite_config(dir.path(), Some(plain_addr));
+    cfg.imap_tls_bind = Some(tls_addr);
+    cfg.imap_tls_cert = Some(cert_path);
+    cfg.imap_tls_key = Some(key_path);
+
+    let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
+    let raw_seed = concat!(
+        "Date: Thu, 13 Feb 2025 10:00:00 +0000\r\n",
+        "From: Security Bot <sec@example.com>\r\n",
+        "To: Agent <agent@example.com>\r\n",
+        "Subject: TLS Encrypted Mail Check\r\n",
+        "Message-ID: <imap-tls-check-1@example.com>\r\n",
+        "\r\n",
+        "Encrypted payload delivered over TLS.\r\n"
+    );
+    let seed_input = parse_raw_to_new_message_input(
+        raw_seed.as_bytes().to_vec(),
+        vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
+        None,
+        "local",
+        None,
+        None,
+        false,
+        false,
+    );
+    store.imap_append("INBOX", seed_input).await.unwrap();
+
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(StubResendClient::noop()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = serve_imap(state, shutdown_rx).await;
+    });
+    wait_tcp_ready(plain_addr).await;
+    wait_tcp_ready(tls_addr).await;
+
+    // --- Part A: Implicit TLS (`--imap-tls-bind` / `serve_tls_listener`) ---
+    let tcp_tls = TcpStream::connect(tls_addr).await.unwrap();
+    let tls_stream = tls_connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp_tls)
+        .await
+        .expect("implicit TLS handshake should succeed with ephemeral cert");
+    let mut tls_client = async_imap::Client::new(tls_stream);
+    let _greeting = tls_client.read_response().await.unwrap();
+
+    let mut tls_session = tls_client
+        .login("agent@example.com", "imap-secret")
+        .await
+        .map_err(|(e, _)| e)
+        .expect("LOGIN over implicit TLS should succeed");
+
+    let post_caps = tls_session.capabilities().await.unwrap();
+    assert!(
+        !post_caps.has_str("STARTTLS"),
+        "implicit TLS session must not advertise STARTTLS"
+    );
+    assert!(post_caps.has_str("ENABLE"));
+    assert!(post_caps.has_str("CONDSTORE"));
+    assert!(post_caps.has_str("QRESYNC"));
+
+    let mbx = tls_session.select("INBOX").await.unwrap();
+    assert_eq!(mbx.exists, 1);
+    assert!(
+        mbx.highest_modseq.unwrap_or(0) >= 1,
+        "SELECT should expose HIGHESTMODSEQ to async-imap"
+    );
+
+    let fetches: Vec<_> = tls_session
+        .fetch("1", "(UID FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(fetches.len(), 1);
+    let body = String::from_utf8_lossy(fetches[0].text().unwrap());
+    assert!(body.contains("Encrypted payload delivered over TLS."));
+    let header = String::from_utf8_lossy(fetches[0].header().unwrap());
+    assert!(header.contains("Subject: TLS Encrypted Mail Check"));
+    tls_session.logout().await.unwrap();
+
+    // --- Part B: STARTTLS upgrade (`--imap-bind` / `serve_plain_listener` with TLS acceptor) ---
+    let tcp_plain = TcpStream::connect(plain_addr).await.unwrap();
+    let mut reader = BufReader::new(tcp_plain);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(
+        greeting.contains("STARTTLS"),
+        "pre-TLS greeting should advertise STARTTLS, got: {greeting}"
+    );
+
+    let pre_caps = imap_cmd(&mut reader, "C0", "CAPABILITY").await;
+    assert!(
+        pre_caps.join("").contains("STARTTLS"),
+        "plain CAPABILITY must advertise STARTTLS, got: {pre_caps:?}"
+    );
+
+    let starttls_resp = imap_cmd(&mut reader, "S0", "STARTTLS").await;
+    assert!(
+        starttls_resp.last().unwrap().starts_with("S0 OK"),
+        "STARTTLS should succeed, got: {starttls_resp:?}"
+    );
+
+    // Upgrade the underlying TcpStream to TLS via tokio-rustls and hand it to `async-imap`.
+    let upgraded_tcp = reader.into_inner();
+    let upgraded_tls = tls_connector
+        .connect(ServerName::try_from("localhost").unwrap(), upgraded_tcp)
+        .await
+        .expect("STARTTLS rustls handshake should succeed");
+    let stls_client = async_imap::Client::new(upgraded_tls);
+    let mut stls_session = stls_client
+        .login("agent@example.com", "imap-secret")
+        .await
+        .map_err(|(e, _)| e)
+        .expect("LOGIN after STARTTLS should succeed");
+
+    let after_caps = stls_session.capabilities().await.unwrap();
+    assert!(
+        !after_caps.has_str("STARTTLS"),
+        "STARTTLS must not be advertised once TLS is active"
+    );
+    assert!(after_caps.has_str("CONDSTORE"));
+    assert!(after_caps.has_str("QRESYNC"));
+
+    let stls_mbx = stls_session.select("INBOX").await.unwrap();
+    assert_eq!(stls_mbx.exists, 1);
+
+    let stls_fetches: Vec<_> = stls_session
+        .uid_fetch("1:*", "(UID FLAGS BODY.PEEK[TEXT])")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(stls_fetches.len(), 1);
+    assert!(
+        String::from_utf8_lossy(stls_fetches[0].text().unwrap())
+            .contains("Encrypted payload delivered over TLS.")
+    );
+    stls_session.logout().await.unwrap();
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn e2e_imap_condstore_and_qresync_delta_sync_sqlite() {
+    let dir = TempDir::new().unwrap();
+    let imap_addr = pick_ephemeral_addr().await;
+    let cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(StubResendClient::noop()));
+
+    let (addr, shutdown_tx) = spawn_live_serve_imap(state).await;
+
+    // Seed 3 messages into INBOX via SqliteStore.
+    for (idx, subject) in ["Delta One", "Delta Two", "Delta Three"].iter().enumerate() {
+        let raw = format!(
+            "Date: Fri, 14 Feb 2025 12:0{idx}:00 +0000\r\nFrom: user{idx}@example.com\r\nTo: agent@example.com\r\nSubject: {subject}\r\nMessage-ID: <delta-{idx}@example.com>\r\n\r\nBody {subject}\r\n"
+        );
+        let input = parse_raw_to_new_message_input(
+            raw.into_bytes(),
+            vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
+            None,
+            "local",
+            None,
+            None,
+            false,
+            false,
+        );
+        store.imap_append("INBOX", input).await.unwrap();
+    }
+
+    let extract_bracket_u64 = |lines: &[String], key: &str| -> u64 {
+        let line = lines
+            .iter()
+            .find(|l| l.contains(key))
+            .unwrap_or_else(|| panic!("missing {key} in {lines:?}"));
+        let start = line.find(key).unwrap() + key.len();
+        let rest = &line[start..];
+        let end = rest.find(']').unwrap();
+        rest[..end].trim().parse::<u64>().unwrap()
+    };
+
+    // --- Session 1: ENABLE CONDSTORE QRESYNC, SELECT (CONDSTORE), STATUS (HIGHESTMODSEQ),
+    //     UID FETCH (CHANGEDSINCE), UID STORE (UNCHANGEDSINCE), EXPUNGE ---
+    let stream1 = TcpStream::connect(addr).await.unwrap();
+    let mut r1 = BufReader::new(stream1);
+    let mut g1 = String::new();
+    r1.read_line(&mut g1).await.unwrap();
+
+    let login1 = imap_cmd(&mut r1, "A1", "LOGIN agent@example.com imap-secret").await;
+    assert!(login1.last().unwrap().contains("CONDSTORE"));
+    assert!(login1.last().unwrap().contains("QRESYNC"));
+
+    let enable1 = imap_cmd(&mut r1, "A2", "ENABLE CONDSTORE QRESYNC").await;
+    assert!(
+        enable1
+            .iter()
+            .any(|l| l.trim() == "* ENABLED CONDSTORE QRESYNC"),
+        "got {enable1:?}"
+    );
+    assert!(enable1.last().unwrap().starts_with("A2 OK"));
+
+    let status1 = imap_cmd(&mut r1, "A3", "STATUS INBOX (MESSAGES HIGHESTMODSEQ)").await;
+    let status_line = status1
+        .iter()
+        .find(|l| l.starts_with("* STATUS "))
+        .expect("STATUS response");
+    assert!(status_line.contains("MESSAGES 3"), "got {status_line}");
+    assert!(status_line.contains("HIGHESTMODSEQ "), "got {status_line}");
+
+    let sel1 = imap_cmd(&mut r1, "A4", "SELECT INBOX (CONDSTORE)").await;
+    assert!(sel1.iter().any(|l| l.trim() == "* 3 EXISTS"));
+    let uid_validity = extract_bracket_u64(&sel1, "[UIDVALIDITY ");
+    let baseline_modseq = extract_bracket_u64(&sel1, "[HIGHESTMODSEQ ");
+    assert!(baseline_modseq >= 1);
+
+    // Mutate ONLY UID 2 flags -> must include MODSEQ in untagged FETCH response.
+    let store_u2 = imap_cmd(&mut r1, "A5", r#"UID STORE 2 +FLAGS (\Seen \Flagged)"#).await;
+    assert!(
+        store_u2
+            .iter()
+            .any(|l| l.contains("UID 2") && l.contains("\\Flagged") && l.contains("MODSEQ (")),
+        "expected MODSEQ in UID STORE response, got {store_u2:?}"
+    );
+
+    // UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE <baseline_modseq>) returns ONLY UID 2.
+    let changed = imap_cmd(
+        &mut r1,
+        "A6",
+        &format!("UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE {baseline_modseq})"),
+    )
+    .await;
+    let fetch_rows: Vec<&String> = changed.iter().filter(|l| l.contains(" FETCH (")).collect();
+    assert_eq!(
+        fetch_rows.len(),
+        1,
+        "CHANGEDSINCE must return only UID 2, got {changed:?}"
+    );
+    assert!(fetch_rows[0].contains("UID 2"));
+    assert!(fetch_rows[0].contains("MODSEQ ("));
+
+    // UID STORE 2 (UNCHANGEDSINCE <baseline_modseq>) must reject modification & return [MODIFIED 2].
+    let stale_store = imap_cmd(
+        &mut r1,
+        "A7",
+        &format!(r#"UID STORE 2 (UNCHANGEDSINCE {baseline_modseq}) +FLAGS (\Answered)"#),
+    )
+    .await;
+    assert!(
+        stale_store.last().unwrap().contains("[MODIFIED 2]"),
+        "expected [MODIFIED 2], got {stale_store:?}"
+    );
+    let verify_u2 = imap_cmd(&mut r1, "A8", "UID FETCH 2 (FLAGS)").await;
+    assert!(
+        !verify_u2.join("").contains("\\Answered"),
+        "UNCHANGEDSINCE must prevent modifying stale message"
+    );
+
+    // Expunge UID 3 (mark \Deleted then EXPUNGE).
+    let _ = imap_cmd(&mut r1, "A9", r#"UID STORE 3 +FLAGS (\Deleted)"#).await;
+    let exp = imap_cmd(&mut r1, "A10", "EXPUNGE").await;
+    assert!(
+        exp.iter().any(|l| l.trim() == "* VANISHED 3"),
+        "QRESYNC session should emit * VANISHED 3 on EXPUNGE, got {exp:?}"
+    );
+    let _ = imap_cmd(&mut r1, "A11", "LOGOUT").await;
+
+    // --- Session 2: Fresh reconnect using QRESYNC (<uid_validity> <baseline_modseq>) ---
+    // Proves SqliteStore persists vanished UIDs + modseqs across sessions!
+    let stream2 = TcpStream::connect(addr).await.unwrap();
+    let mut r2 = BufReader::new(stream2);
+    let mut g2 = String::new();
+    r2.read_line(&mut g2).await.unwrap();
+
+    let _ = imap_cmd(&mut r2, "B1", "LOGIN agent@example.com imap-secret").await;
+    let en2 = imap_cmd(&mut r2, "B2", "ENABLE CONDSTORE QRESYNC").await;
+    assert!(
+        en2.iter()
+            .any(|l| l.trim() == "* ENABLED CONDSTORE QRESYNC")
+    );
+
+    let qsel = imap_cmd(
+        &mut r2,
+        "B3",
+        &format!("SELECT INBOX (QRESYNC ({uid_validity} {baseline_modseq}))"),
+    )
+    .await;
+    assert!(qsel.iter().any(|l| l.trim() == "* 2 EXISTS"));
+    let new_highest = extract_bracket_u64(&qsel, "[HIGHESTMODSEQ ");
+    assert!(new_highest > baseline_modseq);
+    assert!(
+        qsel.iter().any(|l| l.trim() == "* VANISHED (EARLIER) 3"),
+        "QRESYNC SELECT must emit * VANISHED (EARLIER) 3, got {qsel:?}"
+    );
+    let qsel_fetches: Vec<&String> = qsel.iter().filter(|l| l.contains(" FETCH (")).collect();
+    assert_eq!(
+        qsel_fetches.len(),
+        1,
+        "QRESYNC SELECT must emit FETCH only for modified UID 2, got {qsel:?}"
+    );
+    assert!(qsel_fetches[0].contains("UID 2"));
+    assert!(qsel_fetches[0].contains("\\Flagged"));
+    assert!(qsel_fetches[0].contains("MODSEQ ("));
+
+    // UID FETCH 1:* (FLAGS) (CHANGEDSINCE <baseline_modseq> VANISHED) also emits VANISHED (EARLIER) 3 + UID 2
+    let vfetch = imap_cmd(
+        &mut r2,
+        "B4",
+        &format!("UID FETCH 1:* (FLAGS) (CHANGEDSINCE {baseline_modseq} VANISHED)"),
+    )
+    .await;
+    assert!(
+        vfetch.iter().any(|l| l.trim() == "* VANISHED (EARLIER) 3"),
+        "expected * VANISHED (EARLIER) 3 in UID FETCH, got {vfetch:?}"
+    );
+    let vf_rows: Vec<&String> = vfetch.iter().filter(|l| l.contains(" FETCH (")).collect();
+    assert_eq!(vf_rows.len(), 1);
+    assert!(vf_rows[0].contains("UID 2"));
+
+    let _ = imap_cmd(&mut r2, "B5", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
