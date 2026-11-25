@@ -60,7 +60,24 @@ Query `GET /v1/capabilities` to see the active backend names under `.backends`.
 cargo build --release
 ```
 
-### 1. Start the server (`nogml serve`)
+### 1. Generate a config file and start the server (`nogml config`, `nogml serve`)
+
+Create a starter `nogml.toml` (with a random bearer token saved to a mode `0600` file or printed once to stderr), validate it, and start the server:
+
+```bash
+# Generate starter nogml.toml and a mode 0600 bearer token file
+nogml config init --output nogml.toml --token-file ./auth_token
+
+# Validate syntax, secret sources, and TLS certificates (secrets are always redacted)
+nogml config check --config nogml.toml
+
+# Start the server using nogml.toml (CLI flags and env vars override file settings)
+nogml serve --config nogml.toml
+```
+
+For production deployments (Docker Compose with Caddy HTTPS, Linux `systemd` with `LoadCredential=`, PostgreSQL multi-node setup, Resend DNS/webhooks, IMAP TLS, and SQLite WAL backups), see the [Self-hosting guide](docs/self-hosting.md) and templates under [`deploy/`](deploy).
+
+You can also pass all settings directly as CLI flags or environment variables without a config file:
 
 ```bash
 # Local dev mode (SQLite at ./nogml.db, no auth, draft-only guardrail)
@@ -172,10 +189,13 @@ nogml serve --bind 0.0.0.0:8080 --user-email agent@example.com
 
 ## Configuration
 
+Load settings from a structured TOML file (`--config nogml.toml` / `NOGML_CONFIG`), environment variables, `*_FILE` secret files, or CLI flags with precedence `CLI flags > environment variables > nogml.toml > defaults`. Secret fields accept `file:///path/to/secret`, `file://$CREDENTIALS_DIRECTORY/secret`, `env://VAR_NAME`, and `*_FILE` environment variables, and are always redacted in `Debug` output and `nogml config check`. See [`deploy/nogml.example.toml`](deploy/nogml.example.toml) and the [Self-hosting guide](docs/self-hosting.md) for the full TOML schema and deployment templates.
+
 Every CLI flag has a matching environment variable:
 
 | Variable | CLI flag | Default | Description |
 | --- | --- | --- | --- |
+| `NOGML_CONFIG` | `--config` | *(none)* | Path to structured TOML configuration file (`nogml.toml`) |
 | `NOGML_BIND` | `--bind` | `127.0.0.1:8080` | HTTP listen address |
 | `NOGML_MAX_BODY_BYTES` | `--max-body-bytes` | `41943040` (40 MiB) | Max HTTP body and IMAP literal size |
 | `NOGML_CORS_ORIGINS` | `--cors-origins` | *(any)* | Comma-separated allowed CORS origins |

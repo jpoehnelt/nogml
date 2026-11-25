@@ -1,15 +1,18 @@
 use std::{
+    fs,
     io::{IsTerminal, Read},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{
+    ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource,
+};
 use serde_json::{Value, json};
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use nogml::{
@@ -19,8 +22,9 @@ use nogml::{
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
-        AuthFailAction, BlobBackend, Config, DraftOnlyAction, RspamdRejectAction, SearchBackend,
-        SmtpTlsMode, StorageBackend, SyncMode, TransportBackend,
+        AuthFailAction, BlobBackend, Config, ConfigCheckReport, DraftOnlyAction,
+        RspamdRejectAction, SearchBackend, SmtpTlsMode, StorageBackend, SyncMode, TomlConfig,
+        TransportBackend, render_starter_toml, validate_config,
     },
     ensure_crypto_provider,
     error::{AppError, AppResult},
@@ -28,6 +32,10 @@ use nogml::{
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
+    secrets::{
+        SecretResolutionReport, ValueOrigin, generate_bearer_token, system_env_lookup,
+        write_secret_file,
+    },
     storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store_async},
     sync::{self, SyncRunOptions},
 };
@@ -66,6 +74,10 @@ struct Cli {
 
 #[derive(Debug, Clone, Args)]
 struct CommonConfigArgs {
+    /// Path to a structured TOML configuration file (`nogml.toml`).
+    #[arg(long, env = "NOGML_CONFIG", global = true)]
+    config: Option<PathBuf>,
+
     /// Storage backend (`sqlite`, `memory`, or `postgres`).
     #[arg(long, env = "NOGML_STORAGE", default_value = "sqlite", global = true)]
     storage: StorageBackend,
@@ -588,6 +600,12 @@ enum Command {
         action: SearchCommand,
     },
 
+    /// Configuration file management (`init` starter config, `check` validation and redacted output).
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+
     /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints.
     Schema {
         /// Optional command or endpoint name to inspect.
@@ -705,6 +723,27 @@ enum StorageCommand {
 enum SearchCommand {
     /// Re-index all stored messages into the active SearchIndex backend.
     Reindex,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Write an annotated starter `nogml.toml` and generate a cryptographically random bearer token.
+    Init {
+        /// Output path for the generated `nogml.toml` file.
+        #[arg(short, long, default_value = "nogml.toml")]
+        output: PathBuf,
+
+        /// Write the generated bearer token to a 0600 secret file and reference it with `file://`.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+
+        /// Overwrite an existing config or token file.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Validate layered config, secret references, and IMAP TLS files, printing redacted JSON.
+    Check(Box<ServeArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -861,129 +900,399 @@ enum ApprovalsAction {
     },
 }
 
+fn arg_origin(matches: &ArgMatches, id: &str) -> ValueOrigin {
+    if matches.try_contains_id(id).unwrap_or(false) {
+        match matches.value_source(id) {
+            Some(ValueSource::CommandLine) => ValueOrigin::Cli,
+            Some(ValueSource::EnvVariable) => ValueOrigin::DirectEnv,
+            _ => ValueOrigin::Unset,
+        }
+    } else {
+        ValueOrigin::Unset
+    }
+}
+
+fn is_explicit(matches: &ArgMatches, id: &str) -> bool {
+    arg_origin(matches, id) != ValueOrigin::Unset
+}
+
+struct LoadedConfig {
+    config: Config,
+    log_json: bool,
+    config_file: Option<PathBuf>,
+    resolution: SecretResolutionReport,
+}
+
 impl CommonConfigArgs {
-    fn into_config(self, serve: Option<ServeArgs>) -> Config {
-        let user_email = match self.user_email {
-            Some(email) if !email.trim().is_empty() => email,
-            _ => {
-                let detected = if self.storage == StorageBackend::Sqlite
-                    && self.mailboxes.is_empty()
-                    && self.db_path.exists()
-                {
-                    SqliteStore::list_mailbox_ids(&self.db_path)
-                        .ok()
-                        .and_then(|mut mbs| (mbs.len() == 1).then(|| mbs.remove(0)))
-                } else {
-                    None
-                };
-                detected.unwrap_or_else(|| "me@localhost".to_string())
-            }
-        };
+    fn load_layered(
+        self,
+        serve: Option<ServeArgs>,
+        root_matches: &ArgMatches,
+        serve_matches: Option<&ArgMatches>,
+        cli_log_json: bool,
+    ) -> AppResult<LoadedConfig> {
+        let mut cfg = Config::default();
+        let config_file = self.config.clone();
+        let mut base_dir: Option<PathBuf> = None;
+        let mut user_email_set = false;
+        let mut toml_log_json: Option<bool> = None;
 
-        let mut cfg = Config {
-            storage: self.storage,
-            db_path: self.db_path,
-            database_url: self.database_url,
-            blob_backend: self.blob_backend,
-            blob_dir: self.blob_dir,
-            blob_s3_bucket: self.blob_s3_bucket,
-            blob_s3_region: self.blob_s3_region,
-            blob_s3_endpoint: self.blob_s3_endpoint,
-            blob_s3_prefix: self.blob_s3_prefix,
-            blob_s3_access_key_id: self.blob_s3_access_key_id,
-            blob_s3_secret_access_key: self.blob_s3_secret_access_key,
-            blob_s3_session_token: self.blob_s3_session_token,
-            blob_s3_force_path_style: self.blob_s3_force_path_style,
-            user_email,
-            mailboxes: self.mailboxes,
-            default_domain: self.default_domain,
-            transport: self.transport,
-            resend_api_key: self.resend_api_key,
-            resend_base_url: self.resend_base_url,
-            resend_webhook_secret: self.resend_webhook_secret,
-            ses_region: self.ses_region,
-            ses_endpoint: self.ses_endpoint,
-            ses_access_key_id: self.ses_access_key_id,
-            ses_secret_access_key: self.ses_secret_access_key,
-            ses_session_token: self.ses_session_token,
-            ses_s3_endpoint: self.ses_s3_endpoint,
-            ses_webhook_secret: self.ses_webhook_secret,
-            smtp_host: self.smtp_host,
-            smtp_port: self.smtp_port,
-            smtp_tls_mode: self.smtp_tls_mode,
-            smtp_username: self.smtp_username,
-            smtp_password: self.smtp_password,
-            smtp_helo_domain: self.smtp_helo_domain,
-            auth_tokens: self.auth_tokens,
-            scoped_tokens: self.scoped_tokens.map(|l| l.0).unwrap_or_default(),
-            oauth2_client_id: self.oauth2_client_id,
-            oauth2_client_secret: self.oauth2_client_secret,
-            oauth2_signing_secret: self.oauth2_signing_secret,
-            draft_only: self.draft_only,
-            draft_only_action: self.draft_only_action,
-            require_approval: self.require_approval,
-            approval_ttl_secs: self.approval_ttl_secs,
-            approval_webhook_url: self.approval_webhook_url,
-            allowed_recipients: self.allowed_recipients,
-            max_send_recipients: self.max_send_recipients,
-            default_max_body_chars: self.default_max_body_chars,
-            untrusted_content_guard: self.untrusted_content_guard,
-            sync_mode: self.sync_mode,
-            gmail_client_id: self.gmail_client_id,
-            gmail_client_secret: self.gmail_client_secret,
-            gmail_refresh_token: self.gmail_refresh_token,
-            gmail_access_token: self.gmail_access_token,
-            gmail_user_id: self.gmail_user_id,
-            gmail_api_base_url: self.gmail_api_base_url,
-            gmail_oauth_token_url: self.gmail_oauth_token_url,
-            gmail_imap_host: self.gmail_imap_host,
-            gmail_imap_port: self.gmail_imap_port,
-            gmail_imap_tls: self.gmail_imap_tls,
-            gmail_imap_user: self.gmail_imap_user,
-            gmail_imap_password: self.gmail_imap_password,
-            gmail_imap_mailbox: self.gmail_imap_mailbox,
-            sync_query: self.sync_query,
-            sync_max_messages: self.sync_max_messages,
-            sync_bidirectional: self.sync_bidirectional,
-            filter_auth_results: self.filter_auth_results,
-            filter_dmarc_fail_action: self.filter_dmarc_fail_action,
-            filter_spf_fail_action: self.filter_spf_fail_action,
-            filter_dkim_fail_action: self.filter_dkim_fail_action,
-            rspamd_url: self.rspamd_url,
-            rspamd_password: self.rspamd_password,
-            rspamd_timeout_ms: self.rspamd_timeout_ms,
-            rspamd_spam_threshold: self.rspamd_spam_threshold,
-            rspamd_reject_action: self.rspamd_reject_action,
-            rspamd_fail_closed: self.rspamd_fail_closed,
-            llm_triage_base_url: self.llm_triage_base_url,
-            llm_triage_api_key: self.llm_triage_api_key,
-            llm_triage_model: self.llm_triage_model,
-            llm_triage_timeout_ms: self.llm_triage_timeout_ms,
-            llm_triage_max_body_chars: self.llm_triage_max_body_chars,
-            search_backend: self.search_backend,
-            embedding_base_url: self.embedding_base_url,
-            embedding_api_key: self.embedding_api_key,
-            embedding_model: self.embedding_model,
-            embedding_timeout_secs: self.embedding_timeout_secs,
-            ..Config::default()
-        };
-
-        if let Some(s) = serve {
-            cfg.bind = s.bind;
-            cfg.max_body_bytes = s.max_body_bytes;
-            cfg.cors_allow_origins = s.cors_allow_origins;
-            cfg.imap_bind = s.imap_bind;
-            cfg.imap_tls_bind = s.imap_tls_bind;
-            cfg.imap_tls_cert = s.imap_tls_cert;
-            cfg.imap_tls_key = s.imap_tls_key;
-            cfg.imap_username = s.imap_username;
-            cfg.imap_password = s.imap_password;
-            cfg.sync_interval_secs = s.sync_interval_secs;
-            cfg.watch_webhook_url = s.watch_webhook_url;
+        if let Some(ref path) = config_file {
+            let toml_cfg = TomlConfig::from_file(path)?;
+            let meta = toml_cfg.apply_to(&mut cfg);
+            user_email_set = meta.user_email_set;
+            toml_log_json = meta.log_json;
+            base_dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf);
         }
 
-        cfg
+        // Overlay CLI flags and direct environment variables (strictly beating nogml.toml and defaults).
+        if is_explicit(root_matches, "storage") {
+            cfg.storage = self.storage;
+        }
+        if is_explicit(root_matches, "db_path") {
+            cfg.db_path = self.db_path;
+        }
+        if is_explicit(root_matches, "database_url") {
+            cfg.database_url = self.database_url;
+        }
+        if is_explicit(root_matches, "blob_backend") {
+            cfg.blob_backend = self.blob_backend;
+        }
+        if is_explicit(root_matches, "blob_dir") {
+            cfg.blob_dir = self.blob_dir;
+        }
+        if is_explicit(root_matches, "blob_s3_bucket") {
+            cfg.blob_s3_bucket = self.blob_s3_bucket;
+        }
+        if is_explicit(root_matches, "blob_s3_region") {
+            cfg.blob_s3_region = self.blob_s3_region;
+        }
+        if is_explicit(root_matches, "blob_s3_endpoint") {
+            cfg.blob_s3_endpoint = self.blob_s3_endpoint;
+        }
+        if is_explicit(root_matches, "blob_s3_prefix") {
+            cfg.blob_s3_prefix = self.blob_s3_prefix;
+        }
+        if is_explicit(root_matches, "blob_s3_access_key_id") {
+            cfg.blob_s3_access_key_id = self.blob_s3_access_key_id;
+        }
+        if is_explicit(root_matches, "blob_s3_secret_access_key") {
+            cfg.blob_s3_secret_access_key = self.blob_s3_secret_access_key;
+        }
+        if is_explicit(root_matches, "blob_s3_session_token") {
+            cfg.blob_s3_session_token = self.blob_s3_session_token;
+        }
+        if is_explicit(root_matches, "blob_s3_force_path_style") {
+            cfg.blob_s3_force_path_style = self.blob_s3_force_path_style;
+        }
+        if is_explicit(root_matches, "user_email")
+            && let Some(email) = self.user_email
+            && !email.trim().is_empty()
+        {
+            cfg.user_email = email;
+            user_email_set = true;
+        }
+        if is_explicit(root_matches, "mailboxes") {
+            cfg.mailboxes = self.mailboxes;
+        }
+        if is_explicit(root_matches, "default_domain") {
+            cfg.default_domain = self.default_domain;
+        }
+        if is_explicit(root_matches, "transport") {
+            cfg.transport = self.transport;
+        }
+        if is_explicit(root_matches, "resend_api_key") {
+            cfg.resend_api_key = self.resend_api_key;
+        }
+        if is_explicit(root_matches, "resend_base_url") {
+            cfg.resend_base_url = self.resend_base_url;
+        }
+        if is_explicit(root_matches, "resend_webhook_secret") {
+            cfg.resend_webhook_secret = self.resend_webhook_secret;
+        }
+        if is_explicit(root_matches, "ses_region") {
+            cfg.ses_region = self.ses_region;
+        }
+        if is_explicit(root_matches, "ses_endpoint") {
+            cfg.ses_endpoint = self.ses_endpoint;
+        }
+        if is_explicit(root_matches, "ses_access_key_id") {
+            cfg.ses_access_key_id = self.ses_access_key_id;
+        }
+        if is_explicit(root_matches, "ses_secret_access_key") {
+            cfg.ses_secret_access_key = self.ses_secret_access_key;
+        }
+        if is_explicit(root_matches, "ses_session_token") {
+            cfg.ses_session_token = self.ses_session_token;
+        }
+        if is_explicit(root_matches, "ses_s3_endpoint") {
+            cfg.ses_s3_endpoint = self.ses_s3_endpoint;
+        }
+        if is_explicit(root_matches, "ses_webhook_secret") {
+            cfg.ses_webhook_secret = self.ses_webhook_secret;
+        }
+        if is_explicit(root_matches, "smtp_host") {
+            cfg.smtp_host = self.smtp_host;
+        }
+        if is_explicit(root_matches, "smtp_port") {
+            cfg.smtp_port = self.smtp_port;
+        }
+        if is_explicit(root_matches, "smtp_tls_mode") {
+            cfg.smtp_tls_mode = self.smtp_tls_mode;
+        }
+        if is_explicit(root_matches, "smtp_username") {
+            cfg.smtp_username = self.smtp_username;
+        }
+        if is_explicit(root_matches, "smtp_password") {
+            cfg.smtp_password = self.smtp_password;
+        }
+        if is_explicit(root_matches, "smtp_helo_domain") {
+            cfg.smtp_helo_domain = self.smtp_helo_domain;
+        }
+        if is_explicit(root_matches, "auth_tokens") {
+            cfg.auth_tokens = self.auth_tokens;
+        }
+        if is_explicit(root_matches, "scoped_tokens") {
+            cfg.scoped_tokens = self.scoped_tokens.map(|l| l.0).unwrap_or_default();
+        }
+        if is_explicit(root_matches, "oauth2_client_id") {
+            cfg.oauth2_client_id = self.oauth2_client_id;
+        }
+        if is_explicit(root_matches, "oauth2_client_secret") {
+            cfg.oauth2_client_secret = self.oauth2_client_secret;
+        }
+        if is_explicit(root_matches, "oauth2_signing_secret") {
+            cfg.oauth2_signing_secret = self.oauth2_signing_secret;
+        }
+        if is_explicit(root_matches, "draft_only") {
+            cfg.draft_only = self.draft_only;
+        }
+        if is_explicit(root_matches, "draft_only_action") {
+            cfg.draft_only_action = self.draft_only_action;
+        }
+        if is_explicit(root_matches, "require_approval") {
+            cfg.require_approval = self.require_approval;
+        }
+        if is_explicit(root_matches, "approval_ttl_secs") {
+            cfg.approval_ttl_secs = self.approval_ttl_secs;
+        }
+        if is_explicit(root_matches, "approval_webhook_url") {
+            cfg.approval_webhook_url = self.approval_webhook_url;
+        }
+        if is_explicit(root_matches, "allowed_recipients") {
+            cfg.allowed_recipients = self.allowed_recipients;
+        }
+        if is_explicit(root_matches, "max_send_recipients") {
+            cfg.max_send_recipients = self.max_send_recipients;
+        }
+        if is_explicit(root_matches, "default_max_body_chars") {
+            cfg.default_max_body_chars = self.default_max_body_chars;
+        }
+        if is_explicit(root_matches, "untrusted_content_guard") {
+            cfg.untrusted_content_guard = self.untrusted_content_guard;
+        }
+        if is_explicit(root_matches, "sync_mode") {
+            cfg.sync_mode = self.sync_mode;
+        }
+        if is_explicit(root_matches, "gmail_client_id") {
+            cfg.gmail_client_id = self.gmail_client_id;
+        }
+        if is_explicit(root_matches, "gmail_client_secret") {
+            cfg.gmail_client_secret = self.gmail_client_secret;
+        }
+        if is_explicit(root_matches, "gmail_refresh_token") {
+            cfg.gmail_refresh_token = self.gmail_refresh_token;
+        }
+        if is_explicit(root_matches, "gmail_access_token") {
+            cfg.gmail_access_token = self.gmail_access_token;
+        }
+        if is_explicit(root_matches, "gmail_user_id") {
+            cfg.gmail_user_id = self.gmail_user_id;
+        }
+        if is_explicit(root_matches, "gmail_api_base_url") {
+            cfg.gmail_api_base_url = self.gmail_api_base_url;
+        }
+        if is_explicit(root_matches, "gmail_oauth_token_url") {
+            cfg.gmail_oauth_token_url = self.gmail_oauth_token_url;
+        }
+        if is_explicit(root_matches, "gmail_imap_host") {
+            cfg.gmail_imap_host = self.gmail_imap_host;
+        }
+        if is_explicit(root_matches, "gmail_imap_port") {
+            cfg.gmail_imap_port = self.gmail_imap_port;
+        }
+        if is_explicit(root_matches, "gmail_imap_tls") {
+            cfg.gmail_imap_tls = self.gmail_imap_tls;
+        }
+        if is_explicit(root_matches, "gmail_imap_user") {
+            cfg.gmail_imap_user = self.gmail_imap_user;
+        }
+        if is_explicit(root_matches, "gmail_imap_password") {
+            cfg.gmail_imap_password = self.gmail_imap_password;
+        }
+        if is_explicit(root_matches, "gmail_imap_mailbox") {
+            cfg.gmail_imap_mailbox = self.gmail_imap_mailbox;
+        }
+        if is_explicit(root_matches, "sync_query") {
+            cfg.sync_query = self.sync_query;
+        }
+        if is_explicit(root_matches, "sync_max_messages") {
+            cfg.sync_max_messages = self.sync_max_messages;
+        }
+        if is_explicit(root_matches, "sync_bidirectional") {
+            cfg.sync_bidirectional = self.sync_bidirectional;
+        }
+        if is_explicit(root_matches, "filter_auth_results") {
+            cfg.filter_auth_results = self.filter_auth_results;
+        }
+        if is_explicit(root_matches, "filter_dmarc_fail_action") {
+            cfg.filter_dmarc_fail_action = self.filter_dmarc_fail_action;
+        }
+        if is_explicit(root_matches, "filter_spf_fail_action") {
+            cfg.filter_spf_fail_action = self.filter_spf_fail_action;
+        }
+        if is_explicit(root_matches, "filter_dkim_fail_action") {
+            cfg.filter_dkim_fail_action = self.filter_dkim_fail_action;
+        }
+        if is_explicit(root_matches, "rspamd_url") {
+            cfg.rspamd_url = self.rspamd_url;
+        }
+        if is_explicit(root_matches, "rspamd_password") {
+            cfg.rspamd_password = self.rspamd_password;
+        }
+        if is_explicit(root_matches, "rspamd_timeout_ms") {
+            cfg.rspamd_timeout_ms = self.rspamd_timeout_ms;
+        }
+        if is_explicit(root_matches, "rspamd_spam_threshold") {
+            cfg.rspamd_spam_threshold = self.rspamd_spam_threshold;
+        }
+        if is_explicit(root_matches, "rspamd_reject_action") {
+            cfg.rspamd_reject_action = self.rspamd_reject_action;
+        }
+        if is_explicit(root_matches, "rspamd_fail_closed") {
+            cfg.rspamd_fail_closed = self.rspamd_fail_closed;
+        }
+        if is_explicit(root_matches, "llm_triage_base_url") {
+            cfg.llm_triage_base_url = self.llm_triage_base_url;
+        }
+        if is_explicit(root_matches, "llm_triage_api_key") {
+            cfg.llm_triage_api_key = self.llm_triage_api_key;
+        }
+        if is_explicit(root_matches, "llm_triage_model") {
+            cfg.llm_triage_model = self.llm_triage_model;
+        }
+        if is_explicit(root_matches, "llm_triage_timeout_ms") {
+            cfg.llm_triage_timeout_ms = self.llm_triage_timeout_ms;
+        }
+        if is_explicit(root_matches, "llm_triage_max_body_chars") {
+            cfg.llm_triage_max_body_chars = self.llm_triage_max_body_chars;
+        }
+        if is_explicit(root_matches, "search_backend") {
+            cfg.search_backend = self.search_backend;
+        }
+        if is_explicit(root_matches, "embedding_base_url") {
+            cfg.embedding_base_url = self.embedding_base_url;
+        }
+        if is_explicit(root_matches, "embedding_api_key") {
+            cfg.embedding_api_key = self.embedding_api_key;
+        }
+        if is_explicit(root_matches, "embedding_model") {
+            cfg.embedding_model = self.embedding_model;
+        }
+        if is_explicit(root_matches, "embedding_timeout_secs") {
+            cfg.embedding_timeout_secs = self.embedding_timeout_secs;
+        }
+
+        if let (Some(s), Some(sm)) = (serve, serve_matches) {
+            if is_explicit(sm, "bind") {
+                cfg.bind = s.bind;
+            }
+            if is_explicit(sm, "max_body_bytes") {
+                cfg.max_body_bytes = s.max_body_bytes;
+            }
+            if is_explicit(sm, "cors_allow_origins") {
+                cfg.cors_allow_origins = s.cors_allow_origins;
+            }
+            if is_explicit(sm, "imap_bind") {
+                cfg.imap_bind = s.imap_bind;
+            }
+            if is_explicit(sm, "imap_tls_bind") {
+                cfg.imap_tls_bind = s.imap_tls_bind;
+            }
+            if is_explicit(sm, "imap_tls_cert") {
+                cfg.imap_tls_cert = s.imap_tls_cert;
+            }
+            if is_explicit(sm, "imap_tls_key") {
+                cfg.imap_tls_key = s.imap_tls_key;
+            }
+            if is_explicit(sm, "imap_username") {
+                cfg.imap_username = s.imap_username;
+            }
+            if is_explicit(sm, "imap_password") {
+                cfg.imap_password = s.imap_password;
+            }
+            if is_explicit(sm, "sync_interval_secs") {
+                cfg.sync_interval_secs = s.sync_interval_secs;
+            }
+            if is_explicit(sm, "watch_webhook_url") {
+                cfg.watch_webhook_url = s.watch_webhook_url;
+            }
+        }
+
+        // Preserve SQLite sole-mailbox auto-detection when user_email was not explicitly set
+        // by CLI, env, or nogml.toml.
+        if !user_email_set
+            && cfg.storage == StorageBackend::Sqlite
+            && cfg.mailboxes.is_empty()
+            && cfg.db_path.exists()
+            && let Some(detected) = SqliteStore::list_mailbox_ids(&cfg.db_path)
+                .ok()
+                .and_then(|mut mbs| (mbs.len() == 1).then(|| mbs.remove(0)))
+        {
+            cfg.user_email = detected;
+        }
+
+        let origin_of = |id: &str| -> ValueOrigin {
+            if let Some(sm) = serve_matches {
+                let o = arg_origin(sm, id);
+                if o != ValueOrigin::Unset {
+                    return o;
+                }
+            }
+            arg_origin(root_matches, id)
+        };
+
+        let resolution = cfg.apply_env_file_secrets_and_resolve(
+            base_dir.as_deref(),
+            &origin_of,
+            &system_env_lookup,
+        );
+
+        let log_json = if is_explicit(root_matches, "log_json") {
+            cli_log_json
+        } else {
+            toml_log_json.unwrap_or(false)
+        };
+
+        Ok(LoadedConfig {
+            config: cfg,
+            log_json,
+            config_file,
+            resolution,
+        })
     }
+}
+
+fn finalize_runtime_config(loaded: LoadedConfig, force_stderr: bool) -> AppResult<Config> {
+    init_tracing(loaded.log_json, force_stderr);
+    for warning in &loaded.resolution.warnings {
+        warn!("{warning}");
+    }
+    loaded.resolution.into_result()?;
+    Ok(loaded.config)
 }
 
 fn init_tracing(json_logs: bool, force_stderr: bool) {
@@ -1458,13 +1767,16 @@ async fn run_remote_mail(
     }
 }
 
-async fn run(cli: Cli) -> AppResult<()> {
+async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
     ensure_crypto_provider();
 
     match cli.command {
         Command::Serve(serve_args) => {
-            init_tracing(cli.log_json, false);
-            let config = cli.common.into_config(Some(serve_args));
+            let serve_matches = matches.subcommand_matches("serve");
+            let loaded =
+                cli.common
+                    .load_layered(Some(serve_args), &matches, serve_matches, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, false)?;
             let bind = config.bind;
             let has_imap = config.imap_bind.is_some() || config.imap_tls_bind.is_some();
             let has_bg_sync = config.sync_interval_secs > 0;
@@ -1538,20 +1850,25 @@ async fn run(cli: Cli) -> AppResult<()> {
             }
 
             serve_res.map_err(|e| AppError::Internal(format!("HTTP server error: {e}")))?;
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
 
         Command::Mcp => {
             // MCP stdio MUST keep stdout strictly clean for JSON-RPC frames.
-            init_tracing(cli.log_json, true);
-            let config = cli.common.into_config(None);
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
             let state = AppState::from_config_async(config).await?;
-            mcp::run_stdio(state).await
+            mcp::run_stdio(state).await?;
+            Ok(ExitCode::SUCCESS)
         }
 
         Command::Sync { provider } => {
-            init_tracing(cli.log_json, true);
-            let config = cli.common.into_config(None);
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
             let state = AppState::from_config_async(config).await?;
             match provider {
                 SyncCommand::Gmail {
@@ -1577,14 +1894,17 @@ async fn run(cli: Cli) -> AppResult<()> {
                         },
                     )
                     .await?;
-                    emit_output(serde_json::to_value(report)?, None, false)
+                    emit_output(serde_json::to_value(report)?, None, false)?;
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
 
         Command::Storage { action } => {
-            init_tracing(cli.log_json, true);
-            let config = cli.common.into_config(None);
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
             match action {
                 StorageCommand::MigrateBlobs { to } => {
                     let store = open_store_async(&config).await?;
@@ -1594,27 +1914,164 @@ async fn run(cli: Cli) -> AppResult<()> {
                     let target = open_blob_store(&target_config)?;
                     let report =
                         migrate_blobs(store.as_ref(), source.as_ref(), target.as_ref()).await?;
-                    emit_output(serde_json::to_value(report)?, None, false)
+                    emit_output(serde_json::to_value(report)?, None, false)?;
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
 
         Command::Search { action } => {
-            init_tracing(cli.log_json, true);
-            let config = cli.common.into_config(None);
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
             let state = AppState::from_config_async(config).await?;
             match action {
                 SearchCommand::Reindex => {
                     let report =
                         reindex_mailbox(state.store.as_ref(), state.search.as_ref()).await?;
-                    emit_output(serde_json::to_value(report)?, None, false)
+                    emit_output(serde_json::to_value(report)?, None, false)?;
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
 
+        Command::Config { action } => match action {
+            ConfigCommand::Init {
+                output,
+                token_file,
+                force,
+            } => {
+                if output.exists() && !force {
+                    return Err(AppError::Config(format!(
+                        "Config file '{}' already exists; pass --force to overwrite",
+                        output.display()
+                    )));
+                }
+
+                let user_email = if is_explicit(&matches, "user_email") {
+                    cli.common
+                        .user_email
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("agent@example.com")
+                        .to_string()
+                } else {
+                    "agent@example.com".to_string()
+                };
+
+                let default_domain = if is_explicit(&matches, "default_domain") {
+                    cli.common.default_domain.clone()
+                } else {
+                    user_email
+                        .split_once('@')
+                        .map(|(_, d)| d.to_string())
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| "example.com".to_string())
+                };
+
+                let token = generate_bearer_token();
+                let resolved_token_file = if let Some(ref tf) = token_file {
+                    write_secret_file(tf, &token, force)?;
+                    Some(fs::canonicalize(tf).unwrap_or_else(|_| tf.clone()))
+                } else {
+                    None
+                };
+
+                let rendered = render_starter_toml(
+                    &user_email,
+                    &default_domain,
+                    resolved_token_file.as_deref(),
+                );
+
+                if let Some(parent) = output.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        AppError::Config(format!(
+                            "Failed to create directory '{}' for config file: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                fs::write(&output, rendered).map_err(|e| {
+                    AppError::Config(format!(
+                        "Failed to write config file '{}': {e}",
+                        output.display()
+                    ))
+                })?;
+
+                let note = if let Some(ref tf) = resolved_token_file {
+                    format!(
+                        "Generated starter config and wrote bearer token with mode 0600 to '{}'.",
+                        tf.display()
+                    )
+                } else {
+                    eprintln!("Generated bearer token (printed once, not written to config file):");
+                    eprintln!("  {token}");
+                    eprintln!();
+                    eprintln!("Enable authentication by exporting:");
+                    eprintln!("  export NOGML_AUTH_TOKENS=\"{token}\"");
+                    eprintln!(
+                        "Or save it to a mode 0600 secret file and reference it via file:///path/to/token."
+                    );
+                    "Generated starter config; bearer token printed once to stderr (not written to config file)."
+                        .to_string()
+                };
+
+                emit_output(
+                    json!({
+                        "ok": true,
+                        "path": output,
+                        "token_file": resolved_token_file,
+                        "note": note,
+                    }),
+                    None,
+                    false,
+                )?;
+                Ok(ExitCode::SUCCESS)
+            }
+
+            ConfigCommand::Check(serve_args) => {
+                init_tracing(cli.log_json, true);
+                let check_matches = matches
+                    .subcommand_matches("config")
+                    .and_then(|m| m.subcommand_matches("check"));
+                let config_path = cli.common.config.clone();
+
+                let report = match cli.common.load_layered(
+                    Some(*serve_args),
+                    &matches,
+                    check_matches,
+                    cli.log_json,
+                ) {
+                    Ok(loaded) => {
+                        validate_config(&loaded.config, loaded.config_file, loaded.resolution)
+                    }
+                    Err(err) => ConfigCheckReport {
+                        ok: false,
+                        config_file: config_path,
+                        warnings: Vec::new(),
+                        errors: vec![err.to_string()],
+                        effective_config: None,
+                    },
+                };
+
+                let exit = if report.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                };
+                emit_output(serde_json::to_value(&report)?, None, false)?;
+                Ok(exit)
+            }
+        },
+
         Command::Schema { command } => {
             let schema = ai::runtime_schema(command.as_deref());
-            emit_output(schema, None, true)
+            emit_output(schema, None, true)?;
+            Ok(ExitCode::SUCCESS)
         }
 
         Command::Mail {
@@ -1624,10 +2081,14 @@ async fn run(cli: Cli) -> AppResult<()> {
             fields,
             action,
         } => {
-            init_tracing(cli.log_json, true);
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
+
             if let Some(remote_url) = url {
-                let token = cli.common.auth_tokens.first().cloned();
-                return run_remote_mail(
+                let token = config.auth_tokens.first().cloned();
+                run_remote_mail(
                     &remote_url,
                     token.as_deref(),
                     action,
@@ -1635,10 +2096,10 @@ async fn run(cli: Cli) -> AppResult<()> {
                     json_flag,
                     ndjson,
                 )
-                .await;
+                .await?;
+                return Ok(ExitCode::SUCCESS);
             }
 
-            let config = cli.common.into_config(None);
             let state = AppState::from_config_async(config).await?;
 
             match action {
@@ -1678,13 +2139,12 @@ async fn run(cli: Cli) -> AppResult<()> {
                         for item in items {
                             emit_output(serde_json::to_value(item)?, fields.as_deref(), true)?;
                         }
-                        Ok(())
                     } else {
                         emit_output(
                             json!({ "messages": items, "next_cursor": page.next_cursor, "has_more": page.has_more }),
                             fields.as_deref(),
                             json_flag,
-                        )
+                        )?;
                     }
                 }
                 MailAction::Threads {
@@ -1707,13 +2167,12 @@ async fn run(cli: Cli) -> AppResult<()> {
                         for item in page.threads {
                             emit_output(serde_json::to_value(item)?, fields.as_deref(), true)?;
                         }
-                        Ok(())
                     } else {
                         emit_output(
                             json!({ "threads": page.threads, "next_cursor": page.next_cursor, "has_more": page.has_more }),
                             fields.as_deref(),
                             json_flag,
-                        )
+                        )?;
                     }
                 }
                 MailAction::Read {
@@ -1746,7 +2205,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                             json!({ "id": detail.id, "messages": messages }),
                             fields.as_deref(),
                             json_flag,
-                        )
+                        )?;
                     } else {
                         let msg =
                             state.store.get_message(&id).await?.ok_or_else(|| {
@@ -1760,7 +2219,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                             strip_quotes,
                             include_html,
                         );
-                        emit_output(serde_json::to_value(compact)?, fields.as_deref(), json_flag)
+                        emit_output(serde_json::to_value(compact)?, fields.as_deref(), json_flag)?;
                     }
                 }
                 MailAction::Send {
@@ -1791,7 +2250,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                         req.dry_run = true;
                     }
                     let res = ai::execute_send_email(&state, req).await?;
-                    emit_output(res, fields.as_deref(), json_flag)
+                    emit_output(res, fields.as_deref(), json_flag)?;
                 }
                 MailAction::Draft {
                     payload,
@@ -1816,7 +2275,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                         },
                     };
                     let res = ai::execute_create_draft(&state, req).await?;
-                    emit_output(res, fields.as_deref(), json_flag)
+                    emit_output(res, fields.as_deref(), json_flag)?;
                 }
                 MailAction::Triage {
                     thread_id,
@@ -1844,11 +2303,11 @@ async fn run(cli: Cli) -> AppResult<()> {
                         },
                     )
                     .await?;
-                    emit_output(res, fields.as_deref(), json_flag)
+                    emit_output(res, fields.as_deref(), json_flag)?;
                 }
                 MailAction::Labels => {
                     let labels = state.store.list_labels().await?;
-                    emit_output(json!({ "labels": labels }), fields.as_deref(), json_flag)
+                    emit_output(json!({ "labels": labels }), fields.as_deref(), json_flag)?;
                 }
                 MailAction::Approvals { action } => match action {
                     ApprovalsAction::List { status, limit } => {
@@ -1859,14 +2318,13 @@ async fn run(cli: Cli) -> AppResult<()> {
                             for item in items {
                                 emit_output(item.clone(), fields.as_deref(), true)?;
                             }
-                            Ok(())
                         } else {
-                            emit_output(val, fields.as_deref(), json_flag)
+                            emit_output(val, fields.as_deref(), json_flag)?;
                         }
                     }
                     ApprovalsAction::Get { id } => {
                         let val = ai::execute_get_approval(&state, &id).await?;
-                        emit_output(val, fields.as_deref(), json_flag)
+                        emit_output(val, fields.as_deref(), json_flag)?;
                     }
                     ApprovalsAction::Approve {
                         id,
@@ -1881,7 +2339,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                             EventSource::Api,
                         )
                         .await?;
-                        emit_output(val, fields.as_deref(), json_flag)
+                        emit_output(val, fields.as_deref(), json_flag)?;
                     }
                     ApprovalsAction::Reject {
                         id,
@@ -1896,7 +2354,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                             EventSource::Api,
                         )
                         .await?;
-                        emit_output(val, fields.as_deref(), json_flag)
+                        emit_output(val, fields.as_deref(), json_flag)?;
                     }
                 },
                 MailAction::Watch => {
@@ -1904,18 +2362,19 @@ async fn run(cli: Cli) -> AppResult<()> {
                     while let Ok(env) = rx.recv().await {
                         println!("{}", serde_json::to_string(&env)?);
                     }
-                    Ok(())
                 }
             }
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match run(cli, matches).await {
+        Ok(code) => code,
         Err(err) => {
             let code = err.exit_code();
             let envelope = err.to_ai_envelope();

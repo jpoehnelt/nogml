@@ -1,0 +1,60 @@
+services:
+  nogml:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # Or use a prebuilt image:
+    # image: ghcr.io/jpoehnelt/nogml:latest
+    restart: unless-stopped
+    command: ["serve", "--config", "/etc/nogml/nogml.toml"]
+    environment:
+      RUST_LOG: info
+      NOGML_AUTH_TOKENS_FILE: /run/secrets/nogml_auth_tokens
+      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
+      RESEND_WEBHOOK_SECRET_FILE: /run/secrets/resend_webhook_secret
+    volumes:
+      - ./nogml.toml:/etc/nogml/nogml.toml:ro
+      - nogml_data:/var/lib/nogml
+    secrets:
+      - nogml_auth_tokens
+      - resend_api_key
+      - resend_webhook_secret
+    # Uncomment to expose embedded IMAP locally or via TLS:
+    # ports:
+    #   - "127.0.0.1:1143:1143"
+    networks:
+      - nogml_internal
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - nogml
+    environment:
+      NOGML_DOMAIN: ${NOGML_DOMAIN:-mail.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - nogml_internal
+
+secrets:
+  nogml_auth_tokens:
+    file: ./secrets/nogml_auth_tokens
+  resend_api_key:
+    file: ./secrets/resend_api_key
+  resend_webhook_secret:
+    file: ./secrets/resend_webhook_secret
+
+volumes:
+  nogml_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  nogml_internal:

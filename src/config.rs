@@ -1,9 +1,27 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fmt, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use url::Url;
 
-use crate::auth::ScopedTokenConfig;
+use crate::{
+    auth::ScopedTokenConfig,
+    blob::S3BlobConfig,
+    error::{AppError, AppResult},
+    search_index::OpenAiEmbeddingConfig,
+    secrets::{
+        REDACTED, SecretResolutionReport, ValueOrigin, check_secret_file_permissions,
+        read_secret_file, resolve_secret_tokens, resolve_secret_value, split_token_list,
+        system_env_lookup,
+    },
+    transport::{SesConfig, SmtpConfig},
+};
 
 /// Normalize a mailbox identifier (email address) by trimming whitespace and lowercasing ASCII.
 pub fn normalize_mailbox_id(mailbox_id: &str) -> String {
@@ -159,7 +177,10 @@ pub enum RspamdRejectAction {
 }
 
 /// Central runtime configuration for `nogml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Implements a custom [`fmt::Debug`] that replaces all secret, password, token, and
+/// credential fields with `"[REDACTED]"`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     // --- HTTP server ---
     pub bind: SocketAddr,
@@ -560,5 +581,1914 @@ impl Config {
                 .llm_triage_api_key
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Return a structured JSON view of the effective configuration with every secret,
+    /// password, token, and credential field replaced by `"[REDACTED]"` (or `null` when unset).
+    pub fn redacted_summary(&self) -> Value {
+        let Self {
+            bind,
+            max_body_bytes,
+            cors_allow_origins,
+            storage,
+            db_path,
+            database_url,
+            blob_backend,
+            blob_dir,
+            blob_s3_bucket,
+            blob_s3_region,
+            blob_s3_endpoint,
+            blob_s3_prefix,
+            blob_s3_access_key_id,
+            blob_s3_secret_access_key,
+            blob_s3_session_token,
+            blob_s3_force_path_style,
+            auth_tokens,
+            scoped_tokens,
+            oauth2_client_id,
+            oauth2_client_secret,
+            oauth2_signing_secret,
+            user_email,
+            mailboxes,
+            default_domain,
+            transport,
+            resend_api_key,
+            resend_base_url,
+            resend_webhook_secret,
+            ses_region,
+            ses_endpoint,
+            ses_access_key_id,
+            ses_secret_access_key,
+            ses_session_token,
+            ses_s3_endpoint,
+            ses_webhook_secret,
+            smtp_host,
+            smtp_port,
+            smtp_tls_mode,
+            smtp_username,
+            smtp_password,
+            smtp_helo_domain,
+            draft_only,
+            draft_only_action,
+            require_approval,
+            approval_ttl_secs,
+            approval_webhook_url,
+            allowed_recipients,
+            max_send_recipients,
+            default_max_body_chars,
+            untrusted_content_guard,
+            imap_bind,
+            imap_tls_bind,
+            imap_tls_cert,
+            imap_tls_key,
+            imap_username,
+            imap_password,
+            sync_mode,
+            gmail_client_id,
+            gmail_client_secret,
+            gmail_refresh_token,
+            gmail_access_token,
+            gmail_user_id,
+            gmail_api_base_url,
+            gmail_oauth_token_url,
+            gmail_imap_host,
+            gmail_imap_port,
+            gmail_imap_tls,
+            gmail_imap_user,
+            gmail_imap_password,
+            gmail_imap_mailbox,
+            sync_interval_secs,
+            sync_query,
+            sync_max_messages,
+            sync_bidirectional,
+            watch_webhook_url,
+            filter_auth_results,
+            filter_dmarc_fail_action,
+            filter_spf_fail_action,
+            filter_dkim_fail_action,
+            rspamd_url,
+            rspamd_password,
+            rspamd_timeout_ms,
+            rspamd_spam_threshold,
+            rspamd_reject_action,
+            rspamd_fail_closed,
+            llm_triage_base_url,
+            llm_triage_api_key,
+            llm_triage_model,
+            llm_triage_timeout_ms,
+            llm_triage_max_body_chars,
+            search_backend,
+            embedding_base_url,
+            embedding_api_key,
+            embedding_model,
+            embedding_timeout_secs,
+        } = self;
+
+        let redact_opt = |opt: &Option<String>| -> Value {
+            if opt.is_some() {
+                Value::String(REDACTED.to_string())
+            } else {
+                Value::Null
+            }
+        };
+
+        let redacted_auth_tokens: Vec<&str> = auth_tokens.iter().map(|_| REDACTED).collect();
+        let redacted_scoped_tokens: Vec<Value> = scoped_tokens
+            .iter()
+            .map(|st| {
+                json!({
+                    "token": REDACTED,
+                    "mailbox_id": st.mailbox_id,
+                    "scopes": st.scopes,
+                    "draft_only": st.draft_only,
+                    "allowed_recipients": st.allowed_recipients,
+                    "max_send_recipients": st.max_send_recipients,
+                })
+            })
+            .collect();
+
+        json!({
+            "server": {
+                "bind": bind.to_string(),
+                "max_body_bytes": max_body_bytes,
+                "cors_allow_origins": cors_allow_origins,
+            },
+            "storage": {
+                "backend": storage,
+                "db_path": db_path,
+                "database_url": redact_opt(database_url),
+            },
+            "blob": {
+                "backend": blob_backend,
+                "dir": blob_dir,
+                "s3_bucket": blob_s3_bucket,
+                "s3_region": blob_s3_region,
+                "s3_endpoint": blob_s3_endpoint,
+                "s3_prefix": blob_s3_prefix,
+                "s3_access_key_id": blob_s3_access_key_id,
+                "s3_secret_access_key": redact_opt(blob_s3_secret_access_key),
+                "s3_session_token": redact_opt(blob_s3_session_token),
+                "s3_force_path_style": blob_s3_force_path_style,
+            },
+            "auth": {
+                "user_email": user_email,
+                "mailboxes": mailboxes,
+                "default_domain": default_domain,
+                "tokens": redacted_auth_tokens,
+                "scoped_tokens": redacted_scoped_tokens,
+            },
+            "oauth2": {
+                "client_id": oauth2_client_id,
+                "client_secret": redact_opt(oauth2_client_secret),
+                "signing_secret": redact_opt(oauth2_signing_secret),
+            },
+            "transport": {
+                "backend": transport,
+            },
+            "resend": {
+                "api_key": redact_opt(resend_api_key),
+                "base_url": resend_base_url,
+                "webhook_secret": redact_opt(resend_webhook_secret),
+            },
+            "ses": {
+                "region": ses_region,
+                "endpoint": ses_endpoint,
+                "access_key_id": ses_access_key_id,
+                "secret_access_key": redact_opt(ses_secret_access_key),
+                "session_token": redact_opt(ses_session_token),
+                "s3_endpoint": ses_s3_endpoint,
+                "webhook_secret": redact_opt(ses_webhook_secret),
+            },
+            "smtp": {
+                "host": smtp_host,
+                "port": smtp_port,
+                "tls_mode": smtp_tls_mode,
+                "username": smtp_username,
+                "password": redact_opt(smtp_password),
+                "helo_domain": smtp_helo_domain,
+            },
+            "safety": {
+                "draft_only": draft_only,
+                "draft_only_action": draft_only_action,
+                "require_approval": require_approval,
+                "approval_ttl_secs": approval_ttl_secs,
+                "approval_webhook_url": approval_webhook_url,
+                "allowed_recipients": allowed_recipients,
+                "max_send_recipients": max_send_recipients,
+                "default_max_body_chars": default_max_body_chars,
+                "untrusted_content_guard": untrusted_content_guard,
+            },
+            "imap": {
+                "bind": imap_bind.map(|a| a.to_string()),
+                "tls_bind": imap_tls_bind.map(|a| a.to_string()),
+                "tls_cert": imap_tls_cert,
+                "tls_key": imap_tls_key,
+                "username": imap_username,
+                "password": redact_opt(imap_password),
+            },
+            "sync": {
+                "mode": sync_mode,
+                "interval_secs": sync_interval_secs,
+                "query": sync_query,
+                "max_messages": sync_max_messages,
+                "bidirectional": sync_bidirectional,
+                "gmail_client_id": gmail_client_id,
+                "gmail_client_secret": redact_opt(gmail_client_secret),
+                "gmail_refresh_token": redact_opt(gmail_refresh_token),
+                "gmail_access_token": redact_opt(gmail_access_token),
+                "gmail_user_id": gmail_user_id,
+                "gmail_api_base_url": gmail_api_base_url,
+                "gmail_oauth_token_url": gmail_oauth_token_url,
+                "gmail_imap_host": gmail_imap_host,
+                "gmail_imap_port": gmail_imap_port,
+                "gmail_imap_tls": gmail_imap_tls,
+                "gmail_imap_user": gmail_imap_user,
+                "gmail_imap_password": redact_opt(gmail_imap_password),
+                "gmail_imap_mailbox": gmail_imap_mailbox,
+            },
+            "watch": {
+                "webhook_url": watch_webhook_url,
+            },
+            "filters": {
+                "auth_results": filter_auth_results,
+                "dmarc_fail_action": filter_dmarc_fail_action,
+                "spf_fail_action": filter_spf_fail_action,
+                "dkim_fail_action": filter_dkim_fail_action,
+                "rspamd": {
+                    "url": rspamd_url,
+                    "password": redact_opt(rspamd_password),
+                    "timeout_ms": rspamd_timeout_ms,
+                    "spam_threshold": rspamd_spam_threshold,
+                    "reject_action": rspamd_reject_action,
+                    "fail_closed": rspamd_fail_closed,
+                },
+                "llm_triage": {
+                    "base_url": llm_triage_base_url,
+                    "api_key": redact_opt(llm_triage_api_key),
+                    "model": llm_triage_model,
+                    "timeout_ms": llm_triage_timeout_ms,
+                    "max_body_chars": llm_triage_max_body_chars,
+                },
+            },
+            "search": {
+                "backend": search_backend,
+                "embedding_base_url": embedding_base_url,
+                "embedding_api_key": redact_opt(embedding_api_key),
+                "embedding_model": embedding_model,
+                "embedding_timeout_secs": embedding_timeout_secs,
+            },
+        })
+    }
+
+    /// Apply `*_FILE` environment variables (when not overridden by CLI or direct env vars)
+    /// and resolve all `file://` and `env://` secret references across every secret field.
+    pub fn apply_env_file_secrets_and_resolve(
+        &mut self,
+        base_dir: Option<&Path>,
+        origin_of: &dyn Fn(&str) -> ValueOrigin,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> SecretResolutionReport {
+        let mut report = SecretResolutionReport::default();
+        let mut loaded_from_env_file: HashSet<&'static str> = HashSet::new();
+
+        macro_rules! load_opt_env_file {
+            ($arg_id:expr, $field_name:expr, $direct_env:expr, $file_env:expr, $slot:expr) => {
+                if let Some(path_str) = env_lookup($file_env)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    match origin_of($arg_id) {
+                        ValueOrigin::Cli => {}
+                        ValueOrigin::DirectEnv => {
+                            report.push_warning_unique(format!(
+                                "Both {} and {} are set; using {}",
+                                $direct_env, $file_env, $direct_env
+                            ));
+                        }
+                        ValueOrigin::Unset => {
+                            if let Some(val) =
+                                read_secret_file($field_name, Path::new(&path_str), &mut report)
+                            {
+                                $slot = Some(val);
+                                loaded_from_env_file.insert($field_name);
+                            } else {
+                                $slot = None;
+                                loaded_from_env_file.insert($field_name);
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        load_opt_env_file!(
+            "database_url",
+            "storage.database_url",
+            "NOGML_DATABASE_URL",
+            "NOGML_DATABASE_URL_FILE",
+            self.database_url
+        );
+        load_opt_env_file!(
+            "blob_s3_secret_access_key",
+            "blob.s3_secret_access_key",
+            "NOGML_BLOB_S3_SECRET_ACCESS_KEY",
+            "NOGML_BLOB_S3_SECRET_ACCESS_KEY_FILE",
+            self.blob_s3_secret_access_key
+        );
+        load_opt_env_file!(
+            "blob_s3_session_token",
+            "blob.s3_session_token",
+            "NOGML_BLOB_S3_SESSION_TOKEN",
+            "NOGML_BLOB_S3_SESSION_TOKEN_FILE",
+            self.blob_s3_session_token
+        );
+        load_opt_env_file!(
+            "oauth2_client_secret",
+            "oauth2.client_secret",
+            "NOGML_OAUTH2_CLIENT_SECRET",
+            "NOGML_OAUTH2_CLIENT_SECRET_FILE",
+            self.oauth2_client_secret
+        );
+        load_opt_env_file!(
+            "oauth2_signing_secret",
+            "oauth2.signing_secret",
+            "NOGML_OAUTH2_SIGNING_SECRET",
+            "NOGML_OAUTH2_SIGNING_SECRET_FILE",
+            self.oauth2_signing_secret
+        );
+        load_opt_env_file!(
+            "resend_api_key",
+            "resend.api_key",
+            "RESEND_API_KEY",
+            "RESEND_API_KEY_FILE",
+            self.resend_api_key
+        );
+        load_opt_env_file!(
+            "resend_webhook_secret",
+            "resend.webhook_secret",
+            "RESEND_WEBHOOK_SECRET",
+            "RESEND_WEBHOOK_SECRET_FILE",
+            self.resend_webhook_secret
+        );
+        load_opt_env_file!(
+            "ses_secret_access_key",
+            "ses.secret_access_key",
+            "NOGML_SES_SECRET_ACCESS_KEY",
+            "NOGML_SES_SECRET_ACCESS_KEY_FILE",
+            self.ses_secret_access_key
+        );
+        load_opt_env_file!(
+            "ses_session_token",
+            "ses.session_token",
+            "NOGML_SES_SESSION_TOKEN",
+            "NOGML_SES_SESSION_TOKEN_FILE",
+            self.ses_session_token
+        );
+        load_opt_env_file!(
+            "ses_webhook_secret",
+            "ses.webhook_secret",
+            "NOGML_SES_WEBHOOK_SECRET",
+            "NOGML_SES_WEBHOOK_SECRET_FILE",
+            self.ses_webhook_secret
+        );
+        load_opt_env_file!(
+            "smtp_password",
+            "smtp.password",
+            "NOGML_SMTP_PASSWORD",
+            "NOGML_SMTP_PASSWORD_FILE",
+            self.smtp_password
+        );
+        load_opt_env_file!(
+            "imap_password",
+            "imap.password",
+            "NOGML_IMAP_PASSWORD",
+            "NOGML_IMAP_PASSWORD_FILE",
+            self.imap_password
+        );
+        load_opt_env_file!(
+            "gmail_client_secret",
+            "sync.gmail_client_secret",
+            "GMAIL_CLIENT_SECRET",
+            "GMAIL_CLIENT_SECRET_FILE",
+            self.gmail_client_secret
+        );
+        load_opt_env_file!(
+            "gmail_refresh_token",
+            "sync.gmail_refresh_token",
+            "GMAIL_REFRESH_TOKEN",
+            "GMAIL_REFRESH_TOKEN_FILE",
+            self.gmail_refresh_token
+        );
+        load_opt_env_file!(
+            "gmail_access_token",
+            "sync.gmail_access_token",
+            "GMAIL_ACCESS_TOKEN",
+            "GMAIL_ACCESS_TOKEN_FILE",
+            self.gmail_access_token
+        );
+        load_opt_env_file!(
+            "gmail_imap_password",
+            "sync.gmail_imap_password",
+            "GMAIL_IMAP_PASSWORD",
+            "GMAIL_IMAP_PASSWORD_FILE",
+            self.gmail_imap_password
+        );
+        load_opt_env_file!(
+            "rspamd_password",
+            "filters.rspamd.password",
+            "NOGML_RSPAMD_PASSWORD",
+            "NOGML_RSPAMD_PASSWORD_FILE",
+            self.rspamd_password
+        );
+        load_opt_env_file!(
+            "llm_triage_api_key",
+            "filters.llm_triage.api_key",
+            "NOGML_LLM_TRIAGE_API_KEY",
+            "NOGML_LLM_TRIAGE_API_KEY_FILE",
+            self.llm_triage_api_key
+        );
+        load_opt_env_file!(
+            "embedding_api_key",
+            "search.embedding_api_key",
+            "NOGML_EMBEDDING_API_KEY",
+            "NOGML_EMBEDDING_API_KEY_FILE",
+            self.embedding_api_key
+        );
+
+        // NOGML_AUTH_TOKENS_FILE
+        if let Some(path_str) = env_lookup("NOGML_AUTH_TOKENS_FILE")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            match origin_of("auth_tokens") {
+                ValueOrigin::Cli => {}
+                ValueOrigin::DirectEnv => {
+                    report.push_warning_unique(
+                        "Both NOGML_AUTH_TOKENS and NOGML_AUTH_TOKENS_FILE are set; using NOGML_AUTH_TOKENS"
+                            .to_string(),
+                    );
+                }
+                ValueOrigin::Unset => {
+                    if let Some(raw) =
+                        read_secret_file("auth.tokens", Path::new(&path_str), &mut report)
+                    {
+                        self.auth_tokens = split_token_list(&raw);
+                    } else {
+                        self.auth_tokens.clear();
+                    }
+                    loaded_from_env_file.insert("auth.tokens");
+                }
+            }
+        }
+
+        // NOGML_SCOPED_TOKENS_FILE
+        if let Some(path_str) = env_lookup("NOGML_SCOPED_TOKENS_FILE")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            match origin_of("scoped_tokens") {
+                ValueOrigin::Cli => {}
+                ValueOrigin::DirectEnv => {
+                    report.push_warning_unique(
+                        "Both NOGML_SCOPED_TOKENS and NOGML_SCOPED_TOKENS_FILE are set; using NOGML_SCOPED_TOKENS"
+                            .to_string(),
+                    );
+                }
+                ValueOrigin::Unset => {
+                    if let Some(raw) =
+                        read_secret_file("auth.scoped_tokens", Path::new(&path_str), &mut report)
+                    {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            self.scoped_tokens.clear();
+                        } else {
+                            match serde_json::from_str::<Vec<ScopedTokenConfig>>(trimmed) {
+                                Ok(parsed) => self.scoped_tokens = parsed,
+                                Err(err) => {
+                                    report.errors.push(format!(
+                                        "Invalid JSON in NOGML_SCOPED_TOKENS_FILE '{path_str}': {err}"
+                                    ));
+                                    self.scoped_tokens.clear();
+                                }
+                            }
+                        }
+                    } else {
+                        self.scoped_tokens.clear();
+                    }
+                }
+            }
+        }
+
+        // Resolve file:// and env:// URIs across all scalar secrets not already read from *_FILE.
+        macro_rules! resolve_opt_uri {
+            ($field_name:expr, $slot:expr) => {
+                if !loaded_from_env_file.contains($field_name)
+                    && let Some(raw) = $slot.clone()
+                {
+                    if raw.starts_with("file://") || raw.starts_with("env://") {
+                        $slot = resolve_secret_value(
+                            $field_name,
+                            &raw,
+                            base_dir,
+                            env_lookup,
+                            &mut report,
+                        );
+                    }
+                }
+            };
+        }
+
+        resolve_opt_uri!("storage.database_url", self.database_url);
+        resolve_opt_uri!("blob.s3_secret_access_key", self.blob_s3_secret_access_key);
+        resolve_opt_uri!("blob.s3_session_token", self.blob_s3_session_token);
+        resolve_opt_uri!("oauth2.client_secret", self.oauth2_client_secret);
+        resolve_opt_uri!("oauth2.signing_secret", self.oauth2_signing_secret);
+        resolve_opt_uri!("resend.api_key", self.resend_api_key);
+        resolve_opt_uri!("resend.webhook_secret", self.resend_webhook_secret);
+        resolve_opt_uri!("ses.secret_access_key", self.ses_secret_access_key);
+        resolve_opt_uri!("ses.session_token", self.ses_session_token);
+        resolve_opt_uri!("ses.webhook_secret", self.ses_webhook_secret);
+        resolve_opt_uri!("smtp.password", self.smtp_password);
+        resolve_opt_uri!("imap.password", self.imap_password);
+        resolve_opt_uri!("sync.gmail_client_secret", self.gmail_client_secret);
+        resolve_opt_uri!("sync.gmail_refresh_token", self.gmail_refresh_token);
+        resolve_opt_uri!("sync.gmail_access_token", self.gmail_access_token);
+        resolve_opt_uri!("sync.gmail_imap_password", self.gmail_imap_password);
+        resolve_opt_uri!("filters.rspamd.password", self.rspamd_password);
+        resolve_opt_uri!("filters.llm_triage.api_key", self.llm_triage_api_key);
+        resolve_opt_uri!("search.embedding_api_key", self.embedding_api_key);
+
+        if !loaded_from_env_file.contains("auth.tokens") {
+            self.auth_tokens = resolve_secret_tokens(
+                "auth.tokens",
+                &self.auth_tokens,
+                base_dir,
+                env_lookup,
+                &mut report,
+            );
+        }
+
+        for (idx, st) in self.scoped_tokens.iter_mut().enumerate() {
+            if st.token.starts_with("file://") || st.token.starts_with("env://") {
+                let field_name = format!("auth.scoped_tokens[{idx}].token");
+                match resolve_secret_value(
+                    &field_name,
+                    &st.token,
+                    base_dir,
+                    env_lookup,
+                    &mut report,
+                ) {
+                    Some(val) => st.token = val,
+                    None => st.token.clear(),
+                }
+            }
+        }
+
+        report
+    }
+
+    /// Resolve `file://` and `env://` secret references using the process environment.
+    pub fn resolve_secrets(&mut self, base_dir: Option<&Path>) -> SecretResolutionReport {
+        self.apply_env_file_secrets_and_resolve(
+            base_dir,
+            &|_| ValueOrigin::Unset,
+            &system_env_lookup,
+        )
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            bind,
+            max_body_bytes,
+            cors_allow_origins,
+            storage,
+            db_path,
+            database_url,
+            blob_backend,
+            blob_dir,
+            blob_s3_bucket,
+            blob_s3_region,
+            blob_s3_endpoint,
+            blob_s3_prefix,
+            blob_s3_access_key_id,
+            blob_s3_secret_access_key,
+            blob_s3_session_token,
+            blob_s3_force_path_style,
+            auth_tokens,
+            scoped_tokens,
+            oauth2_client_id,
+            oauth2_client_secret,
+            oauth2_signing_secret,
+            user_email,
+            mailboxes,
+            default_domain,
+            transport,
+            resend_api_key,
+            resend_base_url,
+            resend_webhook_secret,
+            ses_region,
+            ses_endpoint,
+            ses_access_key_id,
+            ses_secret_access_key,
+            ses_session_token,
+            ses_s3_endpoint,
+            ses_webhook_secret,
+            smtp_host,
+            smtp_port,
+            smtp_tls_mode,
+            smtp_username,
+            smtp_password,
+            smtp_helo_domain,
+            draft_only,
+            draft_only_action,
+            require_approval,
+            approval_ttl_secs,
+            approval_webhook_url,
+            allowed_recipients,
+            max_send_recipients,
+            default_max_body_chars,
+            untrusted_content_guard,
+            imap_bind,
+            imap_tls_bind,
+            imap_tls_cert,
+            imap_tls_key,
+            imap_username,
+            imap_password,
+            sync_mode,
+            gmail_client_id,
+            gmail_client_secret,
+            gmail_refresh_token,
+            gmail_access_token,
+            gmail_user_id,
+            gmail_api_base_url,
+            gmail_oauth_token_url,
+            gmail_imap_host,
+            gmail_imap_port,
+            gmail_imap_tls,
+            gmail_imap_user,
+            gmail_imap_password,
+            gmail_imap_mailbox,
+            sync_interval_secs,
+            sync_query,
+            sync_max_messages,
+            sync_bidirectional,
+            watch_webhook_url,
+            filter_auth_results,
+            filter_dmarc_fail_action,
+            filter_spf_fail_action,
+            filter_dkim_fail_action,
+            rspamd_url,
+            rspamd_password,
+            rspamd_timeout_ms,
+            rspamd_spam_threshold,
+            rspamd_reject_action,
+            rspamd_fail_closed,
+            llm_triage_base_url,
+            llm_triage_api_key,
+            llm_triage_model,
+            llm_triage_timeout_ms,
+            llm_triage_max_body_chars,
+            search_backend,
+            embedding_base_url,
+            embedding_api_key,
+            embedding_model,
+            embedding_timeout_secs,
+        } = self;
+
+        let redacted_opt = |opt: &Option<String>| opt.as_ref().map(|_| REDACTED);
+        let redacted_tokens: Vec<&str> = auth_tokens.iter().map(|_| REDACTED).collect();
+
+        f.debug_struct("Config")
+            .field("bind", bind)
+            .field("max_body_bytes", max_body_bytes)
+            .field("cors_allow_origins", cors_allow_origins)
+            .field("storage", storage)
+            .field("db_path", db_path)
+            .field("database_url", &redacted_opt(database_url))
+            .field("blob_backend", blob_backend)
+            .field("blob_dir", blob_dir)
+            .field("blob_s3_bucket", blob_s3_bucket)
+            .field("blob_s3_region", blob_s3_region)
+            .field("blob_s3_endpoint", blob_s3_endpoint)
+            .field("blob_s3_prefix", blob_s3_prefix)
+            .field("blob_s3_access_key_id", blob_s3_access_key_id)
+            .field(
+                "blob_s3_secret_access_key",
+                &redacted_opt(blob_s3_secret_access_key),
+            )
+            .field(
+                "blob_s3_session_token",
+                &redacted_opt(blob_s3_session_token),
+            )
+            .field("blob_s3_force_path_style", blob_s3_force_path_style)
+            .field("auth_tokens", &redacted_tokens)
+            .field("scoped_tokens", scoped_tokens)
+            .field("oauth2_client_id", oauth2_client_id)
+            .field("oauth2_client_secret", &redacted_opt(oauth2_client_secret))
+            .field(
+                "oauth2_signing_secret",
+                &redacted_opt(oauth2_signing_secret),
+            )
+            .field("user_email", user_email)
+            .field("mailboxes", mailboxes)
+            .field("default_domain", default_domain)
+            .field("transport", transport)
+            .field("resend_api_key", &redacted_opt(resend_api_key))
+            .field("resend_base_url", resend_base_url)
+            .field(
+                "resend_webhook_secret",
+                &redacted_opt(resend_webhook_secret),
+            )
+            .field("ses_region", ses_region)
+            .field("ses_endpoint", ses_endpoint)
+            .field("ses_access_key_id", ses_access_key_id)
+            .field(
+                "ses_secret_access_key",
+                &redacted_opt(ses_secret_access_key),
+            )
+            .field("ses_session_token", &redacted_opt(ses_session_token))
+            .field("ses_s3_endpoint", ses_s3_endpoint)
+            .field("ses_webhook_secret", &redacted_opt(ses_webhook_secret))
+            .field("smtp_host", smtp_host)
+            .field("smtp_port", smtp_port)
+            .field("smtp_tls_mode", smtp_tls_mode)
+            .field("smtp_username", smtp_username)
+            .field("smtp_password", &redacted_opt(smtp_password))
+            .field("smtp_helo_domain", smtp_helo_domain)
+            .field("draft_only", draft_only)
+            .field("draft_only_action", draft_only_action)
+            .field("require_approval", require_approval)
+            .field("approval_ttl_secs", approval_ttl_secs)
+            .field("approval_webhook_url", approval_webhook_url)
+            .field("allowed_recipients", allowed_recipients)
+            .field("max_send_recipients", max_send_recipients)
+            .field("default_max_body_chars", default_max_body_chars)
+            .field("untrusted_content_guard", untrusted_content_guard)
+            .field("imap_bind", imap_bind)
+            .field("imap_tls_bind", imap_tls_bind)
+            .field("imap_tls_cert", imap_tls_cert)
+            .field("imap_tls_key", imap_tls_key)
+            .field("imap_username", imap_username)
+            .field("imap_password", &redacted_opt(imap_password))
+            .field("sync_mode", sync_mode)
+            .field("gmail_client_id", gmail_client_id)
+            .field("gmail_client_secret", &redacted_opt(gmail_client_secret))
+            .field("gmail_refresh_token", &redacted_opt(gmail_refresh_token))
+            .field("gmail_access_token", &redacted_opt(gmail_access_token))
+            .field("gmail_user_id", gmail_user_id)
+            .field("gmail_api_base_url", gmail_api_base_url)
+            .field("gmail_oauth_token_url", gmail_oauth_token_url)
+            .field("gmail_imap_host", gmail_imap_host)
+            .field("gmail_imap_port", gmail_imap_port)
+            .field("gmail_imap_tls", gmail_imap_tls)
+            .field("gmail_imap_user", gmail_imap_user)
+            .field("gmail_imap_password", &redacted_opt(gmail_imap_password))
+            .field("gmail_imap_mailbox", gmail_imap_mailbox)
+            .field("sync_interval_secs", sync_interval_secs)
+            .field("sync_query", sync_query)
+            .field("sync_max_messages", sync_max_messages)
+            .field("sync_bidirectional", sync_bidirectional)
+            .field("watch_webhook_url", watch_webhook_url)
+            .field("filter_auth_results", filter_auth_results)
+            .field("filter_dmarc_fail_action", filter_dmarc_fail_action)
+            .field("filter_spf_fail_action", filter_spf_fail_action)
+            .field("filter_dkim_fail_action", filter_dkim_fail_action)
+            .field("rspamd_url", rspamd_url)
+            .field("rspamd_password", &redacted_opt(rspamd_password))
+            .field("rspamd_timeout_ms", rspamd_timeout_ms)
+            .field("rspamd_spam_threshold", rspamd_spam_threshold)
+            .field("rspamd_reject_action", rspamd_reject_action)
+            .field("rspamd_fail_closed", rspamd_fail_closed)
+            .field("llm_triage_base_url", llm_triage_base_url)
+            .field("llm_triage_api_key", &redacted_opt(llm_triage_api_key))
+            .field("llm_triage_model", llm_triage_model)
+            .field("llm_triage_timeout_ms", llm_triage_timeout_ms)
+            .field("llm_triage_max_body_chars", llm_triage_max_body_chars)
+            .field("search_backend", search_backend)
+            .field("embedding_base_url", embedding_base_url)
+            .field("embedding_api_key", &redacted_opt(embedding_api_key))
+            .field("embedding_model", embedding_model)
+            .field("embedding_timeout_secs", embedding_timeout_secs)
+            .finish()
+    }
+}
+
+// ============================================================================
+// Structured `nogml.toml` configuration file schema
+// ============================================================================
+
+/// Root schema for `nogml.toml`.
+///
+/// Unknown fields are rejected so configuration typos fail fast during startup and
+/// `nogml config check`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TomlConfig {
+    pub server: ServerTomlConfig,
+    pub storage: StorageTomlConfig,
+    pub blob: BlobTomlConfig,
+    pub auth: AuthTomlConfig,
+    pub oauth2: OAuth2TomlConfig,
+    pub transport: TransportTomlConfig,
+    pub resend: ResendTomlConfig,
+    pub ses: SesTomlConfig,
+    pub smtp: SmtpTomlConfig,
+    pub safety: SafetyTomlConfig,
+    pub imap: ImapTomlConfig,
+    pub sync: SyncTomlConfig,
+    pub watch: WatchTomlConfig,
+    pub filters: FiltersTomlConfig,
+    pub search: SearchTomlConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerTomlConfig {
+    pub bind: Option<SocketAddr>,
+    pub max_body_bytes: Option<usize>,
+    #[serde(alias = "cors_origins")]
+    pub cors_allow_origins: Option<Vec<String>>,
+    pub log_json: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageTomlConfig {
+    pub backend: Option<StorageBackend>,
+    pub db_path: Option<PathBuf>,
+    pub database_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlobTomlConfig {
+    pub backend: Option<BlobBackend>,
+    pub dir: Option<PathBuf>,
+    pub s3_bucket: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub s3_prefix: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_access_key: Option<String>,
+    pub s3_session_token: Option<String>,
+    pub s3_force_path_style: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthTomlConfig {
+    pub user_email: Option<String>,
+    pub mailboxes: Option<Vec<String>>,
+    pub default_domain: Option<String>,
+    #[serde(alias = "auth_tokens")]
+    pub tokens: Option<Vec<String>>,
+    pub scoped_tokens: Option<Vec<ScopedTokenConfig>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuth2TomlConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub signing_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransportTomlConfig {
+    pub backend: Option<TransportBackend>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResendTomlConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SesTomlConfig {
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SmtpTomlConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub tls_mode: Option<SmtpTlsMode>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub helo_domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SafetyTomlConfig {
+    pub draft_only: Option<bool>,
+    pub draft_only_action: Option<DraftOnlyAction>,
+    pub require_approval: Option<bool>,
+    pub approval_ttl_secs: Option<u64>,
+    pub approval_webhook_url: Option<String>,
+    pub allowed_recipients: Option<Vec<String>>,
+    pub max_send_recipients: Option<usize>,
+    pub default_max_body_chars: Option<usize>,
+    pub untrusted_content_guard: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImapTomlConfig {
+    pub bind: Option<SocketAddr>,
+    pub tls_bind: Option<SocketAddr>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncTomlConfig {
+    pub mode: Option<SyncMode>,
+    pub interval_secs: Option<u64>,
+    pub query: Option<String>,
+    pub max_messages: Option<usize>,
+    pub bidirectional: Option<bool>,
+    pub gmail_client_id: Option<String>,
+    pub gmail_client_secret: Option<String>,
+    pub gmail_refresh_token: Option<String>,
+    pub gmail_access_token: Option<String>,
+    pub gmail_user_id: Option<String>,
+    pub gmail_api_base_url: Option<String>,
+    pub gmail_oauth_token_url: Option<String>,
+    pub gmail_imap_host: Option<String>,
+    pub gmail_imap_port: Option<u16>,
+    pub gmail_imap_tls: Option<bool>,
+    pub gmail_imap_user: Option<String>,
+    pub gmail_imap_password: Option<String>,
+    pub gmail_imap_mailbox: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchTomlConfig {
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FiltersTomlConfig {
+    pub auth_results: Option<bool>,
+    pub dmarc_fail_action: Option<AuthFailAction>,
+    pub spf_fail_action: Option<AuthFailAction>,
+    pub dkim_fail_action: Option<AuthFailAction>,
+    pub rspamd: RspamdTomlConfig,
+    pub llm_triage: LlmTriageTomlConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RspamdTomlConfig {
+    pub url: Option<String>,
+    pub password: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub spam_threshold: Option<f32>,
+    pub reject_action: Option<RspamdRejectAction>,
+    pub fail_closed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmTriageTomlConfig {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_body_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchTomlConfig {
+    pub backend: Option<SearchBackend>,
+    pub embedding_base_url: Option<String>,
+    pub embedding_api_key: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_timeout_secs: Option<u64>,
+}
+
+/// Metadata returned when applying a [`TomlConfig`] onto a [`Config`].
+#[derive(Debug, Clone, Default)]
+pub struct TomlApplyMeta {
+    pub user_email_set: bool,
+    pub log_json: Option<bool>,
+}
+
+impl TomlConfig {
+    /// Parse a `nogml.toml` string into [`TomlConfig`].
+    pub fn from_toml_str(input: &str) -> AppResult<Self> {
+        toml::from_str(input).map_err(|e| AppError::Config(format!("Invalid TOML config: {e}")))
+    }
+
+    /// Read and parse a `nogml.toml` file from disk.
+    pub fn from_file(path: &Path) -> AppResult<Self> {
+        let raw = fs::read_to_string(path).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to read config file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        Self::from_toml_str(&raw).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to parse config file '{}': {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Overlay all fields set in this TOML document onto `cfg`.
+    pub fn apply_to(&self, cfg: &mut Config) -> TomlApplyMeta {
+        let mut meta = TomlApplyMeta {
+            user_email_set: false,
+            log_json: self.server.log_json,
+        };
+
+        // [server]
+        if let Some(v) = self.server.bind {
+            cfg.bind = v;
+        }
+        if let Some(v) = self.server.max_body_bytes {
+            cfg.max_body_bytes = v;
+        }
+        if let Some(ref v) = self.server.cors_allow_origins {
+            cfg.cors_allow_origins = v.clone();
+        }
+
+        // [storage]
+        if let Some(v) = self.storage.backend {
+            cfg.storage = v;
+        }
+        if let Some(ref v) = self.storage.db_path {
+            cfg.db_path = v.clone();
+        }
+        if let Some(ref v) = self.storage.database_url {
+            cfg.database_url = Some(v.clone());
+        }
+
+        // [blob]
+        if let Some(v) = self.blob.backend {
+            cfg.blob_backend = v;
+        }
+        if let Some(ref v) = self.blob.dir {
+            cfg.blob_dir = v.clone();
+        }
+        if let Some(ref v) = self.blob.s3_bucket {
+            cfg.blob_s3_bucket = Some(v.clone());
+        }
+        if let Some(ref v) = self.blob.s3_region {
+            cfg.blob_s3_region = v.clone();
+        }
+        if let Some(ref v) = self.blob.s3_endpoint {
+            cfg.blob_s3_endpoint = Some(v.clone());
+        }
+        if let Some(ref v) = self.blob.s3_prefix {
+            cfg.blob_s3_prefix = Some(v.clone());
+        }
+        if let Some(ref v) = self.blob.s3_access_key_id {
+            cfg.blob_s3_access_key_id = Some(v.clone());
+        }
+        if let Some(ref v) = self.blob.s3_secret_access_key {
+            cfg.blob_s3_secret_access_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.blob.s3_session_token {
+            cfg.blob_s3_session_token = Some(v.clone());
+        }
+        if let Some(v) = self.blob.s3_force_path_style {
+            cfg.blob_s3_force_path_style = Some(v);
+        }
+
+        // [auth]
+        if let Some(ref v) = self.auth.user_email
+            && !v.trim().is_empty()
+        {
+            cfg.user_email = v.clone();
+            meta.user_email_set = true;
+        }
+        if let Some(ref v) = self.auth.mailboxes {
+            cfg.mailboxes = v.clone();
+        }
+        if let Some(ref v) = self.auth.default_domain {
+            cfg.default_domain = v.clone();
+        }
+        if let Some(ref v) = self.auth.tokens {
+            cfg.auth_tokens = v.clone();
+        }
+        if let Some(ref v) = self.auth.scoped_tokens {
+            cfg.scoped_tokens = v.clone();
+        }
+
+        // [oauth2]
+        if let Some(ref v) = self.oauth2.client_id {
+            cfg.oauth2_client_id = Some(v.clone());
+        }
+        if let Some(ref v) = self.oauth2.client_secret {
+            cfg.oauth2_client_secret = Some(v.clone());
+        }
+        if let Some(ref v) = self.oauth2.signing_secret {
+            cfg.oauth2_signing_secret = Some(v.clone());
+        }
+
+        // [transport]
+        if let Some(v) = self.transport.backend {
+            cfg.transport = v;
+        }
+
+        // [resend]
+        if let Some(ref v) = self.resend.api_key {
+            cfg.resend_api_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.resend.base_url {
+            cfg.resend_base_url = v.clone();
+        }
+        if let Some(ref v) = self.resend.webhook_secret {
+            cfg.resend_webhook_secret = Some(v.clone());
+        }
+
+        // [ses]
+        if let Some(ref v) = self.ses.region {
+            cfg.ses_region = v.clone();
+        }
+        if let Some(ref v) = self.ses.endpoint {
+            cfg.ses_endpoint = Some(v.clone());
+        }
+        if let Some(ref v) = self.ses.access_key_id {
+            cfg.ses_access_key_id = Some(v.clone());
+        }
+        if let Some(ref v) = self.ses.secret_access_key {
+            cfg.ses_secret_access_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.ses.session_token {
+            cfg.ses_session_token = Some(v.clone());
+        }
+        if let Some(ref v) = self.ses.s3_endpoint {
+            cfg.ses_s3_endpoint = Some(v.clone());
+        }
+        if let Some(ref v) = self.ses.webhook_secret {
+            cfg.ses_webhook_secret = Some(v.clone());
+        }
+
+        // [smtp]
+        if let Some(ref v) = self.smtp.host {
+            cfg.smtp_host = v.clone();
+        }
+        if let Some(v) = self.smtp.port {
+            cfg.smtp_port = v;
+        }
+        if let Some(v) = self.smtp.tls_mode {
+            cfg.smtp_tls_mode = v;
+        }
+        if let Some(ref v) = self.smtp.username {
+            cfg.smtp_username = Some(v.clone());
+        }
+        if let Some(ref v) = self.smtp.password {
+            cfg.smtp_password = Some(v.clone());
+        }
+        if let Some(ref v) = self.smtp.helo_domain {
+            cfg.smtp_helo_domain = Some(v.clone());
+        }
+
+        // [safety]
+        if let Some(v) = self.safety.draft_only {
+            cfg.draft_only = v;
+        }
+        if let Some(v) = self.safety.draft_only_action {
+            cfg.draft_only_action = v;
+        }
+        if let Some(v) = self.safety.require_approval {
+            cfg.require_approval = v;
+        }
+        if let Some(v) = self.safety.approval_ttl_secs {
+            cfg.approval_ttl_secs = v;
+        }
+        if let Some(ref v) = self.safety.approval_webhook_url {
+            cfg.approval_webhook_url = Some(v.clone());
+        }
+        if let Some(ref v) = self.safety.allowed_recipients {
+            cfg.allowed_recipients = v.clone();
+        }
+        if let Some(v) = self.safety.max_send_recipients {
+            cfg.max_send_recipients = v;
+        }
+        if let Some(v) = self.safety.default_max_body_chars {
+            cfg.default_max_body_chars = v;
+        }
+        if let Some(v) = self.safety.untrusted_content_guard {
+            cfg.untrusted_content_guard = v;
+        }
+
+        // [imap]
+        if let Some(v) = self.imap.bind {
+            cfg.imap_bind = Some(v);
+        }
+        if let Some(v) = self.imap.tls_bind {
+            cfg.imap_tls_bind = Some(v);
+        }
+        if let Some(ref v) = self.imap.tls_cert {
+            cfg.imap_tls_cert = Some(v.clone());
+        }
+        if let Some(ref v) = self.imap.tls_key {
+            cfg.imap_tls_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.imap.username {
+            cfg.imap_username = Some(v.clone());
+        }
+        if let Some(ref v) = self.imap.password {
+            cfg.imap_password = Some(v.clone());
+        }
+
+        // [sync]
+        if let Some(v) = self.sync.mode {
+            cfg.sync_mode = v;
+        }
+        if let Some(v) = self.sync.interval_secs {
+            cfg.sync_interval_secs = v;
+        }
+        if let Some(ref v) = self.sync.query {
+            cfg.sync_query = Some(v.clone());
+        }
+        if let Some(v) = self.sync.max_messages {
+            cfg.sync_max_messages = Some(v);
+        }
+        if let Some(v) = self.sync.bidirectional {
+            cfg.sync_bidirectional = v;
+        }
+        if let Some(ref v) = self.sync.gmail_client_id {
+            cfg.gmail_client_id = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_client_secret {
+            cfg.gmail_client_secret = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_refresh_token {
+            cfg.gmail_refresh_token = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_access_token {
+            cfg.gmail_access_token = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_user_id {
+            cfg.gmail_user_id = v.clone();
+        }
+        if let Some(ref v) = self.sync.gmail_api_base_url {
+            cfg.gmail_api_base_url = v.clone();
+        }
+        if let Some(ref v) = self.sync.gmail_oauth_token_url {
+            cfg.gmail_oauth_token_url = v.clone();
+        }
+        if let Some(ref v) = self.sync.gmail_imap_host {
+            cfg.gmail_imap_host = v.clone();
+        }
+        if let Some(v) = self.sync.gmail_imap_port {
+            cfg.gmail_imap_port = v;
+        }
+        if let Some(v) = self.sync.gmail_imap_tls {
+            cfg.gmail_imap_tls = v;
+        }
+        if let Some(ref v) = self.sync.gmail_imap_user {
+            cfg.gmail_imap_user = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_imap_password {
+            cfg.gmail_imap_password = Some(v.clone());
+        }
+        if let Some(ref v) = self.sync.gmail_imap_mailbox {
+            cfg.gmail_imap_mailbox = v.clone();
+        }
+
+        // [watch]
+        if let Some(ref v) = self.watch.webhook_url {
+            cfg.watch_webhook_url = Some(v.clone());
+        }
+
+        // [filters]
+        if let Some(v) = self.filters.auth_results {
+            cfg.filter_auth_results = v;
+        }
+        if let Some(v) = self.filters.dmarc_fail_action {
+            cfg.filter_dmarc_fail_action = v;
+        }
+        if let Some(v) = self.filters.spf_fail_action {
+            cfg.filter_spf_fail_action = v;
+        }
+        if let Some(v) = self.filters.dkim_fail_action {
+            cfg.filter_dkim_fail_action = v;
+        }
+        if let Some(ref v) = self.filters.rspamd.url {
+            cfg.rspamd_url = Some(v.clone());
+        }
+        if let Some(ref v) = self.filters.rspamd.password {
+            cfg.rspamd_password = Some(v.clone());
+        }
+        if let Some(v) = self.filters.rspamd.timeout_ms {
+            cfg.rspamd_timeout_ms = v;
+        }
+        if let Some(v) = self.filters.rspamd.spam_threshold {
+            cfg.rspamd_spam_threshold = Some(v);
+        }
+        if let Some(v) = self.filters.rspamd.reject_action {
+            cfg.rspamd_reject_action = v;
+        }
+        if let Some(v) = self.filters.rspamd.fail_closed {
+            cfg.rspamd_fail_closed = v;
+        }
+        if let Some(ref v) = self.filters.llm_triage.base_url {
+            cfg.llm_triage_base_url = Some(v.clone());
+        }
+        if let Some(ref v) = self.filters.llm_triage.api_key {
+            cfg.llm_triage_api_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.filters.llm_triage.model {
+            cfg.llm_triage_model = v.clone();
+        }
+        if let Some(v) = self.filters.llm_triage.timeout_ms {
+            cfg.llm_triage_timeout_ms = v;
+        }
+        if let Some(v) = self.filters.llm_triage.max_body_chars {
+            cfg.llm_triage_max_body_chars = v;
+        }
+
+        // [search]
+        if let Some(v) = self.search.backend {
+            cfg.search_backend = v;
+        }
+        if let Some(ref v) = self.search.embedding_base_url {
+            cfg.embedding_base_url = Some(v.clone());
+        }
+        if let Some(ref v) = self.search.embedding_api_key {
+            cfg.embedding_api_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.search.embedding_model {
+            cfg.embedding_model = v.clone();
+        }
+        if let Some(v) = self.search.embedding_timeout_secs {
+            cfg.embedding_timeout_secs = v;
+        }
+
+        meta
+    }
+}
+
+// ============================================================================
+// Configuration validation (`nogml config check`) & starter template (`init`)
+// ============================================================================
+
+/// Structured validation report emitted by `nogml config check`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigCheckReport {
+    pub ok: bool,
+    pub config_file: Option<PathBuf>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub effective_config: Option<Value>,
+}
+
+fn validate_optional_url(label: &str, value: Option<&str>, errors: &mut Vec<String>) {
+    if let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty())
+        && let Err(err) = Url::parse(raw)
+    {
+        errors.push(format!("Invalid URL for {label} ('{raw}'): {err}"));
+    }
+}
+
+/// Validate a resolved [`Config`] across storage, blob, transport, auth/OAuth2, IMAP TLS,
+/// safety, filter, search, and sync settings without leaking any secrets.
+pub fn validate_config(
+    config: &Config,
+    config_file: Option<PathBuf>,
+    resolution: SecretResolutionReport,
+) -> ConfigCheckReport {
+    let mut warnings = resolution.warnings;
+    let mut errors = resolution.errors;
+
+    // --- Server & safety bounds ---
+    if config.max_body_bytes == 0 {
+        errors.push("server.max_body_bytes must be greater than 0".to_string());
+    }
+    if config.max_send_recipients == 0 {
+        errors.push("safety.max_send_recipients must be greater than 0".to_string());
+    }
+    if config.approval_ttl_secs == 0 {
+        errors.push("safety.approval_ttl_secs must be greater than 0".to_string());
+    }
+
+    // --- Storage ---
+    if config.storage == StorageBackend::Postgres {
+        match config
+            .database_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => {
+                if !errors.iter().any(|e| e.contains("storage.database_url")) {
+                    errors.push(
+                        "storage.database_url (NOGML_DATABASE_URL / NOGML_DATABASE_URL_FILE) is required when storage.backend = \"postgres\""
+                            .to_string(),
+                    );
+                }
+            }
+            Some(url) => {
+                if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                    errors.push(
+                        "storage.database_url must start with postgres:// or postgresql://"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "postgres"))]
+        errors.push(
+            "storage.backend = \"postgres\" requires building nogml with --features postgres"
+                .to_string(),
+        );
+    }
+
+    // --- BlobStore ---
+    if config.blob_backend == BlobBackend::S3
+        && let Err(err) = S3BlobConfig::from_config(config)
+    {
+        errors.push(err.to_string());
+    }
+
+    // --- Outbound transport ---
+    match config.transport {
+        TransportBackend::Resend => {
+            validate_optional_url(
+                "resend.base_url",
+                Some(config.resend_base_url.as_str()),
+                &mut errors,
+            );
+            if config
+                .resend_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                warnings.push(
+                    "resend.api_key is not set; outbound Resend sends and Receiving API fetches will fail"
+                        .to_string(),
+                );
+            }
+            if config
+                .resend_webhook_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                warnings.push(
+                    "resend.webhook_secret is not set; POST /webhooks/resend signature verification is not configured"
+                        .to_string(),
+                );
+            }
+        }
+        TransportBackend::Ses => {
+            if let Err(err) = SesConfig::from_config(config) {
+                errors.push(err.to_string());
+            }
+            if config
+                .ses_access_key_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+                || config
+                    .ses_secret_access_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+            {
+                warnings.push(
+                    "ses.access_key_id or ses.secret_access_key is missing; outbound AWS SES sends will fail"
+                        .to_string(),
+                );
+            }
+        }
+        TransportBackend::Smtp => {
+            if let Err(err) = SmtpConfig::from_config(config) {
+                errors.push(err.to_string());
+            }
+            let has_user = config
+                .smtp_username
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_pass = config
+                .smtp_password
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            if has_user != has_pass {
+                warnings.push(
+                    "Only one of smtp.username and smtp.password is set; SMTP AUTH requires both"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // --- Auth & OAuth2 ---
+    if !config.auth_required() {
+        warnings.push(
+            "No auth.tokens, auth.scoped_tokens, or oauth2 credentials configured; HTTP server will run in unauthenticated dev mode"
+                .to_string(),
+        );
+    }
+
+    let has_oauth_client = config
+        .oauth2_client_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_oauth_signing = config
+        .oauth2_signing_secret
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if has_oauth_client != has_oauth_signing {
+        errors.push(
+            "OAuth2 requires both oauth2.client_id and oauth2.signing_secret to be set together"
+                .to_string(),
+        );
+    }
+    if config
+        .oauth2_client_secret
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        && !config.oauth2_enabled()
+    {
+        warnings.push(
+            "oauth2.client_secret is set, but local OAuth2 is inactive until both oauth2.client_id and oauth2.signing_secret are configured"
+                .to_string(),
+        );
+    }
+
+    for (idx, st) in config.scoped_tokens.iter().enumerate() {
+        if st.token.trim().is_empty() {
+            let tag = format!("auth.scoped_tokens[{idx}].token");
+            if !errors.iter().any(|e| e.contains(&tag)) {
+                errors.push(format!("{tag} must not be empty"));
+            }
+        }
+        if st.scopes.is_empty() {
+            warnings.push(format!(
+                "auth.scoped_tokens[{idx}] has no scopes; requests using this token will receive 403 Forbidden"
+            ));
+        }
+    }
+
+    // --- IMAP TLS / STARTTLS ---
+    match (
+        config.imap_tls_cert.as_deref(),
+        config.imap_tls_key.as_deref(),
+    ) {
+        (Some(cert), Some(key)) => {
+            if let Err(err) = crate::imap::build_tls_acceptor(cert, key) {
+                errors.push(err.to_string());
+            } else if let Some(warn) = check_secret_file_permissions(key)
+                && !warnings.contains(&warn)
+            {
+                warnings.push(warn);
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            errors.push(
+                "Both imap.tls_cert and imap.tls_key must be set together for IMAP TLS/STARTTLS"
+                    .to_string(),
+            );
+        }
+        (None, None) => {
+            if config.imap_tls_bind.is_some() {
+                errors.push(
+                    "imap.tls_bind requires both imap.tls_cert and imap.tls_key to be configured"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // --- URLs, filters, search, sync ---
+    validate_optional_url(
+        "safety.approval_webhook_url",
+        config.approval_webhook_url.as_deref(),
+        &mut errors,
+    );
+    validate_optional_url(
+        "watch.webhook_url",
+        config.watch_webhook_url.as_deref(),
+        &mut errors,
+    );
+    validate_optional_url(
+        "filters.rspamd.url",
+        config.rspamd_url.as_deref(),
+        &mut errors,
+    );
+    validate_optional_url(
+        "filters.llm_triage.base_url",
+        config.llm_triage_base_url.as_deref(),
+        &mut errors,
+    );
+    validate_optional_url(
+        "sync.gmail_api_base_url",
+        Some(config.gmail_api_base_url.as_str()),
+        &mut errors,
+    );
+    validate_optional_url(
+        "sync.gmail_oauth_token_url",
+        Some(config.gmail_oauth_token_url.as_str()),
+        &mut errors,
+    );
+    validate_optional_url(
+        "search.embedding_base_url",
+        config.embedding_base_url.as_deref(),
+        &mut errors,
+    );
+
+    if config.search_backend == SearchBackend::Hybrid
+        && let Err(err) = OpenAiEmbeddingConfig::from_config(config)
+    {
+        errors.push(err.to_string());
+    }
+
+    if config.sync_interval_secs > 0 && !config.gmail_sync_configured() {
+        warnings.push(
+            "sync.interval_secs > 0, but no upstream Gmail sync credentials are configured"
+                .to_string(),
+        );
+    }
+
+    ConfigCheckReport {
+        ok: errors.is_empty(),
+        config_file,
+        warnings,
+        errors,
+        effective_config: Some(config.redacted_summary()),
+    }
+}
+
+/// Render a cleanly annotated starter `nogml.toml` using `env://` and `file://` secret references
+/// instead of hardcoded secrets.
+pub fn render_starter_toml(
+    user_email: &str,
+    default_domain: &str,
+    token_file: Option<&Path>,
+) -> String {
+    let tokens_line = match token_file {
+        Some(path) => {
+            let escaped = path.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+            format!("tokens = [\"file://{escaped}\"]")
+        }
+        None => {
+            "# Set NOGML_AUTH_TOKENS or NOGML_AUTH_TOKENS_FILE, or reference a secret file:\n# tokens = [\"env://NOGML_AUTH_TOKENS\"]\n# tokens = [\"file:///etc/nogml/secrets/auth_token\"]".to_string()
+        }
+    };
+
+    format!(
+        r#"# nogml configuration file
+# Precedence: CLI flags > environment variables > nogml.toml > defaults
+# Secret values support "file:///path/to/secret", "env://VAR_NAME",
+# "file://$CREDENTIALS_DIRECTORY/secret", or *_FILE environment variables.
+
+[server]
+bind = "127.0.0.1:8080"
+max_body_bytes = 41943040
+# cors_allow_origins = ["https://app.example.com"]
+# log_json = true
+
+[storage]
+backend = "sqlite"
+db_path = "nogml.db"
+# For multi-node deployments (--features postgres):
+# backend = "postgres"
+# database_url = "file:///run/secrets/database_url"
+
+[blob]
+backend = "inline"
+dir = "nogml-blobs"
+# For local disk or S3/R2 blobs:
+# backend = "fs"
+# backend = "s3"
+# s3_bucket = "my-mail-blobs"
+# s3_region = "us-east-1"
+# s3_secret_access_key = "env://NOGML_BLOB_S3_SECRET_ACCESS_KEY"
+
+[auth]
+user_email = "{user_email}"
+default_domain = "{default_domain}"
+# mailboxes = ["support@{default_domain}"]
+{tokens_line}
+
+# Example least-privilege scoped token:
+# [[auth.scoped_tokens]]
+# token = "file:///etc/nogml/secrets/agent_ro_token"
+# mailbox_id = "{user_email}"
+# scopes = ["read"]
+# draft_only = true
+
+[transport]
+backend = "resend"
+
+[resend]
+# api_key = "env://RESEND_API_KEY"
+# webhook_secret = "env://RESEND_WEBHOOK_SECRET"
+base_url = "https://api.resend.com"
+
+[safety]
+# Start in draft-only mode until outbound recipients and webhooks are verified.
+draft_only = true
+draft_only_action = "block"
+require_approval = false
+approval_ttl_secs = 86400
+# allowed_recipients = ["@{default_domain}"]
+max_send_recipients = 50
+default_max_body_chars = 4000
+untrusted_content_guard = true
+
+[imap]
+# bind = "127.0.0.1:1143"
+# tls_bind = "0.0.0.0:1993"
+# tls_cert = "/etc/nogml/tls/fullchain.pem"
+# tls_key = "/etc/nogml/tls/privkey.pem"
+# password = "file:///etc/nogml/secrets/imap_password"
+
+[search]
+backend = "store"
+# backend = "hybrid"
+# embedding_base_url = "http://127.0.0.1:11434/v1"
+# embedding_api_key = "env://NOGML_EMBEDDING_API_KEY"
+# embedding_model = "text-embedding-3-small"
+"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        auth::AuthScope,
+        secrets::{ValueOrigin, write_secret_file},
+    };
+
+    use super::*;
+
+    #[test]
+    fn debug_and_redacted_summary_never_leak_secrets() {
+        let mut cfg = Config::for_test();
+        cfg.database_url = Some("postgres://u:super-secret-db-pass@db/nogml".to_string());
+        cfg.blob_s3_secret_access_key = Some("super-secret-s3-key".to_string());
+        cfg.blob_s3_session_token = Some("super-secret-s3-session".to_string());
+        cfg.auth_tokens = vec!["super-secret-bearer-token".to_string()];
+        cfg.scoped_tokens = vec![ScopedTokenConfig {
+            token: "super-secret-scoped-token".to_string(),
+            mailbox_id: Some("agent@example.com".to_string()),
+            scopes: vec![AuthScope::Read],
+            draft_only: Some(true),
+            allowed_recipients: None,
+            max_send_recipients: None,
+        }];
+        cfg.oauth2_client_secret = Some("super-secret-oauth-client".to_string());
+        cfg.oauth2_signing_secret = Some("super-secret-oauth-sign".to_string());
+        cfg.resend_api_key = Some("super-secret-resend-key".to_string());
+        cfg.resend_webhook_secret = Some("super-secret-resend-whsec".to_string());
+        cfg.ses_secret_access_key = Some("super-secret-ses-key".to_string());
+        cfg.ses_session_token = Some("super-secret-ses-session".to_string());
+        cfg.ses_webhook_secret = Some("super-secret-ses-whsec".to_string());
+        cfg.smtp_password = Some("super-secret-smtp-pass".to_string());
+        cfg.imap_password = Some("super-secret-imap-pass".to_string());
+        cfg.gmail_client_secret = Some("super-secret-gmail-client".to_string());
+        cfg.gmail_refresh_token = Some("super-secret-gmail-refresh".to_string());
+        cfg.gmail_access_token = Some("super-secret-gmail-access".to_string());
+        cfg.gmail_imap_password = Some("super-secret-gmail-imap".to_string());
+        cfg.rspamd_password = Some("super-secret-rspamd".to_string());
+        cfg.llm_triage_api_key = Some("super-secret-llm".to_string());
+        cfg.embedding_api_key = Some("super-secret-embed".to_string());
+
+        let debug_out = format!("{cfg:?}");
+        let summary_out = cfg.redacted_summary().to_string();
+
+        for leaked in [
+            "super-secret-db-pass",
+            "super-secret-s3-key",
+            "super-secret-s3-session",
+            "super-secret-bearer-token",
+            "super-secret-scoped-token",
+            "super-secret-oauth-client",
+            "super-secret-oauth-sign",
+            "super-secret-resend-key",
+            "super-secret-resend-whsec",
+            "super-secret-ses-key",
+            "super-secret-ses-session",
+            "super-secret-ses-whsec",
+            "super-secret-smtp-pass",
+            "super-secret-imap-pass",
+            "super-secret-gmail-client",
+            "super-secret-gmail-refresh",
+            "super-secret-gmail-access",
+            "super-secret-gmail-imap",
+            "super-secret-rspamd",
+            "super-secret-llm",
+            "super-secret-embed",
+        ] {
+            assert!(
+                !debug_out.contains(leaked),
+                "Debug output leaked secret '{leaked}'"
+            );
+            assert!(
+                !summary_out.contains(leaked),
+                "redacted_summary leaked secret '{leaked}'"
+            );
+        }
+
+        assert!(debug_out.contains(REDACTED));
+        assert!(summary_out.contains(REDACTED));
+    }
+
+    #[test]
+    fn starter_toml_parses_cleanly() {
+        let rendered = render_starter_toml("agent@example.com", "example.com", None);
+        let parsed = TomlConfig::from_toml_str(&rendered).expect("starter toml must parse");
+        let mut cfg = Config::default();
+        let meta = parsed.apply_to(&mut cfg);
+        assert!(meta.user_email_set);
+        assert_eq!(cfg.user_email, "agent@example.com");
+        assert_eq!(cfg.default_domain, "example.com");
+        assert!(cfg.draft_only);
+    }
+
+    #[test]
+    fn env_file_and_uri_resolution_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let resend_file = dir.path().join("resend_key");
+        let tokens_file = dir.path().join("tokens");
+        let scoped_token_file = dir.path().join("scoped_tok");
+        write_secret_file(&resend_file, "re_from_env_file", false).unwrap();
+        write_secret_file(&tokens_file, "tok_a\ntok_b", false).unwrap();
+        write_secret_file(&scoped_token_file, "tok_scoped_secret", false).unwrap();
+
+        let toml_src = format!(
+            r#"
+[auth]
+user_email = "bot@example.com"
+tokens = ["file://{}"]
+
+[[auth.scoped_tokens]]
+token = "file://{}"
+scopes = ["read"]
+
+[resend]
+api_key = "env://RESEND_FROM_TOML"
+webhook_secret = "env://WEBHOOK_ENV"
+"#,
+            tokens_file.display(),
+            scoped_token_file.display()
+        );
+        let parsed = TomlConfig::from_toml_str(&toml_src).unwrap();
+        let mut cfg = Config::default();
+        parsed.apply_to(&mut cfg);
+
+        let vars: HashMap<String, String> = [
+            (
+                "RESEND_API_KEY_FILE".to_string(),
+                resend_file.display().to_string(),
+            ),
+            ("WEBHOOK_ENV".to_string(), "whsec_from_env".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let report = cfg.apply_env_file_secrets_and_resolve(
+            Some(dir.path()),
+            &|_| ValueOrigin::Unset,
+            &|k| vars.get(k).cloned(),
+        );
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(cfg.resend_api_key.as_deref(), Some("re_from_env_file"));
+        assert_eq!(cfg.resend_webhook_secret.as_deref(), Some("whsec_from_env"));
+        assert_eq!(cfg.auth_tokens, vec!["tok_a", "tok_b"]);
+        assert_eq!(cfg.scoped_tokens[0].token, "tok_scoped_secret");
+    }
+
+    #[test]
+    fn unknown_toml_key_fails_parse() {
+        let bad = "[safety]\ndraft_olny = true\n";
+        let err = TomlConfig::from_toml_str(bad).unwrap_err();
+        assert!(err.to_string().contains("draft_olny"));
     }
 }

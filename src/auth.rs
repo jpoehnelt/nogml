@@ -67,8 +67,8 @@ pub struct AgentPolicyOverride {
 }
 
 /// Configuration entry for a least-privilege scoped API key parsed from
-/// `NOGML_SCOPED_TOKENS` / `--scoped-tokens`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `NOGML_SCOPED_TOKENS` / `--scoped-tokens` / `[[auth.scoped_tokens]]`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedTokenConfig {
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +81,19 @@ pub struct ScopedTokenConfig {
     pub allowed_recipients: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_send_recipients: Option<usize>,
+}
+
+impl std::fmt::Debug for ScopedTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedTokenConfig")
+            .field("token", &crate::secrets::REDACTED)
+            .field("mailbox_id", &self.mailbox_id)
+            .field("scopes", &self.scopes)
+            .field("draft_only", &self.draft_only)
+            .field("allowed_recipients", &self.allowed_recipients)
+            .field("max_send_recipients", &self.max_send_recipients)
+            .finish()
+    }
 }
 
 impl ScopedTokenConfig {
@@ -196,7 +209,7 @@ pub trait AuthProvider: Send + Sync {
 ///
 /// Preserves constant-time SHA-256 token verification, open dev mode when no tokens or OAuth2
 /// settings are configured, and IMAP username/password fallback rules.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StaticTokenAuthProvider {
     mailbox_id: String,
     auth_tokens: Vec<String>,
@@ -204,6 +217,30 @@ pub struct StaticTokenAuthProvider {
     oauth2: Option<OAuth2Verifier>,
     imap_username: String,
     imap_password: Option<String>,
+}
+
+impl std::fmt::Debug for StaticTokenAuthProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_tokens: Vec<&str> = self
+            .auth_tokens
+            .iter()
+            .map(|_| crate::secrets::REDACTED)
+            .collect();
+        f.debug_struct("StaticTokenAuthProvider")
+            .field("mailbox_id", &self.mailbox_id)
+            .field("auth_tokens", &redacted_tokens)
+            .field("scoped_tokens", &self.scoped_tokens)
+            .field("oauth2_enabled", &self.oauth2.is_some())
+            .field("imap_username", &self.imap_username)
+            .field(
+                "imap_password",
+                &self
+                    .imap_password
+                    .as_ref()
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .finish()
+    }
 }
 
 impl StaticTokenAuthProvider {

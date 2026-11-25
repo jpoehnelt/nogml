@@ -1,0 +1,162 @@
+# Complete example configuration for nogml.
+#
+# Precedence (highest to lowest):
+#   1. CLI flags (--bind, --user-email, ...)
+#   2. Direct environment variables (NOGML_BIND, RESEND_API_KEY, ...)
+#   3. *_FILE environment variables (RESEND_API_KEY_FILE, NOGML_AUTH_TOKENS_FILE, ...)
+#   4. Values in this TOML file (--config / NOGML_CONFIG)
+#   5. Built-in defaults
+#
+# Secret values support:
+#   - "file:///absolute/path/to/secret"
+#   - "file://$CREDENTIALS_DIRECTORY/secret_name" (systemd LoadCredential)
+#   - "env://ENV_VAR_NAME"
+#
+# Validate this file before starting the server:
+#   nogml config check --config /etc/nogml/nogml.toml
+
+[server]
+bind = "0.0.0.0:8080"
+max_body_bytes = 41943040
+cors_allow_origins = ["https://app.example.com"]
+log_json = true
+
+[storage]
+# Options: "sqlite", "memory", "postgres" (requires --features postgres)
+backend = "sqlite"
+db_path = "/var/lib/nogml/nogml.db"
+# database_url = "file:///run/secrets/nogml_database_url"
+
+[blob]
+# Options: "inline", "fs", "memory", "s3"
+backend = "fs"
+dir = "/var/lib/nogml/blobs"
+# For AWS S3, Cloudflare R2, or MinIO:
+s3_bucket = "nogml-mail-blobs"
+s3_region = "us-east-1"
+s3_endpoint = "https://s3.us-east-1.amazonaws.com"
+s3_prefix = "prod"
+s3_access_key_id = "AKIAEXAMPLE"
+s3_secret_access_key = "env://NOGML_BLOB_S3_SECRET_ACCESS_KEY"
+s3_force_path_style = false
+
+[auth]
+user_email = "agent@example.com"
+mailboxes = ["support@example.com"]
+default_domain = "example.com"
+# Each entry may be a literal token, "file:///path", or "env://VAR".
+# Files referenced by file:// may contain one token per line or comma-separated tokens.
+tokens = ["file:///run/secrets/nogml_auth_tokens"]
+
+[[auth.scoped_tokens]]
+token = "env://NOGML_READONLY_TOKEN"
+mailbox_id = "agent@example.com"
+scopes = ["read"]
+draft_only = true
+allowed_recipients = ["@example.com"]
+max_send_recipients = 5
+
+[oauth2]
+client_id = "nogml-local-client"
+client_secret = "env://NOGML_OAUTH2_CLIENT_SECRET"
+signing_secret = "env://NOGML_OAUTH2_SIGNING_SECRET"
+
+[transport]
+# Options: "resend", "ses", "smtp"
+backend = "resend"
+
+[resend]
+api_key = "env://RESEND_API_KEY"
+base_url = "https://api.resend.com"
+webhook_secret = "env://RESEND_WEBHOOK_SECRET"
+
+[ses]
+region = "us-east-1"
+endpoint = "https://email.us-east-1.amazonaws.com"
+access_key_id = "AKIAEXAMPLE"
+secret_access_key = "env://NOGML_SES_SECRET_ACCESS_KEY"
+s3_endpoint = "https://s3.us-east-1.amazonaws.com"
+webhook_secret = "env://NOGML_SES_WEBHOOK_SECRET"
+
+[smtp]
+host = "smtp.example.com"
+port = 587
+# Options: "starttls", "tls", "none"
+tls_mode = "starttls"
+username = "agent@example.com"
+password = "env://NOGML_SMTP_PASSWORD"
+helo_domain = "example.com"
+
+[safety]
+draft_only = false
+# Options: "block", "downgrade"
+draft_only_action = "block"
+require_approval = false
+approval_ttl_secs = 86400
+approval_webhook_url = "https://hooks.example.com/nogml-approvals"
+allowed_recipients = ["@example.com", "partner@acme.org"]
+max_send_recipients = 50
+default_max_body_chars = 4000
+untrusted_content_guard = true
+
+[imap]
+bind = "127.0.0.1:1143"
+tls_bind = "0.0.0.0:1993"
+tls_cert = "/etc/nogml/tls/fullchain.pem"
+tls_key = "/etc/nogml/tls/privkey.pem"
+username = "agent@example.com"
+password = "file:///run/secrets/nogml_imap_password"
+
+[sync]
+# Options: "api", "imap"
+mode = "api"
+interval_secs = 0
+query = "newer_than:30d"
+max_messages = 500
+bidirectional = false
+gmail_client_id = "example-client-id.apps.googleusercontent.com"
+gmail_client_secret = "env://GMAIL_CLIENT_SECRET"
+gmail_refresh_token = "env://GMAIL_REFRESH_TOKEN"
+gmail_user_id = "me"
+gmail_api_base_url = "https://gmail.googleapis.com"
+gmail_oauth_token_url = "https://oauth2.googleapis.com/token"
+gmail_imap_host = "imap.gmail.com"
+gmail_imap_port = 993
+gmail_imap_tls = true
+gmail_imap_user = "you@gmail.com"
+gmail_imap_password = "env://GMAIL_IMAP_PASSWORD"
+gmail_imap_mailbox = "[Gmail]/All Mail"
+
+[watch]
+webhook_url = "https://hooks.example.com/nogml-watch"
+
+[filters]
+auth_results = true
+# Options: "allow", "tag", "spam", "reject"
+dmarc_fail_action = "spam"
+spf_fail_action = "tag"
+dkim_fail_action = "tag"
+
+[filters.rspamd]
+url = "http://127.0.0.1:11333"
+password = "env://NOGML_RSPAMD_PASSWORD"
+timeout_ms = 5000
+spam_threshold = 6.0
+# Options: "reject", "spam"
+reject_action = "reject"
+fail_closed = false
+
+[filters.llm_triage]
+base_url = "https://api.openai.com/v1"
+api_key = "env://NOGML_LLM_TRIAGE_API_KEY"
+model = "gpt-4o-mini"
+timeout_ms = 10000
+max_body_chars = 2000
+
+[search]
+# Options: "store", "hybrid"
+backend = "store"
+embedding_base_url = "http://127.0.0.1:11434/v1"
+embedding_api_key = "env://NOGML_EMBEDDING_API_KEY"
+embedding_model = "text-embedding-3-small"
+embedding_timeout_secs = 15
