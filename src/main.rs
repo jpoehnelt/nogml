@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use nogml::{
     AppState,
     ai::{self, ApprovalDecisionRequest},
+    auth::ScopedTokenConfig,
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
@@ -30,6 +31,19 @@ use nogml::{
     storage::{AiSearchQuery, AiThreadQuery, open_store},
     sync::{self, SyncRunOptions},
 };
+
+#[derive(Debug, Clone)]
+struct ScopedTokenList(Vec<ScopedTokenConfig>);
+
+fn parse_scoped_tokens_arg(raw: &str) -> Result<ScopedTokenList, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(ScopedTokenList(Vec::new()));
+    }
+    let parsed: Vec<ScopedTokenConfig> = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Invalid JSON for NOGML_SCOPED_TOKENS / --scoped-tokens: {e}"))?;
+    Ok(ScopedTokenList(parsed))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -226,6 +240,27 @@ struct CommonConfigArgs {
     /// Comma-separated bearer auth tokens (empty = dev unauthenticated mode).
     #[arg(long, env = "NOGML_AUTH_TOKENS", value_delimiter = ',', global = true)]
     auth_tokens: Vec<String>,
+
+    /// JSON array of scoped API key definitions (e.g. `[{"token":"...","scopes":["read"],"draft_only":true}]`).
+    #[arg(
+        long,
+        env = "NOGML_SCOPED_TOKENS",
+        value_parser = parse_scoped_tokens_arg,
+        global = true
+    )]
+    scoped_tokens: Option<ScopedTokenList>,
+
+    /// Optional local OAuth2 client ID (auto-enables `/oauth2/*` when paired with `--oauth2-signing-secret`).
+    #[arg(long, env = "NOGML_OAUTH2_CLIENT_ID", global = true)]
+    oauth2_client_id: Option<String>,
+
+    /// Optional local OAuth2 client secret required on `POST /oauth2/token`.
+    #[arg(long, env = "NOGML_OAUTH2_CLIENT_SECRET", global = true)]
+    oauth2_client_secret: Option<String>,
+
+    /// HMAC-SHA256 signing secret for local OAuth2 JWT access and refresh tokens.
+    #[arg(long, env = "NOGML_OAUTH2_SIGNING_SECRET", global = true)]
+    oauth2_signing_secret: Option<String>,
 
     /// Enable draft-only safety mode (prevent direct agent sends).
     #[arg(long, env = "NOGML_DRAFT_ONLY", default_value_t = false, global = true)]
@@ -854,6 +889,10 @@ impl CommonConfigArgs {
             smtp_password: self.smtp_password,
             smtp_helo_domain: self.smtp_helo_domain,
             auth_tokens: self.auth_tokens,
+            scoped_tokens: self.scoped_tokens.map(|l| l.0).unwrap_or_default(),
+            oauth2_client_id: self.oauth2_client_id,
+            oauth2_client_secret: self.oauth2_client_secret,
+            oauth2_signing_secret: self.oauth2_signing_secret,
             draft_only: self.draft_only,
             draft_only_action: self.draft_only_action,
             require_approval: self.require_approval,

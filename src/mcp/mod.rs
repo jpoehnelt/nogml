@@ -5,7 +5,7 @@
 //! Owned by the `ai-mcp` worker.
 
 use axum::{
-    Router,
+    Extension, Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 
 use crate::{
     AppState, ai,
+    auth::{AuthScope, Principal},
     config::DraftOnlyAction,
     error::{AppError, AppResult},
     events::EventSource,
@@ -45,11 +46,20 @@ const ERR_RESOURCE_NOT_FOUND: i64 = -32002;
 #[derive(Clone)]
 pub struct McpServer {
     state: AppState,
+    principal: Principal,
 }
 
 impl McpServer {
+    /// Construct an MCP server with full local mailbox access (default for stdio `nogml mcp`).
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        let principal = Principal::full_access(&state.config.user_email);
+        Self { state, principal }
+    }
+
+    /// Construct an MCP server bound to an authenticated HTTP [`Principal`], enforcing
+    /// its [`AuthScope`]s and [`crate::auth::AgentPolicyOverride`].
+    pub fn with_principal(state: AppState, principal: Principal) -> Self {
+        Self { state, principal }
     }
 
     /// Handle one JSON-RPC 2.0 request object. Returns `Ok(None)` for notifications (no `id`).
@@ -202,19 +212,11 @@ impl McpServer {
             ));
         }
 
-        let outcome: AppResult<Value> = match name {
-            "search_emails" => self.tool_search_emails(arguments).await,
-            "list_threads" => self.tool_list_threads(arguments).await,
-            "read_thread" => self.tool_read_thread(arguments).await,
-            "read_email" => self.tool_read_email(arguments).await,
-            "send_email" => self.tool_send_email(arguments).await,
-            "create_draft" => self.tool_create_draft(arguments).await,
-            "send_draft" => self.tool_send_draft(arguments).await,
-            "triage_thread" => self.tool_triage_thread(arguments).await,
-            "modify_labels" => self.tool_modify_labels(arguments).await,
-            "list_labels" => self.tool_list_labels().await,
-            "sync_gmail" => self.tool_sync_gmail(arguments).await,
-            "sync_status" => self.tool_sync_status().await,
+        let required_scope = match name {
+            "search_emails" | "list_threads" | "read_thread" | "read_email" | "list_labels"
+            | "sync_status" => AuthScope::Read,
+            "create_draft" | "triage_thread" | "modify_labels" | "sync_gmail" => AuthScope::Write,
+            "send_email" | "send_draft" => AuthScope::Send,
             unknown => {
                 return Err(RpcError::new(
                     ERR_INVALID_PARAMS,
@@ -224,6 +226,27 @@ impl McpServer {
             }
         };
 
+        let outcome: AppResult<Value> =
+            if let Err(err) = self.principal.require_scope(required_scope) {
+                Err(err)
+            } else {
+                match name {
+                    "search_emails" => self.tool_search_emails(arguments).await,
+                    "list_threads" => self.tool_list_threads(arguments).await,
+                    "read_thread" => self.tool_read_thread(arguments).await,
+                    "read_email" => self.tool_read_email(arguments).await,
+                    "send_email" => self.tool_send_email(arguments).await,
+                    "create_draft" => self.tool_create_draft(arguments).await,
+                    "send_draft" => self.tool_send_draft(arguments).await,
+                    "triage_thread" => self.tool_triage_thread(arguments).await,
+                    "modify_labels" => self.tool_modify_labels(arguments).await,
+                    "list_labels" => self.tool_list_labels().await,
+                    "sync_gmail" => self.tool_sync_gmail(arguments).await,
+                    "sync_status" => self.tool_sync_status().await,
+                    _ => unreachable!(),
+                }
+            };
+
         match outcome {
             Ok(data) => Ok(tool_success_result(data)),
             Err(err) => Ok(tool_error_result(&err)),
@@ -231,6 +254,10 @@ impl McpServer {
     }
 
     async fn handle_resources_read(&self, params: Value) -> Result<Value, RpcError> {
+        self.principal
+            .require_scope(AuthScope::Read)
+            .map_err(RpcError::from_app)?;
+
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return Err(RpcError::new(
                 ERR_INVALID_PARAMS,
@@ -606,7 +633,13 @@ impl McpServer {
 
     async fn tool_send_email(&self, args: Value) -> AppResult<Value> {
         let req: AiSendEmailRequest = serde_json::from_value(args)?;
-        ai::execute_send_email_with_source(&self.state, req, EventSource::Mcp).await
+        ai::execute_send_email_with_context(
+            &self.state,
+            req,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
     }
 
     async fn tool_create_draft(&self, args: Value) -> AppResult<Value> {
@@ -623,12 +656,13 @@ impl McpServer {
         }
 
         let parsed: Args = serde_json::from_value(args)?;
-        ai::execute_send_draft_with_source(
+        ai::execute_send_draft_with_context(
             &self.state,
             &parsed.draft_id,
             AiSendDraftRequest {
                 dry_run: parsed.dry_run,
             },
+            Some(self.principal.clone()),
             EventSource::Mcp,
         )
         .await
@@ -797,13 +831,28 @@ fn echo_session_header(req_headers: &HeaderMap) -> HeaderMap {
     out
 }
 
+fn is_scope_forbidden_payload(payload: &Value) -> bool {
+    payload
+        .pointer("/result/structuredContent/error/code")
+        .and_then(Value::as_str)
+        == Some("forbidden")
+        || payload
+            .pointer("/error/data/error/code")
+            .and_then(Value::as_str)
+            == Some("forbidden")
+}
+
 async fn mcp_http_post(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     req_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let mut resp_headers = echo_session_header(&req_headers);
-    let server = McpServer::new(state);
+    let resolved_principal = principal
+        .map(|Extension(p)| p)
+        .unwrap_or_else(|| Principal::full_access(&state.config.user_email));
+    let server = McpServer::with_principal(state, resolved_principal);
 
     let parsed = match serde_json::from_slice::<Value>(&body) {
         Ok(val) => val,
@@ -862,8 +911,13 @@ async fn mcp_http_post(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
+            let status = if is_scope_forbidden_payload(&payload) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::OK,
+                status,
                 resp_headers,
                 serde_json::to_string(&payload).unwrap_or_default(),
             )

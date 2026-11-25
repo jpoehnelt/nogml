@@ -3,6 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::ScopedTokenConfig;
+
 /// Selectable storage backend behind `MailStore`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,8 +130,18 @@ pub struct Config {
     pub blob_s3_force_path_style: Option<bool>,
 
     // --- Auth & mailbox identity ---
-    /// Allowed bearer tokens. Empty means dev unauthenticated mode.
+    /// Allowed bearer tokens (full scopes). Empty means dev unauthenticated mode unless
+    /// `scoped_tokens` or local OAuth2 is configured.
     pub auth_tokens: Vec<String>,
+    /// Scoped API keys with explicit scopes and optional per-agent outbound safety overrides.
+    pub scoped_tokens: Vec<ScopedTokenConfig>,
+    /// Optional local OAuth2 client ID (enables `/oauth2/*` and JWT verification when paired
+    /// with `oauth2_signing_secret`).
+    pub oauth2_client_id: Option<String>,
+    /// Optional local OAuth2 client secret verified on `POST /oauth2/token` when set.
+    pub oauth2_client_secret: Option<String>,
+    /// HMAC-SHA256 (`HS256`) signing secret for local OAuth2 JWT access/refresh tokens.
+    pub oauth2_signing_secret: Option<String>,
     /// Primary mailbox email address (returned by `/profile` and used as default `From`).
     pub user_email: String,
     /// Default domain for generated Message-IDs and fallback sender addresses.
@@ -276,6 +288,10 @@ impl Default for Config {
             blob_s3_force_path_style: None,
 
             auth_tokens: Vec::new(),
+            scoped_tokens: Vec::new(),
+            oauth2_client_id: None,
+            oauth2_client_secret: None,
+            oauth2_signing_secret: None,
             user_email: "me@localhost".to_string(),
             default_domain: "localhost".to_string(),
 
@@ -376,9 +392,21 @@ impl Config {
         }
     }
 
+    /// Returns `true` when the optional local OAuth2 provider is enabled
+    /// (`oauth2_client_id` and `oauth2_signing_secret` are both non-empty).
+    pub fn oauth2_enabled(&self) -> bool {
+        self.oauth2_client_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && self
+                .oauth2_signing_secret
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
     /// Returns `true` when bearer token authentication is enforced.
     pub fn auth_required(&self) -> bool {
-        !self.auth_tokens.is_empty()
+        !self.auth_tokens.is_empty() || !self.scoped_tokens.is_empty() || self.oauth2_enabled()
     }
 
     /// Returns `true` when any upstream Gmail sync credentials are configured.

@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use crate::{
     AppState,
+    auth::{AuthScope, Principal},
     blob::is_external_blob_store,
     error::{AppError, AppResult},
     events::{EventSource, MailEvent},
@@ -111,6 +112,7 @@ enum AuthState {
 struct ImapSession {
     state: AppState,
     auth: AuthState,
+    principal: Option<Principal>,
     subscribed: HashSet<String>,
     tls_acceptor: Option<TlsAcceptor>,
     /// RFC 7162 `CONDSTORE` enabled for this connection (via `ENABLE` or any CONDSTORE command).
@@ -130,6 +132,7 @@ pub async fn handle_connection(
     let mut session = ImapSession {
         state,
         auth: AuthState::NotAuthenticated,
+        principal: None,
         subscribed: HashSet::new(),
         tls_acceptor,
         condstore_enabled: false,
@@ -229,6 +232,7 @@ pub async fn handle_connection(
                 Ok(tls_stream) => {
                     reader = BufReader::new(ImapStream::Tls(Box::new(tls_stream)));
                     session.auth = AuthState::NotAuthenticated;
+                    session.principal = None;
                     session.condstore_enabled = false;
                     session.qresync_enabled = false;
                 }
@@ -249,6 +253,18 @@ pub async fn handle_connection(
                 let _ = write_flush(
                     &mut reader,
                     format!("{} NO Authenticate first\r\n", cmd.tag).as_bytes(),
+                )
+                .await;
+                continue;
+            }
+            if !session.has_scope(AuthScope::Read) {
+                let _ = write_flush(
+                    &mut reader,
+                    format!(
+                        "{} NO [NOPERM] Insufficient scope: read scope required\r\n",
+                        cmd.tag
+                    )
+                    .as_bytes(),
                 )
                 .await;
                 continue;
@@ -282,6 +298,7 @@ impl ImapSession {
                     caps.push("STARTTLS");
                 }
                 caps.push("AUTH=PLAIN");
+                caps.push("AUTH=XOAUTH2");
             }
             AuthState::Authenticated | AuthState::Selected(_) => {
                 caps.extend_from_slice(&["ENABLE", "CONDSTORE", "QRESYNC"]);
@@ -354,6 +371,12 @@ impl ImapSession {
                         format!("{tag} NO Authenticate first\r\n").as_bytes(),
                     )
                     .await?;
+                    return Ok(true);
+                }
+                if !self
+                    .require_scope_or_no(&tag, AuthScope::Read, stream)
+                    .await?
+                {
                     return Ok(true);
                 }
                 let resp = format!(
@@ -473,12 +496,29 @@ impl ImapSession {
         matches!(self.auth, AuthState::Selected(_))
     }
 
-    async fn verify_credentials(&self, username: &str, password: &str) -> bool {
-        self.state
-            .auth
-            .authenticate_imap(username, password)
-            .await
-            .is_ok()
+    fn has_scope(&self, scope: AuthScope) -> bool {
+        self.principal.as_ref().is_some_and(|p| p.has_scope(scope))
+    }
+
+    async fn require_scope_or_no(
+        &self,
+        tag: &str,
+        scope: AuthScope,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<bool> {
+        if self.has_scope(scope) {
+            return Ok(true);
+        }
+        write_flush(
+            stream,
+            format!(
+                "{tag} NO [NOPERM] Insufficient scope: {} scope required\r\n",
+                scope.as_str()
+            )
+            .as_bytes(),
+        )
+        .await?;
+        Ok(false)
     }
 
     async fn handle_login(
@@ -497,20 +537,24 @@ impl ImapSession {
         }
         let user = args[0].as_str_lossy().unwrap_or_default();
         let pass = args[1].as_str_lossy().unwrap_or_default();
-        if self.verify_credentials(&user, &pass).await {
-            self.auth = AuthState::Authenticated;
-            let cap = self.capability_string(stream.get_ref().is_tls());
-            write_flush(
-                stream,
-                format!("{tag} OK [CAPABILITY {cap}] LOGIN completed\r\n").as_bytes(),
-            )
-            .await?;
-        } else {
-            write_flush(
-                stream,
-                format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
-            )
-            .await?;
+        match self.state.auth.authenticate_imap(&user, &pass).await {
+            Ok(principal) => {
+                self.principal = Some(principal);
+                self.auth = AuthState::Authenticated;
+                let cap = self.capability_string(stream.get_ref().is_tls());
+                write_flush(
+                    stream,
+                    format!("{tag} OK [CAPABILITY {cap}] LOGIN completed\r\n").as_bytes(),
+                )
+                .await?;
+            }
+            Err(_) => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -529,7 +573,9 @@ impl ImapSession {
             .await?;
             return Ok(());
         };
-        if !mech.eq_ignore_ascii_case("PLAIN") {
+        let is_plain = mech.eq_ignore_ascii_case("PLAIN");
+        let is_xoauth2 = mech.eq_ignore_ascii_case("XOAUTH2");
+        if !is_plain && !is_xoauth2 {
             write_flush(
                 stream,
                 format!("{tag} NO Unsupported SASL mechanism {mech}\r\n").as_bytes(),
@@ -564,42 +610,60 @@ impl ImapSession {
         {
             Ok(bytes) => bytes,
             Err(_) => {
+                let mech_label = if is_xoauth2 { "XOAUTH2" } else { "PLAIN" };
                 write_flush(
                     stream,
-                    format!("{tag} BAD Invalid base64 in AUTHENTICATE PLAIN\r\n").as_bytes(),
+                    format!("{tag} BAD Invalid base64 in AUTHENTICATE {mech_label}\r\n").as_bytes(),
                 )
                 .await?;
                 return Ok(());
             }
         };
 
-        // Format: [authzid]\0authcid\0passwd
-        let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
-        if parts.len() != 3 {
-            write_flush(
-                stream,
-                format!("{tag} BAD Malformed PLAIN SASL payload\r\n").as_bytes(),
-            )
-            .await?;
-            return Ok(());
-        }
-        let authcid = String::from_utf8_lossy(parts[1]);
-        let passwd = String::from_utf8_lossy(parts[2]);
-
-        if self.verify_credentials(&authcid, &passwd).await {
-            self.auth = AuthState::Authenticated;
-            let cap = self.capability_string(stream.get_ref().is_tls());
-            write_flush(
-                stream,
-                format!("{tag} OK [CAPABILITY {cap}] AUTHENTICATE completed\r\n").as_bytes(),
-            )
-            .await?;
+        let auth_result = if is_xoauth2 {
+            let Some((user, token)) = parse_xoauth2_payload(&decoded) else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD Malformed XOAUTH2 SASL payload\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            self.state.auth.authenticate_xoauth2(&user, &token).await
         } else {
-            write_flush(
-                stream,
-                format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
-            )
-            .await?;
+            // Format: [authzid]\0authcid\0passwd
+            let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
+            if parts.len() != 3 {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD Malformed PLAIN SASL payload\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            let authcid = String::from_utf8_lossy(parts[1]);
+            let passwd = String::from_utf8_lossy(parts[2]);
+            self.state.auth.authenticate_imap(&authcid, &passwd).await
+        };
+
+        match auth_result {
+            Ok(principal) => {
+                self.principal = Some(principal);
+                self.auth = AuthState::Authenticated;
+                let cap = self.capability_string(stream.get_ref().is_tls());
+                write_flush(
+                    stream,
+                    format!("{tag} OK [CAPABILITY {cap}] AUTHENTICATE completed\r\n").as_bytes(),
+                )
+                .await?;
+            }
+            Err(_) => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -690,6 +754,12 @@ impl ImapSession {
             .await?;
             return Ok(());
         }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
         if args.len() < 2 {
             write_flush(
                 stream,
@@ -775,6 +845,12 @@ impl ImapSession {
             .await?;
             return Ok(());
         }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
         if args.len() < 2 {
             write_flush(
                 stream,
@@ -852,6 +928,13 @@ impl ImapSession {
             .await?;
             return Ok(());
         }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
+        let effective_read_only = read_only || !self.has_scope(AuthScope::Write);
         let Some(raw_mbx) = args.first().and_then(ImapArg::as_str_lossy) else {
             write_flush(
                 stream,
@@ -980,7 +1063,7 @@ impl ImapSession {
             "* OK [HIGHESTMODSEQ {highest_modseq}] Highest\r\n"
         ));
         out.push_str("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n");
-        if read_only {
+        if effective_read_only {
             out.push_str("* OK [PERMANENTFLAGS ()] Read-only mailbox\r\n");
         } else {
             out.push_str(
@@ -1032,13 +1115,15 @@ impl ImapSession {
 
         if read_only {
             out.push_str(&format!("{tag} OK [READ-ONLY] EXAMINE completed\r\n"));
+        } else if effective_read_only {
+            out.push_str(&format!("{tag} OK [READ-ONLY] SELECT completed\r\n"));
         } else {
             out.push_str(&format!("{tag} OK [READ-WRITE] SELECT completed\r\n"));
         }
 
         self.auth = AuthState::Selected(SelectedState {
             mailbox: info.name,
-            read_only,
+            read_only: effective_read_only,
             snapshot: entries,
         });
         write_flush(stream, out.as_bytes()).await?;
@@ -1057,6 +1142,12 @@ impl ImapSession {
                 format!("{tag} NO Authenticate first\r\n").as_bytes(),
             )
             .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
             return Ok(());
         }
         let Some(name) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -1106,6 +1197,12 @@ impl ImapSession {
                 format!("{tag} NO Authenticate first\r\n").as_bytes(),
             )
             .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
             return Ok(());
         }
         let Some(name) = args.first().and_then(ImapArg::as_str_lossy) else {
@@ -1160,6 +1257,12 @@ impl ImapSession {
                 format!("{tag} NO Authenticate first\r\n").as_bytes(),
             )
             .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
             return Ok(());
         }
         if args.len() < 2 {
@@ -1272,6 +1375,12 @@ impl ImapSession {
                 format!("{tag} NO Authenticate first\r\n").as_bytes(),
             )
             .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
             return Ok(());
         }
         if args.len() < 2 {
@@ -1431,7 +1540,7 @@ impl ImapSession {
                 return Ok(());
             }
         };
-        if !sel.read_only {
+        if !sel.read_only && self.has_scope(AuthScope::Write) {
             let _ = self.state.store.imap_expunge(&sel.mailbox).await?;
         }
         self.auth = AuthState::Authenticated;
@@ -1455,6 +1564,12 @@ impl ImapSession {
                 return Ok(());
             }
         };
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
+            return Ok(());
+        }
         if sel.read_only {
             write_flush(
                 stream,
@@ -1859,6 +1974,12 @@ impl ImapSession {
                 return Ok(());
             }
         };
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
+            return Ok(());
+        }
         if sel.read_only {
             write_flush(
                 stream,
@@ -2096,6 +2217,12 @@ impl ImapSession {
                 return Ok(());
             }
         };
+        if !self
+            .require_scope_or_no(tag, AuthScope::Write, stream)
+            .await?
+        {
+            return Ok(());
+        }
         if is_move && sel.read_only {
             write_flush(
                 stream,
@@ -2367,6 +2494,37 @@ async fn write_flush<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> AppResul
     w.flush()
         .await
         .map_err(|e| AppError::Internal(format!("IMAP flush error: {e}")))
+}
+
+/// Parse a decoded Google SASL `XOAUTH2` payload:
+/// `user=<username>\x01auth=Bearer <access_token>\x01\x01`.
+fn parse_xoauth2_payload(decoded: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(decoded).ok()?;
+    let body = text.strip_suffix("\x01\x01")?;
+    let mut user: Option<String> = None;
+    let mut token: Option<String> = None;
+
+    for part in body.split('\x01') {
+        if let Some(u) = part.strip_prefix("user=") {
+            let trimmed = u.trim();
+            if !trimmed.is_empty() {
+                user = Some(trimmed.to_string());
+            }
+        } else if let Some(auth) = part.strip_prefix("auth=") {
+            let trimmed = auth.trim();
+            if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+                let tok = trimmed[7..].trim();
+                if !tok.is_empty() {
+                    token = Some(tok.to_string());
+                }
+            }
+        }
+    }
+
+    match (user, token) {
+        (Some(u), Some(t)) => Some((u, t)),
+        _ => None,
+    }
 }
 
 fn is_reserved_mailbox(name: &str) -> bool {

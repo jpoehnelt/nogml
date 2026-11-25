@@ -15,7 +15,7 @@ pub use watch::run_watch_webhook_listener;
 use std::collections::{BTreeMap, HashMap};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
     extract::{Path, RawQuery, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
@@ -28,7 +28,10 @@ use chrono::{Duration, Utc};
 use crate::{
     AppState,
     ai::safety::{OutboundCheck, OutboundDecision},
-    auth::{resolve_user_id, validate_email_header, validate_resource_id},
+    auth::{
+        AgentPolicyOverride, Principal, resolve_user_id, validate_email_header,
+        validate_resource_id,
+    },
     blob::is_external_blob_store,
     error::{AppError, AppResult},
     events::{EventSource, MailEvent},
@@ -539,6 +542,8 @@ async fn execute_gmail_send(
     thread_id: Option<String>,
     extra_labels: Vec<String>,
     idempotency_key: Option<&str>,
+    agent_policy: Option<AgentPolicyOverride>,
+    is_draft_send: bool,
 ) -> AppResult<StoredMessage> {
     if raw_bytes.is_empty() {
         return Err(AppError::BadRequest(
@@ -565,7 +570,8 @@ async fn execute_gmail_send(
         text: outbound.text.clone(),
         html: outbound.html.clone(),
         thread_id: thread_id.clone(),
-        is_draft_send: false,
+        is_draft_send,
+        agent_policy,
     };
     match state.outbound_policy.evaluate(&policy_check).await? {
         OutboundDecision::Allow => {}
@@ -731,6 +737,7 @@ async fn complete_send_message(
     metadata: Message,
     raw_bytes: Option<Vec<u8>>,
     idempotency_key: Option<&str>,
+    agent_policy: Option<AgentPolicyOverride>,
 ) -> AppResult<Message> {
     let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
@@ -749,6 +756,8 @@ async fn complete_send_message(
         thread_id,
         metadata.label_ids.unwrap_or_default(),
         idempotency_key,
+        agent_policy,
+        false,
     )
     .await?;
 
@@ -963,6 +972,7 @@ async fn execute_completed_resumable(
     state: &AppState,
     session: ResumableUploadSession,
     headers: &HeaderMap,
+    agent_policy: Option<AgentPolicyOverride>,
 ) -> AppResult<Response> {
     let idempotency_key = session
         .idempotency_key
@@ -972,7 +982,9 @@ async fn execute_completed_resumable(
     match (session.target, session.metadata) {
         (ResumableUploadTarget::MessagesSend, ResumableUploadMetadata::Message(metadata)) => {
             let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
-            let msg = complete_send_message(state, metadata, raw_bytes, idempotency_key).await?;
+            let msg =
+                complete_send_message(state, metadata, raw_bytes, idempotency_key, agent_policy)
+                    .await?;
             Ok(Json(msg).into_response())
         }
         (
@@ -1024,7 +1036,9 @@ async fn execute_completed_resumable(
         }
         (ResumableUploadTarget::DraftsSend, ResumableUploadMetadata::Draft(metadata)) => {
             let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
-            let msg = complete_send_draft(state, metadata, raw_bytes, idempotency_key).await?;
+            let msg =
+                complete_send_draft(state, metadata, raw_bytes, idempotency_key, agent_policy)
+                    .await?;
             Ok(Json(msg).into_response())
         }
         _ => Err(AppError::Internal(
@@ -1064,6 +1078,7 @@ async fn handle_resumable_chunk(
     raw_query: Option<&str>,
     headers: &HeaderMap,
     body: Bytes,
+    agent_policy: Option<AgentPolicyOverride>,
 ) -> AppResult<Response> {
     let user_email = resolve_user_id(user_id, &state.config)?;
     let params = QueryParams::from_raw(raw_query);
@@ -1107,7 +1122,7 @@ async fn handle_resumable_chunk(
             build_resumable_incomplete_response(received)
         }
         ResumableChunkOutcome::Complete(session) => {
-            execute_completed_resumable(state, *session, headers).await
+            execute_completed_resumable(state, *session, headers, agent_policy).await
         }
     }
 }
@@ -1147,11 +1162,13 @@ async fn handle_resumable_cancel(
 
 async fn send_message_resumable_put(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
+    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     handle_resumable_chunk(
         &state,
         &user_id,
@@ -1159,6 +1176,7 @@ async fn send_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
+        agent_policy,
     )
     .await
 }
@@ -1191,6 +1209,7 @@ async fn insert_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
+        None,
     )
     .await
 }
@@ -1223,6 +1242,7 @@ async fn import_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
+        None,
     )
     .await
 }
@@ -1255,6 +1275,7 @@ async fn create_draft_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
+        None,
     )
     .await
 }
@@ -1275,11 +1296,13 @@ async fn create_draft_resumable_delete(
 
 async fn send_draft_resumable_put(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
+    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     handle_resumable_chunk(
         &state,
         &user_id,
@@ -1287,6 +1310,7 @@ async fn send_draft_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
+        agent_policy,
     )
     .await
 }
@@ -1323,6 +1347,7 @@ async fn update_draft_resumable_delete(
 /// `POST /gmail/v1/users/{userId}/messages/send` & `/upload/gmail/v1/users/{userId}/messages/send`
 async fn send_message(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -1345,12 +1370,14 @@ async fn send_message(
         );
     }
 
+    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     let extracted = extract_message_upload(&headers, &params, &body)?;
     let msg = complete_send_message(
         &state,
         extracted.metadata,
         extracted.raw_bytes,
         idempotency_key_header(&headers),
+        agent_policy,
     )
     .await?;
     Ok(Json(msg).into_response())
@@ -2162,6 +2189,7 @@ async fn complete_send_draft(
     metadata: Draft,
     raw_bytes: Option<Vec<u8>>,
     idempotency_key: Option<&str>,
+    agent_policy: Option<AgentPolicyOverride>,
 ) -> AppResult<Message> {
     let draft_id = (!metadata.id.trim().is_empty()).then(|| metadata.id.trim().to_string());
     if let Some(ref did) = draft_id {
@@ -2206,8 +2234,16 @@ async fn complete_send_draft(
         .and_then(|m| m.label_ids.clone())
         .unwrap_or_default();
 
-    let stored =
-        execute_gmail_send(state, raw_bytes, thread_id, extra_labels, idempotency_key).await?;
+    let stored = execute_gmail_send(
+        state,
+        raw_bytes,
+        thread_id,
+        extra_labels,
+        idempotency_key,
+        agent_policy,
+        true,
+    )
+    .await?;
 
     if let Some(ref did) = draft_id {
         let _ = state.store.delete_draft(did).await?;
@@ -2270,6 +2306,7 @@ async fn update_draft(
             raw_query.as_deref(),
             &headers,
             body,
+            None,
         )
         .await;
     }
@@ -2325,6 +2362,7 @@ async fn delete_draft(
 /// `POST /gmail/v1/users/{userId}/drafts/send` & `/upload/gmail/v1/users/{userId}/drafts/send`
 async fn send_draft(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -2347,12 +2385,14 @@ async fn send_draft(
         );
     }
 
+    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     let extracted = extract_draft_upload(&headers, &params, &body)?;
     let msg = complete_send_draft(
         &state,
         extracted.metadata,
         extracted.raw_bytes,
         idempotency_key_header(&headers),
+        agent_policy,
     )
     .await?;
     Ok(Json(msg).into_response())
