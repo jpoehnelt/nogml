@@ -13,13 +13,15 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use nogml::{
-    AppState, ai, build_router,
+    AppState, ai,
+    blob::{migrate_blobs, open_blob_store},
+    build_router,
     config::{BlobBackend, Config, DraftOnlyAction, StorageBackend, SyncMode},
     ensure_crypto_provider,
     error::{AppError, AppResult},
     gmail, imap, mcp,
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
-    storage::{AiSearchQuery, AiThreadQuery},
+    storage::{AiSearchQuery, AiThreadQuery, open_store},
     sync::{self, SyncRunOptions},
 };
 
@@ -52,7 +54,7 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_DB_PATH", default_value = "nogml.db", global = true)]
     db_path: PathBuf,
 
-    /// Blob storage backend (`inline`, `fs`, or `memory`).
+    /// Blob storage backend (`inline`, `fs`, `memory`, or `s3`).
     #[arg(
         long,
         env = "NOGML_BLOB_BACKEND",
@@ -69,6 +71,43 @@ struct CommonConfigArgs {
         global = true
     )]
     blob_dir: PathBuf,
+
+    /// S3 bucket name (when `--blob-backend=s3`).
+    #[arg(long, env = "NOGML_BLOB_S3_BUCKET", global = true)]
+    blob_s3_bucket: Option<String>,
+
+    /// S3 region (e.g. `us-east-1` or `auto` for Cloudflare R2).
+    #[arg(
+        long,
+        env = "NOGML_BLOB_S3_REGION",
+        default_value = "us-east-1",
+        global = true
+    )]
+    blob_s3_region: String,
+
+    /// Optional custom S3-compatible endpoint URL (e.g. Cloudflare R2 or MinIO).
+    #[arg(long, env = "NOGML_BLOB_S3_ENDPOINT", global = true)]
+    blob_s3_endpoint: Option<String>,
+
+    /// Optional key prefix applied to all S3 object keys.
+    #[arg(long, env = "NOGML_BLOB_S3_PREFIX", global = true)]
+    blob_s3_prefix: Option<String>,
+
+    /// S3 access key ID.
+    #[arg(long, env = "NOGML_BLOB_S3_ACCESS_KEY_ID", global = true)]
+    blob_s3_access_key_id: Option<String>,
+
+    /// S3 secret access key.
+    #[arg(long, env = "NOGML_BLOB_S3_SECRET_ACCESS_KEY", global = true)]
+    blob_s3_secret_access_key: Option<String>,
+
+    /// Optional S3 STS session token.
+    #[arg(long, env = "NOGML_BLOB_S3_SESSION_TOKEN", global = true)]
+    blob_s3_session_token: Option<String>,
+
+    /// Force path-style S3 URLs (`true` by default when `--blob-s3-endpoint` is set).
+    #[arg(long, env = "NOGML_BLOB_S3_FORCE_PATH_STYLE", global = true)]
+    blob_s3_force_path_style: Option<bool>,
 
     /// Primary mailbox email address.
     #[arg(
@@ -242,6 +281,12 @@ enum Command {
         provider: SyncCommand,
     },
 
+    /// Storage maintenance operations (e.g. migrating blobs across backends).
+    Storage {
+        #[command(subcommand)]
+        action: StorageCommand,
+    },
+
     /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints.
     Schema {
         /// Optional command or endpoint name to inspect.
@@ -338,6 +383,16 @@ enum SyncCommand {
         /// Optional Gmail search query filter.
         #[arg(long)]
         query: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// Copy existing raw `.eml` messages and attachments into a target blob backend.
+    MigrateBlobs {
+        /// Target blob backend (`inline`, `fs`, `memory`, or `s3`).
+        #[arg(long)]
+        to: BlobBackend,
     },
 }
 
@@ -455,6 +510,14 @@ impl CommonConfigArgs {
             db_path: self.db_path,
             blob_backend: self.blob_backend,
             blob_dir: self.blob_dir,
+            blob_s3_bucket: self.blob_s3_bucket,
+            blob_s3_region: self.blob_s3_region,
+            blob_s3_endpoint: self.blob_s3_endpoint,
+            blob_s3_prefix: self.blob_s3_prefix,
+            blob_s3_access_key_id: self.blob_s3_access_key_id,
+            blob_s3_secret_access_key: self.blob_s3_secret_access_key,
+            blob_s3_session_token: self.blob_s3_session_token,
+            blob_s3_force_path_style: self.blob_s3_force_path_style,
             user_email: self.user_email,
             default_domain: self.default_domain,
             resend_api_key: self.resend_api_key,
@@ -1008,6 +1071,23 @@ async fn run(cli: Cli) -> AppResult<()> {
                         },
                     )
                     .await?;
+                    emit_output(serde_json::to_value(report)?, None, false)
+                }
+            }
+        }
+
+        Command::Storage { action } => {
+            init_tracing(cli.log_json, true);
+            let config = cli.common.into_config(None);
+            match action {
+                StorageCommand::MigrateBlobs { to } => {
+                    let store = open_store(&config)?;
+                    let source = open_blob_store(&config)?;
+                    let mut target_config = config.clone();
+                    target_config.blob_backend = to;
+                    let target = open_blob_store(&target_config)?;
+                    let report =
+                        migrate_blobs(store.as_ref(), source.as_ref(), target.as_ref()).await?;
                     emit_output(serde_json::to_value(report)?, None, false)
                 }
             }

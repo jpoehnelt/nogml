@@ -4,8 +4,9 @@
 //! - [`InlineBlobStore`]: default no-op adapter indicating blobs remain inline inside `MailStore`.
 //! - [`MemoryBlobStore`]: in-memory key-value blob store for testing and ephemeral deployments.
 //! - [`FsBlobStore`]: atomic filesystem blob store with path-traversal protection and temp-file rename.
-//!
-//! External backends (S3, Cloudflare R2, GCS) only need to implement [`BlobStore`].
+//! - [`S3BlobStore`]: pure-Rust AWS SigV4 blob store for AWS S3, Cloudflare R2, and MinIO.
+
+pub mod s3;
 
 use std::{
     collections::HashMap,
@@ -14,13 +15,17 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::{
     config::{BlobBackend, Config},
     error::{AppError, AppResult},
+    storage::{MailStore, MessageListQuery},
 };
+
+pub use s3::{S3BlobConfig, S3BlobStore};
 
 /// Canonical blob key for a message's verbatim RFC 2822 bytes.
 pub fn raw_message_blob_key(message_id: &str) -> String {
@@ -276,13 +281,104 @@ impl BlobStore for FsBlobStore {
     }
 }
 
-/// Construct the configured [`BlobStore`] backend (`inline`, `fs`, or `memory`).
+/// Construct the configured [`BlobStore`] backend (`inline`, `fs`, `memory`, or `s3`).
 pub fn open_blob_store(config: &Config) -> AppResult<Arc<dyn BlobStore>> {
     match config.blob_backend {
         BlobBackend::Inline => Ok(Arc::new(InlineBlobStore)),
         BlobBackend::Memory => Ok(Arc::new(MemoryBlobStore::new())),
         BlobBackend::Fs => Ok(Arc::new(FsBlobStore::open(&config.blob_dir)?)),
+        BlobBackend::S3 => Ok(Arc::new(S3BlobStore::from_config(config)?)),
     }
+}
+
+/// Summary produced by [`migrate_blobs`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobMigrationReport {
+    pub source_backend: String,
+    pub target_backend: String,
+    pub messages_migrated: u64,
+    pub attachments_migrated: u64,
+    pub bytes_copied: u64,
+}
+
+/// Copy existing message raw `.eml` bytes and attachment bytes from `store`/`source`
+/// into `target`.
+pub async fn migrate_blobs(
+    store: &dyn MailStore,
+    source: &dyn BlobStore,
+    target: &dyn BlobStore,
+) -> AppResult<BlobMigrationReport> {
+    let mut page_token: Option<String> = None;
+    let mut messages_migrated = 0u64;
+    let mut attachments_migrated = 0u64;
+    let mut bytes_copied = 0u64;
+
+    loop {
+        let page = store
+            .list_messages(&MessageListQuery {
+                include_spam_trash: true,
+                max_results: 500,
+                page_token: page_token.clone(),
+                ..Default::default()
+            })
+            .await?;
+
+        for msg in &page.messages {
+            let raw_key = raw_message_blob_key(&msg.id);
+            let raw_bytes = if is_external_blob_store(source) {
+                match source.get(&raw_key).await? {
+                    Some(bytes) => bytes,
+                    None => msg.raw_rfc2822.clone(),
+                }
+            } else {
+                msg.raw_rfc2822.clone()
+            };
+
+            if !raw_bytes.is_empty() {
+                target.put(&raw_key, &raw_bytes).await?;
+                messages_migrated += 1;
+                bytes_copied += raw_bytes.len() as u64;
+            }
+
+            let metas = store.list_attachment_meta(&msg.id).await?;
+            for meta in metas {
+                let att_key = attachment_blob_key(&msg.id, &meta.id);
+                let att_bytes = if is_external_blob_store(source) {
+                    match source.get(&att_key).await? {
+                        Some(bytes) => Some(bytes),
+                        None => store
+                            .get_attachment(&msg.id, &meta.id)
+                            .await?
+                            .map(|a| a.data),
+                    }
+                } else {
+                    store
+                        .get_attachment(&msg.id, &meta.id)
+                        .await?
+                        .map(|a| a.data)
+                };
+
+                if let Some(bytes) = att_bytes {
+                    target.put(&att_key, &bytes).await?;
+                    attachments_migrated += 1;
+                    bytes_copied += bytes.len() as u64;
+                }
+            }
+        }
+
+        match page.next_page_token {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+
+    Ok(BlobMigrationReport {
+        source_backend: source.backend_name().to_string(),
+        target_backend: target.backend_name().to_string(),
+        messages_migrated,
+        attachments_migrated,
+        bytes_copied,
+    })
 }
 
 #[cfg(test)]

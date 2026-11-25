@@ -23,6 +23,8 @@ pub enum BlobBackend {
     Fs,
     /// Mirror and serve raw RFC 2822 and attachments from an in-memory blob store.
     Memory,
+    /// Mirror and serve raw RFC 2822 and attachments from S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
+    S3,
 }
 
 /// Behavior when `draft_only` is enabled and an agent attempts to send mail.
@@ -56,6 +58,14 @@ pub struct Config {
     pub db_path: PathBuf,
     pub blob_backend: BlobBackend,
     pub blob_dir: PathBuf,
+    pub blob_s3_bucket: Option<String>,
+    pub blob_s3_region: String,
+    pub blob_s3_endpoint: Option<String>,
+    pub blob_s3_prefix: Option<String>,
+    pub blob_s3_access_key_id: Option<String>,
+    pub blob_s3_secret_access_key: Option<String>,
+    pub blob_s3_session_token: Option<String>,
+    pub blob_s3_force_path_style: Option<bool>,
 
     // --- Auth & mailbox identity ---
     /// Allowed bearer tokens. Empty means dev unauthenticated mode.
@@ -121,6 +131,14 @@ impl Default for Config {
             db_path: PathBuf::from("nogml.db"),
             blob_backend: BlobBackend::Inline,
             blob_dir: PathBuf::from("nogml-blobs"),
+            blob_s3_bucket: None,
+            blob_s3_region: "us-east-1".to_string(),
+            blob_s3_endpoint: None,
+            blob_s3_prefix: None,
+            blob_s3_access_key_id: None,
+            blob_s3_secret_access_key: None,
+            blob_s3_session_token: None,
+            blob_s3_force_path_style: None,
 
             auth_tokens: Vec::new(),
             user_email: "me@localhost".to_string(),

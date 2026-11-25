@@ -35,14 +35,14 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
   | SqliteStore| | Inline    | | ResendTransp. | | NoopFilter    | | StaticToken  | | StoreSearch | | ConfigPolicy   |
   | MemoryStore| | FsBlob    | | (SES / SMTP)  | | FilterChain   | | (JWT / OIDC) | | (Tantivy /  | | (Approval /    |
   | (Postgres) | | MemoryBlob| |               | | (Rspamd / AI) | |              | |  pgvector)  | |  DLP / Budget) |
-  |            | | (S3 / R2) | |               | |               | |              | |             | |                |
+  |            | | S3Blob    | |               | |               | |              | |             | |                |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
 ```
 
 | Trait | Module | Built-in implementations | Role |
 | --- | --- | --- | --- |
 | `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore` | Messages, threads, labels, drafts, history, IMAP UIDs, watch state, and sync state |
-| `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore` | Raw RFC 2822 bytes and attachment blobs (atomic temp-file rename on disk; implement `BlobStore` for S3 or R2) |
+| `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
 | `MailTransport` | `src/transport/` | `ResendTransport` (`src/resend/`) | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend webhooks, Gmail import, IMAP `APPEND`, and Gmail sync |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
@@ -129,6 +129,18 @@ nogml sync gmail --mode imap
 
 Pass `--sync-interval-secs 60` to `nogml serve` to run sync periodically in the background.
 
+### 5. Migrate blobs between backends (`nogml storage migrate-blobs`)
+
+```bash
+# Copy existing raw .eml messages and attachments from inline/fs storage into S3 or R2
+NOGML_BLOB_S3_BUCKET=my-mail-blobs \
+NOGML_BLOB_S3_REGION=auto \
+NOGML_BLOB_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com \
+NOGML_BLOB_S3_ACCESS_KEY_ID=... \
+NOGML_BLOB_S3_SECRET_ACCESS_KEY=... \
+nogml storage migrate-blobs --db-path ./nogml.db --blob-backend inline --to s3
+```
+
 ## Configuration
 
 Every CLI flag has a matching environment variable:
@@ -140,8 +152,16 @@ Every CLI flag has a matching environment variable:
 | `NOGML_CORS_ORIGINS` | `--cors-origins` | *(any)* | Comma-separated allowed CORS origins |
 | `NOGML_STORAGE` | `--storage` | `sqlite` | `MailStore` backend (`sqlite` or `memory`) |
 | `NOGML_DB_PATH` | `--db-path` | `nogml.db` | SQLite database file path |
-| `NOGML_BLOB_BACKEND` | `--blob-backend` | `inline` | `BlobStore` backend (`inline`, `fs`, or `memory`) |
+| `NOGML_BLOB_BACKEND` | `--blob-backend` | `inline` | `BlobStore` backend (`inline`, `fs`, `memory`, or `s3`) |
 | `NOGML_BLOB_DIR` | `--blob-dir` | `nogml-blobs` | Directory for the `fs` blob backend |
+| `NOGML_BLOB_S3_BUCKET` | `--blob-s3-bucket` | *(none)* | S3 bucket name for the `s3` blob backend |
+| `NOGML_BLOB_S3_REGION` | `--blob-s3-region` | `us-east-1` | S3 region (use `auto` for Cloudflare R2) |
+| `NOGML_BLOB_S3_ENDPOINT` | `--blob-s3-endpoint` | *(AWS default)* | Optional custom S3-compatible endpoint URL (Cloudflare R2, MinIO) |
+| `NOGML_BLOB_S3_PREFIX` | `--blob-s3-prefix` | *(none)* | Optional key prefix prepended to all S3 object keys |
+| `NOGML_BLOB_S3_ACCESS_KEY_ID` | `--blob-s3-access-key-id` | *(none)* | S3 access key ID |
+| `NOGML_BLOB_S3_SECRET_ACCESS_KEY` | `--blob-s3-secret-access-key` | *(none)* | S3 secret access key |
+| `NOGML_BLOB_S3_SESSION_TOKEN` | `--blob-s3-session-token` | *(none)* | Optional S3 STS session token |
+| `NOGML_BLOB_S3_FORCE_PATH_STYLE` | `--blob-s3-force-path-style` | *(true with endpoint)* | Use path-style URLs (`/{bucket}/{key}`) instead of virtual-host URLs |
 | `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens |
 | `NOGML_USER_EMAIL` | `--user-email` | `me@localhost` | Primary mailbox address |
 | `NOGML_DEFAULT_DOMAIN` | `--default-domain` | `localhost` | Default domain for generated `Message-ID` headers |
