@@ -143,6 +143,7 @@ impl MemoryState {
         self.history_seq
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_history_event(
         &mut self,
         history_id: u64,
@@ -151,6 +152,7 @@ impl MemoryState {
         thread_id: &str,
         label_ids: Vec<String>,
         context_labels: Vec<String>,
+        upstream_gmail_id: Option<String>,
     ) {
         self.history_event_seq += 1;
         self.history_events.push(MemHistoryEvent {
@@ -161,6 +163,7 @@ impl MemoryState {
                 message_id: message_id.to_string(),
                 thread_id: thread_id.to_string(),
                 label_ids,
+                upstream_gmail_id,
             },
             context_labels,
         });
@@ -364,6 +367,7 @@ impl MemoryState {
             &thread_id,
             resolved_labels.clone(),
             resolved_labels,
+            stored.upstream_gmail_id.clone(),
         );
         Ok(stored)
     }
@@ -374,12 +378,16 @@ impl MemoryState {
         resolved_add: &[String],
         resolved_remove: &[String],
     ) -> AppResult<StoredMessage> {
-        let (thread_id, current_labels) = {
+        let (thread_id, current_labels, upstream_gmail_id) = {
             let msg = self
                 .messages
                 .get(message_id)
                 .ok_or_else(|| AppError::NotFound(format!("Message not found: {message_id}")))?;
-            (msg.thread_id.clone(), msg.label_ids.clone())
+            (
+                msg.thread_id.clone(),
+                msg.label_ids.clone(),
+                msg.upstream_gmail_id.clone(),
+            )
         };
 
         let current_set: HashSet<String> = current_labels.iter().cloned().collect();
@@ -446,6 +454,7 @@ impl MemoryState {
                     &thread_id,
                     actually_added,
                     context_labels.clone(),
+                    upstream_gmail_id.clone(),
                 );
             }
             if !actually_removed.is_empty() {
@@ -456,6 +465,7 @@ impl MemoryState {
                     &thread_id,
                     actually_removed,
                     context_labels,
+                    upstream_gmail_id,
                 );
             }
         }
@@ -479,6 +489,7 @@ impl MemoryState {
             &msg.thread_id,
             msg.label_ids.clone(),
             msg.label_ids.clone(),
+            msg.upstream_gmail_id.clone(),
         );
         Some(msg)
     }
@@ -1624,14 +1635,21 @@ impl MailStore for MemoryStore {
             )));
         }
 
-        let affected: Vec<(String, String, Vec<String>)> = state
+        let affected: Vec<(String, String, Vec<String>, Option<String>)> = state
             .messages
             .values()
             .filter(|m| m.label_ids.iter().any(|l| l == id))
-            .map(|m| (m.id.clone(), m.thread_id.clone(), m.label_ids.clone()))
+            .map(|m| {
+                (
+                    m.id.clone(),
+                    m.thread_id.clone(),
+                    m.label_ids.clone(),
+                    m.upstream_gmail_id.clone(),
+                )
+            })
             .collect();
 
-        for (mid, tid, ctx) in affected {
+        for (mid, tid, ctx, up_id) in affected {
             let hid = state.bump_history_id();
             if let Some(msg) = state.messages.get_mut(&mid) {
                 msg.label_ids.retain(|l| l != id);
@@ -1647,6 +1665,7 @@ impl MailStore for MemoryStore {
                 &tid,
                 vec![id.to_string()],
                 ctx,
+                up_id,
             );
         }
 

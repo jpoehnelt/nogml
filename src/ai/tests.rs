@@ -1374,11 +1374,13 @@ fn runtime_schema_and_sync_trigger_helpers() {
         provider: Some("imap".to_string()),
         max_messages: Some(50),
         query: None,
+        bidirectional: Some(true),
     })
     .unwrap();
     assert!(opts.full);
     assert_eq!(opts.mode, Some(SyncMode::Imap));
     assert_eq!(opts.max_messages, Some(50));
+    assert_eq!(opts.bidirectional, Some(true));
 
     assert!(
         parse_sync_trigger(SyncTriggerRequest {

@@ -18,7 +18,7 @@ Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME 
 - **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...` (`media`, `multipart`, and chunked `resumable` uploads), `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
 - **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS. Maps Gmail labels to folders including `[Gmail]/All Mail`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-LABELS`, and pushes updates over `IDLE`.
 - **Pluggable mail transports (Resend, AWS SES, SMTP)**: Sends outbound mail via Resend (`POST /emails` with `Idempotency-Key`), AWS SESv2 raw MIME (`POST /v2/email/outbound-emails` signed with AWS SigV4), or direct SMTP (`STARTTLS`, implicit TLS, or plain TCP with `AUTH PLAIN` / `AUTH LOGIN` and RFC 5321 dot-stuffing). Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures and handles `POST /webhooks/ses` SNS notifications (inline base64 or S3 downloads) through the same inbound ingestion and filtering pipeline.
-- **Upstream Gmail sync**: Imports existing Gmail accounts via Gmail REST API v1 (OAuth2 refresh, paginated backfill, incremental `history.list` with automatic 404 full resync) or Gmail IMAP (`X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`.
+- **Upstream Gmail sync (`SyncSource`)**: Imports existing Gmail accounts via pluggable `SyncSource` connectors (`GmailApiSyncSource` for Gmail REST API v1 with OAuth2 refresh, paginated backfill, and incremental `history.list` with automatic 404 full resync, or `GmailImapSyncSource` for Gmail IMAP with `X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`, and supports optional bidirectional label, flag, trash, and delete pushback (`NOGML_SYNC_BIDIRECTIONAL=true`).
 - **CLI (`nogml mail`)**: Runs against the local store or a remote server (`--url`). Outputs JSON automatically when stdout is not a TTY, supports `--ndjson`, `--fields`, and `--payload @-`, and returns deterministic exit codes (`0` ok, `2` validation or config error, `3` policy block, `4` auth or upstream error, `1` runtime error).
 
 ## Pluggable traits
@@ -48,6 +48,7 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
 | `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
 | `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202, `Deny` returning 403) and `dry_run` checks |
+| `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | Pluggable upstream pull and optional bidirectional pushback sharing single-flight locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
 
 Query `GET /v1/capabilities` to see the active backend names under `.backends`.
 
@@ -127,7 +128,7 @@ GMAIL_IMAP_PASSWORD=app-password \
 nogml sync gmail --mode imap
 ```
 
-Pass `--sync-interval-secs 60` to `nogml serve` to run sync periodically in the background.
+Pass `--sync-interval-secs 60` to `nogml serve` to run sync periodically in the background. Set `NOGML_SYNC_BIDIRECTIONAL=true` (or pass `--sync-bidirectional`) to push local read, star, archive, label, trash, and delete changes back to upstream Gmail via `messages.modify`/`trash`/`delete` (API mode) or `UID STORE`/`UID MOVE`/`EXPUNGE` (IMAP mode). Pushback counts and status are exposed on `GET /v1/sync/status`.
 
 ### 5. Migrate blobs between backends (`nogml storage migrate-blobs`)
 
@@ -201,6 +202,7 @@ Every CLI flag has a matching environment variable:
 | `NOGML_IMAP_TLS_CERT` / `KEY` | `--imap-tls-cert` / `--imap-tls-key` | *(none)* | PEM certificate chain and private key for IMAP TLS |
 | `NOGML_IMAP_USERNAME` / `PASSWORD` | `--imap-username` / `--imap-password` | *(user_email / first token)* | IMAP login override |
 | `NOGML_SYNC_MODE` | `--sync-mode` | `api` | Upstream Gmail sync mode (`api` or `imap`) |
+| `NOGML_SYNC_BIDIRECTIONAL` | `--sync-bidirectional` | `false` | Push local label, flag, trash, and delete changes back to the upstream account |
 | `NOGML_SYNC_INTERVAL_SECS` | `--sync-interval-secs` | `0` | Background sync interval in seconds (`0` disables) |
 | `GMAIL_CLIENT_ID` / `SECRET` / `REFRESH_TOKEN` / `ACCESS_TOKEN` | `--gmail-*` | *(none)* | Upstream Gmail REST API credentials |
 | `GMAIL_IMAP_USER` / `PASSWORD` | `--gmail-imap-*` | *(none)* | Upstream Gmail IMAP credentials |

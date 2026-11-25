@@ -219,6 +219,7 @@ impl MailStore for MockStore {
             message_id: id,
             thread_id,
             label_ids: input.label_ids,
+            upstream_gmail_id: stored.upstream_gmail_id.clone(),
         });
         s.messages.push(stored.clone());
         Ok(stored)
@@ -281,6 +282,7 @@ impl MailStore for MockStore {
                 message_id: cloned.id.clone(),
                 thread_id: cloned.thread_id.clone(),
                 label_ids: add_labels.to_vec(),
+                upstream_gmail_id: cloned.upstream_gmail_id.clone(),
             });
         }
         if !remove_labels.is_empty() {
@@ -290,6 +292,7 @@ impl MailStore for MockStore {
                 message_id: cloned.id.clone(),
                 thread_id: cloned.thread_id.clone(),
                 label_ids: remove_labels.to_vec(),
+                upstream_gmail_id: cloned.upstream_gmail_id.clone(),
             });
         }
         Ok(cloned)
@@ -327,6 +330,7 @@ impl MailStore for MockStore {
                 message_id: m.id,
                 thread_id: m.thread_id,
                 label_ids: m.label_ids,
+                upstream_gmail_id: m.upstream_gmail_id,
             });
         }
         s.messages.retain(|m| m.id != id);

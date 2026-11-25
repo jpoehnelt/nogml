@@ -343,6 +343,15 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_SYNC_MAX_MESSAGES", global = true)]
     sync_max_messages: Option<usize>,
 
+    /// Push local label, flag, trash, and delete changes back to the upstream account.
+    #[arg(
+        long,
+        env = "NOGML_SYNC_BIDIRECTIONAL",
+        default_value_t = false,
+        global = true
+    )]
+    sync_bidirectional: bool,
+
     // --- Inbound filter pipeline ---
     /// Enable `AuthResultsFilter` to parse `Authentication-Results` headers.
     #[arg(
@@ -798,6 +807,7 @@ impl CommonConfigArgs {
             gmail_imap_mailbox: self.gmail_imap_mailbox,
             sync_query: self.sync_query,
             sync_max_messages: self.sync_max_messages,
+            sync_bidirectional: self.sync_bidirectional,
             filter_auth_results: self.filter_auth_results,
             filter_dmarc_fail_action: self.filter_dmarc_fail_action,
             filter_spf_fail_action: self.filter_spf_fail_action,
@@ -1344,6 +1354,7 @@ async fn run(cli: Cli) -> AppResult<()> {
                             full,
                             max_messages,
                             query,
+                            bidirectional: None,
                         },
                     )
                     .await?;

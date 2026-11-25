@@ -1060,6 +1060,7 @@ pub fn parse_sync_trigger(req: SyncTriggerRequest) -> AppResult<SyncRunOptions> 
         full,
         max_messages: req.max_messages,
         query: req.query,
+        bidirectional: req.bidirectional,
     })
 }
 

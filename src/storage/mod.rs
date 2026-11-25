@@ -121,6 +121,8 @@ pub struct StoredHistoryEntry {
     pub message_id: String,
     pub thread_id: String,
     pub label_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_gmail_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,7 +346,7 @@ pub struct UpsertOutcome {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub account_key: String,
-    /// `"gmail_api"` or `"gmail_imap"`.
+    /// `"gmail_api"`, `"gmail_imap"`, or a custom `SyncSource` provider name.
     pub provider: String,
     pub last_history_id: Option<String>,
     pub imap_mailbox: Option<String>,
@@ -355,6 +357,12 @@ pub struct SyncState {
     pub status: String,
     pub last_error: Option<String>,
     pub messages_synced: u64,
+    /// Local `MailStore` history checkpoint up to which local mutations have been pushed upstream.
+    #[serde(default)]
+    pub last_pushed_history_id: Option<u64>,
+    /// Cumulative count of local message mutations pushed back upstream.
+    #[serde(default)]
+    pub messages_pushed: u64,
 }
 
 // ============================================================================
