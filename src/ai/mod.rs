@@ -1338,6 +1338,7 @@ struct SearchParams {
     q: Option<String>,
     label: Option<String>,
     labels: Option<String>,
+    unread: Option<bool>,
     thread_id: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -1807,6 +1808,7 @@ async fn search_messages(
         .search(&AiSearchQuery {
             q: params.q,
             labels,
+            unread: params.unread,
             thread_id: params.thread_id,
             from: params.from,
             to: params.to,

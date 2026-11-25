@@ -412,6 +412,8 @@ impl McpServer {
             #[serde(default)]
             labels: Vec<String>,
             #[serde(default)]
+            unread: Option<bool>,
+            #[serde(default)]
             from: Option<String>,
             #[serde(default)]
             to: Option<String>,
@@ -443,6 +445,7 @@ impl McpServer {
             .search(&AiSearchQuery {
                 q: parsed.query,
                 labels: parsed.labels,
+                unread: parsed.unread,
                 from: parsed.from,
                 to: parsed.to,
                 has_attachment: parsed.has_attachment,
@@ -1028,12 +1031,13 @@ fn tool_catalog() -> Value {
     json!([
         {
             "name": "search_emails",
-            "description": "Search emails using FTS5 full-text search and structured filters (labels, from, to, has_attachment). Returns compact messages without base64 blobs.",
+            "description": "Search emails using FTS5 full-text or hybrid semantic search and structured filters (labels, unread, from, to, has_attachment). Returns compact messages without base64 blobs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Full-text or Gmail-style search query" },
+                    "query": { "type": "string", "description": "Full-text or semantic search query" },
                     "labels": { "type": "array", "items": { "type": "string" } },
+                    "unread": { "type": "boolean" },
                     "from": { "type": "string" },
                     "to": { "type": "string" },
                     "has_attachment": { "type": "boolean" },

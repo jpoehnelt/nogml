@@ -13,8 +13,9 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "q": { "type": "string", "description": "Full-text or Gmail-style search query" },
+                    "q": { "type": "string", "description": "Full-text or semantic search query" },
                     "labels": { "type": "array", "items": { "type": "string" } },
+                    "unread": { "type": "boolean" },
                     "from": { "type": "string" },
                     "to": { "type": "string" },
                     "after": { "type": "string", "format": "date-time" },

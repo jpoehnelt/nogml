@@ -27,6 +27,17 @@ pub enum BlobBackend {
     S3,
 }
 
+/// Selectable search index backend behind `SearchIndex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// Default lexical search backed directly by `MailStore` (SQLite FTS5 or Memory).
+    #[default]
+    Store,
+    /// Hybrid lexical + vector semantic search fused with Reciprocal Rank Fusion (RRF).
+    Hybrid,
+}
+
 /// Selectable outbound mail transport backend behind `MailTransport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +233,18 @@ pub struct Config {
     pub llm_triage_timeout_ms: u64,
     /// Maximum plain-text body characters included in the LLM triage prompt (default 2000).
     pub llm_triage_max_body_chars: usize,
+
+    // --- Pluggable search & embeddings ---
+    /// Search index backend (`store` [default] or `hybrid`).
+    pub search_backend: SearchBackend,
+    /// OpenAI-compatible embeddings base URL (`{url}/embeddings`, e.g. OpenAI, Ollama `/v1`).
+    pub embedding_base_url: Option<String>,
+    /// Optional Bearer API key for the embeddings endpoint.
+    pub embedding_api_key: Option<String>,
+    /// Embedding model name sent to `/embeddings`.
+    pub embedding_model: String,
+    /// HTTP timeout for embedding requests in seconds (default 15).
+    pub embedding_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -320,6 +343,12 @@ impl Default for Config {
             llm_triage_model: "gpt-4o-mini".to_string(),
             llm_triage_timeout_ms: 10_000,
             llm_triage_max_body_chars: 2_000,
+
+            search_backend: SearchBackend::Store,
+            embedding_base_url: None,
+            embedding_api_key: None,
+            embedding_model: "text-embedding-3-small".to_string(),
+            embedding_timeout_secs: 15,
         }
     }
 }

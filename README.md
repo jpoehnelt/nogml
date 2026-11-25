@@ -33,8 +33,8 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
   | MailStore  | | BlobStore | | MailTransport | | InboundFilter | | AuthProvider | | SearchIndex | | OutboundPolicy |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
   | SqliteStore| | Inline    | | ResendTransp. | | NoopFilter    | | StaticToken  | | StoreSearch | | ConfigPolicy   |
-  | MemoryStore| | FsBlob    | | SesTransport  | | FilterChain   | | (JWT / OIDC) | | (Tantivy /  | | (Approval /    |
-  | (Postgres) | | MemoryBlob| | SmtpTransport | | AuthResults   | |              | |  pgvector)  | |  DLP / Budget) |
+  | MemoryStore| | FsBlob    | | SesTransport  | | FilterChain   | | (JWT / OIDC) | | HybridSearch| | (Approval /    |
+  | (Postgres) | | MemoryBlob| | SmtpTransport | | AuthResults   | |              | | (FTS5+Vec)  | |  DLP / Budget) |
   |            | | S3Blob    | |               | | Rspamd / LLM  | |              | |             | |                |
   +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
 ```
@@ -46,7 +46,7 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP authentication returning `Principal` and scopes |
-| `SearchIndex` | `src/search_index.rs` | `StoreSearchIndex` | Search backend used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
+| `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
 | `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy` | Send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202, `Deny` returning 403) and `dry_run` checks |
 
 Query `GET /v1/capabilities` to see the active backend names under `.backends`.
@@ -141,6 +141,18 @@ NOGML_BLOB_S3_SECRET_ACCESS_KEY=... \
 nogml storage migrate-blobs --db-path ./nogml.db --blob-backend inline --to s3
 ```
 
+### 6. Enable hybrid semantic search (`nogml search reindex`)
+
+Set `NOGML_SEARCH_BACKEND=hybrid` with an OpenAI-compatible embeddings endpoint (OpenAI, Ollama `/v1`, Voyage, or Mistral) to combine FTS5 keyword search with vector cosine similarity via Reciprocal Rank Fusion (RRF). Embeddings are stored as little-endian `f32` blobs in SQLite (`message_embeddings`) with zero native extensions, and search falls back to lexical matching if the embedding endpoint is unavailable.
+
+```bash
+# Backfill embeddings for an existing SQLite mailbox (for example with local Ollama)
+NOGML_SEARCH_BACKEND=hybrid \
+NOGML_EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1 \
+NOGML_EMBEDDING_MODEL=nomic-embed-text \
+nogml search reindex --db-path ./nogml.db
+```
+
 ## Configuration
 
 Every CLI flag has a matching environment variable:
@@ -208,6 +220,11 @@ Every CLI flag has a matching environment variable:
 | `NOGML_LLM_TRIAGE_MODEL` | `--llm-triage-model` | `gpt-4o-mini` | Model name sent to `/chat/completions` |
 | `NOGML_LLM_TRIAGE_TIMEOUT_MS` | `--llm-triage-timeout-ms` | `10000` | LLM triage HTTP timeout in milliseconds |
 | `NOGML_LLM_TRIAGE_MAX_BODY_CHARS` | `--llm-triage-max-body-chars` | `2000` | Maximum sanitized plain-text body characters sent to the LLM classifier |
+| `NOGML_SEARCH_BACKEND` | `--search-backend` | `store` | `SearchIndex` backend (`store` [default, zero API keys] or `hybrid`) |
+| `NOGML_EMBEDDING_BASE_URL` | `--embedding-base-url` | *(OpenAI `/v1` when key set)* | OpenAI-compatible base URL (`{url}/embeddings`) for `hybrid` search |
+| `NOGML_EMBEDDING_API_KEY` | `--embedding-api-key` | *(none)* | Optional Bearer API key for the embeddings endpoint |
+| `NOGML_EMBEDDING_MODEL` | `--embedding-model` | `text-embedding-3-small` | Embedding model name sent to `/embeddings` |
+| `NOGML_EMBEDDING_TIMEOUT_SECS` | `--embedding-timeout-secs` | `15` | HTTP timeout in seconds for embedding requests |
 | `NOGML_LOG_JSON` | `--log-json` | `false` | Emit JSON logs |
 
 ## Connecting clients

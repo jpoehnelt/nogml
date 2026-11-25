@@ -38,7 +38,7 @@ use crate::{
     events::EventBus,
     filter::{InboundFilter, open_filter},
     resend::{HttpResendClient, ResendClient, ResendTransport},
-    search_index::{SearchIndex, StoreSearchIndex},
+    search_index::{SearchIndex, StoreSearchIndex, open_search_index},
     storage::{MailStore, StoredAttachment, StoredMessage, open_store},
     transport::{MailTransport, open_transport},
 };
@@ -80,16 +80,32 @@ pub struct AppState {
 
 impl AppState {
     /// Construct application state from `Config`, opening the configured `MailStore`,
-    /// `BlobStore`, and `MailTransport`.
+    /// `BlobStore`, `MailTransport`, and `SearchIndex`.
     pub fn from_config(config: Config) -> AppResult<Self> {
         ensure_crypto_provider();
         let store = open_store(&config)?;
         let blobs = open_blob_store(&config)?;
         let resend: Arc<dyn ResendClient> = Arc::new(HttpResendClient::from_config(&config));
         let transport = open_transport(&config, resend.clone())?;
-        Ok(Self::with_backends(config, store, resend)
-            .with_blobs(blobs)
-            .with_transport(transport))
+        let search = open_search_index(&config, store.clone())?;
+        let filter: Arc<dyn InboundFilter> = open_filter(&config);
+        let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
+        let outbound_policy: Arc<dyn OutboundPolicy> =
+            Arc::new(ConfigOutboundPolicy::from_config(&config));
+
+        Ok(Self {
+            config: Arc::new(config),
+            store,
+            blobs,
+            transport,
+            filter,
+            auth,
+            search,
+            outbound_policy,
+            resend,
+            events: EventBus::new(),
+            sync_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Construct application state with explicit `MailStore` and `ResendClient` implementations
@@ -114,7 +130,10 @@ impl AppState {
         };
         let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
-        let search: Arc<dyn SearchIndex> = Arc::new(StoreSearchIndex::new(store.clone()));
+        let search: Arc<dyn SearchIndex> = match open_search_index(&config, store.clone()) {
+            Ok(s) => s,
+            Err(_) => Arc::new(StoreSearchIndex::new(store.clone())),
+        };
         let outbound_policy: Arc<dyn OutboundPolicy> =
             Arc::new(ConfigOutboundPolicy::from_config(&config));
 
