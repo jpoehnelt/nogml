@@ -1,4 +1,5 @@
-//! Pluggable inbound message filtering (`InboundFilter`, `NoopFilter`, `FilterChain`).
+//! Pluggable inbound message filtering (`InboundFilter`, `NoopFilter`, `FilterChain`,
+//! `AuthResultsFilter`, `RspamdFilter`, and `LlmTriageFilter`).
 //!
 //! Provider-agnostic hook executed across all inbound ingestion paths:
 //! - Resend `email.received` webhooks
@@ -6,14 +7,26 @@
 //! - Upstream Gmail sync (`gmail_api` and `gmail_imap`)
 //! - Embedded IMAP `APPEND`
 
+pub mod auth_results;
+pub mod llm;
+pub mod rspamd;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
+    config::Config,
     error::AppResult,
     models::{LABEL_INBOX, LABEL_SPAM, LABEL_UNREAD},
 };
+
+pub use auth_results::{
+    AuthOutcome, AuthResultsFilter, AuthResultsPolicy, LABEL_AUTH_FAIL, ParsedAuthResults,
+    parse_authentication_results,
+};
+pub use llm::{LlmTriageConfig, LlmTriageFilter};
+pub use rspamd::{RspamdConfig, RspamdFilter};
 
 /// Provider-agnostic inbound message view passed to [`InboundFilter`] implementations
 /// before persistence into `MailStore`.
@@ -66,6 +79,14 @@ pub trait InboundFilter: Send + Sync {
 
     fn backend_name(&self) -> &'static str {
         "custom"
+    }
+
+    /// Active filter backend names in execution order.
+    ///
+    /// Leaf filters return `[self.backend_name()]`; [`FilterChain`] expands to its
+    /// member filters in order.
+    fn active_filters(&self) -> Vec<String> {
+        vec![self.backend_name().to_string()]
     }
 }
 
@@ -143,6 +164,40 @@ impl FilterChain {
     pub fn push(&mut self, filter: Arc<dyn InboundFilter>) {
         self.0.push(filter);
     }
+
+    /// Active filter names in deterministic execution order.
+    pub fn active_filter_names(&self) -> Vec<String> {
+        if self.0.is_empty() {
+            return vec!["noop".to_string()];
+        }
+        self.0.iter().flat_map(|f| f.active_filters()).collect()
+    }
+}
+
+/// Build the configured [`InboundFilter`] pipeline from [`Config`] in deterministic order:
+/// 1. Fast deterministic [`AuthResultsFilter`] (when `filter_auth_results = true`)
+/// 2. External [`RspamdFilter`] (when `rspamd_url` is set)
+/// 3. Optional [`LlmTriageFilter`] (when `llm_triage_base_url` or `llm_triage_api_key` is set)
+///
+/// Falls back to [`NoopFilter`] when no filters are enabled.
+pub fn open_filter(config: &Config) -> Arc<dyn InboundFilter> {
+    let mut filters: Vec<Arc<dyn InboundFilter>> = Vec::new();
+
+    if config.filter_auth_results {
+        filters.push(Arc::new(AuthResultsFilter::from_config(config)));
+    }
+    if let Some(rspamd) = RspamdFilter::from_config(config) {
+        filters.push(Arc::new(rspamd));
+    }
+    if let Some(llm) = LlmTriageFilter::from_config(config) {
+        filters.push(Arc::new(llm));
+    }
+
+    if filters.is_empty() {
+        Arc::new(NoopFilter)
+    } else {
+        Arc::new(FilterChain::new(filters))
+    }
 }
 
 #[async_trait]
@@ -195,6 +250,10 @@ impl InboundFilter for FilterChain {
 
     fn backend_name(&self) -> &'static str {
         "chain"
+    }
+
+    fn active_filters(&self) -> Vec<String> {
+        self.active_filter_names()
     }
 }
 
@@ -349,5 +408,27 @@ mod tests {
             },
         );
         assert_eq!(mutated, vec!["NEWSLETTER".to_string()]);
+    }
+
+    #[test]
+    fn open_filter_defaults_to_noop_and_orders_enabled_filters() {
+        let default_cfg = Config::for_test();
+        let noop = open_filter(&default_cfg);
+        assert_eq!(noop.backend_name(), "noop");
+        assert_eq!(noop.active_filters(), vec!["noop"]);
+
+        let empty_chain = FilterChain::empty();
+        assert_eq!(empty_chain.active_filters(), vec!["noop"]);
+
+        let mut all_cfg = Config::for_test();
+        all_cfg.filter_auth_results = true;
+        all_cfg.rspamd_url = Some("http://127.0.0.1:11333".to_string());
+        all_cfg.llm_triage_api_key = Some("sk-test".to_string());
+        let chain = open_filter(&all_cfg);
+        assert_eq!(chain.backend_name(), "chain");
+        assert_eq!(
+            chain.active_filters(),
+            vec!["auth_results", "rspamd", "llm_triage"]
+        );
     }
 }

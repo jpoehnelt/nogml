@@ -45,6 +45,32 @@ pub enum SyncMode {
     Imap,
 }
 
+/// Action taken by `AuthResultsFilter` when an SPF, DKIM, or DMARC check fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFailAction {
+    /// Do not alter the message on failure.
+    Allow,
+    /// Keep the message and add the `AUTH_FAIL` label.
+    #[default]
+    Tag,
+    /// Route the message to `SPAM` (removing `INBOX`).
+    Spam,
+    /// Reject and drop the message prior to storage.
+    Reject,
+}
+
+/// Action taken by `RspamdFilter` when Rspamd responds with `reject` or `soft reject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RspamdRejectAction {
+    /// Drop the message before storing in `MailStore`.
+    #[default]
+    Reject,
+    /// Route the message to `SPAM` instead of dropping it.
+    Spam,
+}
+
 /// Central runtime configuration for `nogml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -118,6 +144,41 @@ pub struct Config {
 
     // --- Optional Gmail /watch push webhook ---
     pub watch_webhook_url: Option<String>,
+
+    // --- Inbound filter pipeline ---
+    /// Enable `AuthResultsFilter` to evaluate `Authentication-Results` headers.
+    pub filter_auth_results: bool,
+    /// Action on `dmarc=fail` (`spam`, `reject`, `tag`, `allow`).
+    pub filter_dmarc_fail_action: AuthFailAction,
+    /// Action on `spf=fail` (`spam`, `reject`, `tag`, `allow`).
+    pub filter_spf_fail_action: AuthFailAction,
+    /// Action on `dkim=fail` (`spam`, `reject`, `tag`, `allow`).
+    pub filter_dkim_fail_action: AuthFailAction,
+
+    /// Base URL for Rspamd (`{rspamd_url}/checkv2`). Enables `RspamdFilter` when set.
+    pub rspamd_url: Option<String>,
+    /// Optional Rspamd controller/scan `Password` header value.
+    pub rspamd_password: Option<String>,
+    /// HTTP timeout for Rspamd `/checkv2` calls in milliseconds (default 5000).
+    pub rspamd_timeout_ms: u64,
+    /// Optional score threshold override for classifying as `Spam`.
+    pub rspamd_spam_threshold: Option<f32>,
+    /// Action on Rspamd `reject` / `soft reject` (`reject` or `spam`).
+    pub rspamd_reject_action: RspamdRejectAction,
+    /// When `true`, reject mail if Rspamd is unreachable or times out (default `false`, fail-open).
+    pub rspamd_fail_closed: bool,
+
+    /// Base URL for an OpenAI-compatible chat completions API (`{url}/chat/completions`).
+    /// Setting either `llm_triage_base_url` or `llm_triage_api_key` enables `LlmTriageFilter`.
+    pub llm_triage_base_url: Option<String>,
+    /// Optional Bearer API key for the LLM triage endpoint.
+    pub llm_triage_api_key: Option<String>,
+    /// Model name passed to `/chat/completions` for inbound triage.
+    pub llm_triage_model: String,
+    /// HTTP timeout for LLM triage calls in milliseconds (default 10000).
+    pub llm_triage_timeout_ms: u64,
+    /// Maximum plain-text body characters included in the LLM triage prompt (default 2000).
+    pub llm_triage_max_body_chars: usize,
 }
 
 impl Default for Config {
@@ -181,6 +242,24 @@ impl Default for Config {
             sync_max_messages: None,
 
             watch_webhook_url: None,
+
+            filter_auth_results: false,
+            filter_dmarc_fail_action: AuthFailAction::Spam,
+            filter_spf_fail_action: AuthFailAction::Tag,
+            filter_dkim_fail_action: AuthFailAction::Tag,
+
+            rspamd_url: None,
+            rspamd_password: None,
+            rspamd_timeout_ms: 5_000,
+            rspamd_spam_threshold: None,
+            rspamd_reject_action: RspamdRejectAction::Reject,
+            rspamd_fail_closed: false,
+
+            llm_triage_base_url: None,
+            llm_triage_api_key: None,
+            llm_triage_model: "gpt-4o-mini".to_string(),
+            llm_triage_timeout_ms: 10_000,
+            llm_triage_max_body_chars: 2_000,
         }
     }
 }
@@ -224,5 +303,23 @@ impl Config {
         self.imap_password
             .as_deref()
             .or_else(|| self.auth_tokens.first().map(String::as_str))
+    }
+
+    /// Returns `true` when `RspamdFilter` is configured with a non-empty URL.
+    pub fn rspamd_enabled(&self) -> bool {
+        self.rspamd_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Returns `true` when `LlmTriageFilter` is enabled via base URL or API key.
+    pub fn llm_triage_enabled(&self) -> bool {
+        self.llm_triage_base_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .llm_triage_api_key
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
     }
 }
