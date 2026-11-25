@@ -322,11 +322,20 @@ pub struct ImapMessageEntry {
     pub uid: u32,
     pub message_id: String,
     pub thread_id: String,
+    /// Monotonic store `history_id` backing RFC 7162 `MODSEQ`.
+    pub history_id: u64,
     pub internal_date_ms: i64,
     pub size_estimate: i32,
     pub label_ids: Vec<String>,
     pub is_answered: bool,
     pub is_deleted: bool,
+}
+
+impl ImapMessageEntry {
+    /// RFC 7162 non-zero modification sequence (`MODSEQ`) derived from `history_id`.
+    pub fn modseq(&self) -> u64 {
+        self.history_id.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +579,17 @@ pub trait MailStore: Send + Sync {
         mailbox_name: &str,
         input: NewMessageInput,
     ) -> AppResult<(u32, u32, StoredMessage)>;
+    /// Return UIDs removed or expunged from `mailbox_name` with `modseq > since_modseq`, sorted ascending.
+    ///
+    /// Used by RFC 7162 `QRESYNC` (`SELECT ... (QRESYNC ...)` and `UID FETCH ... (CHANGEDSINCE ... VANISHED)`).
+    async fn imap_vanished_uids(
+        &self,
+        mailbox_name: &str,
+        since_modseq: u64,
+    ) -> AppResult<Vec<u32>> {
+        let _ = (mailbox_name, since_modseq);
+        Ok(Vec::new())
+    }
 
     // --- Upstream Sync & Deduplication ---
     async fn upsert_synced_message(&self, input: NewMessageInput) -> AppResult<UpsertOutcome>;

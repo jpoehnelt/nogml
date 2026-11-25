@@ -431,6 +431,40 @@ pub fn seq_set_contains(ranges: &[(u32, u32)], value: u32) -> bool {
     ranges.iter().any(|&(lo, hi)| value >= lo && value <= hi)
 }
 
+/// Format a list of positive sequence numbers or UIDs as a compact RFC 3501 sequence set
+/// (e.g. `[1, 2, 3, 5, 7, 8]` -> `"1:3,5,7:8"`). Deduplicates and sorts ascending.
+pub fn format_sequence_set(nums: &[u32]) -> String {
+    let mut sorted: Vec<u32> = nums.iter().copied().filter(|&n| n > 0).collect();
+    if sorted.is_empty() {
+        return String::new();
+    }
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = sorted[0];
+    let mut prev = sorted[0];
+    for &n in &sorted[1..] {
+        if n == prev.saturating_add(1) {
+            prev = n;
+        } else {
+            if start == prev {
+                parts.push(start.to_string());
+            } else {
+                parts.push(format!("{start}:{prev}"));
+            }
+            start = n;
+            prev = n;
+        }
+    }
+    if start == prev {
+        parts.push(start.to_string());
+    } else {
+        parts.push(format!("{start}:{prev}"));
+    }
+    parts.join(",")
+}
+
 /// Match an IMAP mailbox name against a `LIST`/`LSUB` pattern with delimiter `delim` (`'/'`).
 ///
 /// `*` matches zero or more characters including `delim`.

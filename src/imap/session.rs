@@ -30,9 +30,9 @@ use crate::{
         },
         parser::{
             ImapArg, ImapCommand, ReadCommandOutcome, append_literal, format_internal_date,
-            imap_quote, imap_wildcard_match, normalize_mailbox_name, parse_imap_date_time,
-            parse_imap_search_date, parse_sequence_set, read_command, read_crlf_line,
-            seq_set_contains,
+            format_sequence_set, imap_quote, imap_wildcard_match, normalize_mailbox_name,
+            parse_imap_date_time, parse_imap_search_date, parse_sequence_set, read_command,
+            read_crlf_line, seq_set_contains,
         },
     },
     models::{
@@ -113,6 +113,10 @@ struct ImapSession {
     auth: AuthState,
     subscribed: HashSet<String>,
     tls_acceptor: Option<TlsAcceptor>,
+    /// RFC 7162 `CONDSTORE` enabled for this connection (via `ENABLE` or any CONDSTORE command).
+    condstore_enabled: bool,
+    /// RFC 7162 `QRESYNC` enabled for this connection (via `ENABLE QRESYNC`).
+    qresync_enabled: bool,
 }
 
 /// Drive one client IMAP4rev1 connection to completion or shutdown.
@@ -128,6 +132,8 @@ pub async fn handle_connection(
         auth: AuthState::NotAuthenticated,
         subscribed: HashSet::new(),
         tls_acceptor,
+        condstore_enabled: false,
+        qresync_enabled: false,
     };
 
     let greeting = format!(
@@ -177,6 +183,18 @@ pub async fn handle_connection(
 
         // Special-case STARTTLS because it consumes and upgrades the transport stream.
         if cmd.name == "STARTTLS" {
+            if session.is_authenticated() {
+                let _ = write_flush(
+                    &mut reader,
+                    format!(
+                        "{} BAD STARTTLS only valid before authentication\r\n",
+                        cmd.tag
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                continue;
+            }
             if reader.get_ref().is_tls() {
                 let _ = write_flush(
                     &mut reader,
@@ -211,6 +229,8 @@ pub async fn handle_connection(
                 Ok(tls_stream) => {
                     reader = BufReader::new(ImapStream::Tls(Box::new(tls_stream)));
                     session.auth = AuthState::NotAuthenticated;
+                    session.condstore_enabled = false;
+                    session.qresync_enabled = false;
                 }
                 Err(err) => {
                     warn!(%err, "IMAP STARTTLS handshake failed");
@@ -263,7 +283,9 @@ impl ImapSession {
                 }
                 caps.push("AUTH=PLAIN");
             }
-            AuthState::Authenticated | AuthState::Selected(_) => {}
+            AuthState::Authenticated | AuthState::Selected(_) => {
+                caps.extend_from_slice(&["ENABLE", "CONDSTORE", "QRESYNC"]);
+            }
         }
         caps.extend_from_slice(&[
             "LITERAL+",
@@ -319,6 +341,10 @@ impl ImapSession {
             }
             "AUTHENTICATE" => {
                 self.handle_authenticate(&tag, &cmd.args, stream).await?;
+                Ok(true)
+            }
+            "ENABLE" => {
+                self.handle_enable(&tag, &cmd.args, stream).await?;
                 Ok(true)
             }
             "NAMESPACE" => {
@@ -578,6 +604,77 @@ impl ImapSession {
         Ok(())
     }
 
+    async fn handle_enable(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        match self.auth {
+            AuthState::NotAuthenticated => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO Authenticate first\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            AuthState::Selected(_) => {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD ENABLE is only valid in authenticated state\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            AuthState::Authenticated => {}
+        }
+        if args.is_empty() {
+            write_flush(
+                stream,
+                format!("{tag} BAD ENABLE requires at least one capability\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut enabled: Vec<&'static str> = Vec::new();
+        for arg in args {
+            let Some(raw) = arg.as_str_lossy() else {
+                continue;
+            };
+            match raw.to_ascii_uppercase().as_str() {
+                "CONDSTORE" => {
+                    self.condstore_enabled = true;
+                    if !enabled.contains(&"CONDSTORE") {
+                        enabled.push("CONDSTORE");
+                    }
+                }
+                "QRESYNC" => {
+                    // RFC 7162 Section 3.2.3: enabling QRESYNC implicitly enables CONDSTORE.
+                    self.qresync_enabled = true;
+                    self.condstore_enabled = true;
+                    if !enabled.contains(&"QRESYNC") {
+                        enabled.push("QRESYNC");
+                    }
+                }
+                _ => {
+                    // RFC 5161 Section 3.2.1: unsupported capabilities are ignored.
+                }
+            }
+        }
+
+        let mut out = String::new();
+        if enabled.is_empty() {
+            out.push_str("* ENABLED\r\n");
+        } else {
+            out.push_str(&format!("* ENABLED {}\r\n", enabled.join(" ")));
+        }
+        out.push_str(&format!("{tag} OK ENABLE completed\r\n"));
+        write_flush(stream, out.as_bytes()).await?;
+        Ok(())
+    }
+
     async fn handle_list(
         &mut self,
         tag: &str,
@@ -706,6 +803,7 @@ impl ImapSession {
         };
 
         let mut pairs = Vec::new();
+        let mut highest_modseq_cache: Option<u64> = None;
         for item in items {
             let Some(key) = item.as_str_lossy() else {
                 continue;
@@ -716,6 +814,17 @@ impl ImapSession {
                 "UIDNEXT" => pairs.push(format!("UIDNEXT {}", info.uid_next)),
                 "UIDVALIDITY" => pairs.push(format!("UIDVALIDITY {}", info.uid_validity)),
                 "UNSEEN" => pairs.push(format!("UNSEEN {}", info.unseen)),
+                "HIGHESTMODSEQ" => {
+                    let hms = match highest_modseq_cache {
+                        Some(v) => v,
+                        None => {
+                            let v = self.state.store.current_history_id().await?.max(1);
+                            highest_modseq_cache = Some(v);
+                            v
+                        }
+                    };
+                    pairs.push(format!("HIGHESTMODSEQ {hms}"));
+                }
                 _ => {}
             }
         }
@@ -751,6 +860,82 @@ impl ImapSession {
             .await?;
             return Ok(());
         };
+
+        // Parse optional RFC 7162 SELECT/EXAMINE parameters: `(CONDSTORE)` and/or `(QRESYNC (...))`.
+        let mut req_condstore = false;
+        let mut qresync_param: Option<QresyncSelectParam> = None;
+        if let Some(param_arg) = args.get(1) {
+            let Some(params) = param_arg.as_list() else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD SELECT/EXAMINE parameters must be a parenthesized list\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            let mut i = 0usize;
+            while i < params.len() {
+                let Some(key) = params[i].as_str_lossy() else {
+                    write_flush(
+                        stream,
+                        format!("{tag} BAD Invalid SELECT/EXAMINE parameter\r\n").as_bytes(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                match key.to_ascii_uppercase().as_str() {
+                    "CONDSTORE" => {
+                        req_condstore = true;
+                        i += 1;
+                    }
+                    "QRESYNC" => {
+                        if !self.qresync_enabled {
+                            write_flush(
+                                stream,
+                                format!("{tag} BAD QRESYNC requires ENABLE QRESYNC first\r\n")
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        let Some(qlist) = params.get(i + 1).and_then(ImapArg::as_list) else {
+                            write_flush(
+                                stream,
+                                format!(
+                                    "{tag} BAD QRESYNC parameter requires (<uidvalidity> <modseq> ...)\r\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                            return Ok(());
+                        };
+                        match parse_qresync_select_param(qlist) {
+                            Ok(parsed) => {
+                                qresync_param = Some(parsed);
+                                req_condstore = true;
+                            }
+                            Err(err) => {
+                                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes())
+                                    .await?;
+                                return Ok(());
+                            }
+                        }
+                        i += 2;
+                    }
+                    other => {
+                        write_flush(
+                            stream,
+                            format!("{tag} BAD Unsupported SELECT/EXAMINE parameter {other}\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let mailbox = normalize_mailbox_name(&raw_mbx);
         let Some(info) = self.state.store.imap_mailbox_info(&mailbox).await? else {
             write_flush(
@@ -760,13 +945,22 @@ impl ImapSession {
             .await?;
             return Ok(());
         };
+        if req_condstore {
+            self.condstore_enabled = true;
+        }
+
+        let was_selected = self.is_selected();
         let entries = self.state.store.imap_list_messages(&info.name).await?;
+        let highest_modseq = self.state.store.current_history_id().await?.max(1);
         let first_unseen = entries
             .iter()
             .find(|m| m.label_ids.iter().any(|l| l == LABEL_UNREAD))
             .map(|m| m.seq);
 
         let mut out = String::new();
+        if was_selected && self.qresync_enabled {
+            out.push_str("* OK [CLOSED] Previous mailbox closed\r\n");
+        }
         out.push_str(&format!("* {} EXISTS\r\n", entries.len()));
         out.push_str("* 0 RECENT\r\n");
         if let Some(seq) = first_unseen {
@@ -782,14 +976,63 @@ impl ImapSession {
             "* OK [UIDNEXT {}] Predicted next UID\r\n",
             info.uid_next
         ));
+        out.push_str(&format!(
+            "* OK [HIGHESTMODSEQ {highest_modseq}] Highest\r\n"
+        ));
         out.push_str("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n");
         if read_only {
             out.push_str("* OK [PERMANENTFLAGS ()] Read-only mailbox\r\n");
-            out.push_str(&format!("{tag} OK [READ-ONLY] EXAMINE completed\r\n"));
         } else {
             out.push_str(
                 "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted\r\n",
             );
+        }
+
+        // RFC 7162 Section 3.2.5.2: emit VANISHED (EARLIER) and changed FETCH updates
+        // when QRESYNC UIDVALIDITY matches.
+        if let Some(qresync) = qresync_param
+            && qresync.uid_validity == info.uid_validity
+        {
+            let existing_uids: HashSet<u32> = entries.iter().map(|e| e.uid).collect();
+            let mut vanished = self
+                .state
+                .store
+                .imap_vanished_uids(&info.name, qresync.last_modseq)
+                .await?;
+            vanished.retain(|uid| {
+                !existing_uids.contains(uid)
+                    && qresync
+                        .known_uids
+                        .as_ref()
+                        .is_none_or(|ranges| seq_set_contains(ranges, *uid))
+            });
+            if !vanished.is_empty() {
+                let uid_set = format_sequence_set(&vanished);
+                out.push_str(&format!("* VANISHED (EARLIER) {uid_set}\r\n"));
+            }
+
+            for entry in &entries {
+                if entry.modseq() <= qresync.last_modseq {
+                    continue;
+                }
+                if let Some(ref known_ranges) = qresync.known_uids
+                    && !seq_set_contains(known_ranges, entry.uid)
+                {
+                    continue;
+                }
+                let flags_str = format_imap_flags(entry);
+                out.push_str(&format!(
+                    "* {} FETCH (UID {} FLAGS ({flags_str}) MODSEQ ({}))\r\n",
+                    entry.seq,
+                    entry.uid,
+                    entry.modseq()
+                ));
+            }
+        }
+
+        if read_only {
+            out.push_str(&format!("{tag} OK [READ-ONLY] EXAMINE completed\r\n"));
+        } else {
             out.push_str(&format!("{tag} OK [READ-WRITE] SELECT completed\r\n"));
         }
 
@@ -1223,18 +1466,14 @@ impl ImapSession {
         let mut expunged_seqs = self.state.store.imap_expunge(&sel.mailbox).await?;
         expunged_seqs.sort_unstable();
 
-        let mut out = String::new();
-        for (removed_so_far, pre_seq) in expunged_seqs.iter().enumerate() {
-            let adjusted = pre_seq.saturating_sub(removed_so_far as u32).max(1);
-            out.push_str(&format!("* {adjusted} EXPUNGE\r\n"));
-        }
-
         // Refresh snapshot & emit events for removed messages.
         let new_entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
         let remaining_ids: HashSet<&str> =
             new_entries.iter().map(|e| e.message_id.as_str()).collect();
+        let mut expunged_uids: Vec<u32> = Vec::new();
         for old in &sel.snapshot {
             if !remaining_ids.contains(old.message_id.as_str()) {
+                expunged_uids.push(old.uid);
                 self.state.events.publish(
                     EventSource::Imap,
                     MailEvent::MessageDeleted {
@@ -1243,6 +1482,20 @@ impl ImapSession {
                         labels: old.label_ids.clone(),
                     },
                 );
+            }
+        }
+
+        let mut out = String::new();
+        if self.qresync_enabled {
+            // RFC 7162 Section 3.2.10: emit VANISHED instead of EXPUNGE when QRESYNC is enabled.
+            if !expunged_uids.is_empty() {
+                let uid_set = format_sequence_set(&expunged_uids);
+                out.push_str(&format!("* VANISHED {uid_set}\r\n"));
+            }
+        } else {
+            for (removed_so_far, pre_seq) in expunged_seqs.iter().enumerate() {
+                let adjusted = pre_seq.saturating_sub(removed_so_far as u32).max(1);
+                out.push_str(&format!("* {adjusted} EXPUNGE\r\n"));
             }
         }
         if let AuthState::Selected(ref mut s) = self.auth {
@@ -1335,8 +1588,13 @@ impl ImapSession {
             }
         };
 
+        let uses_modseq = criteria_uses_modseq(&criteria);
+        if uses_modseq {
+            self.condstore_enabled = true;
+        }
         let needs_full_msg = criteria_needs_full_message(&criteria);
         let mut matched_ids = Vec::new();
+        let mut max_matched_modseq: u64 = 0;
 
         for entry in &entries {
             let full_msg = if needs_full_msg {
@@ -1346,12 +1604,18 @@ impl ImapSession {
             };
             if eval_search_criteria(&criteria, entry, full_msg.as_ref()) {
                 matched_ids.push(if is_uid { entry.uid } else { entry.seq });
+                max_matched_modseq = max_matched_modseq.max(entry.modseq());
             }
         }
 
         let nums: Vec<String> = matched_ids.into_iter().map(|n| n.to_string()).collect();
         let line = if nums.is_empty() {
             format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n")
+        } else if uses_modseq {
+            format!(
+                "* SEARCH {} (MODSEQ {max_matched_modseq})\r\n{tag} OK SEARCH completed\r\n",
+                nums.join(" ")
+            )
         } else {
             format!(
                 "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
@@ -1389,6 +1653,19 @@ impl ImapSession {
             return Ok(());
         }
 
+        // Parse optional RFC 7162 FETCH modifiers: `(CHANGEDSINCE <n> [VANISHED])`.
+        let modifiers = if let Some(mod_arg) = args.get(2) {
+            match parse_fetch_modifiers(mod_arg, is_uid, self.qresync_enabled) {
+                Ok(m) => m,
+                Err(err) => {
+                    write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            FetchModifiers::default()
+        };
+
         let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
         if let AuthState::Selected(ref mut s) = self.auth {
             s.snapshot = entries.clone();
@@ -1412,6 +1689,44 @@ impl ImapSession {
         if is_uid && !items.iter().any(|i| i.eq_ignore_ascii_case("UID")) {
             items.insert(0, "UID".to_string());
         }
+        if items.iter().any(|i| i.eq_ignore_ascii_case("MODSEQ"))
+            || modifiers.changed_since.is_some()
+        {
+            self.condstore_enabled = true;
+        }
+        // RFC 7162 Section 3.1.4.1: CHANGEDSINCE implicitly includes MODSEQ in each FETCH response.
+        if modifiers.changed_since.is_some()
+            && !items.iter().any(|i| i.eq_ignore_ascii_case("MODSEQ"))
+        {
+            items.push("MODSEQ".to_string());
+        }
+
+        // RFC 7162 Section 3.2.6: UID FETCH ... (CHANGEDSINCE <n> VANISHED) emits
+        // `* VANISHED (EARLIER) <uid_set>` for expunged UIDs matching the requested set.
+        if modifiers.vanished
+            && let Some(since) = modifiers.changed_since
+        {
+            let existing_uids: HashSet<u32> = entries.iter().map(|e| e.uid).collect();
+            let mut vanished = self
+                .state
+                .store
+                .imap_vanished_uids(&sel.mailbox, since)
+                .await?;
+            let vanished_max = max_val.max(vanished.last().copied().unwrap_or(0));
+            let vanished_ranges =
+                parse_sequence_set(&seq_spec, vanished_max).unwrap_or_else(|_| ranges.clone());
+            vanished.retain(|uid| {
+                !existing_uids.contains(uid) && seq_set_contains(&vanished_ranges, *uid)
+            });
+            if !vanished.is_empty() {
+                let uid_set = format_sequence_set(&vanished);
+                write_flush(
+                    stream,
+                    format!("* VANISHED (EARLIER) {uid_set}\r\n").as_bytes(),
+                )
+                .await?;
+            }
+        }
 
         let needs_labels_map = items.iter().any(|i| i.eq_ignore_ascii_case("X-GM-LABELS"));
         let label_name_map: HashMap<String, String> = if needs_labels_map {
@@ -1433,6 +1748,11 @@ impl ImapSession {
             if !seq_set_contains(&ranges, key) {
                 continue;
             }
+            if let Some(since) = modifiers.changed_since
+                && entry.modseq() <= since
+            {
+                continue;
+            }
             let Some(mut msg) = self.state.store.get_message(&entry.message_id).await? else {
                 continue;
             };
@@ -1448,6 +1768,7 @@ impl ImapSession {
                     mark_seen = true;
                 }
             }
+            let mut marked_seen_now = false;
             if mark_seen
                 && !sel.read_only
                 && current_entry.label_ids.iter().any(|l| l == LABEL_UNREAD)
@@ -1468,7 +1789,9 @@ impl ImapSession {
                     .await
                 {
                     current_entry.label_ids = updated.label_ids;
+                    current_entry.history_id = updated.history_id.max(1);
                     updated_entries[idx] = current_entry.clone();
+                    marked_seen_now = true;
                 }
             }
 
@@ -1476,6 +1799,7 @@ impl ImapSession {
             resp.extend_from_slice(format!("* {} FETCH (", current_entry.seq).as_bytes());
             let mut first_item = true;
             let mut emitted_flags = false;
+            let mut emitted_modseq = false;
 
             for item in &items {
                 if !first_item {
@@ -1484,6 +1808,8 @@ impl ImapSession {
                 first_item = false;
                 if item.eq_ignore_ascii_case("FLAGS") {
                     emitted_flags = true;
+                } else if item.eq_ignore_ascii_case("MODSEQ") {
+                    emitted_modseq = true;
                 }
                 write_fetch_item(&mut resp, item, &current_entry, &msg, &label_name_map);
             }
@@ -1492,8 +1818,15 @@ impl ImapSession {
                 if !first_item {
                     resp.push(b' ');
                 }
+                first_item = false;
                 let flags_str = format_imap_flags(&current_entry);
                 resp.extend_from_slice(format!("FLAGS ({flags_str})").as_bytes());
+            }
+            if marked_seen_now && self.condstore_enabled && !emitted_modseq {
+                if !first_item {
+                    resp.push(b' ');
+                }
+                resp.extend_from_slice(format!("MODSEQ ({})", current_entry.modseq()).as_bytes());
             }
 
             resp.extend_from_slice(b")\r\n");
@@ -1543,6 +1876,33 @@ impl ImapSession {
             return Ok(());
         }
 
+        // Optional RFC 7162 `(UNCHANGEDSINCE <modseq>)` modifier appears between seq-set and action.
+        let (unchanged_since, action_idx) = if let Some(ImapArg::List(mods)) = args.get(1) {
+            match parse_store_modifiers(mods) {
+                Ok(us) => {
+                    if us.is_some() {
+                        self.condstore_enabled = true;
+                    }
+                    (us, 2usize)
+                }
+                Err(err) => {
+                    write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (None, 1usize)
+        };
+
+        if args.len() < action_idx + 2 {
+            write_flush(
+                stream,
+                format!("{tag} BAD STORE requires sequence set, action, and flags\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+
         let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
         let seq_spec = args[0].as_str_lossy().unwrap_or_default();
         let max_val = if is_uid {
@@ -1558,7 +1918,7 @@ impl ImapSession {
             }
         };
 
-        let action_raw = args[1]
+        let action_raw = args[action_idx]
             .as_str_lossy()
             .unwrap_or_default()
             .to_ascii_uppercase();
@@ -1573,8 +1933,9 @@ impl ImapSession {
             return Ok(());
         }
 
+        let flags_idx = action_idx + 1;
         let mut req_flags: Vec<String> = Vec::new();
-        match &args[2] {
+        match &args[flags_idx] {
             ImapArg::List(list) => {
                 for a in list {
                     if let Some(s) = a.as_str_lossy() {
@@ -1583,7 +1944,7 @@ impl ImapSession {
                 }
             }
             _ => {
-                for a in &args[2..] {
+                for a in &args[flags_idx..] {
                     if let Some(s) = a.as_str_lossy() {
                         req_flags.push(s);
                     }
@@ -1593,10 +1954,17 @@ impl ImapSession {
 
         let has_flag = |name: &str| req_flags.iter().any(|f| f.eq_ignore_ascii_case(name));
         let mut updated_snapshot = entries.clone();
+        let mut modified_ids: Vec<u32> = Vec::new();
 
         for (idx, entry) in entries.iter().enumerate() {
             let key = if is_uid { entry.uid } else { entry.seq };
             if !seq_set_contains(&ranges, key) {
+                continue;
+            }
+            if let Some(limit) = unchanged_since
+                && entry.modseq() > limit
+            {
+                modified_ids.push(key);
                 continue;
             }
             let cur_seen = !entry.label_ids.iter().any(|l| l == LABEL_UNREAD);
@@ -1667,20 +2035,31 @@ impl ImapSession {
 
             let mut new_entry = entry.clone();
             new_entry.label_ids = updated.label_ids;
+            new_entry.history_id = updated.history_id.max(1);
             new_entry.is_answered = updated.is_answered;
             new_entry.is_deleted = updated.is_deleted;
             updated_snapshot[idx] = new_entry.clone();
 
             if !silent {
                 let flags_str = format_imap_flags(&new_entry);
-                let line = if is_uid {
-                    format!(
-                        "* {} FETCH (UID {} FLAGS ({flags_str}))\r\n",
-                        new_entry.seq, new_entry.uid
-                    )
-                } else {
-                    format!("* {} FETCH (FLAGS ({flags_str}))\r\n", new_entry.seq)
-                };
+                let mut parts = Vec::new();
+                if is_uid {
+                    parts.push(format!("UID {}", new_entry.uid));
+                }
+                parts.push(format!("FLAGS ({flags_str})"));
+                if self.condstore_enabled {
+                    parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                }
+                let line = format!("* {} FETCH ({})\r\n", new_entry.seq, parts.join(" "));
+                write_flush(stream, line.as_bytes()).await?;
+            } else if unchanged_since.is_some() {
+                // RFC 7162 Section 3.1.3: .SILENT with UNCHANGEDSINCE still reports new MODSEQ.
+                let mut parts = Vec::new();
+                if is_uid {
+                    parts.push(format!("UID {}", new_entry.uid));
+                }
+                parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                let line = format!("* {} FETCH ({})\r\n", new_entry.seq, parts.join(" "));
                 write_flush(stream, line.as_bytes()).await?;
             }
         }
@@ -1688,7 +2067,13 @@ impl ImapSession {
         if let AuthState::Selected(ref mut s) = self.auth {
             s.snapshot = updated_snapshot;
         }
-        write_flush(stream, format!("{tag} OK STORE completed\r\n").as_bytes()).await?;
+        let ok_line = if !modified_ids.is_empty() {
+            let mod_set = format_sequence_set(&modified_ids);
+            format!("{tag} OK [MODIFIED {mod_set}] STORE completed\r\n")
+        } else {
+            format!("{tag} OK STORE completed\r\n")
+        };
+        write_flush(stream, ok_line.as_bytes()).await?;
         Ok(())
     }
 
@@ -1806,10 +2191,22 @@ impl ImapSession {
                 .filter(|e| !remaining.contains(e.message_id.as_str()))
                 .map(|e| e.seq)
                 .collect();
+            let removed_uids: Vec<u32> = entries
+                .iter()
+                .filter(|e| !remaining.contains(e.message_id.as_str()))
+                .map(|e| e.uid)
+                .collect();
             removed_seqs.sort_unstable();
-            for (idx, pre_seq) in removed_seqs.iter().enumerate() {
-                let adj = pre_seq.saturating_sub(idx as u32).max(1);
-                out.push_str(&format!("* {adj} EXPUNGE\r\n"));
+            if self.qresync_enabled {
+                if !removed_uids.is_empty() {
+                    let uid_set = format_sequence_set(&removed_uids);
+                    out.push_str(&format!("* VANISHED {uid_set}\r\n"));
+                }
+            } else {
+                for (idx, pre_seq) in removed_seqs.iter().enumerate() {
+                    let adj = pre_seq.saturating_sub(idx as u32).max(1);
+                    out.push_str(&format!("* {adj} EXPUNGE\r\n"));
+                }
             }
             if let AuthState::Selected(ref mut s) = self.auth {
                 s.snapshot = new_entries;
@@ -1897,10 +2294,23 @@ impl ImapSession {
             .filter(|old| !new_by_id.contains_key(old.message_id.as_str()))
             .map(|old| old.seq)
             .collect();
+        let removed_uids: Vec<u32> = sel
+            .snapshot
+            .iter()
+            .filter(|old| !new_by_id.contains_key(old.message_id.as_str()))
+            .map(|old| old.uid)
+            .collect();
         removed_seqs.sort_unstable();
-        for (idx, pre_seq) in removed_seqs.iter().enumerate() {
-            let adj = pre_seq.saturating_sub(idx as u32).max(1);
-            out.push_str(&format!("* {adj} EXPUNGE\r\n"));
+        if self.qresync_enabled {
+            if !removed_uids.is_empty() {
+                let uid_set = format_sequence_set(&removed_uids);
+                out.push_str(&format!("* VANISHED {uid_set}\r\n"));
+            }
+        } else {
+            for (idx, pre_seq) in removed_seqs.iter().enumerate() {
+                let adj = pre_seq.saturating_sub(idx as u32).max(1);
+                out.push_str(&format!("* {adj} EXPUNGE\r\n"));
+            }
         }
 
         let after_expunge_count = sel.snapshot.len().saturating_sub(removed_seqs.len());
@@ -1919,7 +2329,22 @@ impl ImapSession {
                 let old_flags = format_imap_flags(old);
                 let new_flags = format_imap_flags(entry);
                 if old_flags != new_flags {
-                    out.push_str(&format!("* {} FETCH (FLAGS ({new_flags}))\r\n", entry.seq));
+                    if self.qresync_enabled {
+                        out.push_str(&format!(
+                            "* {} FETCH (UID {} FLAGS ({new_flags}) MODSEQ ({}))\r\n",
+                            entry.seq,
+                            entry.uid,
+                            entry.modseq()
+                        ));
+                    } else if self.condstore_enabled {
+                        out.push_str(&format!(
+                            "* {} FETCH (FLAGS ({new_flags}) MODSEQ ({}))\r\n",
+                            entry.seq,
+                            entry.modseq()
+                        ));
+                    } else {
+                        out.push_str(&format!("* {} FETCH (FLAGS ({new_flags}))\r\n", entry.seq));
+                    }
                 }
             }
         }
@@ -2016,6 +2441,9 @@ fn write_fetch_item(
         "FLAGS" => {
             let flags = format_imap_flags(entry);
             out.extend_from_slice(format!("FLAGS ({flags})").as_bytes());
+        }
+        "MODSEQ" => {
+            out.extend_from_slice(format!("MODSEQ ({})", entry.modseq()).as_bytes());
         }
         "INTERNALDATE" => {
             let dt = format_internal_date(msg.internal_date_ms);
@@ -2145,6 +2573,165 @@ fn format_xgm_labels(label_ids: &[String], name_map: &HashMap<String, String>) -
 }
 
 // ============================================================================
+// RFC 7162 (`CONDSTORE` / `QRESYNC`) Parameter & Modifier Parsers
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct QresyncSelectParam {
+    uid_validity: u32,
+    last_modseq: u64,
+    known_uids: Option<Vec<(u32, u32)>>,
+}
+
+/// Parse RFC 7162 `SELECT`/`EXAMINE` `QRESYNC (<uidvalidity> <modseq> [<known-uids> [<seq-match-data>]])`.
+fn parse_qresync_select_param(list: &[ImapArg]) -> AppResult<QresyncSelectParam> {
+    if list.len() < 2 || list.len() > 4 {
+        return Err(AppError::BadRequest(
+            "QRESYNC requires (<uidvalidity> <modseq> [<known-uids> [<seq-match-data>]])"
+                .to_string(),
+        ));
+    }
+    let uv_raw = list[0]
+        .as_str_lossy()
+        .ok_or_else(|| AppError::BadRequest("Invalid QRESYNC uidvalidity".to_string()))?;
+    let uid_validity = uv_raw
+        .parse::<u32>()
+        .ok()
+        .filter(|&v| v >= 1)
+        .ok_or_else(|| AppError::BadRequest(format!("Invalid QRESYNC uidvalidity: {uv_raw}")))?;
+
+    let modseq_raw = list[1]
+        .as_str_lossy()
+        .ok_or_else(|| AppError::BadRequest("Invalid QRESYNC modseq".to_string()))?;
+    let last_modseq = modseq_raw
+        .parse::<u64>()
+        .map_err(|_| AppError::BadRequest(format!("Invalid QRESYNC modseq: {modseq_raw}")))?;
+
+    let known_uids = if let Some(arg) = list.get(2) {
+        if arg.as_list().is_some() {
+            // Optional known-uids omitted; 3rd element is seq-match-data.
+            None
+        } else {
+            let spec = arg
+                .as_str_lossy()
+                .ok_or_else(|| AppError::BadRequest("Invalid QRESYNC known-uids".to_string()))?;
+            if spec.contains('*') {
+                return Err(AppError::BadRequest(
+                    "QRESYNC known-uids must not contain '*'".to_string(),
+                ));
+            }
+            Some(parse_sequence_set(&spec, u32::MAX)?)
+        }
+    } else {
+        None
+    };
+
+    Ok(QresyncSelectParam {
+        uid_validity,
+        last_modseq,
+        known_uids,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct FetchModifiers {
+    changed_since: Option<u64>,
+    vanished: bool,
+}
+
+/// Parse RFC 7162 `FETCH` / `UID FETCH` modifiers: `(CHANGEDSINCE <modseq> [VANISHED])`.
+fn parse_fetch_modifiers(
+    arg: &ImapArg,
+    is_uid: bool,
+    qresync_enabled: bool,
+) -> AppResult<FetchModifiers> {
+    let list = arg
+        .as_list()
+        .ok_or_else(|| AppError::BadRequest("FETCH modifiers must be a list".to_string()))?;
+    let mut out = FetchModifiers::default();
+    let mut i = 0usize;
+    while i < list.len() {
+        let key = list[i]
+            .as_str_lossy()
+            .ok_or_else(|| AppError::BadRequest("Invalid FETCH modifier".to_string()))?;
+        match key.to_ascii_uppercase().as_str() {
+            "CHANGEDSINCE" => {
+                let raw = list
+                    .get(i + 1)
+                    .and_then(ImapArg::as_str_lossy)
+                    .ok_or_else(|| {
+                        AppError::BadRequest("CHANGEDSINCE requires a modseq argument".to_string())
+                    })?;
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| AppError::BadRequest(format!("Invalid CHANGEDSINCE: {raw}")))?;
+                out.changed_since = Some(v);
+                i += 2;
+            }
+            "VANISHED" => {
+                if !is_uid {
+                    return Err(AppError::BadRequest(
+                        "VANISHED modifier is only valid with UID FETCH".to_string(),
+                    ));
+                }
+                if !qresync_enabled {
+                    return Err(AppError::BadRequest(
+                        "VANISHED modifier requires ENABLE QRESYNC first".to_string(),
+                    ));
+                }
+                out.vanished = true;
+                i += 1;
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported FETCH modifier: {other}"
+                )));
+            }
+        }
+    }
+    if out.vanished && out.changed_since.is_none() {
+        return Err(AppError::BadRequest(
+            "VANISHED modifier requires CHANGEDSINCE".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse RFC 7162 `STORE` / `UID STORE` modifiers: `(UNCHANGEDSINCE <modseq>)`.
+fn parse_store_modifiers(list: &[ImapArg]) -> AppResult<Option<u64>> {
+    let mut unchanged_since = None;
+    let mut i = 0usize;
+    while i < list.len() {
+        let key = list[i]
+            .as_str_lossy()
+            .ok_or_else(|| AppError::BadRequest("Invalid STORE modifier".to_string()))?;
+        match key.to_ascii_uppercase().as_str() {
+            "UNCHANGEDSINCE" => {
+                let raw = list
+                    .get(i + 1)
+                    .and_then(ImapArg::as_str_lossy)
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "UNCHANGEDSINCE requires a modseq argument".to_string(),
+                        )
+                    })?;
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| AppError::BadRequest(format!("Invalid UNCHANGEDSINCE: {raw}")))?;
+                unchanged_since = Some(v);
+                i += 2;
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported STORE modifier: {other}"
+                )));
+            }
+        }
+    }
+    Ok(unchanged_since)
+}
+
+// ============================================================================
 // IMAP SEARCH Criteria AST & Evaluator
 // ============================================================================
 
@@ -2182,6 +2769,7 @@ enum SearchKey {
     SentOn(chrono::NaiveDate),
     Larger(usize),
     Smaller(usize),
+    Modseq(u64),
     XGmMsgId(u64),
     XGmThrId(u64),
     Not(Box<SearchKey>),
@@ -2318,6 +2906,21 @@ fn parse_one_search_key(
                 .map_err(|_| AppError::BadRequest(format!("Invalid SMALLER size: {raw}")))?;
             Ok(SearchKey::Smaller(n))
         }
+        "MODSEQ" => {
+            // RFC 7162 Section 3.1.5: `MODSEQ [<entry-name> <entry-type-req>] <mod-sequence-valzer>`
+            let first = next_str(args, pos, "MODSEQ")?;
+            let raw = if let Ok(n) = first.parse::<u64>() {
+                return Ok(SearchKey::Modseq(n));
+            } else {
+                // Skip optional entry-type-req ("shared" | "priv" | "all") then read modseq.
+                let _entry_type = next_str(args, pos, "MODSEQ entry-type")?;
+                next_str(args, pos, "MODSEQ value")?
+            };
+            let n = raw
+                .parse::<u64>()
+                .map_err(|_| AppError::BadRequest(format!("Invalid MODSEQ: {raw}")))?;
+            Ok(SearchKey::Modseq(n))
+        }
         "X-GM-MSGID" => {
             let raw = next_str(args, pos, "X-GM-MSGID")?;
             let n = raw
@@ -2354,6 +2957,16 @@ fn parse_one_search_key(
                 )))
             }
         }
+    }
+}
+
+fn criteria_uses_modseq(key: &SearchKey) -> bool {
+    match key {
+        SearchKey::Modseq(_) => true,
+        SearchKey::Not(inner) => criteria_uses_modseq(inner),
+        SearchKey::Or(a, b) => criteria_uses_modseq(a) || criteria_uses_modseq(b),
+        SearchKey::And(list) => list.iter().any(criteria_uses_modseq),
+        _ => false,
     }
 }
 
@@ -2445,6 +3058,7 @@ fn eval_search_criteria(
         SearchKey::SentOn(d) => sent_date(msg).or(internal_date).is_some_and(|md| md == *d),
         SearchKey::Larger(n) => (entry.size_estimate as usize) > *n,
         SearchKey::Smaller(n) => (entry.size_estimate as usize) < *n,
+        SearchKey::Modseq(n) => entry.modseq() >= *n,
         SearchKey::XGmMsgId(target) => {
             msg.is_some_and(|m| derive_xgm_u64(m.upstream_gmail_id.as_deref(), &m.id) == *target)
         }

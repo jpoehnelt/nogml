@@ -269,6 +269,7 @@ impl TestMailStore {
                 uid,
                 message_id: msg.id.clone(),
                 thread_id: msg.thread_id.clone(),
+                history_id: msg.history_id.max(1),
                 internal_date_ms: msg.internal_date_ms,
                 size_estimate: msg.size_estimate,
                 label_ids: msg.label_ids.clone(),
@@ -1412,5 +1413,262 @@ async fn test_imap_auth_continuation_examine_expunge_search_and_body_peek_vs_bod
             .starts_with("A14 OK")
     );
     let _ = send_cmd(&mut reader, "A15", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[test]
+fn test_format_sequence_set_compact_ranges() {
+    use crate::imap::parser::format_sequence_set;
+
+    assert_eq!(format_sequence_set(&[]), "");
+    assert_eq!(format_sequence_set(&[0]), "");
+    assert_eq!(format_sequence_set(&[5]), "5");
+    assert_eq!(format_sequence_set(&[1, 2, 3]), "1:3");
+    assert_eq!(format_sequence_set(&[8, 2, 1, 3, 5, 7, 3, 0]), "1:3,5,7:8");
+}
+
+#[tokio::test]
+async fn test_imap_condstore_qresync_enable_and_edge_cases() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    // Pre-auth greeting should not advertise post-auth CONDSTORE/QRESYNC.
+    assert!(!greeting.contains("CONDSTORE"));
+    assert!(!greeting.contains("QRESYNC"));
+
+    // ENABLE before authentication is rejected with NO.
+    let pre_enable = send_cmd(&mut reader, "E0", "ENABLE CONDSTORE").await;
+    assert!(pre_enable.last().unwrap().starts_with("E0 NO"));
+
+    // Authenticate and confirm post-auth CAPABILITY advertises ENABLE, CONDSTORE, QRESYNC.
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    let login_line = login.last().unwrap();
+    assert!(login_line.starts_with("L1 OK"));
+    assert!(login_line.contains("ENABLE"));
+    assert!(login_line.contains("CONDSTORE"));
+    assert!(login_line.contains("QRESYNC"));
+
+    let cap = send_cmd(&mut reader, "C1", "CAPABILITY").await;
+    let cap_joined = cap.join("");
+    assert!(cap_joined.contains("ENABLE"));
+    assert!(cap_joined.contains("CONDSTORE"));
+    assert!(cap_joined.contains("QRESYNC"));
+
+    // SELECT ... (QRESYNC ...) before ENABLE QRESYNC must fail with BAD (RFC 7162 §3.2.5.1).
+    let bad_qresync = send_cmd(&mut reader, "Q0", "SELECT INBOX (QRESYNC (1 1))").await;
+    assert!(bad_qresync.last().unwrap().starts_with("Q0 BAD"));
+
+    // ENABLE ignores unknown extensions and returns enabled ones.
+    let en = send_cmd(&mut reader, "E1", "ENABLE CONDSTORE QRESYNC X-UNKNOWN-EXT").await;
+    assert!(
+        en.iter().any(|l| l.trim() == "* ENABLED CONDSTORE QRESYNC"),
+        "expected * ENABLED CONDSTORE QRESYNC, got {en:?}"
+    );
+    assert!(en.last().unwrap().starts_with("E1 OK"));
+
+    // Append 3 messages into INBOX.
+    for (idx, subj) in ["One", "Two", "Three"].iter().enumerate() {
+        let raw = format!("From: s{idx}@example.com\r\nSubject: {subj}\r\n\r\nBody {subj}\r\n");
+        let app = send_cmd(
+            &mut reader,
+            &format!("AP{idx}"),
+            &format!("APPEND INBOX {{{}+}}\r\n{raw}", raw.len()),
+        )
+        .await;
+        assert!(app.last().unwrap().contains("OK [APPENDUID "));
+    }
+
+    // STATUS INBOX (HIGHESTMODSEQ UIDVALIDITY MESSAGES)
+    let st = send_cmd(
+        &mut reader,
+        "S1",
+        "STATUS INBOX (MESSAGES UIDVALIDITY HIGHESTMODSEQ)",
+    )
+    .await;
+    let st_line = st
+        .iter()
+        .find(|l| l.starts_with("* STATUS "))
+        .expect("STATUS response");
+    assert!(st_line.contains("MESSAGES 3"), "got {st_line}");
+    assert!(st_line.contains("HIGHESTMODSEQ "), "got {st_line}");
+
+    // SELECT INBOX (CONDSTORE) emits HIGHESTMODSEQ.
+    let sel = send_cmd(&mut reader, "SEL1", "SELECT INBOX (CONDSTORE)").await;
+    let hms_line = sel
+        .iter()
+        .find(|l| l.contains("[HIGHESTMODSEQ "))
+        .expect("HIGHESTMODSEQ in SELECT");
+    let uv_line = sel
+        .iter()
+        .find(|l| l.contains("[UIDVALIDITY "))
+        .expect("UIDVALIDITY in SELECT");
+    let extract_bracket_num = |line: &str, key: &str| -> u64 {
+        let start = line.find(key).unwrap() + key.len();
+        let rest = &line[start..];
+        let end = rest.find(']').unwrap();
+        rest[..end].trim().parse::<u64>().unwrap()
+    };
+    let uid_validity = extract_bracket_num(uv_line, "[UIDVALIDITY ");
+    let initial_modseq = extract_bracket_num(hms_line, "[HIGHESTMODSEQ ");
+    assert!(initial_modseq >= 1);
+
+    // ENABLE while Selected must fail with BAD per RFC 5161.
+    let bad_en = send_cmd(&mut reader, "E2", "ENABLE CONDSTORE").await;
+    assert!(bad_en.last().unwrap().starts_with("E2 BAD"));
+
+    // Modify ONLY UID 2 flags -> bumps UID 2 modseq above initial_modseq and returns MODSEQ.
+    let st2 = send_cmd(&mut reader, "ST1", r#"UID STORE 2 +FLAGS (\Seen \Flagged)"#).await;
+    assert!(
+        st2.iter()
+            .any(|l| l.contains("UID 2") && l.contains("\\Flagged") && l.contains("MODSEQ (")),
+        "expected MODSEQ in STORE response, got {st2:?}"
+    );
+    assert!(st2.last().unwrap().starts_with("ST1 OK"));
+
+    // UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE <initial_modseq>) returns ONLY UID 2!
+    let delta = send_cmd(
+        &mut reader,
+        "F1",
+        &format!("UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE {initial_modseq})"),
+    )
+    .await;
+    let fetch_lines: Vec<&String> = delta.iter().filter(|l| l.contains(" FETCH (")).collect();
+    assert_eq!(fetch_lines.len(), 1, "expected only UID 2, got {delta:?}");
+    assert!(fetch_lines[0].contains("UID 2"));
+    assert!(fetch_lines[0].contains("MODSEQ ("));
+
+    // SEARCH MODSEQ returns only messages with modseq >= initial_modseq + 1 and includes (MODSEQ <max>).
+    let srch = send_cmd(
+        &mut reader,
+        "SR1",
+        &format!("UID SEARCH MODSEQ {}", initial_modseq + 1),
+    )
+    .await;
+    assert!(
+        srch.iter().any(|l| l.starts_with("* SEARCH 2 (MODSEQ ")),
+        "expected UID 2 with MODSEQ in SEARCH, got {srch:?}"
+    );
+
+    // UID STORE 2 (UNCHANGEDSINCE <initial_modseq>) must NOT modify UID 2 and report [MODIFIED 2].
+    let stale = send_cmd(
+        &mut reader,
+        "ST2",
+        &format!(r#"UID STORE 2 (UNCHANGEDSINCE {initial_modseq}) +FLAGS (\Answered)"#),
+    )
+    .await;
+    assert!(
+        stale.last().unwrap().contains("[MODIFIED 2]"),
+        "expected [MODIFIED 2], got {stale:?}"
+    );
+    // Confirm \Answered was NOT applied to UID 2.
+    let chk = send_cmd(&mut reader, "F2", "UID FETCH 2 (FLAGS)").await;
+    assert!(!chk.join("").contains("\\Answered"));
+
+    // UID STORE 1 (UNCHANGEDSINCE <initial_modseq>) succeeds because UID 1 <= initial_modseq.
+    let ok_store = send_cmd(
+        &mut reader,
+        "ST3",
+        &format!(r#"UID STORE 1 (UNCHANGEDSINCE {initial_modseq}) +FLAGS.SILENT (\Answered)"#),
+    )
+    .await;
+    assert!(
+        ok_store
+            .iter()
+            .any(|l| l.contains("UID 1") && l.contains("MODSEQ (")),
+        "RFC 7162 .SILENT + UNCHANGEDSINCE must return MODSEQ, got {ok_store:?}"
+    );
+    assert!(!ok_store.last().unwrap().contains("[MODIFIED"));
+
+    // Mark UID 3 \Deleted and EXPUNGE -> with QRESYNC enabled, emits `* VANISHED 3` instead of EXPUNGE!
+    let before_expunge_modseq = store.current_history_id().await.unwrap();
+    let _ = send_cmd(&mut reader, "ST4", r#"UID STORE 3 +FLAGS (\Deleted)"#).await;
+    let exp = send_cmd(&mut reader, "EX1", "EXPUNGE").await;
+    assert!(
+        exp.iter().any(|l| l.trim() == "* VANISHED 3"),
+        "expected * VANISHED 3 with QRESYNC enabled, got {exp:?}"
+    );
+    assert!(
+        !exp.iter()
+            .any(|l| l.starts_with("* ") && l.contains(" EXPUNGE")),
+        "expected no untagged EXPUNGE with QRESYNC enabled, got {exp:?}"
+    );
+
+    // UID FETCH 1:* (FLAGS) (CHANGEDSINCE <before_expunge_modseq> VANISHED) emits * VANISHED (EARLIER) 3
+    let vf = send_cmd(
+        &mut reader,
+        "F3",
+        &format!("UID FETCH 1:* (FLAGS) (CHANGEDSINCE {before_expunge_modseq} VANISHED)"),
+    )
+    .await;
+    assert!(
+        vf.iter().any(|l| l.trim() == "* VANISHED (EARLIER) 3"),
+        "expected * VANISHED (EARLIER) 3, got {vf:?}"
+    );
+
+    // Non-UID FETCH with VANISHED must be rejected with BAD.
+    let bad_vf = send_cmd(
+        &mut reader,
+        "F4",
+        &format!("FETCH 1:* (FLAGS) (CHANGEDSINCE {before_expunge_modseq} VANISHED)"),
+    )
+    .await;
+    assert!(bad_vf.last().unwrap().starts_with("F4 BAD"));
+
+    // Re-SELECT INBOX with QRESYNC (<uid_validity> <initial_modseq>) emits:
+    //   * OK [CLOSED] ...
+    //   * VANISHED (EARLIER) 3
+    //   * FETCH for UID 1 and UID 2 (both modified after initial_modseq)
+    let qsel = send_cmd(
+        &mut reader,
+        "Q1",
+        &format!("SELECT INBOX (QRESYNC ({uid_validity} {initial_modseq}))"),
+    )
+    .await;
+    assert!(
+        qsel.iter().any(|l| l.contains("[CLOSED]")),
+        "expected [CLOSED], got {qsel:?}"
+    );
+    assert!(
+        qsel.iter().any(|l| l.trim() == "* VANISHED (EARLIER) 3"),
+        "expected * VANISHED (EARLIER) 3 in QRESYNC SELECT, got {qsel:?}"
+    );
+    assert!(
+        qsel.iter()
+            .any(|l| l.contains("FETCH (UID 1") && l.contains("MODSEQ (")),
+        "expected UID 1 FETCH in QRESYNC SELECT, got {qsel:?}"
+    );
+    assert!(
+        qsel.iter()
+            .any(|l| l.contains("FETCH (UID 2") && l.contains("MODSEQ (")),
+        "expected UID 2 FETCH in QRESYNC SELECT, got {qsel:?}"
+    );
+
+    // QRESYNC with mismatched UIDVALIDITY must ignore QRESYNC and emit NO VANISHED / FETCH.
+    let qmismatch = send_cmd(
+        &mut reader,
+        "Q2",
+        &format!(
+            "SELECT INBOX (QRESYNC ({} {initial_modseq}))",
+            uid_validity + 999
+        ),
+    )
+    .await;
+    assert!(!qmismatch.iter().any(|l| l.contains("VANISHED")));
+    assert!(!qmismatch.iter().any(|l| l.contains(" FETCH ")));
+    assert!(qmismatch.last().unwrap().starts_with("Q2 OK"));
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
     let _ = shutdown_tx.send(true);
 }

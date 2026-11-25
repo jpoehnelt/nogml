@@ -68,6 +68,15 @@ CREATE TABLE IF NOT EXISTS imap_meta (
     uid_next INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS imap_expunged_uids (
+    mailbox_key TEXT NOT NULL,
+    imap_uid INTEGER NOT NULL,
+    modseq INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_key, imap_uid)
+);
+CREATE INDEX IF NOT EXISTS idx_imap_expunged_mailbox_modseq
+    ON imap_expunged_uids (mailbox_key, modseq);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
@@ -953,6 +962,29 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
     })
 }
 
+fn record_expunged_uid_tx(
+    tx: &Transaction<'_>,
+    mailbox_key: &str,
+    imap_uid: u32,
+    modseq: u64,
+) -> AppResult<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO imap_expunged_uids (mailbox_key, imap_uid, modseq) VALUES (?1, ?2, ?3)",
+        params![mailbox_key, imap_uid as i64, modseq as i64],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn clear_expunged_uid_tx(tx: &Transaction<'_>, mailbox_key: &str, imap_uid: u32) -> AppResult<()> {
+    tx.execute(
+        "DELETE FROM imap_expunged_uids WHERE mailbox_key = ?1 AND imap_uid = ?2",
+        params![mailbox_key, imap_uid as i64],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
 fn modify_message_labels_resolved_tx(
     tx: &Transaction<'_>,
     message_id: &str,
@@ -996,14 +1028,42 @@ fn modify_message_labels_resolved_tx(
                 params![message_id, lid, imap_uid as i64],
             )
             .map_err(sql_err)?;
+            clear_expunged_uid_tx(tx, lid, imap_uid)?;
         }
 
         for lid in &actually_removed {
+            let removed_uid: Option<i64> = tx
+                .query_row(
+                    "SELECT imap_uid FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
+                    params![message_id, lid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?;
             tx.execute(
                 "DELETE FROM message_labels WHERE message_id = ?1 AND label_id = ?2",
                 params![message_id, lid],
             )
             .map_err(sql_err)?;
+            if let Some(uid) = removed_uid {
+                record_expunged_uid_tx(tx, lid, uid.max(1) as u32, new_hid)?;
+            }
+        }
+
+        let was_in_all_mail =
+            !current_set.contains(LABEL_TRASH) && !current_set.contains(LABEL_SPAM);
+        let mut new_set = current_set.clone();
+        for lid in &actually_added {
+            new_set.insert(lid.clone());
+        }
+        for lid in &actually_removed {
+            new_set.remove(lid);
+        }
+        let is_in_all_mail = !new_set.contains(LABEL_TRASH) && !new_set.contains(LABEL_SPAM);
+        if was_in_all_mail && !is_in_all_mail {
+            record_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid, new_hid)?;
+        } else if !was_in_all_mail && is_in_all_mail {
+            clear_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid)?;
         }
 
         let mut context_set = current_set.clone();
@@ -1049,7 +1109,35 @@ fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredM
     let Some(msg) = load_message_by_id(tx, id)? else {
         return Ok(None);
     };
+    let label_uids: Vec<(String, u32)> = {
+        let mut stmt = tx
+            .prepare("SELECT label_id, imap_uid FROM message_labels WHERE message_id = ?1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(1) as u32,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(sql_err)?);
+        }
+        out
+    };
     let hid = bump_history_id(tx)?;
+    for (lid, uid) in label_uids {
+        record_expunged_uid_tx(tx, &lid, uid, hid)?;
+    }
+    if !msg
+        .label_ids
+        .iter()
+        .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
+    {
+        record_expunged_uid_tx(tx, ALL_MAIL_MAILBOX, msg.all_mail_uid, hid)?;
+    }
     tx.execute(
         "DELETE FROM messages_fts WHERE message_id = ?1",
         params![id],
@@ -1460,15 +1548,26 @@ fn load_imap_mailbox_info_resolved(
     }
 }
 
+struct RawImapEntry {
+    uid: u32,
+    message_id: String,
+    thread_id: String,
+    history_id: u64,
+    internal_date_ms: i64,
+    size_estimate: i32,
+    is_answered: bool,
+    is_deleted: bool,
+}
+
 fn load_imap_messages_resolved(
     conn: &Connection,
     resolved: &ResolvedMailbox,
 ) -> AppResult<Vec<ImapMessageEntry>> {
-    let raw_entries: Vec<(u32, String, String, i64, i32, bool, bool)> = match resolved {
+    let raw_entries: Vec<RawImapEntry> = match resolved {
         ResolvedMailbox::AllMail => {
             let mut stmt = conn
                 .prepare(
-                    "SELECT m.all_mail_uid, m.id, m.thread_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
+                    "SELECT m.all_mail_uid, m.id, m.thread_id, m.history_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
                      FROM messages m
                      WHERE NOT EXISTS (
                          SELECT 1 FROM message_labels ml
@@ -1479,15 +1578,16 @@ fn load_imap_messages_resolved(
                 .map_err(sql_err)?;
             let rows = stmt
                 .query_map(params![LABEL_TRASH, LABEL_SPAM], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?.max(1) as u32,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i32>(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                        row.get::<_, i64>(6)? != 0,
-                    ))
+                    Ok(RawImapEntry {
+                        uid: row.get::<_, i64>(0)?.max(1) as u32,
+                        message_id: row.get::<_, String>(1)?,
+                        thread_id: row.get::<_, String>(2)?,
+                        history_id: row.get::<_, i64>(3)?.max(1) as u64,
+                        internal_date_ms: row.get::<_, i64>(4)?,
+                        size_estimate: row.get::<_, i32>(5)?,
+                        is_answered: row.get::<_, i64>(6)? != 0,
+                        is_deleted: row.get::<_, i64>(7)? != 0,
+                    })
                 })
                 .map_err(sql_err)?;
             let mut out = Vec::new();
@@ -1499,7 +1599,7 @@ fn load_imap_messages_resolved(
         ResolvedMailbox::Label { id, .. } => {
             let mut stmt = conn
                 .prepare(
-                    "SELECT ml.imap_uid, m.id, m.thread_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
+                    "SELECT ml.imap_uid, m.id, m.thread_id, m.history_id, m.internal_date_ms, m.size_estimate, m.is_answered, m.is_deleted
                      FROM message_labels ml
                      INNER JOIN messages m ON m.id = ml.message_id
                      WHERE ml.label_id = ?1
@@ -1508,15 +1608,16 @@ fn load_imap_messages_resolved(
                 .map_err(sql_err)?;
             let rows = stmt
                 .query_map(params![id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?.max(1) as u32,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i32>(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                        row.get::<_, i64>(6)? != 0,
-                    ))
+                    Ok(RawImapEntry {
+                        uid: row.get::<_, i64>(0)?.max(1) as u32,
+                        message_id: row.get::<_, String>(1)?,
+                        thread_id: row.get::<_, String>(2)?,
+                        history_id: row.get::<_, i64>(3)?.max(1) as u64,
+                        internal_date_ms: row.get::<_, i64>(4)?,
+                        size_estimate: row.get::<_, i32>(5)?,
+                        is_answered: row.get::<_, i64>(6)? != 0,
+                        is_deleted: row.get::<_, i64>(7)? != 0,
+                    })
                 })
                 .map_err(sql_err)?;
             let mut out = Vec::new();
@@ -1527,26 +1628,23 @@ fn load_imap_messages_resolved(
         }
     };
 
-    let ids: Vec<String> = raw_entries.iter().map(|e| e.1.clone()).collect();
+    let ids: Vec<String> = raw_entries.iter().map(|e| e.message_id.clone()).collect();
     let mut label_map = load_labels_for_messages(conn, &ids)?;
 
     let mut entries = Vec::with_capacity(raw_entries.len());
-    for (
-        idx,
-        (uid, message_id, thread_id, internal_date_ms, size_estimate, is_answered, is_deleted),
-    ) in raw_entries.into_iter().enumerate()
-    {
-        let label_ids = label_map.remove(&message_id).unwrap_or_default();
+    for (idx, raw) in raw_entries.into_iter().enumerate() {
+        let label_ids = label_map.remove(&raw.message_id).unwrap_or_default();
         entries.push(ImapMessageEntry {
             seq: (idx + 1) as u32,
-            uid,
-            message_id,
-            thread_id,
-            internal_date_ms,
-            size_estimate,
+            uid: raw.uid,
+            message_id: raw.message_id,
+            thread_id: raw.thread_id,
+            history_id: raw.history_id,
+            internal_date_ms: raw.internal_date_ms,
+            size_estimate: raw.size_estimate,
             label_ids,
-            is_answered,
-            is_deleted,
+            is_answered: raw.is_answered,
+            is_deleted: raw.is_deleted,
         });
     }
     Ok(entries)
@@ -3377,11 +3475,13 @@ impl MailStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_err)?;
-            if load_message_by_id(&tx, &message_id)?.is_none() {
+            let Some(old_msg) = load_message_by_id(&tx, &message_id)? else {
                 return Err(AppError::NotFound(format!(
                     "Message not found: {message_id}"
                 )));
-            }
+            };
+            let flags_changed =
+                old_msg.is_answered != is_answered || old_msg.is_deleted != is_deleted;
 
             let mut add = Vec::new();
             let mut rem = Vec::new();
@@ -3411,7 +3511,16 @@ impl MailStore for SqliteStore {
             )
             .map_err(sql_err)?;
 
-            let msg = modify_message_labels_resolved_tx(&tx, &message_id, &add, &rem)?;
+            let mut msg = modify_message_labels_resolved_tx(&tx, &message_id, &add, &rem)?;
+            if flags_changed && msg.history_id == old_msg.history_id {
+                let new_hid = bump_history_id(&tx)?;
+                tx.execute(
+                    "UPDATE messages SET history_id = ?1 WHERE id = ?2",
+                    params![new_hid as i64, &message_id],
+                )
+                .map_err(sql_err)?;
+                msg.history_id = new_hid;
+            }
             tx.commit().map_err(sql_err)?;
             Ok(msg)
         })
@@ -3617,6 +3726,40 @@ impl MailStore for SqliteStore {
 
             tx.commit().map_err(sql_err)?;
             Ok((uid_validity, assigned_uid, msg))
+        })
+        .await
+    }
+
+    async fn imap_vanished_uids(
+        &self,
+        mailbox_name: &str,
+        since_modseq: u64,
+    ) -> AppResult<Vec<u32>> {
+        let mailbox_name = mailbox_name.to_string();
+        self.run_blocking(move |conn| {
+            let resolved = resolve_imap_mailbox(conn, &mailbox_name)?
+                .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
+            let mailbox_key = match &resolved {
+                ResolvedMailbox::AllMail => ALL_MAIL_MAILBOX.to_string(),
+                ResolvedMailbox::Label { id, .. } => id.clone(),
+            };
+            let mut stmt = conn
+                .prepare(
+                    "SELECT imap_uid FROM imap_expunged_uids
+                     WHERE mailbox_key = ?1 AND modseq > ?2
+                     ORDER BY imap_uid ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![mailbox_key, since_modseq as i64], |row| {
+                    Ok(row.get::<_, i64>(0)?.max(1) as u32)
+                })
+                .map_err(sql_err)?;
+            let mut uids = Vec::new();
+            for r in rows {
+                uids.push(r.map_err(sql_err)?);
+            }
+            Ok(uids)
         })
         .await
     }
