@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS history_events (
     message_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     label_ids_json TEXT NOT NULL,
-    context_labels_json TEXT NOT NULL DEFAULT '[]'
+    context_labels_json TEXT NOT NULL DEFAULT '[]',
+    upstream_gmail_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_history_events_hid ON history_events (history_id, id);
 
@@ -164,7 +165,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_full_sync_at_ms INTEGER,
     status TEXT NOT NULL,
     last_error TEXT,
-    messages_synced INTEGER NOT NULL DEFAULT 0
+    messages_synced INTEGER NOT NULL DEFAULT 0,
+    last_pushed_history_id INTEGER,
+    messages_pushed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS watch_state (
@@ -252,6 +255,16 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+
+        // Idempotent column migrations for existing databases.
+        ensure_column_exists(&tx, "history_events", "upstream_gmail_id", "TEXT")?;
+        ensure_column_exists(&tx, "sync_state", "last_pushed_history_id", "INTEGER")?;
+        ensure_column_exists(
+            &tx,
+            "sync_state",
+            "messages_pushed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         tx.execute(
             "INSERT OR IGNORE INTO meta (key, int_val) VALUES ('history_id', 1)",
@@ -443,6 +456,32 @@ fn str_to_history_kind(s: &str) -> AppResult<HistoryEventKind> {
     }
 }
 
+fn ensure_column_exists(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> AppResult<()> {
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_err)?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_err)?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    drop(stmt);
+    if !exists {
+        tx.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_history_event(
     tx: &Transaction<'_>,
     history_id: u64,
@@ -451,21 +490,23 @@ fn record_history_event(
     thread_id: &str,
     label_ids: &[String],
     context_labels: &[String],
+    upstream_gmail_id: Option<&str>,
 ) -> AppResult<()> {
     let labels_json = serde_json::to_string(label_ids)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
     let ctx_json = serde_json::to_string(context_labels)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
     tx.execute(
-        "INSERT INTO history_events (history_id, kind, message_id, thread_id, label_ids_json, context_labels_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO history_events (history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             history_id as i64,
             history_kind_to_str(kind),
             message_id,
             thread_id,
             labels_json,
-            ctx_json
+            ctx_json,
+            upstream_gmail_id,
         ],
     )
     .map_err(sql_err)?;
@@ -878,6 +919,7 @@ fn insert_message_tx(tx: &Transaction<'_>, input: NewMessageInput) -> AppResult<
         &thread_id,
         &resolved_labels,
         &resolved_labels,
+        input.upstream_gmail_id.as_deref(),
     )?;
 
     Ok(StoredMessage {
@@ -980,6 +1022,7 @@ fn modify_message_labels_resolved_tx(
                 &msg.thread_id,
                 &actually_added,
                 &context_labels,
+                msg.upstream_gmail_id.as_deref(),
             )?;
         }
         if !actually_removed.is_empty() {
@@ -991,6 +1034,7 @@ fn modify_message_labels_resolved_tx(
                 &msg.thread_id,
                 &actually_removed,
                 &context_labels,
+                msg.upstream_gmail_id.as_deref(),
             )?;
         }
 
@@ -1021,6 +1065,7 @@ fn delete_message_tx(tx: &Transaction<'_>, id: &str) -> AppResult<Option<StoredM
         &msg.thread_id,
         &msg.label_ids,
         &msg.label_ids,
+        msg.upstream_gmail_id.as_deref(),
     )?;
     Ok(Some(msg))
 }
@@ -1768,7 +1813,7 @@ impl MailStore for SqliteStore {
 
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json
+                    "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id
                      FROM history_events
                      WHERE history_id > ?1 AND id > ?2
                      ORDER BY id ASC",
@@ -1785,14 +1830,23 @@ impl MailStore for SqliteStore {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })
                 .map_err(sql_err)?;
 
             let mut matched: Vec<(i64, StoredHistoryEntry)> = Vec::new();
             for row in rows {
-                let (row_id, hid, kind_str, message_id, thread_id, labels_json, ctx_json) =
-                    row.map_err(sql_err)?;
+                let (
+                    row_id,
+                    hid,
+                    kind_str,
+                    message_id,
+                    thread_id,
+                    labels_json,
+                    ctx_json,
+                    upstream_gmail_id,
+                ) = row.map_err(sql_err)?;
                 let kind = str_to_history_kind(&kind_str)?;
                 if !query.history_types.is_empty() && !query.history_types.contains(&kind) {
                     continue;
@@ -1813,6 +1867,7 @@ impl MailStore for SqliteStore {
                         message_id,
                         thread_id,
                         label_ids,
+                        upstream_gmail_id,
                     },
                 ));
                 if matched.len() > max_results {
@@ -2460,20 +2515,22 @@ impl MailStore for SqliteStore {
             // Record LabelRemoved history events for messages carrying this label
             let mut stmt = tx
                 .prepare(
-                    "SELECT m.id, m.thread_id
+                    "SELECT m.id, m.thread_id, m.upstream_gmail_id
                      FROM message_labels ml
                      INNER JOIN messages m ON m.id = ml.message_id
                      WHERE ml.label_id = ?1",
                 )
                 .map_err(sql_err)?;
-            let affected: Vec<(String, String)> = stmt
-                .query_map(params![&id], |row| Ok((row.get(0)?, row.get(1)?)))
+            let affected: Vec<(String, String, Option<String>)> = stmt
+                .query_map(params![&id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
                 .map_err(sql_err)?;
             drop(stmt);
 
-            for (mid, tid) in affected {
+            for (mid, tid, up_id) in affected {
                 let ctx = load_message_labels(&tx, &mid)?;
                 let hid = bump_history_id(&tx)?;
                 tx.execute(
@@ -2489,6 +2546,7 @@ impl MailStore for SqliteStore {
                     &tid,
                     std::slice::from_ref(&id),
                     &ctx,
+                    up_id.as_deref(),
                 )?;
             }
 
@@ -3761,7 +3819,8 @@ impl MailStore for SqliteStore {
         self.run_blocking(move |conn| {
             conn.query_row(
                 "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
-                        imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error, messages_synced
+                        imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
+                        messages_synced, last_pushed_history_id, messages_pushed
                  FROM sync_state WHERE account_key = ?1",
                 params![account_key],
                 sync_state_from_row,
@@ -3777,8 +3836,9 @@ impl MailStore for SqliteStore {
             conn.execute(
                 "INSERT INTO sync_state (
                     account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
-                    imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error, messages_synced
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
+                    messages_synced, last_pushed_history_id, messages_pushed
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(account_key) DO UPDATE SET
                     provider = excluded.provider,
                     last_history_id = excluded.last_history_id,
@@ -3789,7 +3849,9 @@ impl MailStore for SqliteStore {
                     last_full_sync_at_ms = excluded.last_full_sync_at_ms,
                     status = excluded.status,
                     last_error = excluded.last_error,
-                    messages_synced = excluded.messages_synced",
+                    messages_synced = excluded.messages_synced,
+                    last_pushed_history_id = excluded.last_pushed_history_id,
+                    messages_pushed = excluded.messages_pushed",
                 params![
                     &state.account_key,
                     &state.provider,
@@ -3802,6 +3864,8 @@ impl MailStore for SqliteStore {
                     &state.status,
                     &state.last_error,
                     state.messages_synced as i64,
+                    state.last_pushed_history_id.map(|v| v as i64),
+                    state.messages_pushed as i64,
                 ],
             )
             .map_err(sql_err)?;
@@ -3815,7 +3879,8 @@ impl MailStore for SqliteStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
-                            imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error, messages_synced
+                            imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
+                            messages_synced, last_pushed_history_id, messages_pushed
                      FROM sync_state ORDER BY account_key ASC",
                 )
                 .map_err(sql_err)?;
@@ -3946,6 +4011,8 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
         status: row.get(8)?,
         last_error: row.get(9)?,
         messages_synced: row.get::<_, i64>(10)?.max(0) as u64,
+        last_pushed_history_id: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u64),
+        messages_pushed: row.get::<_, i64>(12)?.max(0) as u64,
     })
 }
 

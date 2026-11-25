@@ -867,6 +867,9 @@ pub struct SyncTriggerRequest {
     pub max_messages: Option<usize>,
     #[serde(default)]
     pub query: Option<String>,
+    /// Optional per-run override for bidirectional pushback.
+    #[serde(default)]
+    pub bidirectional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,6 +885,10 @@ pub struct SyncStatusResponse {
     pub last_error: Option<String>,
     pub total_messages: i64,
     pub unread_count: i64,
+    #[serde(default)]
+    pub bidirectional_enabled: bool,
+    #[serde(default)]
+    pub messages_pushed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<Value>,
 }

@@ -195,6 +195,8 @@ pub struct Config {
     pub sync_interval_secs: u64,
     pub sync_query: Option<String>,
     pub sync_max_messages: Option<usize>,
+    /// When `true`, push local label/flag/trash/delete changes back to the upstream account.
+    pub sync_bidirectional: bool,
 
     // --- Optional Gmail /watch push webhook ---
     pub watch_webhook_url: Option<String>,
@@ -323,6 +325,7 @@ impl Default for Config {
             sync_interval_secs: 0,
             sync_query: None,
             sync_max_messages: None,
+            sync_bidirectional: false,
 
             watch_webhook_url: None,
 

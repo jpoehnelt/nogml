@@ -1360,6 +1360,8 @@ async fn exercise_mail_store_roundtrip(store: &dyn MailStore) -> (String, String
             status: "idle".to_string(),
             last_error: None,
             messages_synced: 7,
+            last_pushed_history_id: None,
+            messages_pushed: 0,
         })
         .await
         .unwrap();

@@ -1,8 +1,9 @@
-//! Upstream Gmail REST API v1 sync (`SyncMode::Api`):
+//! Upstream Gmail REST API v1 [`SyncSource`] (`SyncMode::Api`):
 //! - OAuth2 refresh token exchange (with in-memory caching) or static access token
 //! - Labels sync (`users.labels.list` -> `MailStore::upsert_upstream_label`)
 //! - Full backfill (`profile` -> paginated `messages.list` -> bounded-concurrency `messages.get?format=raw`)
 //! - Incremental sync (`history.list` with automatic HTTP 404 fallback to full backfill)
+//! - Optional bidirectional pushback (`messages.modify`, `messages.trash`, `messages.delete`)
 
 use std::{
     collections::{HashMap, HashSet},
@@ -10,10 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -24,11 +26,14 @@ use crate::{
     events::{EventSource, MailEvent},
     imap::mime_fmt::parse_raw_to_new_message_input,
     models::{
-        ListHistoryResponse, ListLabelsResponse, ListMessagesResponse, Message, Profile,
-        is_system_label,
+        ListHistoryResponse, ListLabelsResponse, ListMessagesResponse, Message,
+        ModifyMessageRequest, Profile, is_system_label,
     },
-    storage::{NewLabelInput, SyncState, UpsertOutcomeKind},
-    sync::{SyncRunOptions, SyncRunReport},
+    storage::{NewLabelInput, SyncState},
+    sync::{
+        LocalMutation, LocalMutationKind, PullReport, PushReport, SyncRunOptions, SyncSource,
+        ingest_synced_message,
+    },
 };
 
 const FETCH_CONCURRENCY: usize = 8;
@@ -51,6 +56,269 @@ struct OAuthTokenResponse {
     access_token: String,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+/// Upstream Gmail REST API v1 [`SyncSource`] implementation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GmailApiSyncSource;
+
+#[async_trait]
+impl SyncSource for GmailApiSyncSource {
+    fn provider_name(&self) -> &'static str {
+        "gmail_api"
+    }
+
+    fn account_key(&self, config: &Config) -> String {
+        format!("gmail_api:{}", config.gmail_user_id)
+    }
+
+    async fn pull(
+        &self,
+        state: &AppState,
+        sync_state: &mut SyncState,
+        opts: &SyncRunOptions,
+    ) -> AppResult<PullReport> {
+        let client = build_http_client()?;
+        let token = acquire_access_token(&client, &state.config).await?;
+        let base = state.config.gmail_api_base_url.trim_end_matches('/');
+        let user_id = encode_path_segment(&state.config.gmail_user_id);
+
+        let mut report = PullReport::default();
+
+        // 1. Sync upstream user labels and build upstream_label_id -> local_label_id map.
+        let label_map = sync_labels(&client, base, &user_id, &token, state, &mut report).await?;
+
+        // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
+        let mut need_full = opts.full || sync_state.last_history_id.is_none();
+        if !need_full && let Some(start_history_id) = sync_state.last_history_id.clone() {
+            match run_incremental(
+                &client,
+                base,
+                &user_id,
+                &token,
+                &start_history_id,
+                &label_map,
+                state,
+                &mut report,
+            )
+            .await?
+            {
+                IncrementalOutcome::Applied { new_history_id } => {
+                    sync_state.last_history_id = Some(new_history_id.clone());
+                    report.history_id = Some(new_history_id);
+                }
+                IncrementalOutcome::HistoryExpired => {
+                    warn!(
+                        start_history_id,
+                        "Gmail historyId expired (HTTP 404); falling back to full backfill"
+                    );
+                    sync_state.last_history_id = None;
+                    need_full = true;
+                }
+            }
+        }
+
+        // 3. Full backfill (initial run, `--full`, or automatic 404 fallback).
+        if need_full {
+            report.full_resync = true;
+            let baseline_history = run_full_backfill(
+                &client,
+                base,
+                &user_id,
+                &token,
+                opts,
+                &label_map,
+                state,
+                &mut report,
+            )
+            .await?;
+            sync_state.last_history_id = Some(baseline_history.clone());
+            sync_state.last_full_sync_at = Some(Utc::now());
+            report.history_id = Some(baseline_history);
+        }
+
+        sync_state.messages_synced = sync_state
+            .messages_synced
+            .saturating_add(report.messages_added);
+        Ok(report)
+    }
+
+    async fn push_changes(
+        &self,
+        state: &AppState,
+        changes: &[LocalMutation],
+    ) -> AppResult<PushReport> {
+        if changes.is_empty() {
+            return Ok(PushReport::default());
+        }
+
+        let client = build_http_client()?;
+        let token = acquire_access_token(&client, &state.config).await?;
+        let base = state.config.gmail_api_base_url.trim_end_matches('/');
+        let user_id = encode_path_segment(&state.config.gmail_user_id);
+
+        // Build local_label_id -> upstream_label_id reverse mapping.
+        let mut reverse_labels: HashMap<String, String> = HashMap::new();
+        for lbl in state.store.list_labels().await? {
+            if is_system_label(&lbl.id) || lbl.label_type == "system" {
+                reverse_labels.insert(lbl.id.clone(), lbl.id);
+            } else if let Some(up_id) = lbl.upstream_label_id {
+                reverse_labels.insert(lbl.id, up_id);
+            }
+        }
+
+        let mut pushed = 0u64;
+
+        for mutation in changes {
+            let encoded_id = encode_path_segment(&mutation.upstream_id);
+            match &mutation.kind {
+                LocalMutationKind::ModifyLabels {
+                    add_labels,
+                    remove_labels,
+                } => {
+                    let add_label_ids = map_local_to_upstream_labels(add_labels, &reverse_labels);
+                    let remove_label_ids =
+                        map_local_to_upstream_labels(remove_labels, &reverse_labels);
+                    if add_label_ids.is_empty() && remove_label_ids.is_empty() {
+                        continue;
+                    }
+
+                    let url =
+                        format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}/modify");
+                    let payload = serde_json::to_vec(&ModifyMessageRequest {
+                        add_label_ids,
+                        remove_label_ids,
+                    })?;
+                    let (status, body) =
+                        request_with_retry(&client, Method::POST, &url, &token, Some(payload))
+                            .await?;
+                    if status == StatusCode::NOT_FOUND {
+                        warn!(
+                            upstream_id = %mutation.upstream_id,
+                            "Skipping upstream Gmail modify push: message not found (404)"
+                        );
+                        continue;
+                    }
+                    if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail messages.modify({}) failed: {}",
+                                mutation.upstream_id,
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    pushed += 1;
+                }
+                LocalMutationKind::Trash {
+                    add_labels,
+                    remove_labels,
+                } => {
+                    let add_label_ids = map_local_to_upstream_labels(add_labels, &reverse_labels);
+                    let remove_label_ids =
+                        map_local_to_upstream_labels(remove_labels, &reverse_labels);
+                    if !add_label_ids.is_empty() || !remove_label_ids.is_empty() {
+                        let modify_url =
+                            format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}/modify");
+                        let payload = serde_json::to_vec(&ModifyMessageRequest {
+                            add_label_ids,
+                            remove_label_ids,
+                        })?;
+                        let (status, body) = request_with_retry(
+                            &client,
+                            Method::POST,
+                            &modify_url,
+                            &token,
+                            Some(payload),
+                        )
+                        .await?;
+                        if status == StatusCode::NOT_FOUND {
+                            warn!(
+                                upstream_id = %mutation.upstream_id,
+                                "Skipping upstream Gmail trash push: message not found (404)"
+                            );
+                            continue;
+                        }
+                        if !status.is_success() {
+                            return Err(AppError::Upstream {
+                                status: status.as_u16(),
+                                message: format!(
+                                    "Gmail messages.modify({}) before trash failed: {}",
+                                    mutation.upstream_id,
+                                    String::from_utf8_lossy(&body)
+                                ),
+                            });
+                        }
+                    }
+
+                    let trash_url =
+                        format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}/trash");
+                    let (status, body) =
+                        request_with_retry(&client, Method::POST, &trash_url, &token, None).await?;
+                    if status == StatusCode::NOT_FOUND {
+                        warn!(
+                            upstream_id = %mutation.upstream_id,
+                            "Skipping upstream Gmail trash push: message not found (404)"
+                        );
+                        continue;
+                    }
+                    if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail messages.trash({}) failed: {}",
+                                mutation.upstream_id,
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    pushed += 1;
+                }
+                LocalMutationKind::Delete => {
+                    let delete_url =
+                        format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}");
+                    let (status, body) =
+                        request_with_retry(&client, Method::DELETE, &delete_url, &token, None)
+                            .await?;
+                    if status == StatusCode::NOT_FOUND {
+                        debug!(
+                            upstream_id = %mutation.upstream_id,
+                            "Upstream Gmail message already deleted (404)"
+                        );
+                        pushed += 1;
+                        continue;
+                    }
+                    if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail messages.delete({}) failed: {}",
+                                mutation.upstream_id,
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    pushed += 1;
+                }
+            }
+        }
+
+        Ok(PushReport {
+            messages_pushed: pushed,
+        })
+    }
+}
+
+fn build_http_client() -> AppResult<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))
+}
+
+fn encode_path_segment(seg: &str) -> String {
+    url::form_urlencoded::byte_serialize(seg.as_bytes()).collect()
 }
 
 /// Acquire a Gmail API Bearer token via static config override or OAuth2 refresh flow.
@@ -135,92 +403,13 @@ pub async fn acquire_access_token(client: &Client, config: &Config) -> AppResult
     Ok(parsed.access_token)
 }
 
-/// Run one Gmail REST API v1 sync pass (incremental if checkpoint exists and `!opts.full`, else full backfill).
-pub async fn sync_gmail_api(
-    state: &AppState,
-    opts: &SyncRunOptions,
-    sync_state: &mut SyncState,
-) -> AppResult<SyncRunReport> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
-
-    let token = acquire_access_token(&client, &state.config).await?;
-    let base = state.config.gmail_api_base_url.trim_end_matches('/');
-    let user_id = url::form_urlencoded::byte_serialize(state.config.gmail_user_id.as_bytes())
-        .collect::<String>();
-
-    let mut report = SyncRunReport {
-        provider: "gmail_api".to_string(),
-        ..Default::default()
-    };
-
-    // 1. Sync upstream user labels and build upstream_label_id -> local_label_id map.
-    let label_map = sync_labels(&client, base, &user_id, &token, state, &mut report).await?;
-
-    // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
-    let mut need_full = opts.full || sync_state.last_history_id.is_none();
-    if !need_full && let Some(start_history_id) = sync_state.last_history_id.clone() {
-        match run_incremental(
-            &client,
-            base,
-            &user_id,
-            &token,
-            &start_history_id,
-            &label_map,
-            state,
-            &mut report,
-        )
-        .await?
-        {
-            IncrementalOutcome::Applied { new_history_id } => {
-                sync_state.last_history_id = Some(new_history_id.clone());
-                report.history_id = Some(new_history_id);
-            }
-            IncrementalOutcome::HistoryExpired => {
-                warn!(
-                    start_history_id,
-                    "Gmail historyId expired (HTTP 404); falling back to full backfill"
-                );
-                sync_state.last_history_id = None;
-                need_full = true;
-            }
-        }
-    }
-
-    // 3. Full backfill (initial run, `--full`, or automatic 404 fallback).
-    if need_full {
-        report.full_resync = true;
-        let baseline_history = run_full_backfill(
-            &client,
-            base,
-            &user_id,
-            &token,
-            opts,
-            &label_map,
-            state,
-            &mut report,
-        )
-        .await?;
-        sync_state.last_history_id = Some(baseline_history.clone());
-        sync_state.last_full_sync_at = Some(Utc::now());
-        report.history_id = Some(baseline_history);
-    }
-
-    sync_state.messages_synced = sync_state
-        .messages_synced
-        .saturating_add(report.messages_added);
-    Ok(report)
-}
-
 async fn sync_labels(
     client: &Client,
     base: &str,
     user_id: &str,
     token: &str,
     state: &AppState,
-    report: &mut SyncRunReport,
+    report: &mut PullReport,
 ) -> AppResult<HashMap<String, String>> {
     let url = format!("{base}/gmail/v1/users/{user_id}/labels");
     let (status, body) = get_with_retry(client, &url, token).await?;
@@ -274,7 +463,7 @@ async fn run_incremental(
     start_history_id: &str,
     label_map: &HashMap<String, String>,
     state: &AppState,
-    report: &mut SyncRunReport,
+    report: &mut PullReport,
 ) -> AppResult<IncrementalOutcome> {
     let mut page_token: Option<String> = None;
     let mut latest_history_id: Option<String> = None;
@@ -283,11 +472,11 @@ async fn run_incremental(
     loop {
         let mut url = format!(
             "{base}/gmail/v1/users/{user_id}/history?startHistoryId={}&maxResults=500",
-            url::form_urlencoded::byte_serialize(start_history_id.as_bytes()).collect::<String>()
+            encode_path_segment(start_history_id)
         );
         if let Some(ref pt) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(&url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>());
+            url.push_str(&encode_path_segment(pt));
         }
 
         let (status, body) = get_with_retry(client, &url, token).await?;
@@ -416,7 +605,7 @@ async fn run_full_backfill(
     opts: &SyncRunOptions,
     label_map: &HashMap<String, String>,
     state: &AppState,
-    report: &mut SyncRunReport,
+    report: &mut PullReport,
 ) -> AppResult<String> {
     // Capture baseline historyId BEFORE listing messages so concurrent changes aren't missed.
     let profile_url = format!("{base}/gmail/v1/users/{user_id}/profile");
@@ -447,11 +636,11 @@ async fn run_full_backfill(
             && !q.trim().is_empty()
         {
             url.push_str("&q=");
-            url.push_str(&url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>());
+            url.push_str(&encode_path_segment(q));
         }
         if let Some(ref pt) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(&url::form_urlencoded::byte_serialize(pt.as_bytes()).collect::<String>());
+            url.push_str(&encode_path_segment(pt));
         }
 
         let (status, body) = get_with_retry(client, &url, token).await?;
@@ -532,13 +721,13 @@ async fn fetch_and_upsert_messages(
     ids: Vec<String>,
     label_map: &HashMap<String, String>,
     state: &AppState,
-    report: &mut SyncRunReport,
+    report: &mut PullReport,
 ) -> AppResult<()> {
     let fetches = stream::iter(ids.into_iter().map(|id| {
         let client = client.clone();
         let url = format!(
             "{base}/gmail/v1/users/{user_id}/messages/{}?format=raw",
-            url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            encode_path_segment(&id)
         );
         let token = token.to_string();
         async move {
@@ -577,7 +766,7 @@ async fn fetch_and_upsert_messages(
         let upstream_id = if msg.id.is_empty() { id } else { msg.id };
         let upstream_tid = (!msg.thread_id.is_empty()).then_some(msg.thread_id);
 
-        let mut input = parse_raw_to_new_message_input(
+        let input = parse_raw_to_new_message_input(
             raw_bytes,
             mapped_labels,
             internal_date_ms,
@@ -588,34 +777,7 @@ async fn fetch_and_upsert_messages(
             false,
         );
 
-        if !crate::sync::apply_sync_inbound_filter(state, &mut input).await? {
-            continue;
-        }
-
-        let outcome = state.store.upsert_synced_message(input).await?;
-        match outcome.kind {
-            UpsertOutcomeKind::Inserted => {
-                let _ = state.post_store_message(&outcome.message).await;
-                report.messages_added += 1;
-                state.events.publish(
-                    EventSource::GmailSync,
-                    MailEvent::MessageReceived {
-                        message_id: outcome.message.id,
-                        thread_id: outcome.message.thread_id,
-                        from: outcome.message.from_addr,
-                        subject: outcome.message.subject,
-                        snippet: outcome.message.snippet,
-                        labels: outcome.message.label_ids,
-                    },
-                );
-            }
-            UpsertOutcomeKind::Updated => {
-                report.messages_updated += 1;
-            }
-            UpsertOutcomeKind::Deduplicated => {
-                report.messages_deduplicated += 1;
-            }
-        }
+        let _ = ingest_synced_message(state, input, report).await?;
     }
 
     Ok(())
@@ -633,14 +795,56 @@ fn map_labels(raw: &[String], label_map: &HashMap<String, String>) -> Vec<String
     out
 }
 
+fn map_local_to_upstream_labels(
+    local_ids: &[String],
+    reverse_map: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for id in local_ids {
+        let mapped = if is_system_label(id) {
+            Some(id.clone())
+        } else {
+            reverse_map.get(id).cloned()
+        };
+        if let Some(up) = mapped {
+            if seen.insert(up.clone()) {
+                out.push(up);
+            }
+        } else {
+            debug!(local_label_id = %id, "Skipping local-only label during Gmail API pushback");
+        }
+    }
+    out.sort();
+    out
+}
+
 async fn get_with_retry(
     client: &Client,
     url: &str,
     bearer_token: &str,
 ) -> AppResult<(StatusCode, Vec<u8>)> {
+    request_with_retry(client, Method::GET, url, bearer_token, None).await
+}
+
+async fn request_with_retry(
+    client: &Client,
+    method: Method,
+    url: &str,
+    bearer_token: &str,
+    json_body: Option<Vec<u8>>,
+) -> AppResult<(StatusCode, Vec<u8>)> {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..3 {
-        let resp = client.get(url).bearer_auth(bearer_token).send().await;
+        let mut req = client
+            .request(method.clone(), url)
+            .bearer_auth(bearer_token);
+        if let Some(ref body) = json_body {
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone());
+        }
+        let resp = req.send().await;
         match resp {
             Ok(r) => {
                 let status = r.status();

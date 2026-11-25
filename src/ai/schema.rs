@@ -178,7 +178,8 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                     "mode": { "type": "string", "enum": ["incremental", "full"], "default": "incremental" },
                     "provider": { "type": "string", "enum": ["api", "imap"] },
                     "max_messages": { "type": "integer", "minimum": 1 },
-                    "query": { "type": "string" }
+                    "query": { "type": "string" },
+                    "bidirectional": { "type": "boolean", "description": "Override NOGML_SYNC_BIDIRECTIONAL for this run" }
                 }
             }
         },
