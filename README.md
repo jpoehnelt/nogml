@@ -15,7 +15,7 @@ Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME 
 
 - **AI REST API (`/v1`) and SSE (`/v1/events`)**: Returns parsed text and HTML bodies without base64 decoding. Supports quote stripping, body character limits, `?fields=` projection masks, `dry_run` send previews, `draft_only` and `allowed_recipients` guardrails, control and BiDi character stripping, and `Last-Event-ID` event replay.
 - **Built-in MCP server (`nogml mcp` and `POST /mcp`)**: Implements JSON-RPC 2.0 over stdio (logging strictly to stderr) and Streamable HTTP. Exposes 12 tools (`search_emails`, `list_threads`, `read_thread`, `read_email`, `send_email`, `create_draft`, `send_draft`, `triage_thread`, `modify_labels`, `list_labels`, `sync_gmail`, `sync_status`) and `nogml://` resources.
-- **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...`, `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
+- **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...` (`media`, `multipart`, and chunked `resumable` uploads), `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
 - **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS. Maps Gmail labels to folders including `[Gmail]/All Mail`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-LABELS`, and pushes updates over `IDLE`.
 - **Pluggable mail transports (Resend, AWS SES, SMTP)**: Sends outbound mail via Resend (`POST /emails` with `Idempotency-Key`), AWS SESv2 raw MIME (`POST /v2/email/outbound-emails` signed with AWS SigV4), or direct SMTP (`STARTTLS`, implicit TLS, or plain TCP with `AUTH PLAIN` / `AUTH LOGIN` and RFC 5321 dot-stuffing). Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures and handles `POST /webhooks/ses` SNS notifications (inline base64 or S3 downloads) through the same inbound ingestion and filtering pipeline.
 - **Upstream Gmail sync**: Imports existing Gmail accounts via Gmail REST API v1 (OAuth2 refresh, paginated backfill, incremental `history.list` with automatic 404 full resync) or Gmail IMAP (`X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`.
@@ -252,9 +252,41 @@ Point the Gmail API base URL at `http://127.0.0.1:8080` with `Authorization: Bea
 - `GET /gmail/v1/users/me/messages?q=from:alice has:attachment`
 - `GET /gmail/v1/users/me/messages/{id}?format=full&fields=id,snippet,payload/headers`
 - `POST /upload/gmail/v1/users/me/messages/send?uploadType=multipart`
+- `POST /upload/gmail/v1/users/me/messages/send?uploadType=resumable` (returns `Location` for `PUT` `Content-Range` chunks with `308` status probes and `200` completion across `messages/send`, `messages`, `messages/import`, `drafts`, `drafts/{id}`, and `drafts/send`)
 - `POST /batch/gmail/v1` (`multipart/mixed` batch requests)
 - `GET /gmail/v1/users/me/history?startHistoryId=...`
 - `POST /gmail/v1/users/me/watch` (with `NOGML_WATCH_WEBHOOK_URL`, posts `{emailAddress, historyId}` notifications)
+
+#### Official SDK and client base-URL overrides
+
+Node.js (`@googleapis/gmail`):
+
+```js
+import { gmail } from "@googleapis/gmail";
+
+const client = gmail({
+  version: "v1",
+  rootUrl: "http://127.0.0.1:8080/",
+  headers: { Authorization: "Bearer tok_secret_1" },
+});
+```
+
+Python (`google-api-python-client`):
+
+```python
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+creds = Credentials(token="tok_secret_1")
+service = build(
+    "gmail",
+    "v1",
+    credentials=creds,
+    client_options={"api_endpoint": "http://127.0.0.1:8080"},
+)
+```
+
+Superhuman-style and custom HTTP clients: override the Gmail REST root from `https://gmail.googleapis.com` to `http://127.0.0.1:8080` (or your HTTPS reverse proxy URL). Keep the standard `/gmail/v1/...`, `/upload/gmail/v1/...`, and `/batch/gmail/v1` paths intact and pass your configured `NOGML_AUTH_TOKENS` value in `Authorization: Bearer <token>` (or `X-API-Key`). When serving behind TLS termination, forward `Host` and `X-Forwarded-Proto: https` so `uploadType=resumable` `Location` headers use your public HTTPS origin.
 
 ### IMAP clients
 

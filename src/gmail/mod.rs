@@ -16,10 +16,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::{Duration, Utc};
@@ -35,7 +36,13 @@ use crate::{
     gmail::{
         fields::fields_and_alt_middleware,
         query::QueryParams,
-        upload::{extract_draft_upload, extract_message_upload},
+        upload::{
+            NewResumableUpload, ResumableChunkOutcome, ResumableEndpoint, ResumableUploadMetadata,
+            ResumableUploadSession, ResumableUploadTarget, build_resumable_location,
+            extract_draft_upload, extract_message_upload, extract_resumable_draft_metadata,
+            extract_resumable_message_metadata, extract_upload_content_type, is_resumable_upload,
+            parse_upload_content_length,
+        },
     },
     mime,
     models::{
@@ -70,12 +77,16 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
         )
         .route(
             "/upload/gmail/v1/users/{userId}/messages",
-            post(insert_message),
+            post(insert_message)
+                .put(insert_message_resumable_put)
+                .delete(insert_message_resumable_delete),
         )
         .route("/gmail/v1/users/{userId}/messages/send", post(send_message))
         .route(
             "/upload/gmail/v1/users/{userId}/messages/send",
-            post(send_message),
+            post(send_message)
+                .put(send_message_resumable_put)
+                .delete(send_message_resumable_delete),
         )
         .route(
             "/gmail/v1/users/{userId}/messages/import",
@@ -83,7 +94,9 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
         )
         .route(
             "/upload/gmail/v1/users/{userId}/messages/import",
-            post(import_message),
+            post(import_message)
+                .put(import_message_resumable_put)
+                .delete(import_message_resumable_delete),
         )
         .route(
             "/gmail/v1/users/{userId}/messages/batchModify",
@@ -148,11 +161,18 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
             "/gmail/v1/users/{userId}/drafts",
             get(list_drafts).post(create_draft),
         )
-        .route("/upload/gmail/v1/users/{userId}/drafts", post(create_draft))
+        .route(
+            "/upload/gmail/v1/users/{userId}/drafts",
+            post(create_draft)
+                .put(create_draft_resumable_put)
+                .delete(create_draft_resumable_delete),
+        )
         .route("/gmail/v1/users/{userId}/drafts/send", post(send_draft))
         .route(
             "/upload/gmail/v1/users/{userId}/drafts/send",
-            post(send_draft),
+            post(send_draft)
+                .put(send_draft_resumable_put)
+                .delete(send_draft_resumable_delete),
         )
         .route(
             "/gmail/v1/users/{userId}/drafts/{id}",
@@ -160,7 +180,7 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
         )
         .route(
             "/upload/gmail/v1/users/{userId}/drafts/{id}",
-            put(update_draft),
+            put(update_draft).delete(update_draft_resumable_delete),
         )
         // History
         .route("/gmail/v1/users/{userId}/history", get(list_history))
@@ -683,65 +703,67 @@ async fn get_message(
     Ok(Json(msg))
 }
 
-/// `POST /gmail/v1/users/{userId}/messages/send` & `/upload/gmail/v1/users/{userId}/messages/send`
-async fn send_message(
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Json<Message>> {
-    resolve_user_id(&user_id, &state.config)?;
-    let params = QueryParams::from_raw(raw_query.as_deref());
-    let extracted = extract_message_upload(&headers, &params, &body)?;
-    let raw_bytes = extracted.raw_bytes.ok_or_else(|| {
+/// Validate optional `Message` metadata fields (`threadId`, `labelIds`) up front.
+fn validate_message_metadata(metadata: &Message) -> AppResult<()> {
+    if !metadata.thread_id.is_empty() {
+        validate_resource_id(&metadata.thread_id)?;
+    }
+    if let Some(ref labels) = metadata.label_ids {
+        validate_label_ids(labels)?;
+    }
+    Ok(())
+}
+
+/// Validate optional `Draft` metadata fields (`id`, `message.threadId`, `message.labelIds`) up front.
+fn validate_draft_metadata(metadata: &Draft) -> AppResult<()> {
+    if !metadata.id.trim().is_empty() {
+        validate_resource_id(metadata.id.trim())?;
+    }
+    if let Some(ref msg) = metadata.message {
+        validate_message_metadata(msg)?;
+    }
+    Ok(())
+}
+
+/// Shared `messages.send` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_send_message(
+    state: &AppState,
+    metadata: Message,
+    raw_bytes: Option<Vec<u8>>,
+    idempotency_key: Option<&str>,
+) -> AppResult<Message> {
+    let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
             "Missing RFC 2822 message payload ('raw' field or media upload)".to_string(),
         )
     })?;
 
-    let thread_id =
-        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
+    let thread_id = (!metadata.thread_id.is_empty()).then_some(metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
 
     let stored = execute_gmail_send(
-        &state,
+        state,
         raw_bytes,
         thread_id,
-        extracted.metadata.label_ids.unwrap_or_default(),
-        idempotency_key_header(&headers),
+        metadata.label_ids.unwrap_or_default(),
+        idempotency_key,
     )
     .await?;
 
-    let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
-    Ok(Json(msg))
+    format_gmail_message(&stored, MessageFormat::Minimal, &[])
 }
 
-/// `POST /gmail/v1/users/{userId}/messages` & `/upload/gmail/v1/users/{userId}/messages` (`insert`)
-async fn insert_message(
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Json<Message>> {
-    resolve_user_id(&user_id, &state.config)?;
-    let params = QueryParams::from_raw(raw_query.as_deref());
-    let date_source = params
-        .get("internalDateSource")
-        .unwrap_or("receivedTime")
-        .to_ascii_lowercase();
-    if date_source != "receivedtime" && date_source != "dateheader" {
-        return Err(AppError::BadRequest(format!(
-            "Invalid internalDateSource '{date_source}'; expected receivedTime or dateHeader"
-        )));
-    }
-    let deleted = params.get_bool("deleted", false)?;
-
-    let extracted = extract_message_upload(&headers, &params, &body)?;
-    let raw_bytes = extracted.raw_bytes.ok_or_else(|| {
+/// Shared `messages.insert` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_insert_message(
+    state: &AppState,
+    metadata: Message,
+    raw_bytes: Option<Vec<u8>>,
+    date_source: &str,
+    deleted: bool,
+) -> AppResult<Message> {
+    let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
             "Missing RFC 2822 message payload ('raw' field or media upload)".to_string(),
         )
@@ -755,10 +777,9 @@ async fn insert_message(
         now_ms
     };
 
-    let labels = extracted.metadata.label_ids.unwrap_or_default();
+    let labels = metadata.label_ids.unwrap_or_default();
     validate_label_ids(&labels)?;
-    let thread_id =
-        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
+    let thread_id = (!metadata.thread_id.is_empty()).then_some(metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
@@ -788,35 +809,20 @@ async fn insert_message(
         },
     );
 
-    let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
-    Ok(Json(msg))
+    format_gmail_message(&stored, MessageFormat::Minimal, &[])
 }
 
-/// `POST /gmail/v1/users/{userId}/messages/import` & `/upload/gmail/v1/users/{userId}/messages/import`
-async fn import_message(
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Json<Message>> {
-    resolve_user_id(&user_id, &state.config)?;
-    let params = QueryParams::from_raw(raw_query.as_deref());
-    let date_source = params
-        .get("internalDateSource")
-        .unwrap_or("dateHeader")
-        .to_ascii_lowercase();
-    if date_source != "receivedtime" && date_source != "dateheader" {
-        return Err(AppError::BadRequest(format!(
-            "Invalid internalDateSource '{date_source}'; expected dateHeader or receivedTime"
-        )));
-    }
-    let never_mark_spam = params.get_bool("neverMarkSpam", false)?;
-    let _process_for_calendar = params.get_bool("processForCalendar", false)?;
-    let deleted = params.get_bool("deleted", false)?;
-
-    let extracted = extract_message_upload(&headers, &params, &body)?;
-    let raw_bytes = extracted.raw_bytes.ok_or_else(|| {
+/// Shared `messages.import` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_import_message(
+    state: &AppState,
+    metadata: Message,
+    raw_bytes: Option<Vec<u8>>,
+    date_source: &str,
+    never_mark_spam: bool,
+    _process_for_calendar: bool,
+    deleted: bool,
+) -> AppResult<Message> {
+    let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
             "Missing RFC 2822 message payload ('raw' field or media upload)".to_string(),
         )
@@ -830,7 +836,7 @@ async fn import_message(
         now_ms
     };
 
-    let initial_labels = match extracted.metadata.label_ids {
+    let initial_labels = match metadata.label_ids {
         Some(l) if !l.is_empty() => l,
         _ => vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
     };
@@ -874,8 +880,7 @@ async fn import_message(
         labels.retain(|l| l != LABEL_SPAM);
     }
 
-    let thread_id =
-        (!extracted.metadata.thread_id.is_empty()).then_some(extracted.metadata.thread_id);
+    let thread_id = (!metadata.thread_id.is_empty()).then_some(metadata.thread_id);
     if let Some(ref tid) = thread_id {
         validate_resource_id(tid)?;
     }
@@ -905,8 +910,558 @@ async fn import_message(
         },
     );
 
-    let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
-    Ok(Json(msg))
+    format_gmail_message(&stored, MessageFormat::Minimal, &[])
+}
+
+/// Initiate an `uploadType=resumable` session, returning `200 OK` with a `Location` URL.
+fn initiate_resumable_upload(
+    state: &AppState,
+    user_email: &str,
+    target: ResumableUploadTarget,
+    metadata: ResumableUploadMetadata,
+    uri: &Uri,
+    params: &QueryParams,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
+    let declared_total_bytes = parse_upload_content_length(headers, state.config.max_body_bytes)?;
+    let content_type = extract_upload_content_type(headers);
+    let idempotency_key = idempotency_key_header(headers).map(str::to_string);
+
+    let upload_id = state.resumable_uploads.create_session(NewResumableUpload {
+        user_email: user_email.to_string(),
+        target,
+        metadata,
+        content_type,
+        declared_total_bytes,
+        idempotency_key,
+    })?;
+
+    let location = build_resumable_location(headers, uri, &upload_id, params.get("fields"))?;
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(header::LOCATION, location);
+    if let Ok(uid_hdr) = HeaderValue::from_str(&upload_id) {
+        resp.headers_mut().insert("x-guploader-uploadid", uid_hdr);
+    }
+    Ok(resp)
+}
+
+/// Build a `308 Resume Incomplete` response without a `Location` header.
+fn build_resumable_incomplete_response(received: usize) -> AppResult<Response> {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    if received > 0 {
+        let range_val = HeaderValue::from_str(&format!("bytes=0-{}", received - 1))
+            .map_err(|e| AppError::Internal(format!("Invalid Range header: {e}")))?;
+        resp.headers_mut().insert(header::RANGE, range_val);
+    }
+    Ok(resp)
+}
+
+/// Execute the Gmail API action for a completed resumable upload session.
+async fn execute_completed_resumable(
+    state: &AppState,
+    session: ResumableUploadSession,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
+    let idempotency_key = session
+        .idempotency_key
+        .as_deref()
+        .or_else(|| idempotency_key_header(headers));
+
+    match (session.target, session.metadata) {
+        (ResumableUploadTarget::MessagesSend, ResumableUploadMetadata::Message(metadata)) => {
+            let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
+            let msg = complete_send_message(state, metadata, raw_bytes, idempotency_key).await?;
+            Ok(Json(msg).into_response())
+        }
+        (
+            ResumableUploadTarget::MessagesInsert {
+                date_source,
+                deleted,
+            },
+            ResumableUploadMetadata::Message(metadata),
+        ) => {
+            let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
+            let msg =
+                complete_insert_message(state, metadata, raw_bytes, &date_source, deleted).await?;
+            Ok(Json(msg).into_response())
+        }
+        (
+            ResumableUploadTarget::MessagesImport {
+                date_source,
+                never_mark_spam,
+                process_for_calendar,
+                deleted,
+            },
+            ResumableUploadMetadata::Message(metadata),
+        ) => {
+            let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
+            let msg = complete_import_message(
+                state,
+                metadata,
+                raw_bytes,
+                &date_source,
+                never_mark_spam,
+                process_for_calendar,
+                deleted,
+            )
+            .await?;
+            Ok(Json(msg).into_response())
+        }
+        (ResumableUploadTarget::DraftsCreate, ResumableUploadMetadata::Draft(metadata)) => {
+            let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
+            let draft = complete_create_draft(state, metadata, raw_bytes).await?;
+            Ok(Json(draft).into_response())
+        }
+        (
+            ResumableUploadTarget::DraftsUpdate { draft_id },
+            ResumableUploadMetadata::Draft(metadata),
+        ) => {
+            let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
+            let draft = complete_update_draft(state, &draft_id, metadata, raw_bytes).await?;
+            Ok(Json(draft).into_response())
+        }
+        (ResumableUploadTarget::DraftsSend, ResumableUploadMetadata::Draft(metadata)) => {
+            let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
+            let msg = complete_send_draft(state, metadata, raw_bytes, idempotency_key).await?;
+            Ok(Json(msg).into_response())
+        }
+        _ => Err(AppError::Internal(
+            "Mismatched resumable upload session target and metadata".to_string(),
+        )),
+    }
+}
+
+fn resolve_resumable_message_bytes(
+    buffer: Vec<u8>,
+    metadata: &Message,
+) -> AppResult<Option<Vec<u8>>> {
+    if !buffer.is_empty() {
+        return Ok(Some(buffer));
+    }
+    match metadata.raw.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => Ok(Some(mime::decode_base64url(raw)?)),
+        _ => Ok(None),
+    }
+}
+
+fn resolve_resumable_draft_bytes(buffer: Vec<u8>, metadata: &Draft) -> AppResult<Option<Vec<u8>>> {
+    if !buffer.is_empty() {
+        return Ok(Some(buffer));
+    }
+    match metadata.message.as_ref().and_then(|m| m.raw.as_deref()) {
+        Some(raw) if !raw.trim().is_empty() => Ok(Some(mime::decode_base64url(raw)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Handle a `PUT` chunk upload or `Content-Range: bytes */*` status query for an active session.
+async fn handle_resumable_chunk(
+    state: &AppState,
+    user_id: &str,
+    expected_endpoint: ResumableEndpoint,
+    raw_query: Option<&str>,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query);
+
+    if let Some(upload_type) = params.get("uploadType")
+        && !upload_type.eq_ignore_ascii_case("resumable")
+    {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported uploadType '{upload_type}' on resumable upload PUT"
+        )));
+    }
+
+    let upload_id = params
+        .get("upload_id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Missing required 'upload_id' query parameter for resumable upload".to_string(),
+            )
+        })?;
+    validate_resource_id(upload_id)?;
+
+    let content_range = headers
+        .get(header::CONTENT_RANGE)
+        .map(|v| {
+            v.to_str()
+                .map_err(|_| AppError::BadRequest("Invalid Content-Range header".to_string()))
+        })
+        .transpose()?;
+
+    match state.resumable_uploads.process_chunk(
+        upload_id,
+        user_email,
+        &expected_endpoint,
+        content_range,
+        &body,
+        state.config.max_body_bytes,
+    )? {
+        ResumableChunkOutcome::Incomplete { received } => {
+            build_resumable_incomplete_response(received)
+        }
+        ResumableChunkOutcome::Complete(session) => {
+            execute_completed_resumable(state, *session, headers).await
+        }
+    }
+}
+
+/// Handle `DELETE` cancellation of an in-flight resumable upload session.
+async fn handle_resumable_cancel(
+    state: &AppState,
+    user_id: &str,
+    expected_endpoint: ResumableEndpoint,
+    raw_query: Option<&str>,
+) -> AppResult<StatusCode> {
+    let user_email = resolve_user_id(user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query);
+    let upload_id = params
+        .get("upload_id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Missing required 'upload_id' query parameter for resumable upload cancellation"
+                    .to_string(),
+            )
+        })?;
+    validate_resource_id(upload_id)?;
+
+    let removed =
+        state
+            .resumable_uploads
+            .cancel_session(upload_id, user_email, &expected_endpoint)?;
+    if !removed {
+        return Err(AppError::NotFound(format!(
+            "Resumable upload session '{upload_id}' not found or expired"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn send_message_resumable_put(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    handle_resumable_chunk(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesSend,
+        raw_query.as_deref(),
+        &headers,
+        body,
+    )
+    .await
+}
+
+async fn send_message_resumable_delete(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesSend,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+async fn insert_message_resumable_put(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    handle_resumable_chunk(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesInsert,
+        raw_query.as_deref(),
+        &headers,
+        body,
+    )
+    .await
+}
+
+async fn insert_message_resumable_delete(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesInsert,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+async fn import_message_resumable_put(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    handle_resumable_chunk(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesImport,
+        raw_query.as_deref(),
+        &headers,
+        body,
+    )
+    .await
+}
+
+async fn import_message_resumable_delete(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::MessagesImport,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+async fn create_draft_resumable_put(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    handle_resumable_chunk(
+        &state,
+        &user_id,
+        ResumableEndpoint::DraftsCreate,
+        raw_query.as_deref(),
+        &headers,
+        body,
+    )
+    .await
+}
+
+async fn create_draft_resumable_delete(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::DraftsCreate,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+async fn send_draft_resumable_put(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    handle_resumable_chunk(
+        &state,
+        &user_id,
+        ResumableEndpoint::DraftsSend,
+        raw_query.as_deref(),
+        &headers,
+        body,
+    )
+    .await
+}
+
+async fn send_draft_resumable_delete(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::DraftsSend,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+async fn update_draft_resumable_delete(
+    State(state): State<AppState>,
+    Path((user_id, id)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<StatusCode> {
+    validate_resource_id(&id)?;
+    handle_resumable_cancel(
+        &state,
+        &user_id,
+        ResumableEndpoint::DraftsUpdate(id),
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+/// `POST /gmail/v1/users/{userId}/messages/send` & `/upload/gmail/v1/users/{userId}/messages/send`
+async fn send_message(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    uri: Uri,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query.as_deref());
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_message_metadata(&body)?;
+        validate_message_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::MessagesSend,
+            ResumableUploadMetadata::Message(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
+    }
+
+    let extracted = extract_message_upload(&headers, &params, &body)?;
+    let msg = complete_send_message(
+        &state,
+        extracted.metadata,
+        extracted.raw_bytes,
+        idempotency_key_header(&headers),
+    )
+    .await?;
+    Ok(Json(msg).into_response())
+}
+
+/// `POST /gmail/v1/users/{userId}/messages` & `/upload/gmail/v1/users/{userId}/messages` (`insert`)
+async fn insert_message(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    uri: Uri,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query.as_deref());
+    let date_source = params
+        .get("internalDateSource")
+        .unwrap_or("receivedTime")
+        .to_ascii_lowercase();
+    if date_source != "receivedtime" && date_source != "dateheader" {
+        return Err(AppError::BadRequest(format!(
+            "Invalid internalDateSource '{date_source}'; expected receivedTime or dateHeader"
+        )));
+    }
+    let deleted = params.get_bool("deleted", false)?;
+
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_message_metadata(&body)?;
+        validate_message_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::MessagesInsert {
+                date_source,
+                deleted,
+            },
+            ResumableUploadMetadata::Message(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
+    }
+
+    let extracted = extract_message_upload(&headers, &params, &body)?;
+    let msg = complete_insert_message(
+        &state,
+        extracted.metadata,
+        extracted.raw_bytes,
+        &date_source,
+        deleted,
+    )
+    .await?;
+    Ok(Json(msg).into_response())
+}
+
+/// `POST /gmail/v1/users/{userId}/messages/import` & `/upload/gmail/v1/users/{userId}/messages/import`
+async fn import_message(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    uri: Uri,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query.as_deref());
+    let date_source = params
+        .get("internalDateSource")
+        .unwrap_or("dateHeader")
+        .to_ascii_lowercase();
+    if date_source != "receivedtime" && date_source != "dateheader" {
+        return Err(AppError::BadRequest(format!(
+            "Invalid internalDateSource '{date_source}'; expected dateHeader or receivedTime"
+        )));
+    }
+    let never_mark_spam = params.get_bool("neverMarkSpam", false)?;
+    let process_for_calendar = params.get_bool("processForCalendar", false)?;
+    let deleted = params.get_bool("deleted", false)?;
+
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_message_metadata(&body)?;
+        validate_message_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::MessagesImport {
+                date_source,
+                never_mark_spam,
+                process_for_calendar,
+                deleted,
+            },
+            ResumableUploadMetadata::Message(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
+    }
+
+    let extracted = extract_message_upload(&headers, &params, &body)?;
+    let msg = complete_import_message(
+        &state,
+        extracted.metadata,
+        extracted.raw_bytes,
+        &date_source,
+        never_mark_spam,
+        process_for_calendar,
+        deleted,
+    )
+    .await?;
+    Ok(Json(msg).into_response())
 }
 
 /// `POST /gmail/v1/users/{userId}/messages/{id}/modify`
@@ -1558,19 +2113,13 @@ async fn get_draft(
     ))
 }
 
-/// `POST /gmail/v1/users/{userId}/drafts` & `/upload/gmail/v1/users/{userId}/drafts`
-async fn create_draft(
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Json<Draft>> {
-    resolve_user_id(&user_id, &state.config)?;
-    let params = QueryParams::from_raw(raw_query.as_deref());
-    let extracted = extract_draft_upload(&headers, &params, &body)?;
-    let input = build_draft_message_input(&state, &extracted.metadata, extracted.raw_bytes)?;
-
+/// Shared `drafts.create` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_create_draft(
+    state: &AppState,
+    metadata: Draft,
+    raw_bytes: Option<Vec<u8>>,
+) -> AppResult<Draft> {
+    let input = build_draft_message_input(state, &metadata, raw_bytes)?;
     let draft = state.store.create_draft(input).await?;
     state.post_store_message(&draft.message).await?;
     state.events.publish(
@@ -1582,26 +2131,18 @@ async fn create_draft(
         },
     );
 
-    Ok(Json(
-        format_stored_draft(&state, &draft, MessageFormat::Minimal, &[]).await?,
-    ))
+    format_stored_draft(state, &draft, MessageFormat::Minimal, &[]).await
 }
 
-/// `PUT /gmail/v1/users/{userId}/drafts/{id}` & `/upload/gmail/v1/users/{userId}/drafts/{id}`
-async fn update_draft(
-    State(state): State<AppState>,
-    Path((user_id, id)): Path<(String, String)>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Json<Draft>> {
-    resolve_user_id(&user_id, &state.config)?;
-    validate_resource_id(&id)?;
-    let params = QueryParams::from_raw(raw_query.as_deref());
-    let extracted = extract_draft_upload(&headers, &params, &body)?;
-    let input = build_draft_message_input(&state, &extracted.metadata, extracted.raw_bytes)?;
-
-    let draft = state.store.update_draft(&id, input).await?;
+/// Shared `drafts.update` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_update_draft(
+    state: &AppState,
+    draft_id: &str,
+    metadata: Draft,
+    raw_bytes: Option<Vec<u8>>,
+) -> AppResult<Draft> {
+    let input = build_draft_message_input(state, &metadata, raw_bytes)?;
+    let draft = state.store.update_draft(draft_id, input).await?;
     state.post_store_message(&draft.message).await?;
     state.events.publish(
         EventSource::Api,
@@ -1612,9 +2153,144 @@ async fn update_draft(
         },
     );
 
-    Ok(Json(
-        format_stored_draft(&state, &draft, MessageFormat::Minimal, &[]).await?,
-    ))
+    format_stored_draft(state, &draft, MessageFormat::Minimal, &[]).await
+}
+
+/// Shared `drafts.send` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+async fn complete_send_draft(
+    state: &AppState,
+    metadata: Draft,
+    raw_bytes: Option<Vec<u8>>,
+    idempotency_key: Option<&str>,
+) -> AppResult<Message> {
+    let draft_id = (!metadata.id.trim().is_empty()).then(|| metadata.id.trim().to_string());
+    if let Some(ref did) = draft_id {
+        validate_resource_id(did)?;
+    }
+
+    let existing_draft = match draft_id.as_deref() {
+        Some(did) => Some(
+            state
+                .store
+                .get_draft(did)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Draft '{did}' not found")))?,
+        ),
+        None => None,
+    };
+
+    let raw_bytes = match raw_bytes {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => match existing_draft.as_ref() {
+            Some(d) => d.message.raw_rfc2822.clone(),
+            None => {
+                return Err(AppError::BadRequest(
+                    "drafts.send requires either an existing draft 'id' or a raw RFC 2822 message"
+                        .to_string(),
+                ));
+            }
+        },
+    };
+
+    let thread_id = metadata
+        .message
+        .as_ref()
+        .map(|m| m.thread_id.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| existing_draft.as_ref().map(|d| d.message.thread_id.clone()));
+
+    let extra_labels = metadata
+        .message
+        .as_ref()
+        .and_then(|m| m.label_ids.clone())
+        .unwrap_or_default();
+
+    let stored =
+        execute_gmail_send(state, raw_bytes, thread_id, extra_labels, idempotency_key).await?;
+
+    if let Some(ref did) = draft_id {
+        let _ = state.store.delete_draft(did).await?;
+    }
+
+    format_gmail_message(&stored, MessageFormat::Minimal, &[])
+}
+
+/// `POST /gmail/v1/users/{userId}/drafts` & `/upload/gmail/v1/users/{userId}/drafts`
+async fn create_draft(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    uri: Uri,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
+    let params = QueryParams::from_raw(raw_query.as_deref());
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_draft_metadata(&body)?;
+        validate_draft_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::DraftsCreate,
+            ResumableUploadMetadata::Draft(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
+    }
+
+    let extracted = extract_draft_upload(&headers, &params, &body)?;
+    let draft = complete_create_draft(&state, extracted.metadata, extracted.raw_bytes).await?;
+    Ok(Json(draft).into_response())
+}
+
+/// `PUT /gmail/v1/users/{userId}/drafts/{id}` & `/upload/gmail/v1/users/{userId}/drafts/{id}`
+async fn update_draft(
+    State(state): State<AppState>,
+    Path((user_id, id)): Path<(String, String)>,
+    uri: Uri,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
+    validate_resource_id(&id)?;
+    let params = QueryParams::from_raw(raw_query.as_deref());
+
+    if params
+        .get("upload_id")
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return handle_resumable_chunk(
+            &state,
+            &user_id,
+            ResumableEndpoint::DraftsUpdate(id),
+            raw_query.as_deref(),
+            &headers,
+            body,
+        )
+        .await;
+    }
+
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_draft_metadata(&body)?;
+        validate_draft_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::DraftsUpdate { draft_id: id },
+            ResumableUploadMetadata::Draft(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
+    }
+
+    let extracted = extract_draft_upload(&headers, &params, &body)?;
+    let draft = complete_update_draft(&state, &id, extracted.metadata, extracted.raw_bytes).await?;
+    Ok(Json(draft).into_response())
 }
 
 /// `DELETE /gmail/v1/users/{userId}/drafts/{id}`
@@ -1650,75 +2326,36 @@ async fn delete_draft(
 async fn send_draft(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
+    uri: Uri,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
-) -> AppResult<Json<Message>> {
-    resolve_user_id(&user_id, &state.config)?;
+) -> AppResult<Response> {
+    let user_email = resolve_user_id(&user_id, &state.config)?;
     let params = QueryParams::from_raw(raw_query.as_deref());
-    let extracted = extract_draft_upload(&headers, &params, &body)?;
-
-    let draft_id = (!extracted.metadata.id.trim().is_empty())
-        .then(|| extracted.metadata.id.trim().to_string());
-    if let Some(ref did) = draft_id {
-        validate_resource_id(did)?;
+    if is_resumable_upload(&params) {
+        let metadata = extract_resumable_draft_metadata(&body)?;
+        validate_draft_metadata(&metadata)?;
+        return initiate_resumable_upload(
+            &state,
+            user_email,
+            ResumableUploadTarget::DraftsSend,
+            ResumableUploadMetadata::Draft(metadata),
+            &uri,
+            &params,
+            &headers,
+        );
     }
 
-    let existing_draft = match draft_id.as_deref() {
-        Some(did) => Some(
-            state
-                .store
-                .get_draft(did)
-                .await?
-                .ok_or_else(|| AppError::NotFound(format!("Draft '{did}' not found")))?,
-        ),
-        None => None,
-    };
-
-    let raw_bytes = match extracted.raw_bytes {
-        Some(bytes) if !bytes.is_empty() => bytes,
-        _ => match existing_draft.as_ref() {
-            Some(d) => d.message.raw_rfc2822.clone(),
-            None => {
-                return Err(AppError::BadRequest(
-                    "drafts.send requires either an existing draft 'id' or a raw RFC 2822 message"
-                        .to_string(),
-                ));
-            }
-        },
-    };
-
-    let thread_id = extracted
-        .metadata
-        .message
-        .as_ref()
-        .map(|m| m.thread_id.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| existing_draft.as_ref().map(|d| d.message.thread_id.clone()));
-
-    let extra_labels = extracted
-        .metadata
-        .message
-        .as_ref()
-        .and_then(|m| m.label_ids.clone())
-        .unwrap_or_default();
-
-    let stored = execute_gmail_send(
+    let extracted = extract_draft_upload(&headers, &params, &body)?;
+    let msg = complete_send_draft(
         &state,
-        raw_bytes,
-        thread_id,
-        extra_labels,
+        extracted.metadata,
+        extracted.raw_bytes,
         idempotency_key_header(&headers),
     )
     .await?;
-
-    if let Some(ref did) = draft_id {
-        let _ = state.store.delete_draft(did).await?;
-    }
-
-    let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
-    Ok(Json(msg))
+    Ok(Json(msg).into_response())
 }
 
 // ============================================================================
