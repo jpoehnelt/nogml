@@ -19,6 +19,7 @@ const DEFAULT_REPLAY_CAPACITY: usize = 1024;
 pub enum EventSource {
     ResendInbound,
     ResendWebhook,
+    SesInbound,
     GmailSync,
     Api,
     Mcp,

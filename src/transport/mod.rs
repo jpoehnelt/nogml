@@ -5,17 +5,96 @@
 //! can drop in behind `Arc<dyn MailTransport>` without leaking provider types into `gmail`,
 //! `ai`, `mcp`, `imap`, or `storage`.
 
-use std::collections::HashMap;
+pub mod ses;
+pub mod smtp;
+
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::{
+    config::{Config, TransportBackend},
     error::{AppError, AppResult},
     events::{EventBus, EventSource, MailEvent},
     filter::{FilterDecision, InboundFilter, InboundMessage, apply_filter_labels},
+    resend::{ResendClient, ResendTransport},
     storage::{MailStore, NewAttachmentInput, NewMessageInput, StoredMessage},
 };
+
+pub use ses::{
+    SesConfig, SesTransport, SigV4Headers, ses_router, ses_webhook_handler, sign_aws_v4,
+};
+pub use smtp::{SmtpConfig, SmtpTransport, dot_stuff_rfc5321};
+
+/// Construct the active [`MailTransport`] selected by [`Config::transport`].
+pub fn open_transport(
+    config: &Config,
+    resend: Arc<dyn ResendClient>,
+) -> AppResult<Arc<dyn MailTransport>> {
+    match config.transport {
+        TransportBackend::Resend => Ok(Arc::new(ResendTransport::new(
+            resend,
+            config.user_email.clone(),
+        ))),
+        TransportBackend::Ses => Ok(Arc::new(SesTransport::from_config(config)?)),
+        TransportBackend::Smtp => Ok(Arc::new(SmtpTransport::from_config(config)?)),
+    }
+}
+
+/// Return `msg.raw_rfc2822` verbatim when populated, or synthesize RFC 2822 bytes from
+/// structured fields as a fallback.
+pub(crate) fn ensure_raw_rfc2822(msg: &OutboundMessage, default_from: &str) -> AppResult<Vec<u8>> {
+    if !msg.raw_rfc2822.is_empty() {
+        return Ok(msg.raw_rfc2822.clone());
+    }
+
+    let from = if msg.from.trim().is_empty() {
+        default_from.trim().to_string()
+    } else {
+        msg.from.trim().to_string()
+    };
+
+    let compose = crate::mime::ComposeEmailInput {
+        from,
+        to: msg.to.clone(),
+        cc: msg.cc.clone(),
+        bcc: msg.bcc.clone(),
+        reply_to: msg.reply_to.clone(),
+        subject: msg.subject.clone(),
+        text: msg.text.clone(),
+        html: msg.html.clone(),
+        message_id: msg
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("message-id"))
+            .map(|(_, v)| v.clone()),
+        in_reply_to: msg
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("in-reply-to"))
+            .map(|(_, v)| v.clone()),
+        references: msg
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("references"))
+            .map(|(_, v)| v.clone()),
+        extra_headers: msg.headers.clone(),
+        attachments: msg
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(idx, att)| NewAttachmentInput {
+                part_id: format!("att_{}", idx + 1),
+                filename: att.filename.clone(),
+                content_type: att.content_type.clone(),
+                content_id: att.content_id.clone(),
+                data: att.data.clone(),
+            })
+            .collect(),
+    };
+    crate::mime::build_rfc2822(&compose)
+}
 
 /// Attachment carried on an [`OutboundMessage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +232,7 @@ fn source_to_event_source(source: &str) -> EventSource {
     match source {
         "resend_inbound" => EventSource::ResendInbound,
         "resend_webhook" => EventSource::ResendWebhook,
+        "ses_inbound" | "ses_s3" => EventSource::SesInbound,
         "gmail_api" | "gmail_imap" | "gmail_sync" => EventSource::GmailSync,
         "imap_append" | "imap" => EventSource::Imap,
         "mcp" => EventSource::Mcp,

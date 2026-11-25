@@ -27,6 +27,29 @@ pub enum BlobBackend {
     S3,
 }
 
+/// Selectable outbound mail transport backend behind `MailTransport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportBackend {
+    #[default]
+    Resend,
+    Ses,
+    Smtp,
+}
+
+/// TLS mode for `SmtpTransport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTlsMode {
+    /// Upgrade plaintext TCP connection with `STARTTLS` (typical port 587).
+    #[default]
+    Starttls,
+    /// Implicit TLS / SMTPS from connection start (typical port 465).
+    Tls,
+    /// Plaintext TCP without TLS (for local relays and testing).
+    None,
+}
+
 /// Behavior when `draft_only` is enabled and an agent attempts to send mail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,10 +124,30 @@ pub struct Config {
     /// Default domain for generated Message-IDs and fallback sender addresses.
     pub default_domain: String,
 
+    // --- Outbound mail transport ---
+    pub transport: TransportBackend,
+
     // --- Resend outbound & inbound ---
     pub resend_api_key: Option<String>,
     pub resend_base_url: String,
     pub resend_webhook_secret: Option<String>,
+
+    // --- AWS SES outbound & SNS/S3 inbound ---
+    pub ses_region: String,
+    pub ses_endpoint: Option<String>,
+    pub ses_access_key_id: Option<String>,
+    pub ses_secret_access_key: Option<String>,
+    pub ses_session_token: Option<String>,
+    pub ses_s3_endpoint: Option<String>,
+    pub ses_webhook_secret: Option<String>,
+
+    // --- SMTP outbound submission ---
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_tls_mode: SmtpTlsMode,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_helo_domain: Option<String>,
 
     // --- AI-first safety guardrails ---
     pub draft_only: bool,
@@ -205,9 +248,26 @@ impl Default for Config {
             user_email: "me@localhost".to_string(),
             default_domain: "localhost".to_string(),
 
+            transport: TransportBackend::Resend,
+
             resend_api_key: None,
             resend_base_url: "https://api.resend.com".to_string(),
             resend_webhook_secret: None,
+
+            ses_region: "us-east-1".to_string(),
+            ses_endpoint: None,
+            ses_access_key_id: None,
+            ses_secret_access_key: None,
+            ses_session_token: None,
+            ses_s3_endpoint: None,
+            ses_webhook_secret: None,
+
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: 587,
+            smtp_tls_mode: SmtpTlsMode::Starttls,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_helo_domain: None,
 
             draft_only: false,
             draft_only_action: DraftOnlyAction::Block,
