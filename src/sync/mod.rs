@@ -31,8 +31,8 @@ use crate::{
     filter::{FilterDecision, InboundMessage, apply_filter_labels},
     models::{LABEL_INBOX, LABEL_TRASH, LABEL_UNREAD, SyncStatusResponse},
     storage::{
-        HistoryEventKind, HistoryListQuery, NewMessageInput, SyncState, UpsertOutcome,
-        UpsertOutcomeKind,
+        HISTORY_SOURCE_SYNC, HistoryEventKind, HistoryListQuery, NewMessageInput, SyncState,
+        UpsertOutcome, UpsertOutcomeKind,
     },
 };
 
@@ -128,7 +128,7 @@ pub trait SyncSource: Send + Sync {
 pub fn open_sync_source(mode: SyncMode) -> Box<dyn SyncSource> {
     match mode {
         SyncMode::Api => Box::new(GmailApiSyncSource),
-        SyncMode::Imap => Box::new(GmailImapSyncSource),
+        SyncMode::Imap => Box::new(GmailImapSyncSource::default()),
     }
 }
 
@@ -406,8 +406,15 @@ async fn run_sync_source_inner(
         PushReport::default()
     };
 
-    // 4. Advance local push checkpoint past pull-generated history events so pulled changes never echo.
-    sync_state.last_pushed_history_id = Some(post_pull_hid);
+    // 4. Advance local push checkpoint past pull-generated (`source = "sync"`) history events
+    // without skipping any concurrent local (`source = "local"`) mutations created while `pull()`
+    // was executing.
+    let next_pushed_hid = if bidirectional {
+        compute_next_pushed_history_id(state, pre_pull_hid, post_pull_hid).await?
+    } else {
+        post_pull_hid
+    };
+    sync_state.last_pushed_history_id = Some(next_pushed_hid);
     sync_state.messages_pushed = sync_state
         .messages_pushed
         .saturating_add(push_report.messages_pushed);
@@ -470,6 +477,10 @@ async fn collect_local_mutations(
     let mut by_msg: HashMap<String, PendingMutation> = HashMap::new();
 
     for entry in entries {
+        if entry.source == HISTORY_SOURCE_SYNC {
+            // Skip upstream-originated sync writes so retries never echo pulled rows back upstream.
+            continue;
+        }
         let acc = by_msg.entry(entry.message_id.clone()).or_insert_with(|| {
             order.push(entry.message_id.clone());
             PendingMutation::default()
@@ -585,6 +596,10 @@ async fn resolve_pull_conflicts(
     let mut pulled_labels: HashMap<String, HashSet<String>> = HashMap::new();
 
     for ev in pull_events {
+        if ev.source != HISTORY_SOURCE_SYNC {
+            // Concurrent local mutations occurring during `pull()` are NOT upstream pull conflicts.
+            continue;
+        }
         match ev.kind {
             HistoryEventKind::MessageDeleted => {
                 pulled_deleted.insert(ev.message_id);
@@ -639,6 +654,30 @@ async fn resolve_pull_conflicts(
     }
 
     Ok(resolved)
+}
+
+/// Compute the safe `last_pushed_history_id` after `pull()` completes: advance through
+/// `post_pull_hid` if only sync-originated events occurred during `pull()`, or stop immediately
+/// before the earliest concurrent local mutation so it will be pushed on the next sync.
+async fn compute_next_pushed_history_id(
+    state: &AppState,
+    pre_pull_hid: u64,
+    post_pull_hid: u64,
+) -> AppResult<u64> {
+    if post_pull_hid <= pre_pull_hid {
+        return Ok(post_pull_hid);
+    }
+    let range_events = load_mutation_history_range(state, pre_pull_hid, post_pull_hid).await?;
+    if let Some(first_local_hid) = range_events
+        .iter()
+        .filter(|e| e.source != HISTORY_SOURCE_SYNC)
+        .map(|e| e.history_id)
+        .min()
+    {
+        Ok(first_local_hid.saturating_sub(1).max(pre_pull_hid))
+    } else {
+        Ok(post_pull_hid)
+    }
 }
 
 async fn load_mutation_history_range(

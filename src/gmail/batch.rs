@@ -28,6 +28,9 @@ const MAX_BATCH_PARTS: usize = 100;
 /// Max buffered size of a single sub-response body (32 MiB).
 const MAX_SUB_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Default aggregate serialized byte ceiling for the entire `/batch/gmail/v1` response (64 MiB).
+pub const MAX_BATCH_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// `POST /batch/gmail/v1`
 pub async fn batch_handler(
     State(state): State<AppState>,
@@ -59,6 +62,7 @@ pub async fn batch_handler(
     let outer_api_key = headers.get("x-api-key").cloned();
     let outer_principal = outer_principal.map(|Extension(p)| p);
 
+    let max_batch_response_bytes = state.max_batch_response_bytes;
     let sub_router = gmail_api_routes()
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -66,7 +70,8 @@ pub async fn batch_handler(
         ))
         .with_state(state);
     let response_boundary = format!("batch_{}", Uuid::new_v4().simple());
-    let mut out = Vec::with_capacity(body.len() + 1024);
+    let closing_boundary = format!("--{response_boundary}--\r\n");
+    let mut out = Vec::with_capacity((body.len() + 1024).min(max_batch_response_bytes));
 
     for part in parts {
         let part_content_id = part.header("content-id").map(strip_angle_brackets);
@@ -88,13 +93,20 @@ pub async fn batch_handler(
         write_batch_part(
             &mut out,
             &response_boundary,
+            closing_boundary.len(),
+            max_batch_response_bytes,
             part_content_id.as_deref(),
             sub_response,
         )
         .await?;
     }
 
-    out.extend_from_slice(format!("--{response_boundary}--\r\n").as_bytes());
+    if out.len().saturating_add(closing_boundary.len()) > max_batch_response_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Batch response exceeds maximum aggregate size of {max_batch_response_bytes} bytes"
+        )));
+    }
+    out.extend_from_slice(closing_boundary.as_bytes());
 
     let ct_value = HeaderValue::from_str(&format!("multipart/mixed; boundary={response_boundary}"))
         .map_err(|e| AppError::Internal(format!("Invalid batch boundary header: {e}")))?;
@@ -250,26 +262,26 @@ fn normalize_batch_target(raw: &str) -> AppResult<String> {
 async fn write_batch_part(
     out: &mut Vec<u8>,
     boundary: &str,
+    closing_boundary_len: usize,
+    max_batch_response_bytes: usize,
     content_id: Option<&str>,
     response: Response,
 ) -> AppResult<()> {
     let status = response.status();
     let headers = response.headers().clone();
-    let body_bytes = to_bytes(response.into_body(), MAX_SUB_RESPONSE_BYTES)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed reading batch sub-response: {e}")))?;
 
-    out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    out.extend_from_slice(b"Content-Type: application/http\r\n");
+    let mut header_buf = Vec::with_capacity(256);
+    header_buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    header_buf.extend_from_slice(b"Content-Type: application/http\r\n");
     if let Some(cid) = content_id
         && !cid.is_empty()
     {
-        out.extend_from_slice(format!("Content-ID: response-{cid}\r\n").as_bytes());
+        header_buf.extend_from_slice(format!("Content-ID: response-{cid}\r\n").as_bytes());
     }
-    out.extend_from_slice(b"\r\n");
+    header_buf.extend_from_slice(b"\r\n");
 
     let reason = status.canonical_reason().unwrap_or("OK");
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    header_buf.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
 
     let mut wrote_content_type = false;
     for (name, val) in &headers {
@@ -280,14 +292,56 @@ async fn write_batch_part(
             wrote_content_type = true;
         }
         if let Ok(val_str) = val.to_str() {
-            out.extend_from_slice(format!("{name}: {val_str}\r\n").as_bytes());
+            header_buf.extend_from_slice(format!("{name}: {val_str}\r\n").as_bytes());
         }
     }
-    if !wrote_content_type && !body_bytes.is_empty() {
-        out.extend_from_slice(b"content-type: application/json; charset=UTF-8\r\n");
+
+    let overhead = out
+        .len()
+        .saturating_add(header_buf.len())
+        .saturating_add(closing_boundary_len)
+        .saturating_add(4); // \r\n before and after body
+    if overhead > max_batch_response_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Batch response exceeds maximum aggregate size of {max_batch_response_bytes} bytes"
+        )));
     }
-    out.extend_from_slice(format!("content-length: {}\r\n", body_bytes.len()).as_bytes());
-    out.extend_from_slice(b"\r\n");
+    let body_budget = max_batch_response_bytes
+        .saturating_sub(overhead)
+        .min(MAX_SUB_RESPONSE_BYTES);
+
+    let body_bytes = to_bytes(response.into_body(), body_budget)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("length limit") {
+                AppError::PayloadTooLarge(format!(
+                    "Batch response exceeds maximum aggregate size of {max_batch_response_bytes} bytes"
+                ))
+            } else {
+                AppError::Internal(format!("Failed reading batch sub-response: {msg}"))
+            }
+        })?;
+
+    if !wrote_content_type && !body_bytes.is_empty() {
+        header_buf.extend_from_slice(b"content-type: application/json; charset=UTF-8\r\n");
+    }
+    header_buf.extend_from_slice(format!("content-length: {}\r\n", body_bytes.len()).as_bytes());
+    header_buf.extend_from_slice(b"\r\n");
+
+    let projected = out
+        .len()
+        .saturating_add(header_buf.len())
+        .saturating_add(body_bytes.len())
+        .saturating_add(2)
+        .saturating_add(closing_boundary_len);
+    if projected > max_batch_response_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Batch response exceeds maximum aggregate size of {max_batch_response_bytes} bytes"
+        )));
+    }
+
+    out.extend_from_slice(&header_buf);
     out.extend_from_slice(&body_bytes);
     out.extend_from_slice(b"\r\n");
 

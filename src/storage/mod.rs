@@ -138,6 +138,18 @@ pub enum HistoryEventKind {
     LabelRemoved,
 }
 
+/// History event origin: local API/MCP/IMAP/rule mutation.
+pub const HISTORY_SOURCE_LOCAL: &str = "local";
+/// History event origin: upstream sync pull (`upsert_synced_message`, upstream delete/modify).
+pub const HISTORY_SOURCE_SYNC: &str = "sync";
+
+/// Default stale-lease threshold (5 minutes) for reclaiming orphaned `Sending` scheduled sends.
+pub const DEFAULT_SCHEDULED_SEND_STALE_LEASE_MS: i64 = 5 * 60 * 1000;
+
+fn default_history_source() -> String {
+    HISTORY_SOURCE_LOCAL.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredHistoryEntry {
     pub history_id: u64,
@@ -147,6 +159,8 @@ pub struct StoredHistoryEntry {
     pub label_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_gmail_id: Option<String>,
+    #[serde(default = "default_history_source")]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,6 +515,7 @@ pub struct WatchSubscription {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
     Pending,
+    Approving,
     Approved,
     Rejected,
     Expired,
@@ -510,6 +525,7 @@ impl ApprovalStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Approving => "approving",
             Self::Approved => "approved",
             Self::Rejected => "rejected",
             Self::Expired => "expired",
@@ -519,6 +535,7 @@ impl ApprovalStatus {
     pub fn parse_str(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "pending" => Some(Self::Pending),
+            "approving" => Some(Self::Approving),
             "approved" => Some(Self::Approved),
             "rejected" => Some(Self::Rejected),
             "expired" => Some(Self::Expired),
@@ -813,6 +830,7 @@ pub struct SnoozedThread {
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledSendStatus {
     Pending,
+    Sending,
     Sent,
     Canceled,
     Failed,
@@ -822,6 +840,7 @@ impl ScheduledSendStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Sending => "sending",
             Self::Sent => "sent",
             Self::Canceled => "canceled",
             Self::Failed => "failed",
@@ -831,6 +850,7 @@ impl ScheduledSendStatus {
     pub fn parse_str(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "pending" => Some(Self::Pending),
+            "sending" => Some(Self::Sending),
             "sent" => Some(Self::Sent),
             "canceled" | "cancelled" => Some(Self::Canceled),
             "failed" => Some(Self::Failed),
@@ -1519,6 +1539,16 @@ pub trait MailStore: Send + Sync {
 
     // --- Upstream Sync & Deduplication ---
     async fn upsert_synced_message(&self, input: NewMessageInput) -> AppResult<UpsertOutcome>;
+    /// Modify labels on a message due to an upstream sync pull, recording history with `source = "sync"`.
+    async fn modify_synced_message_labels(
+        &self,
+        id: &str,
+        add_labels: &[String],
+        remove_labels: &[String],
+    ) -> AppResult<StoredMessage> {
+        self.modify_message_labels(id, add_labels, remove_labels)
+            .await
+    }
     async fn find_message_by_upstream_id(
         &self,
         upstream_gmail_id: &str,
@@ -1549,7 +1579,33 @@ pub trait MailStore: Send + Sync {
         status: Option<ApprovalStatus>,
         limit: usize,
     ) -> AppResult<Vec<PendingApproval>>;
-    /// Atomically transition a `Pending` approval to `Approved` or `Rejected`.
+    /// Atomically claim a `Pending` non-expired approval for dispatch (transitioning to `Approving`)
+    /// so concurrent replicas can never double-send.
+    /// Returns `AppError::NotFound` if missing, or `AppError::Conflict` if already claimed/decided/expired.
+    async fn claim_pending_approval(&self, id: &str, now_ms: i64) -> AppResult<PendingApproval> {
+        let approval = self
+            .get_pending_approval(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+        if approval.status == ApprovalStatus::Expired || approval.expires_at_ms <= now_ms {
+            let _ = self
+                .resolve_pending_approval(id, ApprovalStatus::Approved, None, None, None, None)
+                .await;
+            return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+        }
+        if approval.status != ApprovalStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' is already {}",
+                approval.status
+            )));
+        }
+        Ok(approval)
+    }
+    /// Best-effort revert an `Approving` claim back to `Pending` when transport dispatch fails before sending.
+    async fn release_claimed_approval(&self, _id: &str) -> AppResult<()> {
+        Ok(())
+    }
+    /// Atomically transition a `Pending` (or `Approving` when finalizing `Approved`) approval to `Approved` or `Rejected`.
     /// Returns `AppError::NotFound` if missing, or `AppError::Conflict` if already decided or expired.
     async fn resolve_pending_approval(
         &self,
@@ -1613,16 +1669,22 @@ pub trait MailStore: Send + Sync {
     /// Atomically transition a `Pending` scheduled send to `Canceled`.
     /// Returns `AppError::NotFound` if missing, or `AppError::Conflict` if already sent/canceled/failed.
     async fn cancel_scheduled_send(&self, id: &str) -> AppResult<ScheduledSend>;
-    /// List due `Pending` scheduled sends (`send_at_ms <= now_ms`) across all mailboxes.
-    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>>;
-    /// Atomically transition a `Pending` scheduled send to `Sent`.
+    /// Atomically claim due `Pending` scheduled sends (`send_at_ms <= now_ms`) and stale `Sending`
+    /// leases (`stale_lease_ms > 0` and `updated_at_ms <= now_ms - stale_lease_ms`) across all
+    /// mailboxes, transitioning them to `Sending` and returning ONLY rows claimed by this caller.
+    async fn claim_due_scheduled_sends(
+        &self,
+        now_ms: i64,
+        stale_lease_ms: i64,
+    ) -> AppResult<Vec<ScheduledSend>>;
+    /// Atomically transition a `Pending` or `Sending` scheduled send to `Sent`.
     async fn complete_scheduled_send(
         &self,
         id: &str,
         sent_message_id: &str,
         provider_message_id: &str,
     ) -> AppResult<ScheduledSend>;
-    /// Atomically transition a `Pending` scheduled send to `Failed`.
+    /// Atomically transition a `Pending` or `Sending` scheduled send to `Failed`.
     async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend>;
 
     // --- Per-Mailbox Event-Driven Inbox Rules ---

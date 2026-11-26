@@ -33,18 +33,18 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
-        ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRuleActions, InboxRulePatch,
-        MAX_SQL_LIMIT, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
-        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
-        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
-        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
-        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip, normalize_contact_email,
-        normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
-        validate_and_normalize_contact_email,
+        ContactRecord, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
+        ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
+        InboxRuleActions, InboxRulePatch, MAX_SQL_LIMIT, MailStore, MessageListPage,
+        MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
+        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
+        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
+        VIP_REPLY_THRESHOLD, WatchSubscription, apply_inbox_rule_patch, clamp_sql_limit,
+        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -66,7 +66,7 @@ pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 7;
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -233,8 +233,10 @@ CREATE TABLE IF NOT EXISTS history_events (
     thread_id TEXT NOT NULL,
     label_ids_json TEXT NOT NULL,
     context_labels_json TEXT NOT NULL DEFAULT '[]',
-    upstream_gmail_id TEXT
+    upstream_gmail_id TEXT,
+    source TEXT NOT NULL DEFAULT 'local'
 );
+ALTER TABLE history_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'local';
 CREATE INDEX IF NOT EXISTS idx_history_events_mailbox_hid
     ON history_events (mailbox_id, history_id, id);
 
@@ -1389,6 +1391,7 @@ async fn record_history_event(
     label_ids: &[String],
     context_labels: &[String],
     upstream_gmail_id: Option<&str>,
+    source: &str,
 ) -> AppResult<()> {
     let labels_json = serde_json::to_string(label_ids)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
@@ -1397,8 +1400,8 @@ async fn record_history_event(
     let hid_i64 = history_id as i64;
     let kind_str = history_kind_to_str(kind);
     tx.execute(
-        "INSERT INTO history_events (mailbox_id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "INSERT INTO history_events (mailbox_id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         &[
             &mailbox_id,
             &hid_i64,
@@ -1408,6 +1411,7 @@ async fn record_history_event(
             &labels_json,
             &ctx_json,
             &upstream_gmail_id,
+            &source,
         ],
     )
     .await
@@ -1765,6 +1769,15 @@ async fn insert_message_tx(
     mailbox_id: &str,
     input: NewMessageInput,
 ) -> AppResult<StoredMessage> {
+    insert_message_tx_with_source(tx, mailbox_id, input, HISTORY_SOURCE_LOCAL).await
+}
+
+async fn insert_message_tx_with_source(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    input: NewMessageInput,
+    history_source: &str,
+) -> AppResult<StoredMessage> {
     let msg_id = input
         .id
         .as_deref()
@@ -1906,6 +1919,7 @@ async fn insert_message_tx(
         &resolved_labels,
         &resolved_labels,
         input.upstream_gmail_id.as_deref(),
+        history_source,
     )
     .await?;
 
@@ -1984,6 +1998,25 @@ async fn modify_message_labels_resolved_tx(
     message_id: &str,
     resolved_add: &[String],
     resolved_remove: &[String],
+) -> AppResult<StoredMessage> {
+    modify_message_labels_resolved_tx_with_source(
+        tx,
+        mailbox_id,
+        message_id,
+        resolved_add,
+        resolved_remove,
+        HISTORY_SOURCE_LOCAL,
+    )
+    .await
+}
+
+async fn modify_message_labels_resolved_tx_with_source(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    message_id: &str,
+    resolved_add: &[String],
+    resolved_remove: &[String],
+    history_source: &str,
 ) -> AppResult<StoredMessage> {
     let mut msg = load_message_by_id_for_update(tx, mailbox_id, message_id)
         .await?
@@ -2087,6 +2120,7 @@ async fn modify_message_labels_resolved_tx(
                 &actually_added,
                 &context_labels,
                 msg.upstream_gmail_id.as_deref(),
+                history_source,
             )
             .await?;
         }
@@ -2101,6 +2135,7 @@ async fn modify_message_labels_resolved_tx(
                 &actually_removed,
                 &context_labels,
                 msg.upstream_gmail_id.as_deref(),
+                history_source,
             )
             .await?;
         }
@@ -2116,6 +2151,15 @@ async fn delete_message_tx(
     tx: &Transaction<'_>,
     mailbox_id: &str,
     id: &str,
+) -> AppResult<Option<StoredMessage>> {
+    delete_message_tx_with_source(tx, mailbox_id, id, HISTORY_SOURCE_LOCAL).await
+}
+
+async fn delete_message_tx_with_source(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    id: &str,
+    history_source: &str,
 ) -> AppResult<Option<StoredMessage>> {
     let Some(msg) = load_message_by_id_for_update(tx, mailbox_id, id).await? else {
         return Ok(None);
@@ -2165,6 +2209,7 @@ async fn delete_message_tx(
         &msg.label_ids,
         &msg.label_ids,
         msg.upstream_gmail_id.as_deref(),
+        history_source,
     )
     .await?;
 
@@ -3195,7 +3240,7 @@ impl MailStore for PostgresStore {
         let start_hid_i64 = query.start_history_id.min(i64::MAX as u64) as i64;
         let rows = conn
             .query(
-                "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id
+                "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source
                  FROM history_events
                  WHERE mailbox_id = $1 AND history_id > $2 AND id > $3
                  ORDER BY id ASC",
@@ -3214,6 +3259,7 @@ impl MailStore for PostgresStore {
             let labels_json: String = row.get(5);
             let ctx_json: String = row.get(6);
             let upstream_gmail_id: Option<String> = row.get(7);
+            let source: String = row.get(8);
 
             let kind = str_to_history_kind(&kind_str)?;
             if !query.history_types.is_empty() && !query.history_types.contains(&kind) {
@@ -3236,6 +3282,7 @@ impl MailStore for PostgresStore {
                     thread_id,
                     label_ids,
                     upstream_gmail_id,
+                    source,
                 },
             ));
             if matched.len() > max_results {
@@ -4106,6 +4153,7 @@ impl MailStore for PostgresStore {
                 std::slice::from_ref(&id_owned),
                 &ctx,
                 up_id.as_deref(),
+                HISTORY_SOURCE_LOCAL,
             )
             .await?;
         }
@@ -5711,8 +5759,15 @@ impl MailStore for PostgresStore {
                 }
 
                 let updated = if labels_changed {
-                    modify_message_labels_resolved_tx(&tx, mb, &existing_id, &to_add, &to_remove)
-                        .await?
+                    modify_message_labels_resolved_tx_with_source(
+                        &tx,
+                        mb,
+                        &existing_id,
+                        &to_add,
+                        &to_remove,
+                        HISTORY_SOURCE_SYNC,
+                    )
+                    .await?
                 } else {
                     load_message_by_id(&tx, mb, &existing_id)
                         .await?
@@ -5777,7 +5832,15 @@ impl MailStore for PostgresStore {
                 }
             }
             let updated = if !to_add.is_empty() {
-                modify_message_labels_resolved_tx(&tx, mb, &existing_id, &to_add, &[]).await?
+                modify_message_labels_resolved_tx_with_source(
+                    &tx,
+                    mb,
+                    &existing_id,
+                    &to_add,
+                    &[],
+                    HISTORY_SOURCE_SYNC,
+                )
+                .await?
             } else {
                 load_message_by_id(&tx, mb, &existing_id)
                     .await?
@@ -5791,12 +5854,47 @@ impl MailStore for PostgresStore {
         }
 
         // 3. Insert new message
-        let inserted = insert_message_tx(&tx, mb, input).await?;
+        let inserted = insert_message_tx_with_source(&tx, mb, input, HISTORY_SOURCE_SYNC).await?;
         tx.commit().await.map_err(pg_err)?;
         Ok(UpsertOutcome {
             kind: UpsertOutcomeKind::Inserted,
             message: inserted,
         })
+    }
+
+    async fn modify_synced_message_labels(
+        &self,
+        id: &str,
+        add_labels: &[String],
+        remove_labels: &[String],
+    ) -> AppResult<StoredMessage> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+        let mut resolved_add = Vec::with_capacity(add_labels.len());
+        for l in add_labels {
+            let lid = resolve_existing_label_id(&tx, mb, l)
+                .await?
+                .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
+            resolved_add.push(lid);
+        }
+        let mut resolved_remove = Vec::with_capacity(remove_labels.len());
+        for l in remove_labels {
+            if let Some(lid) = resolve_existing_label_id(&tx, mb, l).await? {
+                resolved_remove.push(lid);
+            }
+        }
+        let updated = modify_message_labels_resolved_tx_with_source(
+            &tx,
+            mb,
+            id,
+            &resolved_add,
+            &resolved_remove,
+            HISTORY_SOURCE_SYNC,
+        )
+        .await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(updated)
     }
 
     async fn find_message_by_upstream_id(
@@ -5837,7 +5935,7 @@ impl MailStore for PostgresStore {
         let deleted = match row {
             Some(r) => {
                 let mid: String = r.get(0);
-                delete_message_tx(&tx, mb, &mid).await?
+                delete_message_tx_with_source(&tx, mb, &mid, HISTORY_SOURCE_SYNC).await?
             }
             None => None,
         };
@@ -6178,7 +6276,11 @@ impl MailStore for PostgresStore {
                 )
                 .await
                 .map_err(pg_err)?,
-            Some(other @ (ApprovalStatus::Approved | ApprovalStatus::Rejected)) => {
+            Some(
+                other @ (ApprovalStatus::Approving
+                | ApprovalStatus::Approved
+                | ApprovalStatus::Rejected),
+            ) => {
                 let status_str = other.as_str();
                 conn.query(
                     "SELECT id, status, reason, requester_json, outbound_message_json,
@@ -6204,6 +6306,85 @@ impl MailStore for PostgresStore {
             )?);
         }
         Ok(results)
+    }
+
+    async fn claim_pending_approval(&self, id: &str, now_ms: i64) -> AppResult<PendingApproval> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let tx = conn.transaction().await.map_err(pg_err)?;
+
+        let existing_row = tx
+            .query_opt(
+                "SELECT id, status, reason, requester_json, outbound_message_json,
+                        reply_to_message_id, thread_id, draft_id,
+                        sent_message_id, provider_message_id, decided_by, decision_note,
+                        created_at_ms, expires_at_ms, decided_at_ms
+                 FROM pending_approvals
+                 WHERE mailbox_id = $1 AND id = $2
+                 FOR UPDATE",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+        let existing = pending_approval_from_row(&existing_row)?;
+
+        if existing.status == ApprovalStatus::Pending && existing.expires_at_ms <= now_ms {
+            tx.execute(
+                "UPDATE pending_approvals
+                 SET status = 'expired', decided_at_ms = COALESCE(decided_at_ms, $1)
+                 WHERE mailbox_id = $2 AND id = $3 AND status = 'pending'",
+                &[&now_ms, &mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+            tx.commit().await.map_err(pg_err)?;
+            return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+        }
+
+        if existing.status != ApprovalStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' is already {}",
+                existing.status
+            )));
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE pending_approvals
+                 SET status = 'approving'
+                 WHERE mailbox_id = $1 AND id = $2 AND status = 'pending'",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if changed != 1 {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' was already claimed or resolved"
+            )));
+        }
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(PendingApproval {
+            status: ApprovalStatus::Approving,
+            ..existing
+        })
+    }
+
+    async fn release_claimed_approval(&self, id: &str) -> AppResult<()> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        tx.execute(
+            "UPDATE pending_approvals
+             SET status = 'pending'
+             WHERE mailbox_id = $1 AND id = $2 AND status = 'approving'",
+            &[&mb, &id],
+        )
+        .await
+        .map_err(pg_err)?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
     }
 
     async fn resolve_pending_approval(
@@ -6242,14 +6423,22 @@ impl MailStore for PostgresStore {
             .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
         let existing = pending_approval_from_row(&existing_row)?;
 
-        if existing.status != ApprovalStatus::Pending {
+        let allowed = match status {
+            ApprovalStatus::Approved => matches!(
+                existing.status,
+                ApprovalStatus::Pending | ApprovalStatus::Approving
+            ),
+            ApprovalStatus::Rejected => existing.status == ApprovalStatus::Pending,
+            _ => false,
+        };
+        if !allowed {
             return Err(AppError::Conflict(format!(
                 "Approval '{id}' is already {}",
                 existing.status
             )));
         }
 
-        if existing.expires_at_ms <= now_ms {
+        if existing.status == ApprovalStatus::Pending && existing.expires_at_ms <= now_ms {
             tx.execute(
                 "UPDATE pending_approvals
                  SET status = 'expired', decided_at_ms = COALESCE(decided_at_ms, $1)
@@ -6263,6 +6452,7 @@ impl MailStore for PostgresStore {
         }
 
         let status_str = status.as_str();
+        let expected_status = existing.status.as_str();
         let changed = tx
             .execute(
                 "UPDATE pending_approvals
@@ -6272,7 +6462,7 @@ impl MailStore for PostgresStore {
                      sent_message_id = $4,
                      provider_message_id = $5,
                      decided_at_ms = $6
-                 WHERE mailbox_id = $7 AND id = $8 AND status = 'pending'",
+                 WHERE mailbox_id = $7 AND id = $8 AND status = $9",
                 &[
                     &status_str,
                     &decided_by,
@@ -6282,6 +6472,7 @@ impl MailStore for PostgresStore {
                     &now_ms,
                     &mb,
                     &id,
+                    &expected_status,
                 ],
             )
             .await
@@ -6965,24 +7156,49 @@ impl MailStore for PostgresStore {
         })
     }
 
-    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>> {
-        let conn = self.ready_conn().await?;
-        let rows = conn
+    async fn claim_due_scheduled_sends(
+        &self,
+        now_ms: i64,
+        stale_lease_ms: i64,
+    ) -> AppResult<Vec<ScheduledSend>> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let reclaim_stale = stale_lease_ms > 0;
+        let stale_cutoff = now_ms.saturating_sub(stale_lease_ms);
+        let rows = tx
             .query(
-                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
-                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
-                        last_error, created_at_ms, updated_at_ms
-                 FROM scheduled_sends
-                 WHERE status = 'pending' AND send_at_ms <= $1
-                 ORDER BY send_at_ms ASC, created_at_ms ASC, mailbox_id ASC, id ASC",
-                &[&now_ms],
+                "WITH claimed AS (
+                     SELECT mailbox_id, id
+                     FROM scheduled_sends
+                     WHERE (status = 'pending' AND send_at_ms <= $1)
+                        OR ($2 AND status = 'sending' AND updated_at_ms <= $3)
+                     ORDER BY send_at_ms ASC, created_at_ms ASC, mailbox_id ASC, id ASC
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE scheduled_sends s
+                 SET status = 'sending',
+                     updated_at_ms = $1
+                 FROM claimed c
+                 WHERE s.mailbox_id = c.mailbox_id AND s.id = c.id
+                 RETURNING s.id, s.mailbox_id, s.status, s.send_at_ms, s.outbound_message_json,
+                           s.reply_to_message_id, s.thread_id, s.sent_message_id, s.provider_message_id,
+                           s.last_error, s.created_at_ms, s.updated_at_ms",
+                &[&now_ms, &reclaim_stale, &stale_cutoff],
             )
             .await
             .map_err(pg_err)?;
+        tx.commit().await.map_err(pg_err)?;
         let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
             results.push(scheduled_send_from_row(row)?);
         }
+        results.sort_by(|a, b| {
+            a.send_at_ms
+                .cmp(&b.send_at_ms)
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+                .then_with(|| a.mailbox_id.cmp(&b.mailbox_id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(results)
     }
 
@@ -7012,7 +7228,10 @@ impl MailStore for PostgresStore {
             .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
         let existing = scheduled_send_from_row(&existing_row)?;
 
-        if existing.status != ScheduledSendStatus::Pending {
+        if !matches!(
+            existing.status,
+            ScheduledSendStatus::Pending | ScheduledSendStatus::Sending
+        ) {
             return Err(AppError::Conflict(format!(
                 "Scheduled send '{id}' is already {}",
                 existing.status
@@ -7027,14 +7246,14 @@ impl MailStore for PostgresStore {
                      provider_message_id = $2,
                      last_error = NULL,
                      updated_at_ms = $3
-                 WHERE mailbox_id = $4 AND id = $5 AND status = 'pending'",
+                 WHERE mailbox_id = $4 AND id = $5 AND status IN ('pending', 'sending')",
                 &[&sent_message_id, &provider_message_id, &now_ms, &mb, &id],
             )
             .await
             .map_err(pg_err)?;
         if changed != 1 {
             return Err(AppError::Conflict(format!(
-                "Scheduled send '{id}' is no longer pending"
+                "Scheduled send '{id}' is no longer pending or sending"
             )));
         }
         tx.commit().await.map_err(pg_err)?;
@@ -7070,7 +7289,10 @@ impl MailStore for PostgresStore {
             .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
         let existing = scheduled_send_from_row(&existing_row)?;
 
-        if existing.status != ScheduledSendStatus::Pending {
+        if !matches!(
+            existing.status,
+            ScheduledSendStatus::Pending | ScheduledSendStatus::Sending
+        ) {
             return Err(AppError::Conflict(format!(
                 "Scheduled send '{id}' is already {}",
                 existing.status
@@ -7083,14 +7305,14 @@ impl MailStore for PostgresStore {
                  SET status = 'failed',
                      last_error = $1,
                      updated_at_ms = $2
-                 WHERE mailbox_id = $3 AND id = $4 AND status = 'pending'",
+                 WHERE mailbox_id = $3 AND id = $4 AND status IN ('pending', 'sending')",
                 &[&error, &now_ms, &mb, &id],
             )
             .await
             .map_err(pg_err)?;
         if changed != 1 {
             return Err(AppError::Conflict(format!(
-                "Scheduled send '{id}' is no longer pending"
+                "Scheduled send '{id}' is no longer pending or sending"
             )));
         }
         tx.commit().await.map_err(pg_err)?;

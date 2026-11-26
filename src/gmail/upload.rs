@@ -26,6 +26,9 @@ pub const DEFAULT_RESUMABLE_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 /// Maximum number of concurrent in-flight resumable upload sessions held in memory.
 const MAX_CONCURRENT_RESUMABLE_SESSIONS: usize = 1024;
 
+/// Default aggregate in-memory byte ceiling across all active resumable upload sessions (256 MiB).
+pub const MAX_TOTAL_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
+
 /// Maximum initial buffer pre-allocation derived from `X-Upload-Content-Length`.
 const MAX_INITIAL_BUFFER_PREALLOC: usize = 1024 * 1024;
 
@@ -208,10 +211,12 @@ pub fn parse_content_range(raw: &str) -> AppResult<ContentRange> {
     Ok(ContentRange::Chunk { start, end, total })
 }
 
-/// Thread-safe in-memory store for active Gmail `uploadType=resumable` sessions with TTL cleanup.
+/// Thread-safe in-memory store for active Gmail `uploadType=resumable` sessions with TTL cleanup
+/// and an aggregate buffered memory ceiling.
 #[derive(Debug)]
 pub struct ResumableUploadStore {
     ttl: Duration,
+    max_total_bytes: usize,
     sessions: RwLock<HashMap<String, ResumableUploadSession>>,
 }
 
@@ -223,14 +228,25 @@ impl Default for ResumableUploadStore {
 
 impl ResumableUploadStore {
     pub fn new() -> Self {
-        Self::with_ttl(DEFAULT_RESUMABLE_UPLOAD_TTL)
+        Self::with_limits(DEFAULT_RESUMABLE_UPLOAD_TTL, MAX_TOTAL_UPLOAD_BYTES)
     }
 
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_limits(ttl, MAX_TOTAL_UPLOAD_BYTES)
+    }
+
+    pub fn with_limits(ttl: Duration, max_total_bytes: usize) -> Self {
         Self {
             ttl,
+            max_total_bytes,
             sessions: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn total_buffered_bytes(sessions: &HashMap<String, ResumableUploadSession>) -> usize {
+        sessions
+            .values()
+            .fold(0usize, |acc, s| acc.saturating_add(s.buffer.len()))
     }
 
     fn sweep_expired(
@@ -257,11 +273,24 @@ impl ResumableUploadStore {
             ));
         }
 
+        let current_total = Self::total_buffered_bytes(&sessions);
+        if let Some(declared) = init.declared_total_bytes
+            && (declared > self.max_total_bytes
+                || current_total.saturating_add(declared) > self.max_total_bytes)
+        {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Resumable upload aggregate memory cap ({} bytes) would be exceeded",
+                self.max_total_bytes
+            )));
+        }
+
         let id = Uuid::new_v4().simple().to_string();
+        let remaining = self.max_total_bytes.saturating_sub(current_total);
         let initial_cap = init
             .declared_total_bytes
             .unwrap_or(0)
-            .min(MAX_INITIAL_BUFFER_PREALLOC);
+            .min(MAX_INITIAL_BUFFER_PREALLOC)
+            .min(remaining);
 
         sessions.insert(
             id.clone(),
@@ -326,6 +355,14 @@ impl ResumableUploadStore {
                         body.len()
                     )));
                 }
+                let total_buffered = Self::total_buffered_bytes(&sessions);
+                if total_buffered.saturating_add(body.len()) > self.max_total_bytes {
+                    return Err(AppError::PayloadTooLarge(format!(
+                        "Aggregate resumable upload memory ({} bytes) exceeds maximum of {} bytes",
+                        total_buffered.saturating_add(body.len()),
+                        self.max_total_bytes
+                    )));
+                }
                 let mut session = sessions.remove(upload_id).expect("checked above");
                 session.buffer.extend_from_slice(body);
                 session.updated_at = now;
@@ -342,10 +379,10 @@ impl ResumableUploadStore {
                             ));
                         }
                         if let Some(t) = total
-                            && t > max_body_bytes
+                            && (t > max_body_bytes || t > self.max_total_bytes)
                         {
                             return Err(AppError::PayloadTooLarge(format!(
-                                "Declared upload size {t} bytes exceeds maximum allowed body size of {max_body_bytes} bytes"
+                                "Declared upload size {t} bytes exceeds maximum allowed upload size"
                             )));
                         }
                         let received = sessions.get(upload_id).expect("checked above").buffer.len();
@@ -362,9 +399,7 @@ impl ResumableUploadStore {
                                 return Ok(ResumableChunkOutcome::Complete(Box::new(session)));
                             }
                         }
-                        if let Some(session) = sessions.get_mut(upload_id) {
-                            session.updated_at = now;
-                        }
+                        // Do NOT extend session expiration on status probes (`bytes */*`).
                         Ok(ResumableChunkOutcome::Incomplete { received })
                     }
                     ContentRange::Chunk { start, end, total } => {
@@ -383,10 +418,10 @@ impl ResumableUploadStore {
                             )));
                         }
                         if let Some(t) = total
-                            && t > max_body_bytes
+                            && (t > max_body_bytes || t > self.max_total_bytes)
                         {
                             return Err(AppError::PayloadTooLarge(format!(
-                                "Upload total size {t} bytes exceeds maximum allowed body size of {max_body_bytes} bytes"
+                                "Upload total size {t} bytes exceeds maximum allowed upload size"
                             )));
                         }
 
@@ -415,6 +450,15 @@ impl ResumableUploadStore {
                         if new_len > max_body_bytes {
                             return Err(AppError::PayloadTooLarge(format!(
                                 "Cumulative upload size {new_len} bytes exceeds maximum allowed body size of {max_body_bytes} bytes"
+                            )));
+                        }
+
+                        let total_buffered = Self::total_buffered_bytes(&sessions);
+                        if total_buffered.saturating_add(body.len()) > self.max_total_bytes {
+                            return Err(AppError::PayloadTooLarge(format!(
+                                "Aggregate resumable upload memory ({} bytes) exceeds maximum of {} bytes",
+                                total_buffered.saturating_add(body.len()),
+                                self.max_total_bytes
                             )));
                         }
 

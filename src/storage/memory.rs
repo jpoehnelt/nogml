@@ -22,17 +22,17 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
-        ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRulePatch, MailStore,
-        MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
-        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription, apply_inbox_rule_patch, compute_contact_is_vip, normalize_contact_email,
-        normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
-        validate_and_normalize_contact_email,
+        ContactRecord, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
+        ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
+        InboxRulePatch, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
+        UpsertOutcomeKind, UserSettings, WatchSubscription, apply_inbox_rule_patch,
+        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -180,6 +180,7 @@ impl MemoryState {
         label_ids: Vec<String>,
         context_labels: Vec<String>,
         upstream_gmail_id: Option<String>,
+        source: &str,
     ) {
         self.history_event_seq += 1;
         self.history_events.push(MemHistoryEvent {
@@ -191,6 +192,7 @@ impl MemoryState {
                 thread_id: thread_id.to_string(),
                 label_ids,
                 upstream_gmail_id,
+                source: source.to_string(),
             },
             context_labels,
         });
@@ -303,6 +305,14 @@ impl MemoryState {
     }
 
     fn insert_message_inner(&mut self, input: NewMessageInput) -> AppResult<StoredMessage> {
+        self.insert_message_inner_with_source(input, HISTORY_SOURCE_LOCAL)
+    }
+
+    fn insert_message_inner_with_source(
+        &mut self,
+        input: NewMessageInput,
+        history_source: &str,
+    ) -> AppResult<StoredMessage> {
         let msg_id = input
             .id
             .as_deref()
@@ -402,6 +412,7 @@ impl MemoryState {
             resolved_labels.clone(),
             resolved_labels,
             stored.upstream_gmail_id.clone(),
+            history_source,
         );
         Ok(stored)
     }
@@ -411,6 +422,21 @@ impl MemoryState {
         message_id: &str,
         resolved_add: &[String],
         resolved_remove: &[String],
+    ) -> AppResult<StoredMessage> {
+        self.modify_message_labels_resolved_with_source(
+            message_id,
+            resolved_add,
+            resolved_remove,
+            HISTORY_SOURCE_LOCAL,
+        )
+    }
+
+    fn modify_message_labels_resolved_with_source(
+        &mut self,
+        message_id: &str,
+        resolved_add: &[String],
+        resolved_remove: &[String],
+        history_source: &str,
     ) -> AppResult<StoredMessage> {
         let (thread_id, current_labels, upstream_gmail_id, all_mail_uid) = {
             let msg = self
@@ -506,6 +532,7 @@ impl MemoryState {
                     actually_added,
                     context_labels.clone(),
                     upstream_gmail_id.clone(),
+                    history_source,
                 );
             }
             if !actually_removed.is_empty() {
@@ -517,6 +544,7 @@ impl MemoryState {
                     actually_removed,
                     context_labels,
                     upstream_gmail_id,
+                    history_source,
                 );
             }
         }
@@ -528,6 +556,14 @@ impl MemoryState {
     }
 
     fn delete_message_inner(&mut self, id: &str) -> Option<StoredMessage> {
+        self.delete_message_inner_with_source(id, HISTORY_SOURCE_LOCAL)
+    }
+
+    fn delete_message_inner_with_source(
+        &mut self,
+        id: &str,
+        history_source: &str,
+    ) -> Option<StoredMessage> {
         let msg = self.messages.remove(id)?;
         self.attachments.remove(id);
         let removed_label_uids: Vec<(String, u32)> = self
@@ -558,6 +594,7 @@ impl MemoryState {
             msg.label_ids.clone(),
             msg.label_ids.clone(),
             msg.upstream_gmail_id.clone(),
+            history_source,
         );
         Some(msg)
     }
@@ -1783,6 +1820,7 @@ impl MailStore for MemoryStore {
                 vec![id.to_string()],
                 ctx,
                 up_id,
+                HISTORY_SOURCE_LOCAL,
             );
         }
 
@@ -2843,7 +2881,12 @@ impl MailStore for MemoryStore {
 
             let updated =
                 if labels_changed {
-                    state.modify_message_labels_resolved(&existing_id, &to_add, &to_remove)?
+                    state.modify_message_labels_resolved_with_source(
+                        &existing_id,
+                        &to_add,
+                        &to_remove,
+                        HISTORY_SOURCE_SYNC,
+                    )?
                 } else {
                     state.messages.get(&existing_id).cloned().ok_or_else(|| {
                         AppError::Storage("Missing message after sync update".into())
@@ -2890,7 +2933,12 @@ impl MailStore for MemoryStore {
                 }
             }
             let updated = if !to_add.is_empty() {
-                state.modify_message_labels_resolved(&existing_id, &to_add, &[])?
+                state.modify_message_labels_resolved_with_source(
+                    &existing_id,
+                    &to_add,
+                    &[],
+                    HISTORY_SOURCE_SYNC,
+                )?
             } else {
                 state
                     .messages
@@ -2905,11 +2953,39 @@ impl MailStore for MemoryStore {
         }
 
         // 3. Insert new message
-        let inserted = state.insert_message_inner(input)?;
+        let inserted = state.insert_message_inner_with_source(input, HISTORY_SOURCE_SYNC)?;
         Ok(UpsertOutcome {
             kind: UpsertOutcomeKind::Inserted,
             message: inserted,
         })
+    }
+
+    async fn modify_synced_message_labels(
+        &self,
+        id: &str,
+        add_labels: &[String],
+        remove_labels: &[String],
+    ) -> AppResult<StoredMessage> {
+        let mut state = self.write_state()?;
+        let mut resolved_add = Vec::with_capacity(add_labels.len());
+        for l in add_labels {
+            let lid = state
+                .resolve_existing_label_id(l)
+                .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
+            resolved_add.push(lid);
+        }
+        let mut resolved_remove = Vec::with_capacity(remove_labels.len());
+        for l in remove_labels {
+            if let Some(lid) = state.resolve_existing_label_id(l) {
+                resolved_remove.push(lid);
+            }
+        }
+        state.modify_message_labels_resolved_with_source(
+            id,
+            &resolved_add,
+            &resolved_remove,
+            HISTORY_SOURCE_SYNC,
+        )
     }
 
     async fn find_message_by_upstream_id(
@@ -2934,7 +3010,10 @@ impl MailStore for MemoryStore {
             .values()
             .find(|m| m.upstream_gmail_id.as_deref() == Some(upstream_gmail_id))
             .map(|m| m.id.clone());
-        Ok(found_id.and_then(|id| state.delete_message_inner(&id)))
+        Ok(
+            found_id
+                .and_then(|id| state.delete_message_inner_with_source(&id, HISTORY_SOURCE_SYNC)),
+        )
     }
 
     async fn get_sync_state(&self, account_key: &str) -> AppResult<Option<SyncState>> {
@@ -3062,6 +3141,42 @@ impl MailStore for MemoryStore {
         Ok(items)
     }
 
+    async fn claim_pending_approval(&self, id: &str, now_ms: i64) -> AppResult<PendingApproval> {
+        let mut state = self.write_state()?;
+        let entry = state
+            .pending_approvals
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
+
+        if entry.status == ApprovalStatus::Pending && entry.expires_at_ms <= now_ms {
+            entry.status = ApprovalStatus::Expired;
+            if entry.decided_at_ms.is_none() {
+                entry.decided_at_ms = Some(now_ms);
+            }
+            return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
+        }
+
+        if entry.status != ApprovalStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Approval '{id}' is already {}",
+                entry.status
+            )));
+        }
+
+        entry.status = ApprovalStatus::Approving;
+        Ok(entry.clone())
+    }
+
+    async fn release_claimed_approval(&self, id: &str) -> AppResult<()> {
+        let mut state = self.write_state()?;
+        if let Some(entry) = state.pending_approvals.get_mut(id)
+            && entry.status == ApprovalStatus::Approving
+        {
+            entry.status = ApprovalStatus::Pending;
+        }
+        Ok(())
+    }
+
     async fn resolve_pending_approval(
         &self,
         id: &str,
@@ -3084,14 +3199,24 @@ impl MailStore for MemoryStore {
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
 
-        if entry.status != ApprovalStatus::Pending {
+        let allowed = match status {
+            ApprovalStatus::Approved => {
+                matches!(
+                    entry.status,
+                    ApprovalStatus::Pending | ApprovalStatus::Approving
+                )
+            }
+            ApprovalStatus::Rejected => entry.status == ApprovalStatus::Pending,
+            _ => false,
+        };
+        if !allowed {
             return Err(AppError::Conflict(format!(
                 "Approval '{id}' is already {}",
                 entry.status
             )));
         }
 
-        if entry.expires_at_ms <= now_ms {
+        if entry.status == ApprovalStatus::Pending && entry.expires_at_ms <= now_ms {
             entry.status = ApprovalStatus::Expired;
             if entry.decided_at_ms.is_none() {
                 entry.decided_at_ms = Some(now_ms);
@@ -3542,7 +3667,12 @@ impl MailStore for MemoryStore {
         Ok(entry.clone())
     }
 
-    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>> {
+    async fn claim_due_scheduled_sends(
+        &self,
+        now_ms: i64,
+        stale_lease_ms: i64,
+    ) -> AppResult<Vec<ScheduledSend>> {
+        let stale_cutoff = now_ms.saturating_sub(stale_lease_ms);
         let states: Vec<Arc<RwLock<MemoryState>>> = {
             let map = self.mailboxes.read().map_err(|_| {
                 AppError::Storage("MemoryStore mailboxes lock poisoned".to_string())
@@ -3551,11 +3681,18 @@ impl MailStore for MemoryStore {
         };
         let mut items = Vec::new();
         for mb_state in states {
-            let guard = mb_state
-                .read()
+            let mut guard = mb_state
+                .write()
                 .map_err(|_| AppError::Storage("MemoryStore lock poisoned".to_string()))?;
-            for item in guard.scheduled_sends.values() {
-                if item.status == ScheduledSendStatus::Pending && item.send_at_ms <= now_ms {
+            for item in guard.scheduled_sends.values_mut() {
+                let due_pending =
+                    item.status == ScheduledSendStatus::Pending && item.send_at_ms <= now_ms;
+                let stale_sending = stale_lease_ms > 0
+                    && item.status == ScheduledSendStatus::Sending
+                    && item.updated_at_ms <= stale_cutoff;
+                if due_pending || stale_sending {
+                    item.status = ScheduledSendStatus::Sending;
+                    item.updated_at_ms = now_ms;
                     items.push(item.clone());
                 }
             }
@@ -3581,7 +3718,10 @@ impl MailStore for MemoryStore {
             .scheduled_sends
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
-        if entry.status != ScheduledSendStatus::Pending {
+        if !matches!(
+            entry.status,
+            ScheduledSendStatus::Pending | ScheduledSendStatus::Sending
+        ) {
             return Err(AppError::Conflict(format!(
                 "Scheduled send '{id}' is already {}",
                 entry.status
@@ -3601,7 +3741,10 @@ impl MailStore for MemoryStore {
             .scheduled_sends
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
-        if entry.status != ScheduledSendStatus::Pending {
+        if !matches!(
+            entry.status,
+            ScheduledSendStatus::Pending | ScheduledSendStatus::Sending
+        ) {
             return Err(AppError::Conflict(format!(
                 "Scheduled send '{id}' is already {}",
                 entry.status

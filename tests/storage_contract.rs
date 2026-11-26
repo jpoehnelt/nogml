@@ -902,6 +902,62 @@ async fn contract_upsert_dedup_settings_watch_sync_state(store: Arc<dyn MailStor
             .is_none()
     );
 
+    // 4b. Verify history_events.source distinguishes sync-originated vs local mutations
+    let hid_before = store.current_history_id().await.unwrap();
+    let mut src_msg = sample_message("Source check", "src@ex.com", "Body", 2500);
+    src_msg.upstream_gmail_id = Some("gm_src_1".to_string());
+    let up_src = store.upsert_synced_message(src_msg).await.unwrap();
+    store
+        .modify_synced_message_labels(&up_src.message.id, &[LABEL_STARRED.to_string()], &[])
+        .await
+        .unwrap();
+    store
+        .modify_message_labels(&up_src.message.id, &[], &[LABEL_UNREAD.to_string()])
+        .await
+        .unwrap();
+    store
+        .delete_message_by_upstream_id("gm_src_1")
+        .await
+        .unwrap();
+
+    let hist_page = store
+        .list_history(&HistoryListQuery {
+            start_history_id: hid_before,
+            max_results: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let src_entries: Vec<_> = hist_page
+        .entries
+        .iter()
+        .filter(|e| e.message_id == up_src.message.id)
+        .collect();
+    assert!(
+        src_entries
+            .iter()
+            .any(|e| e.kind == HistoryEventKind::MessageAdded && e.source == "sync"),
+        "upsert_synced_message must record source='sync', got {src_entries:?}"
+    );
+    assert!(
+        src_entries
+            .iter()
+            .any(|e| e.kind == HistoryEventKind::LabelAdded && e.source == "sync"),
+        "modify_synced_message_labels must record source='sync', got {src_entries:?}"
+    );
+    assert!(
+        src_entries
+            .iter()
+            .any(|e| e.kind == HistoryEventKind::LabelRemoved && e.source == "local"),
+        "local modify_message_labels must record source='local', got {src_entries:?}"
+    );
+    assert!(
+        src_entries
+            .iter()
+            .any(|e| e.kind == HistoryEventKind::MessageDeleted && e.source == "sync"),
+        "delete_message_by_upstream_id must record source='sync', got {src_entries:?}"
+    );
+
     // 5. Settings round-trip
     let mut settings = store.get_settings().await.unwrap();
     assert_eq!(settings.send_as.len(), 1);
@@ -1080,6 +1136,67 @@ async fn contract_pending_approvals_atomic_transitions(store: Arc<dyn MailStore>
         .await
         .unwrap_err();
     assert!(matches!(third, AppError::Conflict(_)));
+
+    // Atomic claim_pending_approval: concurrent claims on a fresh pending row let EXACTLY ONE win.
+    let claimable = store
+        .create_pending_approval(NewPendingApprovalInput {
+            id: Some("apr_contract_claim".to_string()),
+            reason: "atomic claim test".to_string(),
+            requester: None,
+            outbound_message: sample_outbound("ext@partner.com", "Claim once"),
+            reply_to_message_id: None,
+            thread_id: None,
+            draft_id: None,
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms + 3_600_000,
+        })
+        .await
+        .unwrap();
+    let (c1, c2) = tokio::join!(
+        store.claim_pending_approval(&claimable.id, now_ms),
+        store.claim_pending_approval(&claimable.id, now_ms),
+    );
+    let claim_ok = usize::from(c1.is_ok()) + usize::from(c2.is_ok());
+    let claim_conflict = usize::from(matches!(c1, Err(AppError::Conflict(_))))
+        + usize::from(matches!(c2, Err(AppError::Conflict(_))));
+    assert_eq!(claim_ok, 1, "exactly one concurrent claim must win");
+    assert_eq!(claim_conflict, 1, "losing concurrent claim must Conflict");
+    let claimed = c1.or(c2).unwrap();
+    assert_eq!(claimed.status, ApprovalStatus::Approving);
+
+    // Rejecting an in-flight Approving record returns Conflict
+    let rej_in_flight = store
+        .resolve_pending_approval(
+            &claimable.id,
+            ApprovalStatus::Rejected,
+            Some("bob".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(rej_in_flight, AppError::Conflict(_)));
+
+    // Releasing an Approving claim reverts it to Pending; re-claiming then finalizing to Approved succeeds
+    store.release_claimed_approval(&claimable.id).await.unwrap();
+    let reclaimed = store
+        .claim_pending_approval(&claimable.id, now_ms)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.status, ApprovalStatus::Approving);
+    let approved = store
+        .resolve_pending_approval(
+            &claimable.id,
+            ApprovalStatus::Approved,
+            Some("alice".to_string()),
+            Some("approved after claim".to_string()),
+            Some("msg_claimed_1".to_string()),
+            Some("prov_claimed_1".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status, ApprovalStatus::Approved);
 }
 
 async fn contract_thread_annotations(store: Arc<dyn MailStore>) {
@@ -2193,23 +2310,6 @@ async fn contract_snooze_and_scheduled_sends(
             .is_none()
     );
 
-    // claim_due_scheduled_sends scans across all mailboxes and excludes future items
-    let due_claimed = base_store
-        .claim_due_scheduled_sends(base_ts + 5_000)
-        .await
-        .unwrap();
-    assert!(
-        due_claimed
-            .iter()
-            .any(|s| s.id == sch_due_a.id && s.mailbox_id == mb_a)
-    );
-    assert!(
-        due_claimed
-            .iter()
-            .any(|s| s.id == sch_due_b.id && s.mailbox_id == mb_b)
-    );
-    assert!(!due_claimed.iter().any(|s| s.id == sch_future_a.id));
-
     // Atomic cancel Pending -> Canceled; second cancel returns Conflict; missing returns NotFound
     let canceled = store_a
         .cancel_scheduled_send(&sch_cancel_a.id)
@@ -2227,7 +2327,42 @@ async fn contract_snooze_and_scheduled_sends(
         .unwrap_err();
     assert!(matches!(cancel_missing, AppError::NotFound(_)));
 
-    // Atomic complete Pending -> Sent; subsequent cancel or complete returns Conflict
+    // claim_due_scheduled_sends atomically transitions due Pending rows to Sending across all
+    // mailboxes, excludes future/canceled items, and a concurrent/second claim returns empty.
+    let claim_ts = base_ts + 5_000;
+    let lease_ms = nogml::storage::DEFAULT_SCHEDULED_SEND_STALE_LEASE_MS;
+    let due_claimed = base_store
+        .claim_due_scheduled_sends(claim_ts, lease_ms)
+        .await
+        .unwrap();
+    assert!(due_claimed.iter().any(|s| s.id == sch_due_a.id
+        && s.mailbox_id == mb_a
+        && s.status == ScheduledSendStatus::Sending));
+    assert!(due_claimed.iter().any(|s| s.id == sch_due_b.id
+        && s.mailbox_id == mb_b
+        && s.status == ScheduledSendStatus::Sending));
+    assert!(!due_claimed.iter().any(|s| s.id == sch_future_a.id));
+    assert!(!due_claimed.iter().any(|s| s.id == sch_cancel_a.id));
+
+    let second_claim = base_store
+        .claim_due_scheduled_sends(claim_ts, lease_ms)
+        .await
+        .unwrap();
+    assert!(
+        second_claim.is_empty(),
+        "already-claimed Sending rows must not be double-claimed before lease expiry"
+    );
+
+    // Canceling an already-claimed Sending row returns Conflict
+    assert!(matches!(
+        store_a
+            .cancel_scheduled_send(&sch_due_a.id)
+            .await
+            .unwrap_err(),
+        AppError::Conflict(_)
+    ));
+
+    // Atomic complete Sending -> Sent; subsequent cancel or complete returns Conflict
     let sent = store_a
         .complete_scheduled_send(&sch_due_a.id, "msg_sent_1", "prov_1")
         .await
@@ -2250,7 +2385,7 @@ async fn contract_snooze_and_scheduled_sends(
         AppError::Conflict(_)
     ));
 
-    // Atomic fail Pending -> Failed; subsequent cancel returns Conflict
+    // Atomic fail Sending -> Failed; subsequent cancel returns Conflict
     let failed = store_a
         .fail_scheduled_send(&sch_fail_a.id, "smtp 550")
         .await
@@ -2264,6 +2399,24 @@ async fn contract_snooze_and_scheduled_sends(
             .unwrap_err(),
         AppError::Conflict(_)
     ));
+
+    // Stale-lease recovery: orphaned `sch_due_b` (still Sending) is reclaimed once `short_lease_ms` elapses
+    // while `sch_future_a` (base_ts + 90_000) remains Pending.
+    let short_lease_ms = 10_000;
+    let reclaimed = base_store
+        .claim_due_scheduled_sends(claim_ts + short_lease_ms, short_lease_ms)
+        .await
+        .unwrap();
+    assert!(
+        reclaimed.iter().any(|s| s.id == sch_due_b.id),
+        "stale Sending lease should be reclaimed after stale_lease_ms"
+    );
+    assert!(
+        !reclaimed
+            .iter()
+            .any(|s| s.id == sch_due_a.id || s.id == sch_fail_a.id || s.id == sch_future_a.id),
+        "completed, failed, or future items must never be reclaimed"
+    );
 
     // Status filtering and limit on list_scheduled_sends
     let all_a = store_a.list_scheduled_sends(None, 20).await.unwrap();
@@ -2305,12 +2458,15 @@ async fn contract_snooze_and_scheduled_sends(
         2
     );
 
-    // Clean up remaining pending items so shared Postgres DB stays tidy
+    // Clean up remaining pending/sending items so shared Postgres DB stays tidy
     store_a
         .cancel_scheduled_send(&sch_future_a.id)
         .await
         .unwrap();
-    store_b.cancel_scheduled_send(&sch_due_b.id).await.unwrap();
+    store_b
+        .complete_scheduled_send(&sch_due_b.id, "msg_b_cleanup", "prov_b_cleanup")
+        .await
+        .unwrap();
 }
 
 async fn contract_inbox_rules_crud(store: Arc<dyn MailStore>) {
