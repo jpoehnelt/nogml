@@ -1,12 +1,14 @@
 //! Embedded IMAP4rev1 server (plain TCP + optional STARTTLS + optional implicit TLS),
-//! supporting RFC 3501/2177/6851/6154/7888/4959 commands, Gmail virtual folders,
-//! flags <-> labels mapping, and real-time `IDLE` via `AppState::events`.
+//! supporting RFC 3501/2177/3691/4731/4959/5256/5258/5819/6154/6851/7162/7888 commands,
+//! Gmail virtual folders, flags <-> labels mapping, `X-GM-EXT-1`, and real-time `IDLE`
+//! via `AppState::events`.
 //!
 //! Owned by the `imap-sync` worker.
 
 pub mod mime_fmt;
 pub mod parser;
 pub mod session;
+pub mod sort_thread;
 #[cfg(test)]
 pub(crate) mod tests;
 

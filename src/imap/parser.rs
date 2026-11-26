@@ -1,4 +1,4 @@
-//! RFC 3501 / 7888 (`LITERAL+`) IMAP4rev1 wire-format reader, tokenizer,
+//! RFC 3501 / 7888 (`LITERAL-`) IMAP4rev1 wire-format reader, tokenizer,
 //! sequence-set parser, date helpers, and response formatting utilities.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -10,8 +10,10 @@ use crate::error::{AppError, AppResult};
 const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Maximum parenthesized list nesting depth in IMAP commands.
 pub const MAX_IMAP_LIST_DEPTH: usize = 32;
-/// Pre-authentication maximum size of a single IMAP literal (16 KiB).
+/// Pre-authentication maximum size of a single synchronizing IMAP literal (16 KiB).
 pub const PRE_AUTH_MAX_LITERAL_BYTES: usize = 16 * 1024;
+/// RFC 7888 `LITERAL-` maximum size of a single non-synchronizing literal `{N+}` (4096 bytes).
+pub const LITERAL_MINUS_MAX_BYTES: usize = 4096;
 /// Pre-authentication cumulative command byte cap (32 KiB).
 pub const PRE_AUTH_MAX_COMMAND_BYTES: usize = 32 * 1024;
 /// Maximum number of literals allowed in a single IMAP command.
@@ -22,8 +24,10 @@ pub const POST_AUTH_COMMAND_OVERHEAD_BYTES: usize = 64 * 1024;
 /// Resource limits enforced while reading a single IMAP command frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadCommandLimits {
-    /// Maximum byte length of any single `{N}` or `{N+}` literal.
+    /// Maximum byte length of any single synchronizing `{N}` literal.
     pub max_literal_bytes: usize,
+    /// Maximum byte length of any single non-synchronizing `{N+}` literal (RFC 7888 `LITERAL-`).
+    pub max_non_sync_literal_bytes: usize,
     /// Maximum number of literals allowed in one command.
     pub max_literals: usize,
     /// Maximum cumulative bytes across all lines and literal payloads in one command.
@@ -33,17 +37,20 @@ pub struct ReadCommandLimits {
 impl ReadCommandLimits {
     /// Tight pre-authentication limits to prevent unauthenticated OOM DoS.
     pub fn pre_auth(config_max_body_bytes: usize) -> Self {
+        let max_literal_bytes = config_max_body_bytes.min(PRE_AUTH_MAX_LITERAL_BYTES);
         Self {
-            max_literal_bytes: config_max_body_bytes.min(PRE_AUTH_MAX_LITERAL_BYTES),
+            max_literal_bytes,
+            max_non_sync_literal_bytes: max_literal_bytes.min(LITERAL_MINUS_MAX_BYTES),
             max_literals: MAX_COMMAND_LITERALS,
             max_command_bytes: PRE_AUTH_MAX_COMMAND_BYTES,
         }
     }
 
-    /// Authenticated limits bounded by `max_body_bytes + 64 KiB`.
+    /// Authenticated limits bounded by `max_body_bytes + 64 KiB` (with `LITERAL-` capped at 4096 bytes).
     pub fn authenticated(max_body_bytes: usize) -> Self {
         Self {
             max_literal_bytes: max_body_bytes,
+            max_non_sync_literal_bytes: max_body_bytes.min(LITERAL_MINUS_MAX_BYTES),
             max_literals: MAX_COMMAND_LITERALS,
             max_command_bytes: max_body_bytes.saturating_add(POST_AUTH_COMMAND_OVERHEAD_BYTES),
         }
@@ -203,6 +210,14 @@ where
                     size: lit_len,
                 });
             }
+            if non_sync && lit_len > limits.max_non_sync_literal_bytes {
+                // RFC 7888 LITERAL-: non-synchronizing literals > 4096 bytes are rejected
+                // with TOOBIG; abort connection since client may already be streaming payload bytes.
+                return Err(AppError::PayloadTooLarge(format!(
+                    "[TOOBIG] Non-synchronizing literal size {lit_len} exceeds LITERAL- limit of {} bytes",
+                    limits.max_non_sync_literal_bytes
+                )));
+            }
             if lit_len > limits.max_literal_bytes
                 || total_bytes.saturating_add(lit_len) > limits.max_command_bytes
             {
@@ -210,7 +225,7 @@ where
                 // For non-sync literals, abort connection since stream framing would desync.
                 if non_sync {
                     return Err(AppError::PayloadTooLarge(format!(
-                        "IMAP literal size {lit_len} exceeds limit"
+                        "[TOOBIG] IMAP literal size {lit_len} exceeds limit"
                     )));
                 }
                 return Ok(ReadCommandOutcome::LiteralTooLarge {
@@ -822,13 +837,14 @@ mod tests {
         let mut reader = BufReader::new(server);
         let limits = ReadCommandLimits {
             max_literal_bytes: 16 * 1024,
+            max_non_sync_literal_bytes: LITERAL_MINUS_MAX_BYTES,
             max_literals: 16,
-            max_command_bytes: 20 * 1024,
+            max_command_bytes: 6 * 1024,
         };
         let writer = tokio::spawn(async move {
             client
                 .write_all(
-                    format!("A3 CMD {{12000+}}\r\n{} {{12000+}}\r\n", "x".repeat(12000)).as_bytes(),
+                    format!("A3 CMD {{4000+}}\r\n{} {{4000+}}\r\n", "x".repeat(4000)).as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -838,6 +854,38 @@ mod tests {
             .expect_err("cumulative cap must reject second literal");
         assert!(matches!(err, AppError::PayloadTooLarge(_)));
         let _ = writer.await;
+
+        // 4. RFC 7888 LITERAL-: {4096+} succeeds, {4097+} fails with TOOBIG.
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let mut reader = BufReader::new(server);
+        let payload_4096 = "a".repeat(LITERAL_MINUS_MAX_BYTES);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(format!("A4B CMD {{4096+}}\r\n{payload_4096}\r\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let ok_4096 =
+            read_command_with_limits(&mut reader, ReadCommandLimits::authenticated(40_000_000))
+                .await
+                .expect("4096-byte LITERAL- must succeed");
+        match ok_4096 {
+            ReadCommandOutcome::Command(cmd) => {
+                assert_eq!(cmd.tag, "A4B");
+                assert_eq!(cmd.args[0].as_bytes().unwrap().len(), 4096);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+        let _ = writer.await;
+
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let mut reader = BufReader::new(server);
+        client.write_all(b"A4C CMD {4097+}\r\n").await.unwrap();
+        let err =
+            read_command_with_limits(&mut reader, ReadCommandLimits::authenticated(40_000_000))
+                .await
+                .expect_err("4097-byte LITERAL- must be rejected");
+        assert!(matches!(err, AppError::PayloadTooLarge(ref msg) if msg.contains("[TOOBIG]")));
 
         // 4. Max literal count cap (> 16 literals).
         let (mut client, server) = tokio::io::duplex(64 * 1024);

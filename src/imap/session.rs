@@ -37,14 +37,27 @@ use crate::{
             parse_imap_search_date, parse_sequence_set, read_command_with_limits, read_crlf_line,
             read_crlf_line_into, sanitize_imap_text, seq_set_contains,
         },
+        sort_thread::{
+            SortMessageItem, ThreadAlgorithm, ThreadMessageItem, extract_base_subject,
+            extract_base_subject_with_flag, extract_first_mailbox, extract_references_list,
+            is_supported_charset, message_sent_date_ms, parse_sort_criteria,
+            parse_thread_algorithm, sort_criteria_needs_full_message,
+            sort_criteria_needs_raw_rfc2822, sort_messages, thread_ordered_subject,
+            thread_references,
+        },
     },
+    mime::normalize_message_id,
     models::{
         LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
         LABEL_TRASH, LABEL_UNREAD,
     },
+    search::{
+        SearchQuery, matches_message as matches_gmail_query, query_uses_filename,
+        rewrite_query_labels, try_parse_query as try_parse_gmail_query,
+    },
     storage::{
-        ImapFlagAction, ImapFlagSet, ImapMessageEntry, ImapStoreFlagsOutcome, NewLabelInput,
-        StoredMessage, UpdateLabelInput,
+        ImapFlagAction, ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome,
+        NewLabelInput, StoredMessage, UpdateLabelInput,
     },
 };
 
@@ -353,20 +366,28 @@ impl ImapSession {
                 } else {
                     caps.push("AUTH=PLAIN");
                     caps.push("AUTH=XOAUTH2");
+                    caps.push("SASL-IR");
                 }
             }
             AuthState::Authenticated | AuthState::Selected(_) => {
-                caps.extend_from_slice(&["ENABLE", "CONDSTORE", "QRESYNC"]);
+                caps.extend_from_slice(&["SASL-IR", "ENABLE", "CONDSTORE", "QRESYNC"]);
             }
         }
         caps.extend_from_slice(&[
-            "LITERAL+",
+            "LITERAL-",
             "IDLE",
             "MOVE",
             "UIDPLUS",
+            "UNSELECT",
             "SPECIAL-USE",
+            "LIST-EXTENDED",
+            "LIST-STATUS",
             "NAMESPACE",
             "ID",
+            "SORT",
+            "THREAD=REFERENCES",
+            "THREAD=ORDEREDSUBJECT",
+            "ESEARCH",
             "X-GM-EXT-1",
         ]);
         caps.join(" ")
@@ -496,12 +517,24 @@ impl ImapSession {
                 self.handle_close(&tag, stream).await?;
                 Ok(true)
             }
+            "UNSELECT" => {
+                self.handle_unselect(&tag, stream).await?;
+                Ok(true)
+            }
             "EXPUNGE" => {
                 self.handle_expunge(&tag, stream).await?;
                 Ok(true)
             }
             "SEARCH" => {
                 self.handle_search(&tag, &cmd.args, false, stream).await?;
+                Ok(true)
+            }
+            "SORT" => {
+                self.handle_sort(&tag, &cmd.args, false, stream).await?;
+                Ok(true)
+            }
+            "THREAD" => {
+                self.handle_thread(&tag, &cmd.args, false, stream).await?;
                 Ok(true)
             }
             "FETCH" => {
@@ -694,11 +727,37 @@ impl ImapSession {
             return Ok(true);
         }
 
-        let b64_payload = if let Some(initial) = args.get(1).and_then(ImapArg::as_str_lossy) {
-            if initial == "=" {
-                String::new()
-            } else {
-                initial
+        if args.len() > 2 {
+            write_flush(
+                stream,
+                format!(
+                    "{tag} BAD AUTHENTICATE accepts at most mechanism and initial response\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        // RFC 4959 SASL-IR: initial-resp = base64 / "=" (empty zero-length response).
+        let b64_payload = if let Some(ir_arg) = args.get(1) {
+            match ir_arg {
+                ImapArg::Atom(initial) => {
+                    if initial == "=" {
+                        String::new()
+                    } else {
+                        initial.clone()
+                    }
+                }
+                _ => {
+                    write_flush(
+                        stream,
+                        format!("{tag} BAD Invalid SASL-IR initial response in AUTHENTICATE\r\n")
+                            .as_bytes(),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
             }
         } else {
             write_flush(stream, b"+ \r\n").await?;
@@ -910,52 +969,134 @@ impl ImapSession {
         {
             return Ok(());
         }
-        if args.len() < 2 {
-            write_flush(
-                stream,
-                format!("{tag} BAD LIST requires reference and pattern\r\n").as_bytes(),
-            )
-            .await?;
-            return Ok(());
-        }
-        let reference = args[0].as_str_lossy().unwrap_or_default();
-        let pattern = args[1].as_str_lossy().unwrap_or_default();
         let cmd_word = if is_lsub { "LSUB" } else { "LIST" };
 
+        if is_lsub {
+            if args.len() < 2 {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD LSUB requires reference and pattern\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            let reference = args[0].as_str_lossy().unwrap_or_default();
+            let pattern = args[1].as_str_lossy().unwrap_or_default();
+            let full_pattern = combine_list_pattern(&reference, &pattern);
+            let mailboxes = self.state.store.imap_list_mailboxes().await?;
+            let mut out = String::new();
+
+            let has_gmail_children = mailboxes.iter().any(|m| m.name.starts_with("[Gmail]/"));
+            if has_gmail_children
+                && imap_wildcard_match(&full_pattern, "[Gmail]", '/')
+                && (self.subscribed.is_empty() || self.subscribed.contains("[Gmail]"))
+            {
+                out.push_str("* LSUB (\\Noselect \\HasChildren) \"/\" \"[Gmail]\"\r\n");
+            }
+
+            for mbx in &mailboxes {
+                if !self.subscribed.is_empty() && !self.subscribed.contains(&mbx.name) {
+                    continue;
+                }
+                if !imap_wildcard_match(&full_pattern, &mbx.name, '/') {
+                    continue;
+                }
+                let has_children = mailboxes
+                    .iter()
+                    .any(|other| other.name.starts_with(&format!("{}/", mbx.name)));
+                let mut attrs = Vec::new();
+                attrs.push(if has_children {
+                    "\\HasChildren".to_string()
+                } else {
+                    "\\HasNoChildren".to_string()
+                });
+                if let Some(ref su) = mbx.special_use {
+                    attrs.push(su.clone());
+                }
+                out.push_str(&format!(
+                    "* LSUB ({}) \"/\" {}\r\n",
+                    attrs.join(" "),
+                    imap_string(&mbx.name)
+                ));
+            }
+            out.push_str(&format!("{tag} OK LSUB completed\r\n"));
+            write_flush(stream, out.as_bytes()).await?;
+            return Ok(());
+        }
+
+        // RFC 5258 LIST-EXTENDED + RFC 5819 LIST-STATUS + RFC 6154 SPECIAL-USE:
+        // LIST [(<selection-opts>)] <reference> (<pattern> | (<pattern>...)) [RETURN (<return-opts>)]
+        let parsed = match parse_list_extended_args(args) {
+            Ok(p) => p,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+
         // RFC 3501 Section 6.3.8: empty pattern queries hierarchy delimiter.
-        if pattern.is_empty() && !is_lsub {
+        if !parsed.has_selection_options
+            && parsed.patterns.len() == 1
+            && parsed.patterns[0].is_empty()
+            && parsed.return_status_items.is_none()
+        {
             let resp = format!("* LIST (\\Noselect) \"/\" \"\"\r\n{tag} OK LIST completed\r\n");
             write_flush(stream, resp.as_bytes()).await?;
             return Ok(());
         }
 
-        let full_pattern = if reference.is_empty() {
-            pattern
-        } else if reference.ends_with('/') || pattern.starts_with('/') {
-            format!("{reference}{pattern}")
-        } else {
-            format!("{reference}/{pattern}")
-        };
+        let full_patterns: Vec<String> = parsed
+            .patterns
+            .iter()
+            .map(|p| combine_list_pattern(&parsed.reference, p))
+            .collect();
 
         let mailboxes = self.state.store.imap_list_mailboxes().await?;
-        let mut out = String::new();
+        let highest_modseq = if parsed
+            .return_status_items
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|i| i == "HIGHESTMODSEQ"))
+        {
+            Some(self.state.store.current_history_id().await?.max(1))
+        } else {
+            None
+        };
 
-        // Synthesize virtual "[Gmail]" container if it matches the pattern.
+        let mut out = String::new();
+        let emit_subscribed_attr = parsed.select_subscribed || parsed.return_subscribed;
+
+        // Synthesize virtual "[Gmail]" container if it matches and is not filtered out by SPECIAL-USE.
         let has_gmail_children = mailboxes.iter().any(|m| m.name.starts_with("[Gmail]/"));
         if has_gmail_children
-            && imap_wildcard_match(&full_pattern, "[Gmail]", '/')
-            && (!is_lsub || self.subscribed.is_empty() || self.subscribed.contains("[Gmail]"))
+            && !parsed.select_special_use
+            && full_patterns
+                .iter()
+                .any(|p| imap_wildcard_match(p, "[Gmail]", '/'))
+            && (!parsed.select_subscribed || self.subscribed.contains("[Gmail]"))
         {
+            let mut attrs = vec!["\\Noselect", "\\HasChildren"];
+            if emit_subscribed_attr && self.subscribed.contains("[Gmail]") {
+                attrs.push("\\Subscribed");
+            }
             out.push_str(&format!(
-                "* {cmd_word} (\\Noselect \\HasChildren) \"/\" \"[Gmail]\"\r\n"
+                "* {cmd_word} ({}) \"/\" \"[Gmail]\"\r\n",
+                attrs.join(" ")
             ));
+            // RFC 5819 Section 2: never emit STATUS for \Noselect mailboxes.
         }
 
         for mbx in &mailboxes {
-            if is_lsub && !self.subscribed.is_empty() && !self.subscribed.contains(&mbx.name) {
+            if parsed.select_subscribed && !self.subscribed.contains(&mbx.name) {
                 continue;
             }
-            if !imap_wildcard_match(&full_pattern, &mbx.name, '/') {
+            if parsed.select_special_use && mbx.special_use.is_none() {
+                continue;
+            }
+            if !full_patterns
+                .iter()
+                .any(|p| imap_wildcard_match(p, &mbx.name, '/'))
+            {
                 continue;
             }
             let has_children = mailboxes
@@ -967,6 +1108,9 @@ impl ImapSession {
             } else {
                 "\\HasNoChildren".to_string()
             });
+            if emit_subscribed_attr && self.subscribed.contains(&mbx.name) {
+                attrs.push("\\Subscribed".to_string());
+            }
             if let Some(ref su) = mbx.special_use {
                 attrs.push(su.clone());
             }
@@ -975,6 +1119,15 @@ impl ImapSession {
                 attrs.join(" "),
                 imap_string(&mbx.name)
             ));
+
+            if let Some(ref status_items) = parsed.return_status_items {
+                let pairs = format_status_pairs(mbx, status_items, highest_modseq);
+                out.push_str(&format!(
+                    "* STATUS {} ({})\r\n",
+                    imap_string(&mbx.name),
+                    pairs.join(" ")
+                ));
+            }
         }
         out.push_str(&format!("{tag} OK {cmd_word} completed\r\n"));
         write_flush(stream, out.as_bytes()).await?;
@@ -1786,6 +1939,37 @@ impl ImapSession {
         Ok(())
     }
 
+    async fn handle_unselect(
+        &mut self,
+        tag: &str,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        if !self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self.is_selected() {
+            write_flush(
+                stream,
+                format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        // RFC 3691: UNSELECT deselects the current mailbox without expunging \Deleted messages.
+        self.auth = AuthState::Authenticated;
+        write_flush(
+            stream,
+            format!("{tag} OK UNSELECT completed\r\n").as_bytes(),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn handle_expunge(
         &mut self,
         tag: &str,
@@ -1954,6 +2138,8 @@ impl ImapSession {
         match subcmd.to_ascii_uppercase().as_str() {
             "FETCH" => self.handle_fetch(tag, rest, true, stream).await,
             "SEARCH" => self.handle_search(tag, rest, true, stream).await,
+            "SORT" => self.handle_sort(tag, rest, true, stream).await,
+            "THREAD" => self.handle_thread(tag, rest, true, stream).await,
             "STORE" => self.handle_store(tag, rest, true, stream).await,
             "COPY" => {
                 self.handle_copy_or_move(tag, rest, true, false, stream)
@@ -1975,6 +2161,28 @@ impl ImapSession {
         }
     }
 
+    /// Load label name/ID lookup maps and rewrite `X-GM-RAW` queries inside `criteria`.
+    async fn prepare_search_criteria(
+        &self,
+        criteria: &mut SearchKey,
+    ) -> AppResult<HashMap<String, String>> {
+        if !criteria_uses_label_lookup(criteria) {
+            return Ok(HashMap::new());
+        }
+        let labels = self.state.store.list_labels().await?;
+        let mut name_to_id = HashMap::with_capacity(labels.len() * 2);
+        let mut id_to_name = HashMap::with_capacity(labels.len());
+        for lbl in labels {
+            let lower = lbl.name.to_ascii_lowercase();
+            let hyphen = lower.replace('/', "-");
+            name_to_id.insert(lower, lbl.id.clone());
+            name_to_id.insert(hyphen, lbl.id.clone());
+            id_to_name.insert(lbl.id, lbl.name);
+        }
+        rewrite_search_key_labels(criteria, &name_to_id);
+        Ok(id_to_name)
+    }
+
     async fn handle_search(
         &mut self,
         tag: &str,
@@ -1994,13 +2202,60 @@ impl ImapSession {
             }
         };
 
-        // Skip optional CHARSET <charset>.
+        // Optional RFC 4731 `RETURN (<return-opts>)`.
         let mut slice = args;
-        if slice.len() >= 2
-            && slice[0]
-                .as_str_lossy()
-                .is_some_and(|s| s.eq_ignore_ascii_case("CHARSET"))
+        let esearch_opts = if slice
+            .first()
+            .and_then(ImapArg::as_str_lossy)
+            .is_some_and(|s| s.eq_ignore_ascii_case("RETURN"))
         {
+            let Some(opt_list) = slice.get(1).and_then(ImapArg::as_list) else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD SEARCH RETURN requires a parenthesized option list\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            match parse_esearch_return_opts(opt_list) {
+                Ok(opts) => {
+                    slice = &slice[2..];
+                    Some(opts)
+                }
+                Err(err) => {
+                    let safe_err = sanitize_imap_text(&err.to_string());
+                    write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        // Optional `CHARSET <charset>`.
+        if slice
+            .first()
+            .and_then(ImapArg::as_str_lossy)
+            .is_some_and(|s| s.eq_ignore_ascii_case("CHARSET"))
+        {
+            let Some(cs) = slice.get(1).and_then(ImapArg::as_str_lossy) else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD CHARSET requires a charset name\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            if !is_supported_charset(&cs) {
+                write_flush(
+                    stream,
+                    format!("{tag} NO [BADCHARSET (UTF-8 US-ASCII)] Unsupported charset\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
             slice = &slice[2..];
         }
 
@@ -2008,7 +2263,7 @@ impl ImapSession {
         // overwriting the snapshot or shifting sequence numbers of concurrently deleted messages.
         let max_seq = sel.snapshot.len() as u32;
         let max_uid = sel.snapshot.last().map(|e| e.uid).unwrap_or(0);
-        let criteria = match parse_search_criteria(slice, max_seq, max_uid) {
+        let mut criteria = match parse_search_criteria(slice, max_seq, max_uid) {
             Ok(c) => c,
             Err(err) => {
                 let safe_err = sanitize_imap_text(&err.to_string());
@@ -2017,6 +2272,7 @@ impl ImapSession {
             }
         };
 
+        let label_id_to_name = self.prepare_search_criteria(&mut criteria).await?;
         let uses_modseq = criteria_uses_modseq(&criteria);
         if uses_modseq {
             self.condstore_enabled = true;
@@ -2058,25 +2314,396 @@ impl ImapSession {
             } else {
                 None
             };
-            if eval_search_criteria(&criteria, &effective, full_msg.as_ref()) {
+            if eval_search_criteria(&criteria, &effective, full_msg.as_ref(), &label_id_to_name) {
                 matched_ids.push(if is_uid { effective.uid } else { effective.seq });
                 max_matched_modseq = max_matched_modseq.max(effective.modseq());
             }
         }
 
-        let nums: Vec<String> = matched_ids.into_iter().map(|n| n.to_string()).collect();
-        let line = if nums.is_empty() {
-            format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n")
-        } else if uses_modseq {
-            format!(
-                "* SEARCH {} (MODSEQ {max_matched_modseq})\r\n{tag} OK SEARCH completed\r\n",
-                nums.join(" ")
-            )
+        let line = if let Some(opts) = esearch_opts {
+            let mut resp = format!("* ESEARCH (TAG {})", imap_quote(tag));
+            if is_uid {
+                resp.push_str(" UID");
+            }
+            if opts.min
+                && let Some(&first) = matched_ids.first()
+            {
+                resp.push_str(&format!(" MIN {first}"));
+            }
+            if opts.max
+                && let Some(&last) = matched_ids.last()
+            {
+                resp.push_str(&format!(" MAX {last}"));
+            }
+            if opts.all && !matched_ids.is_empty() {
+                resp.push_str(&format!(" ALL {}", format_sequence_set(&matched_ids)));
+            }
+            if opts.count {
+                resp.push_str(&format!(" COUNT {}", matched_ids.len()));
+            }
+            if uses_modseq && !matched_ids.is_empty() {
+                resp.push_str(&format!(" MODSEQ {max_matched_modseq}"));
+            }
+            resp.push_str(&format!("\r\n{tag} OK SEARCH completed\r\n"));
+            resp
         } else {
-            format!(
-                "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
-                nums.join(" ")
+            let nums: Vec<String> = matched_ids.into_iter().map(|n| n.to_string()).collect();
+            if nums.is_empty() {
+                format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n")
+            } else if uses_modseq {
+                format!(
+                    "* SEARCH {} (MODSEQ {max_matched_modseq})\r\n{tag} OK SEARCH completed\r\n",
+                    nums.join(" ")
+                )
+            } else {
+                format!(
+                    "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
+                    nums.join(" ")
+                )
+            }
+        };
+        write_flush(stream, line.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn handle_sort(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        is_uid: bool,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        let sel = match &self.auth {
+            AuthState::Selected(s) => s.clone(),
+            _ => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if args.len() < 3 {
+            write_flush(
+                stream,
+                format!("{tag} BAD SORT requires sort criteria, charset, and search criteria\r\n")
+                    .as_bytes(),
             )
+            .await?;
+            return Ok(());
+        }
+        let Some(sort_list) = args[0].as_list() else {
+            write_flush(
+                stream,
+                format!("{tag} BAD SORT criteria must be a parenthesized list\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let sort_criteria = match parse_sort_criteria(sort_list) {
+            Ok(c) => c,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        let Some(charset) = args[1].as_str_lossy() else {
+            write_flush(
+                stream,
+                format!("{tag} BAD SORT requires a valid charset\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        if !is_supported_charset(&charset) {
+            write_flush(
+                stream,
+                format!("{tag} NO [BADCHARSET (UTF-8 US-ASCII)] Unsupported charset\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let max_seq = sel.snapshot.len() as u32;
+        let max_uid = sel.snapshot.last().map(|e| e.uid).unwrap_or(0);
+        let mut search_criteria = match parse_search_criteria(&args[2..], max_seq, max_uid) {
+            Ok(c) => c,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+
+        let label_id_to_name = self.prepare_search_criteria(&mut search_criteria).await?;
+        let needs_full_for_search = criteria_needs_full_message(&search_criteria);
+        let needs_raw_for_search = criteria_needs_raw_rfc2822(&search_criteria);
+        let needs_full_for_sort = sort_criteria_needs_full_message(&sort_criteria);
+        let needs_raw_for_sort = sort_criteria_needs_raw_rfc2822(&sort_criteria);
+
+        let live_by_id: HashMap<String, ImapMessageEntry> = self
+            .state
+            .store
+            .imap_list_messages(&sel.mailbox)
+            .await?
+            .into_iter()
+            .map(|e| (e.message_id.clone(), e))
+            .collect();
+
+        let mut matched_items: Vec<SortMessageItem> = Vec::new();
+        for snap_entry in &sel.snapshot {
+            let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
+                continue;
+            };
+            let mut effective = live_entry.clone();
+            effective.seq = snap_entry.seq;
+            effective.uid = snap_entry.uid;
+
+            let mut full_msg = if needs_full_for_search {
+                let mut loaded = self.state.store.get_message(&snap_entry.message_id).await?;
+                if needs_raw_for_search
+                    && is_external_blob_store(self.state.blobs.as_ref())
+                    && let Some(ref mut msg) = loaded
+                {
+                    msg.raw_rfc2822 = self.state.load_raw_rfc2822(msg).await?;
+                }
+                loaded
+            } else {
+                None
+            };
+
+            if !eval_search_criteria(
+                &search_criteria,
+                &effective,
+                full_msg.as_ref(),
+                &label_id_to_name,
+            ) {
+                continue;
+            }
+
+            if needs_full_for_sort && full_msg.is_none() {
+                full_msg = self.state.store.get_message(&snap_entry.message_id).await?;
+            }
+            if needs_raw_for_sort
+                && is_external_blob_store(self.state.blobs.as_ref())
+                && let Some(ref mut msg) = full_msg
+                && msg.raw_rfc2822.is_empty()
+            {
+                msg.raw_rfc2822 = self.state.load_raw_rfc2822(msg).await?;
+            }
+
+            let sent_date_ms = if needs_raw_for_sort {
+                message_sent_date_ms(full_msg.as_ref(), effective.internal_date_ms)
+            } else {
+                effective.internal_date_ms
+            };
+            let size = full_msg
+                .as_ref()
+                .filter(|m| !m.raw_rfc2822.is_empty())
+                .map(|m| m.raw_rfc2822.len())
+                .unwrap_or_else(|| effective.size_estimate.max(0) as usize);
+
+            matched_items.push(SortMessageItem {
+                out_id: if is_uid { effective.uid } else { effective.seq },
+                seq: effective.seq,
+                internal_date_ms: effective.internal_date_ms,
+                sent_date_ms,
+                size,
+                from_mailbox: full_msg
+                    .as_ref()
+                    .map(|m| extract_first_mailbox(&m.from_addr))
+                    .unwrap_or_default(),
+                to_mailbox: full_msg
+                    .as_ref()
+                    .and_then(|m| m.to_addrs.first())
+                    .map(|a| extract_first_mailbox(a))
+                    .unwrap_or_default(),
+                cc_mailbox: full_msg
+                    .as_ref()
+                    .and_then(|m| m.cc_addrs.first())
+                    .map(|a| extract_first_mailbox(a))
+                    .unwrap_or_default(),
+                base_subject: full_msg
+                    .as_ref()
+                    .map(|m| extract_base_subject(&m.subject))
+                    .unwrap_or_default(),
+            });
+        }
+
+        let sorted_ids = sort_messages(matched_items, &sort_criteria);
+        let line = if sorted_ids.is_empty() {
+            format!("* SORT\r\n{tag} OK SORT completed\r\n")
+        } else {
+            let nums: Vec<String> = sorted_ids.into_iter().map(|n| n.to_string()).collect();
+            format!("* SORT {}\r\n{tag} OK SORT completed\r\n", nums.join(" "))
+        };
+        write_flush(stream, line.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn handle_thread(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        is_uid: bool,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        let sel = match &self.auth {
+            AuthState::Selected(s) => s.clone(),
+            _ => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if args.len() < 3 {
+            write_flush(
+                stream,
+                format!("{tag} BAD THREAD requires algorithm, charset, and search criteria\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let Some(algo_raw) = args[0].as_str_lossy() else {
+            write_flush(
+                stream,
+                format!("{tag} BAD THREAD requires an algorithm name\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let algorithm = match parse_thread_algorithm(&algo_raw) {
+            Ok(a) => a,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        let Some(charset) = args[1].as_str_lossy() else {
+            write_flush(
+                stream,
+                format!("{tag} BAD THREAD requires a valid charset\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        if !is_supported_charset(&charset) {
+            write_flush(
+                stream,
+                format!("{tag} NO [BADCHARSET (UTF-8 US-ASCII)] Unsupported charset\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let max_seq = sel.snapshot.len() as u32;
+        let max_uid = sel.snapshot.last().map(|e| e.uid).unwrap_or(0);
+        let mut search_criteria = match parse_search_criteria(&args[2..], max_seq, max_uid) {
+            Ok(c) => c,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+
+        let label_id_to_name = self.prepare_search_criteria(&mut search_criteria).await?;
+        let needs_full_for_search = criteria_needs_full_message(&search_criteria);
+        let needs_raw_for_search = criteria_needs_raw_rfc2822(&search_criteria);
+
+        let live_by_id: HashMap<String, ImapMessageEntry> = self
+            .state
+            .store
+            .imap_list_messages(&sel.mailbox)
+            .await?
+            .into_iter()
+            .map(|e| (e.message_id.clone(), e))
+            .collect();
+
+        let mut matched_items: Vec<ThreadMessageItem> = Vec::new();
+        for snap_entry in &sel.snapshot {
+            let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
+                continue;
+            };
+            let mut effective = live_entry.clone();
+            effective.seq = snap_entry.seq;
+            effective.uid = snap_entry.uid;
+
+            let mut full_msg = if needs_full_for_search {
+                let mut loaded = self.state.store.get_message(&snap_entry.message_id).await?;
+                if needs_raw_for_search
+                    && is_external_blob_store(self.state.blobs.as_ref())
+                    && let Some(ref mut msg) = loaded
+                {
+                    msg.raw_rfc2822 = self.state.load_raw_rfc2822(msg).await?;
+                }
+                loaded
+            } else {
+                None
+            };
+
+            if !eval_search_criteria(
+                &search_criteria,
+                &effective,
+                full_msg.as_ref(),
+                &label_id_to_name,
+            ) {
+                continue;
+            }
+
+            if full_msg.is_none() {
+                full_msg = self.state.store.get_message(&snap_entry.message_id).await?;
+            }
+            if is_external_blob_store(self.state.blobs.as_ref())
+                && let Some(ref mut msg) = full_msg
+                && msg.raw_rfc2822.is_empty()
+            {
+                msg.raw_rfc2822 = self.state.load_raw_rfc2822(msg).await?;
+            }
+
+            let sent_date_ms = message_sent_date_ms(full_msg.as_ref(), effective.internal_date_ms);
+            let (base_subject, is_reply_or_fwd) = full_msg
+                .as_ref()
+                .map(|m| extract_base_subject_with_flag(&m.subject))
+                .unwrap_or_default();
+            let message_id = full_msg
+                .as_ref()
+                .and_then(|m| m.rfc822_message_id.as_deref())
+                .and_then(normalize_message_id);
+            let references = full_msg
+                .as_ref()
+                .map(extract_references_list)
+                .unwrap_or_default();
+
+            matched_items.push(ThreadMessageItem {
+                out_id: if is_uid { effective.uid } else { effective.seq },
+                seq: effective.seq,
+                sent_date_ms,
+                base_subject,
+                is_reply_or_fwd,
+                message_id,
+                references,
+                thread_id: effective.thread_id.clone(),
+            });
+        }
+
+        let tree = match algorithm {
+            ThreadAlgorithm::References => thread_references(&matched_items),
+            ThreadAlgorithm::OrderedSubject => thread_ordered_subject(&matched_items),
+        };
+        let line = if tree.is_empty() {
+            format!("* THREAD\r\n{tag} OK THREAD completed\r\n")
+        } else {
+            format!("* THREAD {tree}\r\n{tag} OK THREAD completed\r\n")
         };
         write_flush(stream, line.as_bytes()).await?;
         Ok(())
@@ -2420,6 +3047,29 @@ impl ImapSession {
             .to_ascii_uppercase();
         let silent = action_raw.ends_with(".SILENT");
         let base_action = action_raw.trim_end_matches(".SILENT");
+
+        if matches!(base_action, "X-GM-LABELS" | "+X-GM-LABELS" | "-X-GM-LABELS") {
+            let label_action = match base_action {
+                "X-GM-LABELS" => ImapFlagAction::Replace,
+                "+X-GM-LABELS" => ImapFlagAction::Add,
+                "-X-GM-LABELS" => ImapFlagAction::Remove,
+                _ => unreachable!(),
+            };
+            return self
+                .handle_store_xgm_labels(
+                    tag,
+                    &sel,
+                    &ranges,
+                    label_action,
+                    silent,
+                    unchanged_since,
+                    &args[action_idx + 1..],
+                    is_uid,
+                    stream,
+                )
+                .await;
+        }
+
         let flag_action = match base_action {
             "FLAGS" => ImapFlagAction::Replace,
             "+FLAGS" => ImapFlagAction::Add,
@@ -2541,6 +3191,256 @@ impl ImapSession {
                 write_flush(stream, line.as_bytes()).await?;
             } else if unchanged_since.is_some() {
                 // RFC 7162 Section 3.1.3: .SILENT with UNCHANGEDSINCE still reports new MODSEQ.
+                let mut parts = Vec::new();
+                if is_uid {
+                    parts.push(format!("UID {}", new_entry.uid));
+                }
+                parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                let line = format!("* {} FETCH ({})\r\n", new_entry.seq, parts.join(" "));
+                write_flush(stream, line.as_bytes()).await?;
+            }
+        }
+
+        if let AuthState::Selected(ref mut s) = self.auth {
+            s.snapshot = updated_snapshot;
+        }
+        let ok_line = if !modified_ids.is_empty() {
+            let mod_set = format_sequence_set(&modified_ids);
+            format!("{tag} OK [MODIFIED {mod_set}] STORE completed\r\n")
+        } else {
+            format!("{tag} OK STORE completed\r\n")
+        };
+        write_flush(stream, ok_line.as_bytes()).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_store_xgm_labels(
+        &mut self,
+        tag: &str,
+        sel: &SelectedState,
+        ranges: &[(u32, u32)],
+        action: ImapFlagAction,
+        silent: bool,
+        unchanged_since: Option<u64>,
+        value_args: &[ImapArg],
+        is_uid: bool,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        let mut req_labels: Vec<String> = Vec::new();
+        match value_args.first() {
+            Some(ImapArg::List(list)) => {
+                for a in list {
+                    if let Some(s) = a.as_str_lossy() {
+                        req_labels.push(s);
+                    }
+                }
+            }
+            Some(_) => {
+                for a in value_args {
+                    if let Some(s) = a.as_str_lossy() {
+                        req_labels.push(s);
+                    }
+                }
+            }
+            None => {}
+        }
+
+        let mut existing_labels = self.state.store.list_labels().await?;
+        let mut target_label_ids: Vec<String> = Vec::new();
+        let mut target_seen: HashSet<String> = HashSet::new();
+
+        for raw in &req_labels {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || !is_valid_mailbox_name(trimmed) {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD Invalid X-GM-LABELS value\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if let Some(sys_id) = resolve_xgm_label_system_id(trimmed) {
+                if target_seen.insert(sys_id.to_string()) {
+                    target_label_ids.push(sys_id.to_string());
+                }
+                continue;
+            }
+
+            if trimmed.starts_with('\\') {
+                let safe = sanitize_imap_text(trimmed);
+                write_flush(
+                    stream,
+                    format!("{tag} NO Unsupported Gmail system label {safe}\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Custom user label: find existing by exact name, case-insensitive name, or ID.
+            let found_id = existing_labels
+                .iter()
+                .find(|l| l.label_type == "user" && l.name == trimmed)
+                .or_else(|| {
+                    existing_labels
+                        .iter()
+                        .find(|l| l.label_type == "user" && l.name.eq_ignore_ascii_case(trimmed))
+                })
+                .or_else(|| existing_labels.iter().find(|l| l.id == trimmed))
+                .map(|l| l.id.clone());
+
+            let resolved_id = match found_id {
+                Some(id) => Some(id),
+                None if matches!(action, ImapFlagAction::Add | ImapFlagAction::Replace) => {
+                    match self
+                        .state
+                        .store
+                        .create_label(NewLabelInput {
+                            name: trimmed.to_string(),
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        Ok(created) => {
+                            let id = created.id.clone();
+                            existing_labels.push(created);
+                            Some(id)
+                        }
+                        Err(AppError::Conflict(_)) => {
+                            existing_labels = self.state.store.list_labels().await?;
+                            existing_labels
+                                .iter()
+                                .find(|l| {
+                                    l.label_type == "user" && l.name.eq_ignore_ascii_case(trimmed)
+                                })
+                                .map(|l| l.id.clone())
+                        }
+                        Err(err) => {
+                            let safe_err = sanitize_imap_text(&err.to_string());
+                            write_flush(stream, format!("{tag} NO {safe_err}\r\n").as_bytes())
+                                .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(id) = resolved_id
+                && target_seen.insert(id.clone())
+            {
+                target_label_ids.push(id);
+            }
+        }
+
+        let label_name_map: HashMap<String, String> = existing_labels
+            .into_iter()
+            .map(|l| (l.id, l.name))
+            .collect();
+
+        let mut updated_snapshot = sel.snapshot.clone();
+        let mut modified_ids: Vec<u32> = Vec::new();
+
+        for (idx, snap_entry) in sel.snapshot.iter().enumerate() {
+            let key = if is_uid {
+                snap_entry.uid
+            } else {
+                snap_entry.seq
+            };
+            if !seq_set_contains(ranges, key) {
+                continue;
+            }
+
+            let Some(current_msg) = self.state.store.get_message(&snap_entry.message_id).await?
+            else {
+                continue;
+            };
+
+            if let Some(limit) = unchanged_since
+                && current_msg.history_id.max(1) > limit
+            {
+                modified_ids.push(key);
+                continue;
+            }
+
+            let (add_labels, remove_labels): (Vec<String>, Vec<String>) = match action {
+                ImapFlagAction::Add => (target_label_ids.clone(), Vec::new()),
+                ImapFlagAction::Remove => (Vec::new(), target_label_ids.clone()),
+                ImapFlagAction::Replace => {
+                    let target_set: HashSet<&str> =
+                        target_label_ids.iter().map(String::as_str).collect();
+                    let current_set: HashSet<&str> =
+                        current_msg.label_ids.iter().map(String::as_str).collect();
+                    let add: Vec<String> = target_label_ids
+                        .iter()
+                        .filter(|id| !current_set.contains(id.as_str()))
+                        .cloned()
+                        .collect();
+                    // Preserve LABEL_UNREAD because \Seen controls UNREAD, not X-GM-LABELS.
+                    let remove: Vec<String> = current_msg
+                        .label_ids
+                        .iter()
+                        .filter(|id| {
+                            id.as_str() != LABEL_UNREAD && !target_set.contains(id.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    (add, remove)
+                }
+            };
+
+            // modify_message_labels updates modseq (history_id) and records HistoryEvent with
+            // HistorySource::Local ("local") so upstream Gmail sync pushes the label mutation.
+            let updated = if add_labels.is_empty() && remove_labels.is_empty() {
+                current_msg.clone()
+            } else {
+                self.state
+                    .store
+                    .modify_message_labels(&snap_entry.message_id, &add_labels, &remove_labels)
+                    .await?
+            };
+
+            let old_set: HashSet<&str> = current_msg.label_ids.iter().map(String::as_str).collect();
+            let new_set: HashSet<&str> = updated.label_ids.iter().map(String::as_str).collect();
+            let added: Vec<String> = new_set
+                .difference(&old_set)
+                .map(|s| (*s).to_string())
+                .collect();
+            let removed: Vec<String> = old_set
+                .difference(&new_set)
+                .map(|s| (*s).to_string())
+                .collect();
+            if !added.is_empty() || !removed.is_empty() {
+                self.state.events.publish(
+                    EventSource::Imap,
+                    MailEvent::MessageUpdated {
+                        message_id: updated.id.clone(),
+                        thread_id: updated.thread_id.clone(),
+                        added_labels: added,
+                        removed_labels: removed,
+                    },
+                );
+            }
+
+            let mut new_entry = snap_entry.clone();
+            new_entry.label_ids = updated.label_ids;
+            new_entry.history_id = updated.history_id.max(1);
+            new_entry.is_answered = updated.is_answered;
+            new_entry.is_deleted = updated.is_deleted;
+            updated_snapshot[idx] = new_entry.clone();
+
+            if !silent {
+                let labels_str = format_xgm_labels(&new_entry.label_ids, &label_name_map);
+                let mut parts = Vec::new();
+                if is_uid {
+                    parts.push(format!("UID {}", new_entry.uid));
+                }
+                parts.push(format!("X-GM-LABELS ({labels_str})"));
+                parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                let line = format!("* {} FETCH ({})\r\n", new_entry.seq, parts.join(" "));
+                write_flush(stream, line.as_bytes()).await?;
+            } else if unchanged_since.is_some() {
                 let mut parts = Vec::new();
                 if is_uid {
                     parts.push(format!("UID {}", new_entry.uid));
@@ -3166,6 +4066,265 @@ fn format_xgm_labels(label_ids: &[String], name_map: &HashMap<String, String>) -
     out.join(" ")
 }
 
+/// Map a Gmail IMAP `X-GM-LABELS` system label token (`\Inbox`, `\Starred`, `\Important`,
+/// `\Sent`, `\Draft`, `\Trash`, `\Spam`, `\Junk`) to its internal system label ID.
+fn resolve_xgm_label_system_id(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "\\inbox" | "inbox" => Some(LABEL_INBOX),
+        "\\starred" | "starred" => Some(LABEL_STARRED),
+        "\\important" | "important" => Some(LABEL_IMPORTANT),
+        "\\sent" | "sent" => Some(LABEL_SENT),
+        "\\draft" | "\\drafts" | "draft" | "drafts" => Some(LABEL_DRAFT),
+        "\\trash" | "trash" => Some(LABEL_TRASH),
+        "\\spam" | "\\junk" | "spam" | "junk" => Some(LABEL_SPAM),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// RFC 5258 (`LIST-EXTENDED`), RFC 5819 (`LIST-STATUS`), RFC 4731 (`ESEARCH`)
+// ============================================================================
+
+#[derive(Debug, Default)]
+struct ListExtendedArgs {
+    has_selection_options: bool,
+    select_subscribed: bool,
+    select_special_use: bool,
+    reference: String,
+    patterns: Vec<String>,
+    return_status_items: Option<Vec<String>>,
+    return_subscribed: bool,
+}
+
+fn combine_list_pattern(reference: &str, pattern: &str) -> String {
+    if reference.is_empty() {
+        pattern.to_string()
+    } else if reference.ends_with('/') || pattern.starts_with('/') {
+        format!("{reference}{pattern}")
+    } else {
+        format!("{reference}/{pattern}")
+    }
+}
+
+fn parse_list_extended_args(args: &[ImapArg]) -> AppResult<ListExtendedArgs> {
+    if args.len() < 2 {
+        return Err(AppError::BadRequest(
+            "LIST requires reference and pattern".to_string(),
+        ));
+    }
+
+    let mut parsed = ListExtendedArgs::default();
+    let mut idx = 0usize;
+
+    // Optional RFC 5258 leading selection options: `LIST (SUBSCRIBED ...) <ref> <pat>`
+    if let Some(ImapArg::List(sel_opts)) = args.first() {
+        parsed.has_selection_options = true;
+        let mut has_recursivematch = false;
+        let mut has_other_selector = false;
+        for opt in sel_opts {
+            let tok = opt
+                .as_str_lossy()
+                .ok_or_else(|| AppError::BadRequest("Invalid LIST selection option".to_string()))?;
+            match tok.to_ascii_uppercase().as_str() {
+                "SUBSCRIBED" => {
+                    parsed.select_subscribed = true;
+                    has_other_selector = true;
+                }
+                "SPECIAL-USE" => {
+                    parsed.select_special_use = true;
+                    has_other_selector = true;
+                }
+                "REMOTE" => {
+                    has_other_selector = true;
+                }
+                "RECURSIVEMATCH" => {
+                    has_recursivematch = true;
+                }
+                other => {
+                    return Err(AppError::BadRequest(format!(
+                        "Unsupported LIST selection option: {other}"
+                    )));
+                }
+            }
+        }
+        if has_recursivematch && !has_other_selector {
+            return Err(AppError::BadRequest(
+                "LIST RECURSIVEMATCH requires another selection option".to_string(),
+            ));
+        }
+        idx = 1;
+    }
+
+    if args.len() < idx + 2 {
+        return Err(AppError::BadRequest(
+            "LIST requires reference and pattern".to_string(),
+        ));
+    }
+
+    parsed.reference = args[idx]
+        .as_str_lossy()
+        .ok_or_else(|| AppError::BadRequest("LIST reference must be a string".to_string()))?;
+
+    match &args[idx + 1] {
+        ImapArg::List(pats) => {
+            if pats.is_empty() {
+                return Err(AppError::BadRequest(
+                    "LIST pattern list must not be empty".to_string(),
+                ));
+            }
+            for pat in pats {
+                let s = pat.as_str_lossy().ok_or_else(|| {
+                    AppError::BadRequest("LIST pattern must be a string".to_string())
+                })?;
+                parsed.patterns.push(s);
+            }
+        }
+        other => {
+            let s = other
+                .as_str_lossy()
+                .ok_or_else(|| AppError::BadRequest("LIST pattern must be a string".to_string()))?;
+            parsed.patterns.push(s);
+        }
+    }
+
+    let rest = &args[idx + 2..];
+    if !rest.is_empty() {
+        let kw = rest[0].as_str_lossy().unwrap_or_default();
+        if !kw.eq_ignore_ascii_case("RETURN") || rest.len() != 2 {
+            return Err(AppError::BadRequest(
+                "Expected RETURN (<options>) after LIST pattern".to_string(),
+            ));
+        }
+        let ret_opts = rest[1].as_list().ok_or_else(|| {
+            AppError::BadRequest("LIST RETURN options must be a parenthesized list".to_string())
+        })?;
+        let mut ri = 0usize;
+        while ri < ret_opts.len() {
+            let tok = ret_opts[ri]
+                .as_str_lossy()
+                .ok_or_else(|| AppError::BadRequest("Invalid LIST RETURN option".to_string()))?;
+            match tok.to_ascii_uppercase().as_str() {
+                "STATUS" => {
+                    let status_list =
+                        ret_opts
+                            .get(ri + 1)
+                            .and_then(ImapArg::as_list)
+                            .ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "LIST RETURN STATUS requires a parenthesized status item list"
+                                        .to_string(),
+                                )
+                            })?;
+                    if status_list.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "LIST RETURN STATUS list must not be empty".to_string(),
+                        ));
+                    }
+                    let mut items = Vec::with_capacity(status_list.len());
+                    for item in status_list {
+                        let key = item
+                            .as_str_lossy()
+                            .ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "Invalid STATUS item in LIST RETURN".to_string(),
+                                )
+                            })?
+                            .to_ascii_uppercase();
+                        if !matches!(
+                            key.as_str(),
+                            "MESSAGES"
+                                | "RECENT"
+                                | "UIDNEXT"
+                                | "UIDVALIDITY"
+                                | "UNSEEN"
+                                | "HIGHESTMODSEQ"
+                        ) {
+                            return Err(AppError::BadRequest(format!(
+                                "Unsupported STATUS data item in LIST RETURN: {key}"
+                            )));
+                        }
+                        items.push(key);
+                    }
+                    parsed.return_status_items = Some(items);
+                    ri += 2;
+                }
+                "SPECIAL-USE" | "CHILDREN" => {
+                    ri += 1;
+                }
+                "SUBSCRIBED" => {
+                    parsed.return_subscribed = true;
+                    ri += 1;
+                }
+                other => {
+                    return Err(AppError::BadRequest(format!(
+                        "Unsupported LIST RETURN option: {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn format_status_pairs(
+    info: &ImapMailboxInfo,
+    items: &[String],
+    highest_modseq: Option<u64>,
+) -> Vec<String> {
+    let mut pairs = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            "MESSAGES" => pairs.push(format!("MESSAGES {}", info.messages)),
+            "RECENT" => pairs.push("RECENT 0".to_string()),
+            "UIDNEXT" => pairs.push(format!("UIDNEXT {}", info.uid_next)),
+            "UIDVALIDITY" => pairs.push(format!("UIDVALIDITY {}", info.uid_validity)),
+            "UNSEEN" => pairs.push(format!("UNSEEN {}", info.unseen)),
+            "HIGHESTMODSEQ" => {
+                pairs.push(format!("HIGHESTMODSEQ {}", highest_modseq.unwrap_or(1)));
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct EsearchReturnOpts {
+    min: bool,
+    max: bool,
+    all: bool,
+    count: bool,
+}
+
+fn parse_esearch_return_opts(list: &[ImapArg]) -> AppResult<EsearchReturnOpts> {
+    if list.is_empty() {
+        // RFC 4731 Section 3.1: empty RETURN () is equivalent to RETURN (ALL).
+        return Ok(EsearchReturnOpts {
+            all: true,
+            ..Default::default()
+        });
+    }
+    let mut opts = EsearchReturnOpts::default();
+    for item in list {
+        let tok = item
+            .as_str_lossy()
+            .ok_or_else(|| AppError::BadRequest("Invalid SEARCH RETURN option".to_string()))?;
+        match tok.to_ascii_uppercase().as_str() {
+            "MIN" => opts.min = true,
+            "MAX" => opts.max = true,
+            "ALL" => opts.all = true,
+            "COUNT" => opts.count = true,
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported SEARCH RETURN option: {other}"
+                )));
+            }
+        }
+    }
+    Ok(opts)
+}
+
 // ============================================================================
 // RFC 7162 (`CONDSTORE` / `QRESYNC`) Parameter & Modifier Parsers
 // ============================================================================
@@ -3366,6 +4525,8 @@ enum SearchKey {
     Modseq(u64),
     XGmMsgId(u64),
     XGmThrId(u64),
+    XGmRaw(SearchQuery),
+    XGmLabels(String),
     Not(Box<SearchKey>),
     Or(Box<SearchKey>, Box<SearchKey>),
     And(Vec<SearchKey>),
@@ -3466,7 +4627,47 @@ fn parse_one_search_key(
         "BCC" => Ok(SearchKey::Bcc(next_str(args, pos, "BCC")?)),
         "SUBJECT" => Ok(SearchKey::Subject(next_str(args, pos, "SUBJECT")?)),
         "BODY" => Ok(SearchKey::Body(next_str(args, pos, "BODY")?)),
-        "TEXT" | "X-GM-RAW" => Ok(SearchKey::Text(next_str(args, pos, &upper)?)),
+        "TEXT" => Ok(SearchKey::Text(next_str(args, pos, "TEXT")?)),
+        "X-GM-RAW" => {
+            let raw = next_str(args, pos, "X-GM-RAW")?;
+            let parsed = try_parse_gmail_query(&raw)?;
+            Ok(SearchKey::XGmRaw(parsed))
+        }
+        "X-GM-LABELS" => {
+            let Some(next_arg) = args.get(*pos) else {
+                return Err(AppError::BadRequest(
+                    "SEARCH X-GM-LABELS requires an argument".to_string(),
+                ));
+            };
+            *pos += 1;
+            match next_arg {
+                ImapArg::List(items) => {
+                    if items.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "SEARCH X-GM-LABELS list must not be empty".to_string(),
+                        ));
+                    }
+                    let mut keys = Vec::with_capacity(items.len());
+                    for item in items {
+                        let lbl = item.as_str_lossy().ok_or_else(|| {
+                            AppError::BadRequest("Invalid X-GM-LABELS criterion".to_string())
+                        })?;
+                        keys.push(SearchKey::XGmLabels(lbl));
+                    }
+                    if keys.len() == 1 {
+                        Ok(keys.pop().unwrap())
+                    } else {
+                        Ok(SearchKey::And(keys))
+                    }
+                }
+                other => {
+                    let lbl = other.as_str_lossy().ok_or_else(|| {
+                        AppError::BadRequest("SEARCH X-GM-LABELS requires an argument".to_string())
+                    })?;
+                    Ok(SearchKey::XGmLabels(lbl))
+                }
+            }
+        }
         "HEADER" => {
             let field = next_str(args, pos, "HEADER field")?;
             let val = next_str(args, pos, "HEADER value")?;
@@ -3586,6 +4787,36 @@ fn criteria_uses_modseq(key: &SearchKey) -> bool {
     }
 }
 
+fn criteria_uses_label_lookup(key: &SearchKey) -> bool {
+    match key {
+        SearchKey::XGmRaw(_) | SearchKey::XGmLabels(_) => true,
+        SearchKey::Not(inner) => criteria_uses_label_lookup(inner),
+        SearchKey::Or(a, b) => criteria_uses_label_lookup(a) || criteria_uses_label_lookup(b),
+        SearchKey::And(list) => list.iter().any(criteria_uses_label_lookup),
+        _ => false,
+    }
+}
+
+fn rewrite_search_key_labels(key: &mut SearchKey, name_to_id: &HashMap<String, String>) {
+    match key {
+        SearchKey::XGmRaw(q) => {
+            let owned = std::mem::take(q);
+            *q = rewrite_query_labels(owned, name_to_id);
+        }
+        SearchKey::Not(inner) => rewrite_search_key_labels(inner, name_to_id),
+        SearchKey::Or(a, b) => {
+            rewrite_search_key_labels(a, name_to_id);
+            rewrite_search_key_labels(b, name_to_id);
+        }
+        SearchKey::And(list) => {
+            for item in list {
+                rewrite_search_key_labels(item, name_to_id);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn criteria_needs_full_message(key: &SearchKey) -> bool {
     match key {
         SearchKey::From(_)
@@ -3600,7 +4831,8 @@ fn criteria_needs_full_message(key: &SearchKey) -> bool {
         | SearchKey::SentBefore(_)
         | SearchKey::SentOn(_)
         | SearchKey::XGmMsgId(_)
-        | SearchKey::XGmThrId(_) => true,
+        | SearchKey::XGmThrId(_)
+        | SearchKey::XGmRaw(_) => true,
         SearchKey::Not(inner) => criteria_needs_full_message(inner),
         SearchKey::Or(a, b) => criteria_needs_full_message(a) || criteria_needs_full_message(b),
         SearchKey::And(list) => list.iter().any(criteria_needs_full_message),
@@ -3616,6 +4848,7 @@ fn criteria_needs_raw_rfc2822(key: &SearchKey) -> bool {
         | SearchKey::SentSince(_)
         | SearchKey::SentBefore(_)
         | SearchKey::SentOn(_) => true,
+        SearchKey::XGmRaw(q) => query_uses_filename(q),
         SearchKey::Not(inner) => criteria_needs_raw_rfc2822(inner),
         SearchKey::Or(a, b) => criteria_needs_raw_rfc2822(a) || criteria_needs_raw_rfc2822(b),
         SearchKey::And(list) => list.iter().any(criteria_needs_raw_rfc2822),
@@ -3633,6 +4866,7 @@ fn eval_search_criteria(
     key: &SearchKey,
     entry: &ImapMessageEntry,
     msg: Option<&StoredMessage>,
+    label_id_to_name: &HashMap<String, String>,
 ) -> bool {
     let internal_date = Utc
         .timestamp_millis_opt(entry.internal_date_ms)
@@ -3701,13 +4935,28 @@ fn eval_search_criteria(
         SearchKey::XGmThrId(target) => msg.is_some_and(|m| {
             derive_xgm_u64(m.upstream_thread_id.as_deref(), &m.thread_id) == *target
         }),
-        SearchKey::Not(inner) => !eval_search_criteria(inner, entry, msg),
+        SearchKey::XGmRaw(query) => msg.is_some_and(|m| matches_gmail_query(query, m)),
+        SearchKey::XGmLabels(wanted) => {
+            if let Some(sys_id) = resolve_xgm_label_system_id(wanted) {
+                entry.label_ids.iter().any(|id| id == sys_id)
+            } else {
+                let wanted_trimmed = wanted.trim();
+                entry.label_ids.iter().any(|id| {
+                    id.eq_ignore_ascii_case(wanted_trimmed)
+                        || label_id_to_name
+                            .get(id)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(wanted_trimmed))
+                })
+            }
+        }
+        SearchKey::Not(inner) => !eval_search_criteria(inner, entry, msg, label_id_to_name),
         SearchKey::Or(a, b) => {
-            eval_search_criteria(a, entry, msg) || eval_search_criteria(b, entry, msg)
+            eval_search_criteria(a, entry, msg, label_id_to_name)
+                || eval_search_criteria(b, entry, msg, label_id_to_name)
         }
         SearchKey::And(list) => list
             .iter()
-            .all(|item| eval_search_criteria(item, entry, msg)),
+            .all(|item| eval_search_criteria(item, entry, msg, label_id_to_name)),
     }
 }
 
