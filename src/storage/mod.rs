@@ -781,6 +781,221 @@ pub struct NewScheduledSend {
     pub thread_id: Option<String>,
     pub created_at_ms: i64,
 }
+
+// ============================================================================
+// Per-Mailbox Event-Driven Inbox Rules Types
+// ============================================================================
+
+fn default_inbox_rule_enabled() -> bool {
+    true
+}
+
+/// Actions applied when an [`InboxRule`] matches an inbound message.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRuleActions {
+    #[serde(default)]
+    pub add_labels: Vec<String>,
+    #[serde(default)]
+    pub remove_labels: Vec<String>,
+    #[serde(default)]
+    pub archive: bool,
+    #[serde(default)]
+    pub mark_read: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
+}
+
+impl std::fmt::Debug for InboxRuleActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboxRuleActions")
+            .field("add_labels", &self.add_labels)
+            .field("remove_labels", &self.remove_labels)
+            .field("archive", &self.archive)
+            .field("mark_read", &self.mark_read)
+            .field("webhook_url", &self.webhook_url)
+            .field(
+                "webhook_secret",
+                &self
+                    .webhook_secret
+                    .as_ref()
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .finish()
+    }
+}
+
+/// Persistent per-mailbox declarative inbox rule evaluated on inbound ingestion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRule {
+    pub id: String,
+    pub mailbox_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub match_query: String,
+    pub vip_only: bool,
+    pub actions: InboxRuleActions,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Input payload used to create a new [`InboxRule`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewInboxRule {
+    pub name: String,
+    #[serde(default = "default_inbox_rule_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub match_query: String,
+    #[serde(default)]
+    pub vip_only: bool,
+    #[serde(default)]
+    pub actions: InboxRuleActions,
+}
+
+impl Default for NewInboxRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            match_query: String::new(),
+            vip_only: false,
+            actions: InboxRuleActions::default(),
+        }
+    }
+}
+
+/// Partial update payload for [`MailStore::patch_inbox_rule`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRulePatch {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub match_query: Option<String>,
+    #[serde(default)]
+    pub vip_only: Option<bool>,
+    #[serde(default)]
+    pub actions: Option<InboxRuleActions>,
+}
+
+/// Redacted API projection of [`InboxRuleActions`] that never exposes `webhook_secret`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRuleActionsView {
+    pub add_labels: Vec<String>,
+    pub remove_labels: Vec<String>,
+    pub archive: bool,
+    pub mark_read: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    pub has_webhook_secret: bool,
+}
+
+/// Redacted API projection of [`InboxRule`] returned by REST `/v1/rules` and MCP tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRuleView {
+    pub id: String,
+    pub mailbox_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub match_query: String,
+    pub vip_only: bool,
+    pub actions: InboxRuleActionsView,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl InboxRule {
+    /// Convert this rule into a redacted API view that replaces `webhook_secret` with
+    /// `has_webhook_secret: bool`.
+    pub fn to_view(&self) -> InboxRuleView {
+        InboxRuleView {
+            id: self.id.clone(),
+            mailbox_id: self.mailbox_id.clone(),
+            name: self.name.clone(),
+            enabled: self.enabled,
+            match_query: self.match_query.clone(),
+            vip_only: self.vip_only,
+            actions: InboxRuleActionsView {
+                add_labels: self.actions.add_labels.clone(),
+                remove_labels: self.actions.remove_labels.clone(),
+                archive: self.actions.archive,
+                mark_read: self.actions.mark_read,
+                webhook_url: self.actions.webhook_url.clone(),
+                has_webhook_secret: self
+                    .actions
+                    .webhook_secret
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty()),
+            },
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
+impl From<InboxRule> for InboxRuleView {
+    fn from(rule: InboxRule) -> Self {
+        rule.to_view()
+    }
+}
+
+impl From<&InboxRule> for InboxRuleView {
+    fn from(rule: &InboxRule) -> Self {
+        rule.to_view()
+    }
+}
+
+fn normalize_label_list(labels: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(labels.len());
+    for raw in labels {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// Normalize [`InboxRuleActions`] by trimming/deduplicating labels and turning blank URLs/secrets
+/// into `None`.
+pub fn normalize_inbox_rule_actions(actions: &InboxRuleActions) -> InboxRuleActions {
+    InboxRuleActions {
+        add_labels: normalize_label_list(&actions.add_labels),
+        remove_labels: normalize_label_list(&actions.remove_labels),
+        archive: actions.archive,
+        mark_read: actions.mark_read,
+        webhook_url: normalize_optional_text(actions.webhook_url.as_deref()),
+        webhook_secret: normalize_optional_text(actions.webhook_secret.as_deref()),
+    }
+}
+
+/// Apply an [`InboxRulePatch`] onto an existing [`InboxRule`], returning the updated rule.
+pub fn apply_inbox_rule_patch(
+    mut existing: InboxRule,
+    patch: &InboxRulePatch,
+    now_ms: i64,
+) -> InboxRule {
+    if let Some(ref name) = patch.name {
+        existing.name = name.trim().to_string();
+    }
+    if let Some(enabled) = patch.enabled {
+        existing.enabled = enabled;
+    }
+    if let Some(ref match_query) = patch.match_query {
+        existing.match_query = match_query.trim().to_string();
+    }
+    if let Some(vip_only) = patch.vip_only {
+        existing.vip_only = vip_only;
+    }
+    if let Some(ref actions) = patch.actions {
+        existing.actions = normalize_inbox_rule_actions(actions);
+    }
+    existing.updated_at_ms = now_ms;
+    existing
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -1114,6 +1329,13 @@ pub trait MailStore: Send + Sync {
     ) -> AppResult<ScheduledSend>;
     /// Atomically transition a `Pending` scheduled send to `Failed`.
     async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend>;
+
+    // --- Per-Mailbox Event-Driven Inbox Rules ---
+    async fn create_inbox_rule(&self, input: &NewInboxRule) -> AppResult<InboxRule>;
+    async fn get_inbox_rule(&self, id: &str) -> AppResult<Option<InboxRule>>;
+    async fn list_inbox_rules(&self) -> AppResult<Vec<InboxRule>>;
+    async fn patch_inbox_rule(&self, id: &str, patch: &InboxRulePatch) -> AppResult<InboxRule>;
+    async fn delete_inbox_rule(&self, id: &str) -> AppResult<()>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).

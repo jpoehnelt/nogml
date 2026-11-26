@@ -16,10 +16,10 @@ use nogml::{
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactDirection,
         ContactInteraction, ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery,
-        MailStore, MemoryStore, MessageListQuery, NewAttachmentInput, NewAuditLogEntry,
-        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
-        ScheduledSendStatus, SqliteStore, SyncState, TriagePatch, UpdateLabelInput,
-        UpsertOutcomeKind, WatchSubscription, open_store,
+        InboxRuleActions, InboxRulePatch, MailStore, MemoryStore, MessageListQuery,
+        NewAttachmentInput, NewAuditLogEntry, NewInboxRule, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, NewScheduledSend, ScheduledSendStatus, SqliteStore, SyncState,
+        TriagePatch, UpdateLabelInput, UpsertOutcomeKind, WatchSubscription, open_store,
     },
     transport::OutboundMessage,
 };
@@ -1642,6 +1642,66 @@ async fn contract_multi_mailbox_isolation(
     assert_eq!(alice_ann.waiting_on, Some(WaitingOn::Me));
     assert_eq!(bob_ann.summary.as_deref(), Some("Bob private summary"));
     assert_eq!(bob_ann.waiting_on, Some(WaitingOn::Them));
+
+    // 7. Inbox rules isolation across mailboxes
+    let alice_rule = alice
+        .create_inbox_rule(&NewInboxRule {
+            name: "Alice Stripe Disputes".to_string(),
+            enabled: true,
+            match_query: "from:@stripe.com subject:dispute".to_string(),
+            vip_only: false,
+            actions: InboxRuleActions {
+                add_labels: vec!["Disputes".to_string()],
+                remove_labels: vec![],
+                archive: true,
+                mark_read: false,
+                webhook_url: Some("https://alice.example/hook".to_string()),
+                webhook_secret: Some("alice_secret".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+    let bob_rule = bob
+        .create_inbox_rule(&NewInboxRule {
+            name: "Bob VIP Alerts".to_string(),
+            enabled: true,
+            match_query: "".to_string(),
+            vip_only: true,
+            actions: InboxRuleActions {
+                add_labels: vec!["VIP".to_string()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    let alice_rules = alice.list_inbox_rules().await.unwrap();
+    let bob_rules = bob.list_inbox_rules().await.unwrap();
+    assert_eq!(alice_rules.len(), 1);
+    assert_eq!(alice_rules[0].id, alice_rule.id);
+    assert_eq!(bob_rules.len(), 1);
+    assert_eq!(bob_rules[0].id, bob_rule.id);
+
+    // Cross-mailbox get, patch, and delete must fail/return None
+    assert!(bob.get_inbox_rule(&alice_rule.id).await.unwrap().is_none());
+    assert!(matches!(
+        bob.patch_inbox_rule(
+            &alice_rule.id,
+            &InboxRulePatch {
+                enabled: Some(false),
+                ..Default::default()
+            }
+        )
+        .await,
+        Err(AppError::NotFound(_))
+    ));
+    assert!(matches!(
+        bob.delete_inbox_rule(&alice_rule.id).await,
+        Err(AppError::NotFound(_))
+    ));
+    // Alice's rule remains intact
+    let alice_still = alice.get_inbox_rule(&alice_rule.id).await.unwrap().unwrap();
+    assert!(alice_still.enabled);
 }
 
 async fn contract_contacts_stats_vip_filtering_and_patch(store: Arc<dyn MailStore>) {
@@ -2129,6 +2189,159 @@ async fn contract_snooze_and_scheduled_sends(
     store_b.cancel_scheduled_send(&sch_due_b.id).await.unwrap();
 }
 
+async fn contract_inbox_rules_crud(store: Arc<dyn MailStore>) {
+    let mb = store.mailbox_id().to_string();
+    assert!(store.list_inbox_rules().await.unwrap().is_empty());
+    assert!(
+        store
+            .get_inbox_rule("rule_missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let r1 = store
+        .create_inbox_rule(&NewInboxRule {
+            name: "  Stripe Disputes  ".to_string(),
+            enabled: true,
+            match_query: " from:@stripe.com subject:dispute ".to_string(),
+            vip_only: false,
+            actions: InboxRuleActions {
+                add_labels: vec![
+                    " Disputes ".to_string(),
+                    "Disputes".to_string(),
+                    "Urgent".to_string(),
+                ],
+                remove_labels: vec![],
+                archive: true,
+                mark_read: true,
+                webhook_url: Some(" https://hooks.example.com/disputes ".to_string()),
+                webhook_secret: Some("super-secret-key".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(r1.id.starts_with("rule_"));
+    assert_eq!(r1.mailbox_id, mb);
+    assert_eq!(r1.name, "Stripe Disputes");
+    assert!(r1.enabled);
+    assert_eq!(r1.match_query, "from:@stripe.com subject:dispute");
+    assert!(!r1.vip_only);
+    assert_eq!(r1.actions.add_labels, vec!["Disputes", "Urgent"]);
+    assert!(r1.actions.archive);
+    assert!(r1.actions.mark_read);
+    assert_eq!(
+        r1.actions.webhook_url.as_deref(),
+        Some("https://hooks.example.com/disputes")
+    );
+    assert_eq!(
+        r1.actions.webhook_secret.as_deref(),
+        Some("super-secret-key")
+    );
+    assert_eq!(r1.created_at_ms, r1.updated_at_ms);
+
+    // View must redact webhook_secret and expose has_webhook_secret
+    let view = r1.to_view();
+    assert!(view.actions.has_webhook_secret);
+    let view_json = serde_json::to_string(&view).unwrap();
+    assert!(!view_json.contains("super-secret-key"));
+
+    let r2 = store
+        .create_inbox_rule(&NewInboxRule {
+            name: "VIP Escalation".to_string(),
+            enabled: false,
+            match_query: "subject:urgent".to_string(),
+            vip_only: true,
+            actions: InboxRuleActions {
+                add_labels: vec!["STARRED".to_string()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert!(!r2.enabled);
+    assert!(r2.vip_only);
+    assert!(!r2.to_view().actions.has_webhook_secret);
+
+    // Get + List ordering
+    let fetched = store.get_inbox_rule(&r1.id).await.unwrap().unwrap();
+    assert_eq!(fetched, r1);
+    let listed = store.list_inbox_rules().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|r| r.id == r1.id));
+    assert!(listed.iter().any(|r| r.id == r2.id));
+
+    // Partial patch preserves unspecified fields (including actions & webhook_secret)
+    let patched = store
+        .patch_inbox_rule(
+            &r1.id,
+            &InboxRulePatch {
+                name: Some("Stripe Chargebacks".to_string()),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.name, "Stripe Chargebacks");
+    assert!(!patched.enabled);
+    assert_eq!(patched.match_query, "from:@stripe.com subject:dispute");
+    assert_eq!(
+        patched.actions.webhook_secret.as_deref(),
+        Some("super-secret-key")
+    );
+    assert!(patched.updated_at_ms >= r1.updated_at_ms);
+
+    // Actions replacement patch
+    let patched2 = store
+        .patch_inbox_rule(
+            &r1.id,
+            &InboxRulePatch {
+                vip_only: Some(true),
+                actions: Some(InboxRuleActions {
+                    add_labels: vec!["VIP_Dispute".to_string()],
+                    remove_labels: vec!["INBOX".to_string()],
+                    archive: false,
+                    mark_read: false,
+                    webhook_url: None,
+                    webhook_secret: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(patched2.vip_only);
+    assert_eq!(patched2.actions.add_labels, vec!["VIP_Dispute"]);
+    assert!(patched2.actions.webhook_url.is_none());
+    assert!(patched2.actions.webhook_secret.is_none());
+
+    // Patching missing rule returns NotFound
+    assert!(matches!(
+        store
+            .patch_inbox_rule(
+                "rule_missing",
+                &InboxRulePatch {
+                    enabled: Some(true),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(AppError::NotFound(_))
+    ));
+
+    // Delete + verify NotFound on second delete
+    store.delete_inbox_rule(&r1.id).await.unwrap();
+    assert!(store.get_inbox_rule(&r1.id).await.unwrap().is_none());
+    assert!(matches!(
+        store.delete_inbox_rule(&r1.id).await,
+        Err(AppError::NotFound(_))
+    ));
+    let remaining = store.list_inbox_rules().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, r2.id);
+}
+
 /// Master contract test runner executing every `MailStore` invariant suite on isolated mailboxes.
 async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &str) {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -2142,6 +2355,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     let mb_idem = format!("{prefix}-idem-{suffix}@contract.test");
     let mb_sched_a = format!("{prefix}-sched-a-{suffix}@contract.test");
     let mb_sched_b = format!("{prefix}-sched-b-{suffix}@contract.test");
+    let mb_rules = format!("{prefix}-rules-{suffix}@contract.test");
     let mb_alice = format!("{prefix}-alice-{suffix}@contract.test");
     let mb_bob = format!("{prefix}-bob-{suffix}@contract.test");
 
@@ -2154,6 +2368,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_thread_annotations(base_store.for_mailbox(&mb_ann)).await;
     contract_idempotency_keys_and_audit_log(base_store.for_mailbox(&mb_idem)).await;
     contract_snooze_and_scheduled_sends(base_store.clone(), &mb_sched_a, &mb_sched_b).await;
+    contract_inbox_rules_crud(base_store.for_mailbox(&mb_rules)).await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
 }
 

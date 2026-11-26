@@ -307,6 +307,33 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                 }
             }
         },
+        "mail.rules": {
+            "endpoint": "GET /v1/rules | POST /v1/rules | PATCH /v1/rules/{id} | DELETE /v1/rules/{id} | POST /v1/rules/{id}/test",
+            "mcp_tool": "list_rules | create_rule | delete_rule",
+            "description": "Manage per-mailbox event-driven inbox rules with automatic label mutations and HMAC-SHA256 signed webhook triggers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "enabled": { "type": "boolean", "default": true },
+                    "match_query": { "type": "string" },
+                    "vip_only": { "type": "boolean", "default": false },
+                    "actions": {
+                        "type": "object",
+                        "properties": {
+                            "add_labels": { "type": "array", "items": { "type": "string" } },
+                            "remove_labels": { "type": "array", "items": { "type": "string" } },
+                            "archive": { "type": "boolean", "default": false },
+                            "mark_read": { "type": "boolean", "default": false },
+                            "webhook_url": { "type": "string" },
+                            "webhook_secret": { "type": "string" }
+                        }
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                }
+            }
+        },
         "mail.approvals": {
             "endpoint": "GET /v1/approvals | GET /v1/approvals/{id} | POST /v1/approvals/{id}/approve | POST /v1/approvals/{id}/reject",
             "description": "List, inspect, approve, or reject outbound emails held for human approval.",
@@ -391,6 +418,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
             "contacts" | "lookup_contact" | "list_vips" | "vips" => "mail.contacts",
+            "rules" | "list_rules" | "create_rule" | "delete_rule" => "mail.rules",
             "approvals" | "approve" | "reject" => "mail.approvals",
             "audit" | "audit_log" => "mail.audit",
             "watch" | "events" => "mail.watch",
@@ -449,6 +477,11 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "GET /v1/contacts",
             "GET /v1/contacts/{email}",
             "PATCH /v1/contacts/{email}",
+            "GET /v1/rules",
+            "POST /v1/rules",
+            "PATCH /v1/rules/{id}",
+            "DELETE /v1/rules/{id}",
+            "POST /v1/rules/{id}/test",
             "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",

@@ -471,6 +471,17 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
         return Some(AuthScope::Read);
     }
 
+    // `POST /v1/rules/{id}/test` is a read-only dry-run against recent messages.
+    if method == Method::POST
+        && let Some(rest) = normalized
+            .strip_prefix("/v1/rules/")
+            .and_then(|s| s.strip_suffix("/test"))
+        && !rest.is_empty()
+        && !rest.contains('/')
+    {
+        return Some(AuthScope::Read);
+    }
+
     // Outbound send endpoints require `Send`.
     if normalized == "/v1/messages/send"
         || (normalized.starts_with("/v1/drafts/") && normalized.ends_with("/send"))

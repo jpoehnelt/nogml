@@ -1373,6 +1373,39 @@ mod tests {
         ) -> AppResult<crate::storage::ScheduledSend> {
             unreachable!()
         }
+
+        async fn create_inbox_rule(
+            &self,
+            _input: &crate::storage::NewInboxRule,
+        ) -> AppResult<crate::storage::InboxRule> {
+            Err(crate::error::AppError::Storage(
+                "unimplemented in mock".to_string(),
+            ))
+        }
+
+        async fn get_inbox_rule(&self, _id: &str) -> AppResult<Option<crate::storage::InboxRule>> {
+            Ok(None)
+        }
+
+        async fn list_inbox_rules(&self) -> AppResult<Vec<crate::storage::InboxRule>> {
+            Ok(Vec::new())
+        }
+
+        async fn patch_inbox_rule(
+            &self,
+            id: &str,
+            _patch: &crate::storage::InboxRulePatch,
+        ) -> AppResult<crate::storage::InboxRule> {
+            Err(crate::error::AppError::NotFound(format!(
+                "Inbox rule not found: {id}"
+            )))
+        }
+
+        async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
+            Err(crate::error::AppError::NotFound(format!(
+                "Inbox rule not found: {id}"
+            )))
+        }
     }
 
     fn test_state(

@@ -34,14 +34,16 @@ use crate::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
-        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        VIP_REPLY_THRESHOLD, WatchSubscription, compute_contact_is_vip, normalize_contact_email,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, InboxRule, InboxRuleActions,
+        InboxRulePatch, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
+        UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
+        apply_inbox_rule_patch, compute_contact_is_vip, normalize_contact_email,
+        normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
 };
 
@@ -63,7 +65,7 @@ const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 5;
+const CURRENT_SCHEMA_VERSION: i32 = 6;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -393,6 +395,21 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_sends_mailbox_status_send_at
     ON scheduled_sends (mailbox_id, status, send_at_ms, id);
 CREATE INDEX IF NOT EXISTS idx_scheduled_sends_due_status
     ON scheduled_sends (status, send_at_ms, mailbox_id, id);
+
+CREATE TABLE IF NOT EXISTS inbox_rules (
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    match_query TEXT NOT NULL,
+    vip_only BOOLEAN NOT NULL DEFAULT FALSE,
+    actions_json TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_rules_mailbox_created
+    ON inbox_rules (mailbox_id, created_at_ms ASC, id ASC);
 "#;
 
 /// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
@@ -6132,6 +6149,145 @@ impl MailStore for PostgresStore {
             ..existing
         })
     }
+
+    async fn create_inbox_rule(&self, input: &NewInboxRule) -> AppResult<InboxRule> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let now_ms = Utc::now().timestamp_millis();
+        let id = format!("rule_{}", Uuid::new_v4().simple());
+        let name = input.name.trim().to_string();
+        let match_query = input.match_query.trim().to_string();
+        let actions = normalize_inbox_rule_actions(&input.actions);
+        let actions_json = serde_json::to_string(&actions)?;
+
+        conn.execute(
+            "INSERT INTO inbox_rules (
+                mailbox_id, id, name, enabled, match_query, vip_only,
+                actions_json, created_at_ms, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &mb,
+                &id,
+                &name,
+                &input.enabled,
+                &match_query,
+                &input.vip_only,
+                &actions_json,
+                &now_ms,
+                &now_ms,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+
+        Ok(InboxRule {
+            id,
+            mailbox_id: self.mailbox_id.clone(),
+            name,
+            enabled: input.enabled,
+            match_query,
+            vip_only: input.vip_only,
+            actions,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    async fn get_inbox_rule(&self, id: &str) -> AppResult<Option<InboxRule>> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let row = conn
+            .query_opt(
+                "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                        actions_json, created_at_ms, updated_at_ms
+                 FROM inbox_rules
+                 WHERE mailbox_id = $1 AND id = $2",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        row.as_ref().map(inbox_rule_from_row).transpose()
+    }
+
+    async fn list_inbox_rules(&self) -> AppResult<Vec<InboxRule>> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let rows = conn
+            .query(
+                "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                        actions_json, created_at_ms, updated_at_ms
+                 FROM inbox_rules
+                 WHERE mailbox_id = $1
+                 ORDER BY created_at_ms ASC, id ASC",
+                &[&mb],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            results.push(inbox_rule_from_row(row)?);
+        }
+        Ok(results)
+    }
+
+    async fn patch_inbox_rule(&self, id: &str, patch: &InboxRulePatch) -> AppResult<InboxRule> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+        let row = tx
+            .query_opt(
+                "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                        actions_json, created_at_ms, updated_at_ms
+                 FROM inbox_rules
+                 WHERE mailbox_id = $1 AND id = $2
+                 FOR UPDATE",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Inbox rule not found: {id}")))?;
+        let existing = inbox_rule_from_row(&row)?;
+        let now_ms = Utc::now().timestamp_millis();
+        let updated = apply_inbox_rule_patch(existing, patch, now_ms);
+        let actions_json = serde_json::to_string(&updated.actions)?;
+
+        tx.execute(
+            "UPDATE inbox_rules
+             SET name = $1, enabled = $2, match_query = $3, vip_only = $4,
+                 actions_json = $5, updated_at_ms = $6
+             WHERE mailbox_id = $7 AND id = $8",
+            &[
+                &updated.name,
+                &updated.enabled,
+                &updated.match_query,
+                &updated.vip_only,
+                &actions_json,
+                &updated.updated_at_ms,
+                &mb,
+                &id,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(updated)
+    }
+
+    async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let affected = conn
+            .execute(
+                "DELETE FROM inbox_rules WHERE mailbox_id = $1 AND id = $2",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if affected == 0 {
+            return Err(AppError::NotFound(format!("Inbox rule not found: {id}")));
+        }
+        Ok(())
+    }
 }
 
 fn scheduled_send_from_row(row: &Row) -> AppResult<ScheduledSend> {
@@ -6155,6 +6311,23 @@ fn scheduled_send_from_row(row: &Row) -> AppResult<ScheduledSend> {
         last_error: row.get(9),
         created_at_ms: row.get(10),
         updated_at_ms: row.get(11),
+    })
+}
+
+fn inbox_rule_from_row(row: &Row) -> AppResult<InboxRule> {
+    let actions_json: String = row.get(6);
+    let actions: InboxRuleActions = serde_json::from_str(&actions_json)
+        .map_err(|e| AppError::Storage(format!("Corrupt inbox_rules actions_json: {e}")))?;
+    Ok(InboxRule {
+        id: row.get(0),
+        mailbox_id: row.get(1),
+        name: row.get(2),
+        enabled: row.get(3),
+        match_query: row.get(4),
+        vip_only: row.get(5),
+        actions,
+        created_at_ms: row.get(7),
+        updated_at_ms: row.get(8),
     })
 }
 

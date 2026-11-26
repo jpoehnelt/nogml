@@ -4,6 +4,7 @@
 //!
 //! Owned by the `ai-mcp` worker.
 
+pub mod rules;
 pub mod safety;
 pub mod scheduler;
 pub mod schema;
@@ -27,7 +28,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream, StreamExt};
@@ -61,9 +62,9 @@ use crate::{
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactPatch, ContactQuery,
-        ContactRecord, MessageListQuery, NewAttachmentInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, StoredLabel, StoredMessage,
-        StoredThreadDetail, TriagePatch, parse_simple_email_address,
+        ContactRecord, InboxRulePatch, MessageListQuery, NewAttachmentInput, NewInboxRule,
+        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, StoredLabel,
+        StoredMessage, StoredThreadDetail, TriagePatch, parse_simple_email_address,
         validate_and_normalize_contact_email,
     },
     sync::{self, SyncRunOptions},
@@ -247,6 +248,15 @@ pub fn ai_router() -> Router<AppState> {
             "/v1/contacts/{email}",
             get(get_contact_handler).patch(patch_contact_handler),
         )
+        .route(
+            "/v1/rules",
+            get(list_rules_handler).post(create_rule_handler),
+        )
+        .route(
+            "/v1/rules/{id}",
+            patch(patch_rule_handler).delete(delete_rule_handler),
+        )
+        .route("/v1/rules/{id}/test", post(test_rule_handler))
         .route("/v1/audit", get(list_audit_handler))
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
@@ -3521,6 +3531,11 @@ async fn get_capabilities(
             "GET /v1/contacts",
             "GET /v1/contacts/{email}",
             "PATCH /v1/contacts/{email}",
+            "GET /v1/rules",
+            "POST /v1/rules",
+            "PATCH /v1/rules/{id}",
+            "DELETE /v1/rules/{id}",
+            "POST /v1/rules/{id}/test",
             "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",
@@ -4561,4 +4576,77 @@ async fn patch_contact_handler(
     let updated = sanitize_contact_record(updated, state.config.untrusted_content_guard);
     let value = serde_json::to_value(updated).map_err(AppError::from)?;
     Ok(Json(project_fields(value, query.fields.as_deref())?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TestRuleParams {
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+async fn list_rules_handler(
+    MailboxState(state): MailboxState,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let body = rules::execute_list_rules(&state).await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn create_rule_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<NewInboxRule>,
+) -> Result<Json<Value>, AiError> {
+    let body = rules::execute_create_rule_with_context(
+        &state,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn patch_rule_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<InboxRulePatch>,
+) -> Result<Json<Value>, AiError> {
+    let body = rules::execute_patch_rule_with_context(
+        &state,
+        &id,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn delete_rule_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let body = rules::execute_delete_rule_with_context(
+        &state,
+        &id,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn test_rule_handler(
+    MailboxState(state): MailboxState,
+    Path(id): Path<String>,
+    Query(params): Query<TestRuleParams>,
+) -> Result<Json<Value>, AiError> {
+    let body = rules::execute_test_rule(&state, &id, params.limit).await?;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
 }

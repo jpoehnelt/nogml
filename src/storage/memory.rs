@@ -23,14 +23,15 @@ use crate::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, InboxRule, InboxRulePatch, MailStore,
+        MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
         ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
         StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
         TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription, compute_contact_is_vip, normalize_contact_email,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        WatchSubscription, apply_inbox_rule_patch, compute_contact_is_vip, normalize_contact_email,
+        normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
 };
 
@@ -95,6 +96,7 @@ struct MemoryState {
     audit_log: Vec<AuditLogEntry>,
     snoozed_threads: HashMap<String, SnoozedThread>,
     scheduled_sends: HashMap<String, ScheduledSend>,
+    inbox_rules: HashMap<String, InboxRule>,
 }
 
 impl MemoryState {
@@ -152,6 +154,7 @@ impl MemoryState {
             audit_log: Vec::new(),
             snoozed_threads: HashMap::new(),
             scheduled_sends: HashMap::new(),
+            inbox_rules: HashMap::new(),
         }
     }
 
@@ -3468,6 +3471,62 @@ impl MailStore for MemoryStore {
         entry.last_error = Some(error.to_string());
         entry.updated_at_ms = Utc::now().timestamp_millis();
         Ok(entry.clone())
+    }
+
+    async fn create_inbox_rule(&self, input: &NewInboxRule) -> AppResult<InboxRule> {
+        let mut state = self.write_state()?;
+        let now_ms = Utc::now().timestamp_millis();
+        let id = format!("rule_{}", Uuid::new_v4().simple());
+        let rule = InboxRule {
+            id: id.clone(),
+            mailbox_id: self.mailbox_id.clone(),
+            name: input.name.trim().to_string(),
+            enabled: input.enabled,
+            match_query: input.match_query.trim().to_string(),
+            vip_only: input.vip_only,
+            actions: normalize_inbox_rule_actions(&input.actions),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        state.inbox_rules.insert(id, rule.clone());
+        Ok(rule)
+    }
+
+    async fn get_inbox_rule(&self, id: &str) -> AppResult<Option<InboxRule>> {
+        let state = self.read_state()?;
+        Ok(state.inbox_rules.get(id).cloned())
+    }
+
+    async fn list_inbox_rules(&self) -> AppResult<Vec<InboxRule>> {
+        let state = self.read_state()?;
+        let mut rules: Vec<InboxRule> = state.inbox_rules.values().cloned().collect();
+        rules.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(rules)
+    }
+
+    async fn patch_inbox_rule(&self, id: &str, patch: &InboxRulePatch) -> AppResult<InboxRule> {
+        let mut state = self.write_state()?;
+        let existing = state
+            .inbox_rules
+            .get(id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("Inbox rule not found: {id}")))?;
+        let now_ms = Utc::now().timestamp_millis();
+        let updated = apply_inbox_rule_patch(existing, patch, now_ms);
+        state.inbox_rules.insert(id.to_string(), updated.clone());
+        Ok(updated)
+    }
+
+    async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
+        let mut state = self.write_state()?;
+        if state.inbox_rules.remove(id).is_none() {
+            return Err(AppError::NotFound(format!("Inbox rule not found: {id}")));
+        }
+        Ok(())
     }
 }
 

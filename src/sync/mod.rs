@@ -212,10 +212,9 @@ pub async fn ingest_synced_message(
         return Ok(None);
     }
 
-    let outcome = state.store.upsert_synced_message(input).await?;
+    let mut outcome = state.store.upsert_synced_message(input).await?;
     match outcome.kind {
         UpsertOutcomeKind::Inserted => {
-            let _ = state.post_store_message(&outcome.message).await;
             report.messages_added += 1;
             state.events.publish(
                 EventSource::GmailSync,
@@ -228,6 +227,14 @@ pub async fn ingest_synced_message(
                     labels: outcome.message.label_ids.clone(),
                 },
             );
+            outcome.message = crate::ai::rules::evaluate_inbox_rules(
+                state.store.as_ref(),
+                &state.events,
+                &outcome.message,
+                state.config.untrusted_content_guard,
+            )
+            .await;
+            let _ = state.post_store_message(&outcome.message).await;
         }
         UpsertOutcomeKind::Updated => {
             report.messages_updated += 1;
