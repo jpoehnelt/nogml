@@ -12,7 +12,7 @@ categories = ["email", "web-programming::http-server", "command-line-utilities"]
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres"]
 
 [dependencies]
 # Async runtime & HTTP server
@@ -41,6 +41,7 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 # Optional PostgreSQL persistence & LISTEN/NOTIFY event bridge (`--features postgres`)
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 
 # MIME parsing/building, encoding & webhook verification
 base64 = "0.22"

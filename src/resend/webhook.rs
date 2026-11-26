@@ -933,6 +933,7 @@ mod tests {
                 all_mail_uid: *seq as u32,
                 is_answered: input.is_answered,
                 is_deleted: input.is_deleted,
+                unsubscribe: None,
             };
             self.messages.lock().unwrap().push(stored.clone());
             Ok(stored)
@@ -1534,6 +1535,7 @@ mod tests {
             all_mail_uid: 1,
             is_answered: false,
             is_deleted: false,
+            unsubscribe: None,
         });
 
         let resend = Arc::new(HttpResendClient::new("http://127.0.0.1:9", None));
@@ -1637,6 +1639,7 @@ mod tests {
             all_mail_uid: 1,
             is_answered: false,
             is_deleted: false,
+            unsubscribe: None,
         });
         let resend = Arc::new(HttpResendClient::new("http://127.0.0.1:9", None));
 
@@ -1869,6 +1872,7 @@ mod tests {
             all_mail_uid: 1,
             is_answered: false,
             is_deleted: false,
+            unsubscribe: None,
         });
 
         let resend = Arc::new(HttpResendClient::new(server.uri(), Some("re_key".into())));

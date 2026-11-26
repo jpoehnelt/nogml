@@ -447,10 +447,26 @@ pub async fn migrate_blobs(
             let raw_bytes = if is_external_blob_store(source) {
                 match source.get(&raw_key).await? {
                     Some(bytes) => bytes,
-                    None => msg.raw_rfc2822.clone(),
+                    None => {
+                        if !msg.raw_rfc2822.is_empty() {
+                            msg.raw_rfc2822.clone()
+                        } else {
+                            store
+                                .get_message(&msg.id)
+                                .await?
+                                .map(|full| full.raw_rfc2822)
+                                .unwrap_or_default()
+                        }
+                    }
                 }
-            } else {
+            } else if !msg.raw_rfc2822.is_empty() {
                 msg.raw_rfc2822.clone()
+            } else {
+                store
+                    .get_message(&msg.id)
+                    .await?
+                    .map(|full| full.raw_rfc2822)
+                    .unwrap_or_default()
             };
 
             if !raw_bytes.is_empty() {

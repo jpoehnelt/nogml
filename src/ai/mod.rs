@@ -1961,6 +1961,10 @@ pub async fn execute_modify_labels_with_source(
     execute_modify_labels_with_context(state, req, None, source).await
 }
 
+/// Maximum combined `message_ids` + `thread_ids` accepted in a single `POST /v1/messages/modify`
+/// (or MCP `modify_labels`) request.
+pub const MAX_MODIFY_BATCH_IDS: usize = 500;
+
 /// Variant accepting the authenticated [`Principal`] for audit attribution.
 pub async fn execute_modify_labels_with_context(
     state: &AppState,
@@ -1974,6 +1978,15 @@ pub async fn execute_modify_labels_with_context(
             "At least one of message_ids or thread_ids must be non-empty",
             Some("Provide message_ids and/or thread_ids to modify.".to_string()),
         ));
+    }
+
+    if req.message_ids.len() > MAX_MODIFY_BATCH_IDS
+        || req.thread_ids.len() > MAX_MODIFY_BATCH_IDS
+        || req.message_ids.len().saturating_add(req.thread_ids.len()) > MAX_MODIFY_BATCH_IDS
+    {
+        return Err(AppError::BadRequest(format!(
+            "Too many target IDs: at most {MAX_MODIFY_BATCH_IDS} combined message_ids and thread_ids are allowed per modify request"
+        )));
     }
 
     for id in req
@@ -2630,7 +2643,12 @@ pub fn to_compact_message(
         Vec::new()
     };
 
-    let unsubscribe = sanitize_unsubscribe(parse_unsubscribe_from_raw(&msg.raw_rfc2822), guard);
+    let unsubscribe = sanitize_unsubscribe(
+        msg.unsubscribe
+            .clone()
+            .or_else(|| parse_unsubscribe_from_raw(&msg.raw_rfc2822)),
+        guard,
+    );
 
     CompactMessage {
         id: msg.id.clone(),
@@ -2797,15 +2815,6 @@ pub async fn build_thread_detail(
                 compact.attachments_meta = Some(meta);
             }
         }
-        if compact.unsubscribe.is_none()
-            && msg.raw_rfc2822.is_empty()
-            && let Ok(raw) = state.load_raw_rfc2822(msg).await
-        {
-            compact.unsubscribe = sanitize_unsubscribe(
-                parse_unsubscribe_from_raw(&raw),
-                state.config.untrusted_content_guard,
-            );
-        }
 
         compact_messages.push(compact);
     }
@@ -2861,15 +2870,6 @@ pub async fn build_compact_message_with_meta(
         if !meta.is_empty() {
             compact.attachments_meta = Some(meta);
         }
-    }
-    if compact.unsubscribe.is_none()
-        && msg.raw_rfc2822.is_empty()
-        && let Ok(raw) = state.load_raw_rfc2822(msg).await
-    {
-        compact.unsubscribe = sanitize_unsubscribe(
-            parse_unsubscribe_from_raw(&raw),
-            state.config.untrusted_content_guard,
-        );
     }
     Ok(compact)
 }

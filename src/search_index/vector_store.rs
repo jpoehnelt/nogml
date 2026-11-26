@@ -376,3 +376,195 @@ impl VectorStore for SqliteVectorStore {
         .await
     }
 }
+
+#[cfg(feature = "postgres")]
+const PG_VECTOR_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    mailbox_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BYTEA NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_mailbox_model
+    ON message_embeddings (mailbox_id, model);
+"#;
+
+/// PostgreSQL-backed [`VectorStore`] persisting little-endian `f32` BYTEAs in `message_embeddings`.
+#[cfg(feature = "postgres")]
+#[derive(Clone)]
+pub struct PostgresVectorStore {
+    pool: deadpool_postgres::Pool,
+    mailbox_id: String,
+    schema_ready: Arc<tokio::sync::OnceCell<()>>,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresVectorStore {
+    /// Construct a `PostgresVectorStore` from a PostgreSQL connection URL or libpq string.
+    ///
+    /// Uses [`crate::storage::postgres::build_postgres_pool`], inheriting TLS (`sslmode=require`)
+    /// handling automatically. The `message_embeddings` table is created idempotently on first use.
+    pub fn from_url(database_url: &str, mailbox_id: &str) -> AppResult<Self> {
+        let pool = crate::storage::postgres::build_postgres_pool(database_url)?;
+        Ok(Self::from_pool(pool, mailbox_id))
+    }
+
+    /// Construct a `PostgresVectorStore` reusing an existing `deadpool-postgres` pool.
+    pub fn from_pool(pool: deadpool_postgres::Pool, mailbox_id: &str) -> Self {
+        Self {
+            pool,
+            mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
+            schema_ready: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    async fn ensure_ready(&self) -> AppResult<deadpool_postgres::Object> {
+        self.schema_ready
+            .get_or_try_init(|| async {
+                let mut conn =
+                    self.pool.get().await.map_err(|e| {
+                        AppError::Storage(format!("Postgres vector pool error: {e}"))
+                    })?;
+
+                let exists: bool = conn
+                    .query_one("SELECT to_regclass('message_embeddings') IS NOT NULL", &[])
+                    .await
+                    .map_err(|e| {
+                        AppError::Storage(format!("Failed to check Postgres vector schema: {e}"))
+                    })?
+                    .get(0);
+                if exists {
+                    return Ok::<(), AppError>(());
+                }
+
+                let tx = conn.transaction().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to begin Postgres vector DDL tx: {e}"))
+                })?;
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&crate::storage::postgres::SCHEMA_ADVISORY_LOCK_KEY],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Storage(format!("Failed to acquire Postgres DDL advisory lock: {e}"))
+                })?;
+
+                let exists_after_lock: bool = tx
+                    .query_one("SELECT to_regclass('message_embeddings') IS NOT NULL", &[])
+                    .await
+                    .map_err(|e| {
+                        AppError::Storage(format!("Failed to re-check Postgres vector schema: {e}"))
+                    })?
+                    .get(0);
+                if !exists_after_lock {
+                    tx.batch_execute(PG_VECTOR_SCHEMA_SQL).await.map_err(|e| {
+                        AppError::Storage(format!(
+                            "Failed to initialize Postgres vector schema: {e}"
+                        ))
+                    })?;
+                }
+                tx.commit().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to commit Postgres vector DDL tx: {e}"))
+                })?;
+                Ok::<(), AppError>(())
+            })
+            .await?;
+
+        self.pool
+            .get()
+            .await
+            .map_err(|e| AppError::Storage(format!("Postgres vector pool error: {e}")))
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl VectorStore for PostgresVectorStore {
+    fn for_mailbox(&self, mailbox_id: &str) -> Arc<dyn VectorStore> {
+        Arc::new(Self {
+            pool: self.pool.clone(),
+            mailbox_id: crate::config::normalize_mailbox_id(mailbox_id),
+            schema_ready: self.schema_ready.clone(),
+        })
+    }
+
+    async fn upsert(&self, message_id: &str, model: &str, vector: &[f32]) -> AppResult<()> {
+        let dims = i32::try_from(vector.len())
+            .map_err(|_| AppError::Storage("Embedding vector exceeds i32 dims".to_string()))?;
+        let blob = encode_f32_le(vector);
+        let updated_at_ms = Utc::now().timestamp_millis();
+        let conn = self.ensure_ready().await?;
+        let mb = self.mailbox_id.as_str();
+
+        conn.execute(
+            "INSERT INTO message_embeddings (mailbox_id, message_id, model, dims, vector, updated_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (mailbox_id, message_id) DO UPDATE SET
+                model = EXCLUDED.model,
+                dims = EXCLUDED.dims,
+                vector = EXCLUDED.vector,
+                updated_at_ms = EXCLUDED.updated_at_ms",
+            &[&mb, &message_id, &model, &dims, &blob, &updated_at_ms],
+        )
+        .await
+        .map_err(|e| AppError::Storage(format!("Failed to upsert Postgres message embedding: {e}")))?;
+        Ok(())
+    }
+
+    async fn remove(&self, message_id: &str) -> AppResult<()> {
+        let conn = self.ensure_ready().await?;
+        let mb = self.mailbox_id.as_str();
+        conn.execute(
+            "DELETE FROM message_embeddings WHERE mailbox_id = $1 AND message_id = $2",
+            &[&mb, &message_id],
+        )
+        .await
+        .map_err(|e| {
+            AppError::Storage(format!("Failed to delete Postgres message embedding: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn list_for_model(&self, model: &str) -> AppResult<Vec<(String, Vec<f32>)>> {
+        let conn = self.ensure_ready().await?;
+        let mb = self.mailbox_id.as_str();
+        let rows = conn
+            .query(
+                "SELECT message_id, dims, vector FROM message_embeddings WHERE mailbox_id = $1 AND model = $2",
+                &[&mb, &model],
+            )
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to query Postgres message embeddings: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let message_id: String = row.get(0);
+            let dims: i32 = row.get(1);
+            let blob: Vec<u8> = row.get(2);
+            match decode_f32_le(&blob) {
+                Ok(vec) if i32::try_from(vec.len()).ok() == Some(dims) => {
+                    out.push((message_id, vec));
+                }
+                Ok(vec) => {
+                    tracing::warn!(
+                        message_id = %message_id,
+                        expected_dims = dims,
+                        actual_dims = vec.len(),
+                        "Skipping Postgres message embedding with mismatched dimensions"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        message_id = %message_id,
+                        error = %err,
+                        "Skipping corrupted Postgres message embedding BYTEA"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+}

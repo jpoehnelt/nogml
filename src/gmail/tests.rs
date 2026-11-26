@@ -193,6 +193,7 @@ impl MailStore for MockStore {
                 data: att.data.clone(),
             });
         }
+        let unsubscribe = crate::mime::parse_unsubscribe_from_raw(&input.raw_rfc2822);
         let stored = StoredMessage {
             id: id.clone(),
             thread_id: thread_id.clone(),
@@ -221,6 +222,7 @@ impl MailStore for MockStore {
             all_mail_uid: s.next_id as u32,
             is_answered: input.is_answered,
             is_deleted: input.is_deleted,
+            unsubscribe,
         };
         s.history.push(StoredHistoryEntry {
             history_id: hid,
@@ -376,6 +378,7 @@ impl MailStore for MockStore {
             .filter(|a| a.message_id == message_id)
             .map(|a| AttachmentMeta {
                 id: a.id.clone(),
+                part_id: (!a.part_id.is_empty()).then(|| a.part_id.clone()),
                 filename: a.filename.clone(),
                 content_type: a.content_type.clone(),
                 size_bytes: a.size_bytes,

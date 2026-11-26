@@ -27,8 +27,8 @@ use crate::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LABEL_DRAFT, LABEL_INBOX,
         LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, PopSettings,
         Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
-        VacationSettings, WaitingOn, apply_thread_annotation_patch, default_extracted_object,
-        is_system_label, truncate_to_millis,
+        UnsubscribeInfo, VacationSettings, WaitingOn, apply_thread_annotation_patch,
+        default_extracted_object, is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -36,13 +36,13 @@ use crate::{
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
         IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
         ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRuleActions, InboxRulePatch,
-        MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule,
-        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval,
-        ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft,
-        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        MAX_SQL_LIMIT, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
-        apply_inbox_rule_patch, compute_contact_is_vip, normalize_contact_email,
+        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip, normalize_contact_email,
         normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
         validate_and_normalize_contact_email,
     },
@@ -59,14 +59,14 @@ const STARRED_MAILBOX: &str = "[Gmail]/Starred";
 pub const PG_EVENTS_CHANNEL: &str = "nogml_events";
 
 /// Advisory lock key serializing idempotent DDL startup across concurrent nodes.
-const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
+pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 
 /// Monotonic schema version tracked in `nogml_schema_meta`.
 ///
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS labels (
     upstream_label_id TEXT,
     PRIMARY KEY (mailbox_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_labels_mailbox_name_lower
+CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_mailbox_name_lower
     ON labels (mailbox_id, LOWER(name));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_mailbox_upstream
     ON labels (mailbox_id, upstream_label_id) WHERE upstream_label_id IS NOT NULL;
@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS messages (
     all_mail_uid BIGINT NOT NULL,
     is_answered BOOLEAN NOT NULL DEFAULT FALSE,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    unsubscribe_json TEXT,
     search_tsv TSVECTOR GENERATED ALWAYS AS (
         to_tsvector(
             'english',
@@ -360,10 +361,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_ts_seq
     ON audit_log (mailbox_id, timestamp_ms DESC, seq DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_action_ts
-    ON audit_log (mailbox_id, action, timestamp_ms DESC, seq DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_actor_ts
-    ON audit_log (mailbox_id, actor, timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_lower_action_ts
+    ON audit_log (mailbox_id, LOWER(action), timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_lower_actor_ts
+    ON audit_log (mailbox_id, LOWER(actor), timestamp_ms DESC, seq DESC);
 
 CREATE TABLE IF NOT EXISTS snoozed_threads (
     mailbox_id TEXT NOT NULL,
@@ -411,10 +412,49 @@ CREATE TABLE IF NOT EXISTS inbox_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_rules_mailbox_created
     ON inbox_rules (mailbox_id, created_at_ms ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    mailbox_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BYTEA NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_mailbox_model
+    ON message_embeddings (mailbox_id, model);
 "#;
 
-/// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
-pub fn build_postgres_pool(database_url: &str) -> AppResult<Pool> {
+const MIGRATION_V7_PRE_SQL: &str = r#"
+DO $$
+BEGIN
+    IF to_regclass('messages') IS NOT NULL THEN
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS unsubscribe_json TEXT;
+    END IF;
+    IF to_regclass('idx_labels_mailbox_name_lower') IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = 'idx_labels_mailbox_name_lower'
+              AND i.indisunique
+        ) THEN
+            DROP INDEX idx_labels_mailbox_name_lower;
+        END IF;
+    END IF;
+END $$;
+DROP INDEX IF EXISTS idx_audit_log_mailbox_action_ts;
+DROP INDEX IF EXISTS idx_audit_log_mailbox_actor_ts;
+"#;
+
+/// Parse a PostgreSQL URL or libpq connection string, detecting whether TLS is required
+/// (`sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`) and normalizing
+/// `verify-ca`/`verify-full` to `sslmode=require` for `tokio-postgres`'s config parser
+/// (while `rustls` + `webpki-roots` always enforces full CA and hostname verification).
+pub(crate) fn parse_postgres_connection_config(
+    database_url: &str,
+) -> AppResult<(tokio_postgres::Config, bool)> {
     let trimmed = database_url.trim();
     if trimmed.is_empty() {
         return Err(AppError::Config(
@@ -422,13 +462,100 @@ pub fn build_postgres_pool(database_url: &str) -> AppResult<Pool> {
                 .to_string(),
         ));
     }
-    let pg_config: tokio_postgres::Config = trimmed
+
+    let mut use_tls = false;
+    let normalized = if trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://") {
+        let mut parsed = url::Url::parse(trimmed)
+            .map_err(|e| AppError::Config(format!("Invalid PostgreSQL database URL: {e}")))?;
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let mut rewritten = Vec::with_capacity(pairs.len());
+        let mut modified = false;
+        for (k, v) in pairs {
+            if k.eq_ignore_ascii_case("sslmode") {
+                match v.to_ascii_lowercase().as_str() {
+                    "require" => {
+                        use_tls = true;
+                        rewritten.push((k, v));
+                    }
+                    "verify-ca" | "verify-full" => {
+                        use_tls = true;
+                        modified = true;
+                        rewritten.push((k, "require".to_string()));
+                    }
+                    _ => rewritten.push((k, v)),
+                }
+            } else {
+                rewritten.push((k, v));
+            }
+        }
+        if modified {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (k, v) in &rewritten {
+                serializer.append_pair(k, v);
+            }
+            parsed.set_query(Some(&serializer.finish()));
+            parsed.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        // libpq key=value format
+        let mut out_parts = Vec::new();
+        for token in trimmed.split_whitespace() {
+            if let Some((k, v)) = token.split_once('=')
+                && k.eq_ignore_ascii_case("sslmode")
+            {
+                let unquoted = v.trim_matches('\'').trim_matches('"');
+                match unquoted.to_ascii_lowercase().as_str() {
+                    "require" => {
+                        use_tls = true;
+                        out_parts.push(token.to_string());
+                    }
+                    "verify-ca" | "verify-full" => {
+                        use_tls = true;
+                        out_parts.push(format!("{k}=require"));
+                    }
+                    _ => out_parts.push(token.to_string()),
+                }
+            } else {
+                out_parts.push(token.to_string());
+            }
+        }
+        out_parts.join(" ")
+    };
+
+    let pg_config: tokio_postgres::Config = normalized
         .parse()
         .map_err(|e| AppError::Config(format!("Invalid PostgreSQL database URL: {e}")))?;
+    Ok((pg_config, use_tls))
+}
+
+fn build_rustls_connector() -> AppResult<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| AppError::Config(format!("Failed to configure Postgres TLS versions: {e}")))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
+}
+
+/// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
+pub fn build_postgres_pool(database_url: &str) -> AppResult<Pool> {
+    let (pg_config, use_tls) = parse_postgres_connection_config(database_url)?;
     let mgr_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     };
-    let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+    let mgr = if use_tls {
+        Manager::from_config(pg_config, build_rustls_connector()?, mgr_config)
+    } else {
+        Manager::from_config(pg_config, NoTls, mgr_config)
+    };
     Pool::builder(mgr)
         .max_size(16)
         .runtime(Runtime::Tokio1)
@@ -501,6 +628,9 @@ impl PostgresStore {
                 .await
                 .map_err(pg_err)?;
                 if !is_schema_current(&tx).await? {
+                    tx.batch_execute(MIGRATION_V7_PRE_SQL)
+                        .await
+                        .map_err(pg_err)?;
                     tx.batch_execute(SCHEMA_SQL).await.map_err(pg_err)?;
                     tx.execute(
                         "INSERT INTO nogml_schema_meta (version) VALUES ($1)
@@ -713,14 +843,121 @@ impl PostgresEventBridge {
                 break;
             }
 
-            let connect_res = tokio_postgres::connect(&self.database_url, NoTls).await;
-            let (client, mut connection) = match connect_res {
-                Ok(pair) => pair,
+            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
+            let channel_for_driver = self.channel.clone();
+
+            let (client, driver_handle) = match parse_postgres_connection_config(&self.database_url)
+            {
+                Ok((pg_config, true)) => {
+                    let tls = match build_rustls_connector() {
+                        Ok(tls) => tls,
+                        Err(err) => {
+                            warn!(
+                                channel = %self.channel,
+                                error = %err,
+                                "Postgres EventBus listener failed to initialize TLS; retrying"
+                            );
+                            tokio::select! {
+                                _ = shutdown_rx.changed() => {
+                                    if *shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
+                            continue;
+                        }
+                    };
+                    match pg_config.connect(tls).await {
+                        Ok((client, mut connection)) => {
+                            let handle = tokio::spawn(async move {
+                                loop {
+                                    match poll_fn(|cx| connection.poll_message(cx)).await {
+                                        Some(Ok(AsyncMessage::Notification(notif))) => {
+                                            if notif_tx.send(notif).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Some(Ok(_)) => {}
+                                        Some(Err(err)) => {
+                                            warn!(
+                                                channel = %channel_for_driver,
+                                                error = %err,
+                                                "Postgres EventBus listener connection error"
+                                            );
+                                            break;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            });
+                            (client, handle)
+                        }
+                        Err(err) => {
+                            warn!(
+                                channel = %self.channel,
+                                error = %err,
+                                "Postgres EventBus listener failed to connect over TLS; retrying"
+                            );
+                            tokio::select! {
+                                _ = shutdown_rx.changed() => {
+                                    if *shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Ok((pg_config, false)) => match pg_config.connect(NoTls).await {
+                    Ok((client, mut connection)) => {
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match poll_fn(|cx| connection.poll_message(cx)).await {
+                                    Some(Ok(AsyncMessage::Notification(notif))) => {
+                                        if notif_tx.send(notif).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(_)) => {}
+                                    Some(Err(err)) => {
+                                        warn!(
+                                            channel = %channel_for_driver,
+                                            error = %err,
+                                            "Postgres EventBus listener connection error"
+                                        );
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        });
+                        (client, handle)
+                    }
+                    Err(err) => {
+                        warn!(
+                            channel = %self.channel,
+                            error = %err,
+                            "Postgres EventBus listener failed to connect; retrying"
+                        );
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                        continue;
+                    }
+                },
                 Err(err) => {
                     warn!(
                         channel = %self.channel,
                         error = %err,
-                        "Postgres EventBus listener failed to connect; retrying"
+                        "Postgres EventBus listener has invalid database URL; retrying"
                     );
                     tokio::select! {
                         _ = shutdown_rx.changed() => {
@@ -733,30 +970,6 @@ impl PostgresEventBridge {
                     continue;
                 }
             };
-
-            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
-            let channel_for_driver = self.channel.clone();
-            let driver_handle = tokio::spawn(async move {
-                loop {
-                    match poll_fn(|cx| connection.poll_message(cx)).await {
-                        Some(Ok(AsyncMessage::Notification(notif))) => {
-                            if notif_tx.send(notif).is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => {
-                            warn!(
-                                channel = %channel_for_driver,
-                                error = %err,
-                                "Postgres EventBus listener connection error"
-                            );
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            });
 
             if let Err(err) = client.batch_execute(&listen_sql).await {
                 warn!(
@@ -1037,6 +1250,16 @@ async fn ensure_mailbox_seeded(
 }
 
 fn pg_err(err: tokio_postgres::Error) -> AppError {
+    if let Some(db) = err.as_db_error() {
+        let mut msg = format!("{}: {} ({})", err, db.message(), db.code().code());
+        if let Some(detail) = db.detail() {
+            msg.push_str(&format!(" [detail: {detail}]"));
+        }
+        if let Some(constraint) = db.constraint() {
+            msg.push_str(&format!(" [constraint: {constraint}]"));
+        }
+        return AppError::Storage(msg);
+    }
     AppError::Storage(err.to_string())
 }
 
@@ -1345,19 +1568,56 @@ async fn load_labels_for_messages(
     Ok(map)
 }
 
-fn message_from_row(row: &Row) -> StoredMessage {
+/// Lightweight column projection for message/thread/draft list queries omitting
+/// `raw_rfc2822` and `html_body`.
+const MESSAGE_SUMMARY_COLUMNS: &str = "\
+    m.id, m.thread_id, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+/// Column projection for `search_messages_ai` omitting `raw_rfc2822` while keeping `html_body`.
+const MESSAGE_SEARCH_COLUMNS: &str = "\
+    m.id, m.thread_id, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.html_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+/// Column projection for `filename:` search fallback (includes `raw_rfc2822`, omits `html_body`).
+const MESSAGE_FILENAME_SEARCH_COLUMNS: &str = "\
+    m.id, m.thread_id, m.raw_rfc2822, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+fn decode_unsubscribe_json(raw: Option<String>) -> Option<UnsubscribeInfo> {
+    raw.and_then(|s| serde_json::from_str::<UnsubscribeInfo>(&s).ok())
+}
+
+fn message_from_row_opts(row: &Row, include_raw: bool, include_html: bool) -> StoredMessage {
     let to_json: String = row.get("to_addrs_json");
     let cc_json: String = row.get("cc_addrs_json");
     let bcc_json: String = row.get("bcc_addrs_json");
     let to_addrs: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
     let cc_addrs: Vec<String> = serde_json::from_str(&cc_json).unwrap_or_default();
     let bcc_addrs: Vec<String> = serde_json::from_str(&bcc_json).unwrap_or_default();
+    let unsubscribe_json: Option<String> = row.get("unsubscribe_json");
 
     StoredMessage {
         id: row.get("id"),
         thread_id: row.get("thread_id"),
         label_ids: Vec::new(),
-        raw_rfc2822: row.get("raw_rfc2822"),
+        raw_rfc2822: if include_raw {
+            row.get("raw_rfc2822")
+        } else {
+            Vec::new()
+        },
         snippet: row.get("snippet"),
         history_id: row.get::<_, i64>("history_id").max(0) as u64,
         internal_date_ms: row.get("internal_date_ms"),
@@ -1368,7 +1628,11 @@ fn message_from_row(row: &Row) -> StoredMessage {
         cc_addrs,
         bcc_addrs,
         text_body: row.get("text_body"),
-        html_body: row.get("html_body"),
+        html_body: if include_html {
+            row.get("html_body")
+        } else {
+            None
+        },
         has_attachments: row.get("has_attachments"),
         rfc822_message_id: row.get("rfc822_message_id"),
         in_reply_to: row.get("in_reply_to"),
@@ -1381,7 +1645,24 @@ fn message_from_row(row: &Row) -> StoredMessage {
         all_mail_uid: row.get::<_, i64>("all_mail_uid").max(0) as u32,
         is_answered: row.get("is_answered"),
         is_deleted: row.get("is_deleted"),
+        unsubscribe: decode_unsubscribe_json(unsubscribe_json),
     }
+}
+
+fn message_from_row(row: &Row) -> StoredMessage {
+    message_from_row_opts(row, true, true)
+}
+
+fn message_summary_from_row(row: &Row) -> StoredMessage {
+    message_from_row_opts(row, false, false)
+}
+
+fn message_search_from_row(row: &Row) -> StoredMessage {
+    message_from_row_opts(row, false, true)
+}
+
+fn message_filename_search_from_row(row: &Row) -> StoredMessage {
+    message_from_row_opts(row, true, false)
 }
 
 async fn load_message_by_id(
@@ -1401,6 +1682,26 @@ async fn load_message_by_id(
     };
     let mut msg = message_from_row(&row);
     msg.label_ids = load_message_labels(client, mailbox_id, &msg.id).await?;
+    Ok(Some(msg))
+}
+
+async fn load_message_by_id_for_update(
+    tx: &Transaction<'_>,
+    mailbox_id: &str,
+    id: &str,
+) -> AppResult<Option<StoredMessage>> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT * FROM messages WHERE mailbox_id = $1 AND id = $2 FOR UPDATE",
+            &[&mailbox_id, &id],
+        )
+        .await
+        .map_err(pg_err)?
+    else {
+        return Ok(None);
+    };
+    let mut msg = message_from_row(&row);
+    msg.label_ids = load_message_labels(tx, mailbox_id, &msg.id).await?;
     Ok(Some(msg))
 }
 
@@ -1503,6 +1804,12 @@ async fn insert_message_tx(
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
     let bcc_json = serde_json::to_string(&input.bcc_addrs)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
+    let unsubscribe = crate::mime::parse_unsubscribe_from_raw(&input.raw_rfc2822);
+    let unsubscribe_json = unsubscribe
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
 
     let history_id_i64 = history_id as i64;
     let all_mail_uid_i64 = all_mail_uid as i64;
@@ -1514,14 +1821,14 @@ async fn insert_message_tx(
             text_body, html_body, has_attachments,
             rfc822_message_id, rfc822_message_id_norm, in_reply_to, references_header,
             resend_id, delivery_status, upstream_gmail_id, upstream_thread_id,
-            source, all_mail_uid, is_answered, is_deleted
+            source, all_mail_uid, is_answered, is_deleted, unsubscribe_json
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
             $9, $10, $11, $12, $13,
             $14, $15, $16,
             $17, $18, $19, $20,
             $21, NULL, $22, $23,
-            $24, $25, $26, $27
+            $24, $25, $26, $27, $28
         )",
         &[
             &mailbox_id,
@@ -1551,6 +1858,7 @@ async fn insert_message_tx(
             &all_mail_uid_i64,
             &input.is_answered,
             &input.is_deleted,
+            &unsubscribe_json,
         ],
     )
     .await
@@ -1629,6 +1937,7 @@ async fn insert_message_tx(
         all_mail_uid,
         is_answered: input.is_answered,
         is_deleted: input.is_deleted,
+        unsubscribe,
     })
 }
 
@@ -1676,7 +1985,7 @@ async fn modify_message_labels_resolved_tx(
     resolved_add: &[String],
     resolved_remove: &[String],
 ) -> AppResult<StoredMessage> {
-    let mut msg = load_message_by_id(tx, mailbox_id, message_id)
+    let mut msg = load_message_by_id_for_update(tx, mailbox_id, message_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Message not found: {message_id}")))?;
 
@@ -1808,7 +2117,7 @@ async fn delete_message_tx(
     mailbox_id: &str,
     id: &str,
 ) -> AppResult<Option<StoredMessage>> {
-    let Some(msg) = load_message_by_id(tx, mailbox_id, id).await? else {
+    let Some(msg) = load_message_by_id_for_update(tx, mailbox_id, id).await? else {
         return Ok(None);
     };
     let rows = tx
@@ -1823,6 +2132,17 @@ async fn delete_message_tx(
         .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1).max(1) as u32))
         .collect();
 
+    let affected = tx
+        .execute(
+            "DELETE FROM messages WHERE mailbox_id = $1 AND id = $2",
+            &[&mailbox_id, &id],
+        )
+        .await
+        .map_err(pg_err)?;
+    if affected != 1 {
+        return Ok(None);
+    }
+
     let hid = bump_history_id(tx, mailbox_id).await?;
     for (lid, uid) in label_uids {
         record_expunged_uid_tx(tx, mailbox_id, &lid, uid, hid).await?;
@@ -1834,13 +2154,6 @@ async fn delete_message_tx(
     {
         record_expunged_uid_tx(tx, mailbox_id, ALL_MAIL_MAILBOX, msg.all_mail_uid, hid).await?;
     }
-
-    tx.execute(
-        "DELETE FROM messages WHERE mailbox_id = $1 AND id = $2",
-        &[&mailbox_id, &id],
-    )
-    .await
-    .map_err(pg_err)?;
 
     record_history_event(
         tx,
@@ -2138,38 +2451,6 @@ async fn upsert_thread_annotation_client<C: GenericClient>(
         .await
         .map_err(pg_err)?;
     Ok(())
-}
-
-async fn load_thread_annotations_filtered<C: GenericClient>(
-    client: &C,
-    mb: &str,
-    needs_reply: Option<bool>,
-    waiting_on: Option<WaitingOn>,
-) -> AppResult<HashMap<String, ThreadAnnotation>> {
-    let waiting_on_str = waiting_on.map(|w| w.as_str().to_string());
-    let mut sql = String::from(
-        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
-                extracted_json, updated_by, updated_at_ms
-         FROM thread_annotations
-         WHERE mailbox_id = $1",
-    );
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&mb];
-    if let Some(ref nr) = needs_reply {
-        params.push(nr);
-        sql.push_str(&format!(" AND needs_reply = ${}", params.len()));
-    }
-    if let Some(ref wo) = waiting_on_str {
-        params.push(wo);
-        sql.push_str(&format!(" AND waiting_on = ${}", params.len()));
-    }
-
-    let rows = client.query(&sql, &params).await.map_err(pg_err)?;
-    let mut map = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let ann = thread_annotation_from_row(row);
-        map.insert(ann.thread_id.clone(), ann);
-    }
-    Ok(map)
 }
 
 async fn load_thread_annotations_for_ids<C: GenericClient>(
@@ -2554,6 +2835,72 @@ async fn parse_query_with_labels(
     Ok(parsed)
 }
 
+async fn resolve_label_filter_ids(
+    client: &impl GenericClient,
+    mailbox_id: &str,
+    label_ids: &[String],
+) -> AppResult<Vec<String>> {
+    let mut resolved = Vec::with_capacity(label_ids.len());
+    for lid in label_ids {
+        resolved.push(
+            resolve_existing_label_id(client, mailbox_id, lid)
+                .await?
+                .unwrap_or_else(|| lid.clone()),
+        );
+    }
+    Ok(resolved)
+}
+
+fn has_spam_or_trash_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(LABEL_TRASH) || l.eq_ignore_ascii_case(LABEL_SPAM))
+}
+
+async fn load_messages_for_threads_summary(
+    client: &impl GenericClient,
+    mailbox_id: &str,
+    thread_ids: &[String],
+    include_spam_trash: bool,
+) -> AppResult<HashMap<String, Vec<StoredMessage>>> {
+    let mut by_thread: HashMap<String, Vec<StoredMessage>> = HashMap::new();
+    if thread_ids.is_empty() {
+        return Ok(by_thread);
+    }
+
+    let rows = if include_spam_trash {
+        let sql = format!(
+            "SELECT {MESSAGE_SUMMARY_COLUMNS} FROM messages m \
+             WHERE m.mailbox_id = $1 AND m.thread_id = ANY($2) \
+             ORDER BY m.internal_date_ms ASC, m.id ASC"
+        );
+        client
+            .query(&sql, &[&mailbox_id, &thread_ids])
+            .await
+            .map_err(pg_err)?
+    } else {
+        let sql = format!(
+            "SELECT {MESSAGE_SUMMARY_COLUMNS} FROM messages m \
+             WHERE m.mailbox_id = $1 AND m.thread_id = ANY($2) \
+               AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN ($3, $4)) \
+             ORDER BY m.internal_date_ms ASC, m.id ASC"
+        );
+        client
+            .query(&sql, &[&mailbox_id, &thread_ids, &LABEL_TRASH, &LABEL_SPAM])
+            .await
+            .map_err(pg_err)?
+    };
+
+    let mut messages: Vec<StoredMessage> = rows.iter().map(message_summary_from_row).collect();
+    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let mut label_map = load_labels_for_messages(client, mailbox_id, &ids).await?;
+    for mut m in messages.drain(..) {
+        m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+        by_thread.entry(m.thread_id.clone()).or_default().push(m);
+    }
+    Ok(by_thread)
+}
+
 async fn load_all_messages_filtered(
     client: &impl GenericClient,
     mailbox_id: &str,
@@ -2566,14 +2913,21 @@ async fn load_all_messages_filtered(
         None => None,
     };
 
-    let explicit_spam_trash = label_ids
-        .iter()
-        .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+    let resolved_labels = resolve_label_filter_ids(client, mailbox_id, label_ids).await?;
+    let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
     let effective_include_spam_trash = include_spam_trash
         || explicit_spam_trash
         || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-    let mut sql = String::from("SELECT m.* FROM messages m WHERE m.mailbox_id = $1");
+    let needs_raw = parsed_q
+        .as_ref()
+        .is_some_and(crate::search::query_uses_filename);
+    let cols = if needs_raw {
+        MESSAGE_FILENAME_SEARCH_COLUMNS
+    } else {
+        MESSAGE_SUMMARY_COLUMNS
+    };
+    let mut sql = format!("SELECT {cols} FROM messages m WHERE m.mailbox_id = $1");
     let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mailbox_id.to_string())];
 
     if !effective_include_spam_trash {
@@ -2586,11 +2940,8 @@ async fn load_all_messages_filtered(
         ));
     }
 
-    for lid in label_ids {
-        let resolved = resolve_existing_label_id(client, mailbox_id, lid)
-            .await?
-            .unwrap_or_else(|| lid.clone());
-        bind_values.push(Box::new(resolved));
+    for resolved in &resolved_labels {
+        bind_values.push(Box::new(resolved.clone()));
         let p = bind_values.len();
         sql.push_str(&format!(
             " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ${p})"
@@ -2604,7 +2955,11 @@ async fn load_all_messages_filtered(
         .map(|b| b.as_ref() as &(dyn ToSql + Sync))
         .collect();
     let rows = client.query(&sql, &param_refs).await.map_err(pg_err)?;
-    let mut messages: Vec<StoredMessage> = rows.iter().map(message_from_row).collect();
+    let mut messages: Vec<StoredMessage> = if needs_raw {
+        rows.iter().map(message_filename_search_from_row).collect()
+    } else {
+        rows.iter().map(message_summary_from_row).collect()
+    };
 
     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let mut label_map = load_labels_for_messages(client, mailbox_id, &ids).await?;
@@ -2837,7 +3192,7 @@ impl MailStore for PostgresStore {
             _ => None,
         };
 
-        let start_hid_i64 = query.start_history_id as i64;
+        let start_hid_i64 = query.start_history_id.min(i64::MAX as u64) as i64;
         let rows = conn
             .query(
                 "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id
@@ -2921,32 +3276,110 @@ impl MailStore for PostgresStore {
 
     async fn list_messages(&self, query: &MessageListQuery) -> AppResult<MessageListPage> {
         let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
         let max_results = if query.max_results == 0 {
             100
         } else {
             query.max_results.min(500)
         };
         let offset = parse_offset_token(query.page_token.as_deref())?;
+        let raw_q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+        if raw_q.is_none() {
+            let resolved_labels = resolve_label_filter_ids(&conn, mb, &query.label_ids).await?;
+            let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
+            let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
+
+            let mut where_sql = String::from("m.mailbox_id = $1");
+            let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
+
+            if !effective_include_spam_trash {
+                bind_values.push(Box::new(LABEL_TRASH.to_string()));
+                let p1 = bind_values.len();
+                bind_values.push(Box::new(LABEL_SPAM.to_string()));
+                let p2 = bind_values.len();
+                where_sql.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (${p1}, ${p2}))"
+                ));
+            }
+
+            for resolved in &resolved_labels {
+                bind_values.push(Box::new(resolved.clone()));
+                let p = bind_values.len();
+                where_sql.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ${p})"
+                ));
+            }
+
+            let count_sql = format!("SELECT COUNT(*) FROM messages m WHERE {where_sql}");
+            let count_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let total_i64: i64 = conn
+                .query_one(&count_sql, &count_params)
+                .await
+                .map_err(pg_err)?
+                .get(0);
+            let total = total_i64.max(0) as usize;
+
+            if offset >= total {
+                return Ok(MessageListPage {
+                    messages: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
+            }
+
+            bind_values.push(Box::new(max_results as i64));
+            let p_lim = bind_values.len();
+            bind_values.push(Box::new(i64::try_from(offset).unwrap_or(i64::MAX)));
+            let p_off = bind_values.len();
+
+            let page_sql = format!(
+                "SELECT {MESSAGE_SUMMARY_COLUMNS} FROM messages m WHERE {where_sql} \
+                 ORDER BY m.internal_date_ms DESC, m.id DESC LIMIT ${p_lim} OFFSET ${p_off}"
+            );
+            let page_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let rows = conn.query(&page_sql, &page_params).await.map_err(pg_err)?;
+            let mut page_msgs: Vec<StoredMessage> =
+                rows.iter().map(message_summary_from_row).collect();
+
+            let ids: Vec<String> = page_msgs.iter().map(|m| m.id.clone()).collect();
+            let mut label_map = load_labels_for_messages(&conn, mb, &ids).await?;
+            for m in &mut page_msgs {
+                m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+            }
+
+            let next_offset = offset.saturating_add(page_msgs.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+            return Ok(MessageListPage {
+                messages: page_msgs,
+                next_page_token,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
+            });
+        }
+
         let all = load_all_messages_filtered(
             &conn,
-            &self.mailbox_id,
+            mb,
             &query.label_ids,
             query.include_spam_trash,
-            query.q.as_deref(),
+            raw_q,
         )
         .await?;
         let total = all.len();
         let page_msgs: Vec<StoredMessage> =
             all.into_iter().skip(offset).take(max_results).collect();
-        let next_page_token = if offset + page_msgs.len() < total {
-            Some((offset + page_msgs.len()).to_string())
-        } else {
-            None
-        };
+        let next_offset = offset.saturating_add(page_msgs.len());
+        let next_page_token = (next_offset < total).then(|| next_offset.to_string());
         Ok(MessageListPage {
             messages: page_msgs,
             next_page_token,
-            result_size_estimate: total as u32,
+            result_size_estimate: total.min(u32::MAX as usize) as u32,
         })
     }
 
@@ -3075,7 +3508,7 @@ impl MailStore for PostgresStore {
         let mb = self.mailbox_id.as_str();
         let rows = conn
             .query(
-                "SELECT id, filename, content_type, size_bytes
+                "SELECT id, part_id, filename, content_type, size_bytes
                  FROM attachments
                  WHERE mailbox_id = $1 AND message_id = $2
                  ORDER BY part_id ASC, id ASC",
@@ -3085,11 +3518,15 @@ impl MailStore for PostgresStore {
             .map_err(pg_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| AttachmentMeta {
-                id: r.get(0),
-                filename: r.get(1),
-                content_type: r.get(2),
-                size_bytes: r.get::<_, i64>(3).max(0) as u64,
+            .map(|r| {
+                let part_id: String = r.get(1);
+                AttachmentMeta {
+                    id: r.get(0),
+                    part_id: (!part_id.is_empty()).then_some(part_id),
+                    filename: r.get(2),
+                    content_type: r.get(3),
+                    size_bytes: r.get::<_, i64>(4).max(0) as u64,
+                }
             })
             .collect())
     }
@@ -3109,25 +3546,148 @@ impl MailStore for PostgresStore {
             None => None,
         };
 
-        let explicit_spam_trash = query
-            .label_ids
-            .iter()
-            .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+        let required_labels = resolve_label_filter_ids(&conn, mb, &query.label_ids).await?;
+        let explicit_spam_trash = has_spam_or_trash_label(&required_labels);
         let effective_include_spam_trash = query.include_spam_trash
             || explicit_spam_trash
             || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-        let mut required_labels = Vec::new();
-        for l in &query.label_ids {
-            required_labels.push(
-                resolve_existing_label_id(&conn, mb, l)
-                    .await?
-                    .unwrap_or_else(|| l.clone()),
+        if parsed_q.is_none() {
+            let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
+            let mut visible_where = String::from("m.mailbox_id = $1");
+            if !effective_include_spam_trash {
+                bind_values.push(Box::new(LABEL_TRASH.to_string()));
+                let p1 = bind_values.len();
+                bind_values.push(Box::new(LABEL_SPAM.to_string()));
+                let p2 = bind_values.len();
+                visible_where.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (${p1}, ${p2}))"
+                ));
+            }
+
+            let mut thread_where = Vec::new();
+            for req in &required_labels {
+                bind_values.push(Box::new(req.clone()));
+                let p = bind_values.len();
+                thread_where.push(format!(
+                    "EXISTS (SELECT 1 FROM visible_msgs v2 INNER JOIN message_labels ml ON ml.mailbox_id = $1 AND ml.message_id = v2.id WHERE v2.thread_id = vm.thread_id AND ml.label_id = ${p})"
+                ));
+            }
+            let thread_where_sql = if thread_where.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", thread_where.join(" AND "))
+            };
+
+            let cte = format!(
+                "WITH visible_msgs AS (SELECT m.id, m.thread_id, m.internal_date_ms FROM messages m WHERE {visible_where})"
             );
+            let count_sql = format!(
+                "{cte} SELECT COUNT(*) FROM (SELECT vm.thread_id FROM visible_msgs vm{thread_where_sql} GROUP BY vm.thread_id) t"
+            );
+            let count_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let total_i64: i64 = conn
+                .query_one(&count_sql, &count_params)
+                .await
+                .map_err(pg_err)?
+                .get(0);
+            let total = total_i64.max(0) as usize;
+
+            if offset >= total {
+                return Ok(ThreadListPage {
+                    threads: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
+            }
+
+            bind_values.push(Box::new(max_results as i64));
+            let p_lim = bind_values.len();
+            bind_values.push(Box::new(i64::try_from(offset).unwrap_or(i64::MAX)));
+            let p_off = bind_values.len();
+
+            let page_sql = format!(
+                "{cte} SELECT vm.thread_id, MAX(vm.internal_date_ms) AS max_ts \
+                 FROM visible_msgs vm{thread_where_sql} \
+                 GROUP BY vm.thread_id \
+                 ORDER BY max_ts DESC, vm.thread_id DESC \
+                 LIMIT ${p_lim} OFFSET ${p_off}"
+            );
+            let page_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let rows = conn.query(&page_sql, &page_params).await.map_err(pg_err)?;
+            let page_thread_ids: Vec<String> = rows.into_iter().map(|r| r.get(0)).collect();
+
+            let mut by_thread = load_messages_for_threads_summary(
+                &conn,
+                mb,
+                &page_thread_ids,
+                effective_include_spam_trash,
+            )
+            .await?;
+
+            let mut page = Vec::with_capacity(page_thread_ids.len());
+            for tid in page_thread_ids {
+                let msgs = by_thread.remove(&tid).unwrap_or_default();
+                let snippet = msgs.last().map(|m| m.snippet.clone()).unwrap_or_default();
+                let history_id = msgs.iter().map(|m| m.history_id).max().unwrap_or(1);
+                page.push(StoredThreadDetail {
+                    id: tid,
+                    snippet,
+                    history_id,
+                    messages: msgs,
+                });
+            }
+
+            let next_offset = offset.saturating_add(page.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+            return Ok(ThreadListPage {
+                threads: page,
+                next_page_token,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
+            });
         }
 
-        let visible_msgs =
-            load_all_messages_filtered(&conn, mb, &[], effective_include_spam_trash, None).await?;
+        let needs_raw = parsed_q
+            .as_ref()
+            .is_some_and(crate::search::query_uses_filename);
+        let cols = if needs_raw {
+            MESSAGE_FILENAME_SEARCH_COLUMNS
+        } else {
+            MESSAGE_SUMMARY_COLUMNS
+        };
+        let mut sql = format!("SELECT {cols} FROM messages m WHERE m.mailbox_id = $1");
+        let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
+        if !effective_include_spam_trash {
+            bind_values.push(Box::new(LABEL_TRASH.to_string()));
+            let p1 = bind_values.len();
+            bind_values.push(Box::new(LABEL_SPAM.to_string()));
+            let p2 = bind_values.len();
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (${p1}, ${p2}))"
+            ));
+        }
+        sql.push_str(" ORDER BY m.internal_date_ms DESC, m.id DESC");
+        let param_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let rows = conn.query(&sql, &param_refs).await.map_err(pg_err)?;
+        let mut visible_msgs: Vec<StoredMessage> = if needs_raw {
+            rows.iter().map(message_filename_search_from_row).collect()
+        } else {
+            rows.iter().map(message_summary_from_row).collect()
+        };
+        let ids: Vec<String> = visible_msgs.iter().map(|m| m.id.clone()).collect();
+        let mut label_map = load_labels_for_messages(&conn, mb, &ids).await?;
+        for m in &mut visible_msgs {
+            m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+        }
 
         let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
         for msg in visible_msgs {
@@ -3183,16 +3743,13 @@ impl MailStore for PostgresStore {
             .take(max_results)
             .map(|(_, t)| t)
             .collect();
-        let next_page_token = if offset + page.len() < total {
-            Some((offset + page.len()).to_string())
-        } else {
-            None
-        };
+        let next_offset = offset.saturating_add(page.len());
+        let next_page_token = (next_offset < total).then(|| next_offset.to_string());
 
         Ok(ThreadListPage {
             threads: page,
             next_page_token,
-            result_size_estimate: total as u32,
+            result_size_estimate: total.min(u32::MAX as usize) as u32,
         })
     }
 
@@ -3391,7 +3948,13 @@ impl MailStore for PostgresStore {
             ],
         )
         .await
-        .map_err(pg_err)?;
+        .map_err(|e| {
+            if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                AppError::Conflict(format!("Label already exists: {name}"))
+            } else {
+                pg_err(e)
+            }
+        })?;
 
         let created = load_label_with_counts(&tx, mb, &id)
             .await?
@@ -3663,7 +4226,13 @@ impl MailStore for PostgresStore {
             ],
         )
         .await
-        .map_err(pg_err)?;
+        .map_err(|e| {
+            if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                AppError::Conflict(format!("Label already exists: {name}"))
+            } else {
+                pg_err(e)
+            }
+        })?;
         let created = load_label_with_counts(&tx, mb, &id)
             .await?
             .ok_or_else(|| AppError::Storage("Failed to load created upstream label".into()))?;
@@ -3687,25 +4256,129 @@ impl MailStore for PostgresStore {
         let effective_include_spam_trash =
             query.include_spam_trash || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-        let rows = conn
-            .query(
-                "SELECT d.id AS draft_id, d.updated_at_ms, m.*
-                 FROM drafts d
-                 INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id
-                 WHERE d.mailbox_id = $1
-                 ORDER BY d.updated_at_ms DESC, d.id DESC",
-                &[&mb],
-            )
-            .await
-            .map_err(pg_err)?;
+        let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
+        let mut where_sql = String::from("d.mailbox_id = $1");
+        if !effective_include_spam_trash {
+            bind_values.push(Box::new(LABEL_TRASH.to_string()));
+            let p1 = bind_values.len();
+            bind_values.push(Box::new(LABEL_SPAM.to_string()));
+            let p2 = bind_values.len();
+            where_sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (${p1}, ${p2}))"
+            ));
+        }
+
+        if parsed_q.is_none() {
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM drafts d \
+                 INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+                 WHERE {where_sql}"
+            );
+            let count_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let total_i64: i64 = conn
+                .query_one(&count_sql, &count_params)
+                .await
+                .map_err(pg_err)?
+                .get(0);
+            let total = total_i64.max(0) as usize;
+
+            if offset >= total {
+                return Ok(DraftListPage {
+                    drafts: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
+            }
+
+            bind_values.push(Box::new(max_results as i64));
+            let p_lim = bind_values.len();
+            bind_values.push(Box::new(i64::try_from(offset).unwrap_or(i64::MAX)));
+            let p_off = bind_values.len();
+
+            let page_sql = format!(
+                "SELECT d.id AS draft_id, d.updated_at_ms, {MESSAGE_SUMMARY_COLUMNS} \
+                 FROM drafts d \
+                 INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+                 WHERE {where_sql} \
+                 ORDER BY d.updated_at_ms DESC, d.id DESC \
+                 LIMIT ${p_lim} OFFSET ${p_off}"
+            );
+            let page_params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+            let rows = conn.query(&page_sql, &page_params).await.map_err(pg_err)?;
+            let raw: Vec<(String, i64, StoredMessage)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>("draft_id"),
+                        r.get::<_, i64>("updated_at_ms"),
+                        message_summary_from_row(r),
+                    )
+                })
+                .collect();
+
+            let msg_ids: Vec<String> = raw.iter().map(|(_, _, m)| m.id.clone()).collect();
+            let mut label_map = load_labels_for_messages(&conn, mb, &msg_ids).await?;
+            let page: Vec<StoredDraft> = raw
+                .into_iter()
+                .map(|(draft_id, updated_ms, mut msg)| {
+                    msg.label_ids = label_map.remove(&msg.id).unwrap_or_default();
+                    StoredDraft {
+                        id: draft_id,
+                        message: msg,
+                        updated_at: DateTime::from_timestamp_millis(updated_ms)
+                            .unwrap_or_else(Utc::now),
+                    }
+                })
+                .collect();
+
+            let next_offset = offset.saturating_add(page.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+            return Ok(DraftListPage {
+                drafts: page,
+                next_page_token,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
+            });
+        }
+
+        let needs_raw = parsed_q
+            .as_ref()
+            .is_some_and(crate::search::query_uses_filename);
+        let cols = if needs_raw {
+            MESSAGE_FILENAME_SEARCH_COLUMNS
+        } else {
+            MESSAGE_SUMMARY_COLUMNS
+        };
+        let sql = format!(
+            "SELECT d.id AS draft_id, d.updated_at_ms, {cols} \
+             FROM drafts d \
+             INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+             WHERE {where_sql} \
+             ORDER BY d.updated_at_ms DESC, d.id DESC"
+        );
+        let param_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let rows = conn.query(&sql, &param_refs).await.map_err(pg_err)?;
 
         let raw: Vec<(String, i64, StoredMessage)> = rows
             .iter()
             .map(|r| {
+                let msg = if needs_raw {
+                    message_filename_search_from_row(r)
+                } else {
+                    message_summary_from_row(r)
+                };
                 (
                     r.get::<_, String>("draft_id"),
                     r.get::<_, i64>("updated_at_ms"),
-                    message_from_row(r),
+                    msg,
                 )
             })
             .collect();
@@ -3716,14 +4389,6 @@ impl MailStore for PostgresStore {
         let mut drafts = Vec::new();
         for (draft_id, updated_ms, mut msg) in raw {
             msg.label_ids = label_map.remove(&msg.id).unwrap_or_default();
-            if !effective_include_spam_trash
-                && msg
-                    .label_ids
-                    .iter()
-                    .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
-            {
-                continue;
-            }
             if let Some(ref pq) = parsed_q
                 && !crate::search::matches_message(pq, &msg)
             {
@@ -3738,16 +4403,13 @@ impl MailStore for PostgresStore {
 
         let total = drafts.len();
         let page: Vec<StoredDraft> = drafts.into_iter().skip(offset).take(max_results).collect();
-        let next_page_token = if offset + page.len() < total {
-            Some((offset + page.len()).to_string())
-        } else {
-            None
-        };
+        let next_offset = offset.saturating_add(page.len());
+        let next_page_token = (next_offset < total).then(|| next_offset.to_string());
 
         Ok(DraftListPage {
             drafts: page,
             next_page_token,
-            result_size_estimate: total as u32,
+            result_size_estimate: total.min(u32::MAX as usize) as u32,
         })
     }
 
@@ -3816,7 +4478,7 @@ impl MailStore for PostgresStore {
 
         let old_msg_id: String = tx
             .query_opt(
-                "SELECT message_id FROM drafts WHERE mailbox_id = $1 AND id = $2",
+                "SELECT message_id FROM drafts WHERE mailbox_id = $1 AND id = $2 FOR UPDATE",
                 &[&mb, &draft_id],
             )
             .await
@@ -3850,7 +4512,7 @@ impl MailStore for PostgresStore {
 
         let Some(row) = tx
             .query_opt(
-                "SELECT message_id FROM drafts WHERE mailbox_id = $1 AND id = $2",
+                "SELECT message_id FROM drafts WHERE mailbox_id = $1 AND id = $2 FOR UPDATE",
                 &[&mb, &draft_id],
             )
             .await
@@ -3883,39 +4545,45 @@ impl MailStore for PostgresStore {
             _ => None,
         };
 
-        let mut resolved_labels = Vec::new();
-        for l in &query.labels {
-            resolved_labels.push(
-                resolve_existing_label_id(&conn, mb, l)
-                    .await?
-                    .unwrap_or_else(|| l.clone()),
-            );
-        }
-        let explicit_spam_trash = resolved_labels
-            .iter()
-            .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+        let resolved_labels = resolve_label_filter_ids(&conn, mb, &query.labels).await?;
+        let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
         let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
 
-        let mut sql = String::from("SELECT m.* FROM messages m");
+        let mut sql = format!("SELECT {MESSAGE_SEARCH_COLUMNS} FROM messages m");
         let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
         let mut where_clauses: Vec<String> = vec!["m.mailbox_id = $1".to_string()];
 
         if let Some(ref raw_q) = query.q {
             let trimmed = raw_q.trim();
             if !trimmed.is_empty() {
-                bind_values.push(Box::new(trimmed.to_string()));
-                let p_q = bind_values.len();
-                bind_values.push(Box::new(escape_like_pattern(trimmed)));
-                let p_like = bind_values.len();
-                where_clauses.push(format!(
-                    "((plainto_tsquery('english', ${p_q}) <> ''::tsquery AND m.search_tsv @@ plainto_tsquery('english', ${p_q})) \
-                      OR m.subject ILIKE ${p_like} ESCAPE '\\' \
-                      OR m.from_addr ILIKE ${p_like} ESCAPE '\\' \
-                      OR m.to_addrs_json ILIKE ${p_like} ESCAPE '\\' \
-                      OR m.cc_addrs_json ILIKE ${p_like} ESCAPE '\\' \
-                      OR m.text_body ILIKE ${p_like} ESCAPE '\\' \
-                      OR m.snippet ILIKE ${p_like} ESCAPE '\\')"
-                ));
+                // Check whether `plainto_tsquery` produces tokens so the main query uses the
+                // GIN index cleanly without an unconditional `OR ILIKE` forcing a seq scan.
+                let has_tsquery: bool = conn
+                    .query_one(
+                        "SELECT plainto_tsquery('english', $1) <> ''::tsquery",
+                        &[&trimmed],
+                    )
+                    .await
+                    .map_err(pg_err)?
+                    .get(0);
+                if has_tsquery {
+                    bind_values.push(Box::new(trimmed.to_string()));
+                    let p_q = bind_values.len();
+                    where_clauses.push(format!(
+                        "m.search_tsv @@ plainto_tsquery('english', ${p_q})"
+                    ));
+                } else {
+                    bind_values.push(Box::new(escape_like_pattern(trimmed)));
+                    let p_like = bind_values.len();
+                    where_clauses.push(format!(
+                        "(m.subject ILIKE ${p_like} ESCAPE '\\' \
+                          OR m.from_addr ILIKE ${p_like} ESCAPE '\\' \
+                          OR m.to_addrs_json ILIKE ${p_like} ESCAPE '\\' \
+                          OR m.cc_addrs_json ILIKE ${p_like} ESCAPE '\\' \
+                          OR m.text_body ILIKE ${p_like} ESCAPE '\\' \
+                          OR m.snippet ILIKE ${p_like} ESCAPE '\\')"
+                    ));
+                }
             }
         }
 
@@ -4016,7 +4684,7 @@ impl MailStore for PostgresStore {
             .map(|b| b.as_ref() as &(dyn ToSql + Sync))
             .collect();
         let rows = conn.query(&sql, &param_refs).await.map_err(pg_err)?;
-        let mut messages: Vec<StoredMessage> = rows.iter().map(message_from_row).collect();
+        let mut messages: Vec<StoredMessage> = rows.iter().map(message_search_from_row).collect();
 
         let has_more = messages.len() > limit;
         if has_more {
@@ -4065,125 +4733,159 @@ impl MailStore for PostgresStore {
             ),
             _ => None,
         };
-        let explicit_spam_trash = resolved_label
-            .as_deref()
-            .is_some_and(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+        let explicit_spam_trash = resolved_label.as_deref().is_some_and(|l| {
+            l.eq_ignore_ascii_case(LABEL_TRASH) || l.eq_ignore_ascii_case(LABEL_SPAM)
+        });
         let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
 
-        let fts_matching_threads: Option<HashSet<String>> = match query.q.as_deref() {
-            Some(raw_q) if !raw_q.trim().is_empty() => {
-                let trimmed = raw_q.trim();
-                let like_pat = escape_like_pattern(trimmed);
-                let rows = conn
-                    .query(
-                        "SELECT DISTINCT thread_id FROM messages
-                         WHERE mailbox_id = $1
-                           AND ((plainto_tsquery('english', $2) <> ''::tsquery AND search_tsv @@ plainto_tsquery('english', $2))
-                                OR subject ILIKE $3 ESCAPE '\\'
-                                OR from_addr ILIKE $3 ESCAPE '\\'
-                                OR to_addrs_json ILIKE $3 ESCAPE '\\'
-                                OR cc_addrs_json ILIKE $3 ESCAPE '\\'
-                                OR text_body ILIKE $3 ESCAPE '\\'
-                                OR snippet ILIKE $3 ESCAPE '\\')",
-                        &[&mb, &trimmed, &like_pat],
-                    )
-                    .await
-                    .map_err(pg_err)?;
-                Some(rows.into_iter().map(|r| r.get(0)).collect())
-            }
-            _ => None,
-        };
-
-        let filtered_annotations: Option<HashMap<String, ThreadAnnotation>> = if query
-            .needs_reply
-            .is_some()
-            || query.waiting_on.is_some()
-        {
-            let map =
-                load_thread_annotations_filtered(&conn, mb, query.needs_reply, query.waiting_on)
-                    .await?;
-            if map.is_empty() {
-                return Ok(AiThreadPage {
-                    threads: Vec::new(),
-                    next_cursor: None,
-                    has_more: false,
-                });
-            }
-            Some(map)
-        } else {
-            None
-        };
-
-        let visible_msgs =
-            load_all_messages_filtered(&conn, mb, &[], effective_include_spam_trash, None).await?;
-
-        let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
-        for msg in visible_msgs {
-            by_thread
-                .entry(msg.thread_id.clone())
-                .or_default()
-                .push(msg);
+        let mut bind_values: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(mb.to_string())];
+        let mut visible_where = String::from("m.mailbox_id = $1");
+        if !effective_include_spam_trash {
+            bind_values.push(Box::new(LABEL_TRASH.to_string()));
+            let p1 = bind_values.len();
+            bind_values.push(Box::new(LABEL_SPAM.to_string()));
+            let p2 = bind_values.len();
+            visible_where.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (${p1}, ${p2}))"
+            ));
         }
 
-        let mut summaries: Vec<(i64, ThreadSummary)> = Vec::new();
-        for (tid, mut msgs) in by_thread {
-            if let Some(ref fts_set) = fts_matching_threads
-                && !fts_set.contains(&tid)
-            {
-                continue;
+        let mut from_sql = String::from("FROM visible_msgs vm");
+        let mut thread_where: Vec<String> = Vec::new();
+
+        if query.needs_reply.is_some() || query.waiting_on.is_some() {
+            from_sql.push_str(
+                " INNER JOIN thread_annotations ta ON ta.mailbox_id = $1 AND ta.thread_id = vm.thread_id",
+            );
+            if let Some(nr) = query.needs_reply {
+                bind_values.push(Box::new(nr));
+                let p = bind_values.len();
+                thread_where.push(format!("ta.needs_reply = ${p}"));
             }
-            let annotation = if let Some(ref ann_map) = filtered_annotations {
-                let Some(ann) = ann_map.get(&tid) else {
-                    continue;
-                };
-                Some(ann.clone())
+            if let Some(wo) = query.waiting_on {
+                bind_values.push(Box::new(wo.as_str().to_string()));
+                let p = bind_values.len();
+                thread_where.push(format!("ta.waiting_on = ${p}"));
+            }
+        }
+
+        if let Some(raw_q) = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let has_tsquery: bool = conn
+                .query_one(
+                    "SELECT plainto_tsquery('english', $1) <> ''::tsquery",
+                    &[&raw_q],
+                )
+                .await
+                .map_err(pg_err)?
+                .get(0);
+            if has_tsquery {
+                bind_values.push(Box::new(raw_q.to_string()));
+                let p_q = bind_values.len();
+                thread_where.push(format!(
+                    "EXISTS (SELECT 1 FROM messages mq WHERE mq.mailbox_id = $1 AND mq.thread_id = vm.thread_id AND mq.search_tsv @@ plainto_tsquery('english', ${p_q}))"
+                ));
             } else {
-                None
-            };
-            msgs.sort_by(|a, b| {
-                a.internal_date_ms
-                    .cmp(&b.internal_date_ms)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            let summary = build_thread_summary(&tid, &msgs, annotation);
-            if let Some(ref req_label) = resolved_label
-                && !summary.labels.contains(req_label)
-            {
-                continue;
+                bind_values.push(Box::new(escape_like_pattern(raw_q)));
+                let p_like = bind_values.len();
+                thread_where.push(format!(
+                    "EXISTS (SELECT 1 FROM messages mq WHERE mq.mailbox_id = $1 AND mq.thread_id = vm.thread_id AND (\
+                        mq.subject ILIKE ${p_like} ESCAPE '\\' \
+                        OR mq.from_addr ILIKE ${p_like} ESCAPE '\\' \
+                        OR mq.to_addrs_json ILIKE ${p_like} ESCAPE '\\' \
+                        OR mq.cc_addrs_json ILIKE ${p_like} ESCAPE '\\' \
+                        OR mq.text_body ILIKE ${p_like} ESCAPE '\\' \
+                        OR mq.snippet ILIKE ${p_like} ESCAPE '\\'\
+                    ))"
+                ));
             }
-            if query.unread_only && !summary.unread {
-                continue;
-            }
-            let max_ts = msgs.iter().map(|m| m.internal_date_ms).max().unwrap_or(0);
-            if let Some((cursor_ts, ref cursor_id)) = cursor
-                && !(max_ts < cursor_ts
-                    || (max_ts == cursor_ts && tid.as_str() < cursor_id.as_str()))
-            {
-                continue;
-            }
-            summaries.push((max_ts, summary));
         }
 
-        summaries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
-        let has_more = summaries.len() > limit;
-        if has_more {
-            summaries.truncate(limit);
+        if let Some(ref req_label) = resolved_label {
+            bind_values.push(Box::new(req_label.clone()));
+            let p = bind_values.len();
+            thread_where.push(format!(
+                "EXISTS (SELECT 1 FROM visible_msgs v_lbl INNER JOIN message_labels ml ON ml.mailbox_id = $1 AND ml.message_id = v_lbl.id WHERE v_lbl.thread_id = vm.thread_id AND ml.label_id = ${p})"
+            ));
         }
+
+        if query.unread_only {
+            bind_values.push(Box::new(LABEL_UNREAD.to_string()));
+            let p = bind_values.len();
+            thread_where.push(format!(
+                "EXISTS (SELECT 1 FROM visible_msgs v_unr INNER JOIN message_labels ml ON ml.mailbox_id = $1 AND ml.message_id = v_unr.id WHERE v_unr.thread_id = vm.thread_id AND ml.label_id = ${p})"
+            ));
+        }
+
+        let mut having_sql = String::new();
+        if let Some((cursor_ts, cursor_id)) = cursor {
+            bind_values.push(Box::new(cursor_ts));
+            let p_ts = bind_values.len();
+            bind_values.push(Box::new(cursor_id));
+            let p_id = bind_values.len();
+            having_sql = format!(
+                " HAVING (MAX(vm.internal_date_ms) < ${p_ts} OR (MAX(vm.internal_date_ms) = ${p_ts} AND vm.thread_id < ${p_id}))"
+            );
+        }
+
+        bind_values.push(Box::new((limit + 1) as i64));
+        let p_lim = bind_values.len();
+
+        let where_sql = if thread_where.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", thread_where.join(" AND "))
+        };
+        let sql = format!(
+            "WITH visible_msgs AS (SELECT m.id, m.thread_id, m.internal_date_ms FROM messages m WHERE {visible_where}) \
+             SELECT vm.thread_id, MAX(vm.internal_date_ms) AS max_ts \
+             {from_sql}{where_sql} \
+             GROUP BY vm.thread_id{having_sql} \
+             ORDER BY max_ts DESC, vm.thread_id DESC \
+             LIMIT ${p_lim}"
+        );
+        let param_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let rows = conn.query(&sql, &param_refs).await.map_err(pg_err)?;
+        let mut page_threads: Vec<(String, i64)> = rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect();
+
+        let has_more = page_threads.len() > limit;
+        if has_more {
+            page_threads.truncate(limit);
+        }
+
+        if page_threads.is_empty() {
+            return Ok(AiThreadPage {
+                threads: Vec::new(),
+                next_cursor: None,
+                has_more: false,
+            });
+        }
+
+        let thread_ids: Vec<String> = page_threads.iter().map(|(tid, _)| tid.clone()).collect();
+        let mut by_thread =
+            load_messages_for_threads_summary(&conn, mb, &thread_ids, effective_include_spam_trash)
+                .await?;
+        let mut ann_map = load_thread_annotations_for_ids(&conn, mb, &thread_ids).await?;
+
+        let mut threads = Vec::with_capacity(page_threads.len());
+        for (tid, _) in &page_threads {
+            let msgs = by_thread.remove(tid).unwrap_or_default();
+            let annotation = ann_map.remove(tid);
+            threads.push(build_thread_summary(tid, &msgs, annotation));
+        }
+
         let next_cursor = if has_more {
-            summaries
+            page_threads
                 .last()
-                .map(|(ts, s)| encode_keyset_cursor(*ts, &s.id))
+                .map(|(tid, ts)| encode_keyset_cursor(*ts, tid))
         } else {
             None
         };
-        let mut threads: Vec<ThreadSummary> = summaries.into_iter().map(|(_, s)| s).collect();
-        if filtered_annotations.is_none() && !threads.is_empty() {
-            let ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
-            let mut ann_map = load_thread_annotations_for_ids(&conn, mb, &ids).await?;
-            for thread in &mut threads {
-                thread.annotation = ann_map.remove(&thread.id);
-            }
-        }
 
         Ok(AiThreadPage {
             threads,
@@ -4358,58 +5060,134 @@ impl MailStore for PostgresStore {
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.as_str();
-        let mut mailboxes = Vec::new();
-        let builtins = [
-            ResolvedMailbox::Label {
-                id: LABEL_INBOX.to_string(),
-                name: "INBOX".to_string(),
-                special_use: None,
-            },
-            ResolvedMailbox::AllMail,
-            ResolvedMailbox::Label {
-                id: LABEL_SENT.to_string(),
-                name: SENT_MAILBOX.to_string(),
-                special_use: Some("\\Sent"),
-            },
-            ResolvedMailbox::Label {
-                id: LABEL_DRAFT.to_string(),
-                name: DRAFTS_MAILBOX.to_string(),
-                special_use: Some("\\Drafts"),
-            },
-            ResolvedMailbox::Label {
-                id: LABEL_TRASH.to_string(),
-                name: TRASH_MAILBOX.to_string(),
-                special_use: Some("\\Trash"),
-            },
-            ResolvedMailbox::Label {
-                id: LABEL_SPAM.to_string(),
-                name: SPAM_MAILBOX.to_string(),
-                special_use: Some("\\Junk"),
-            },
-            ResolvedMailbox::Label {
-                id: LABEL_STARRED.to_string(),
-                name: STARRED_MAILBOX.to_string(),
-                special_use: Some("\\Flagged"),
-            },
-        ];
-        for item in &builtins {
-            mailboxes.push(load_imap_mailbox_info_resolved(&conn, mb, item).await?);
-        }
 
-        let rows = conn
+        // 1. Load all label metadata (system + user) in one query.
+        let label_rows = conn
             .query(
-                "SELECT id, name FROM labels WHERE mailbox_id = $1 AND label_type = 'user' ORDER BY name ASC",
+                "SELECT id, name, label_type, uid_validity, uid_next
+                 FROM labels
+                 WHERE mailbox_id = $1
+                 ORDER BY name ASC",
                 &[&mb],
             )
             .await
             .map_err(pg_err)?;
-        for row in rows {
-            let item = ResolvedMailbox::Label {
-                id: row.get(0),
-                name: row.get(1),
-                special_use: None,
-            };
-            mailboxes.push(load_imap_mailbox_info_resolved(&conn, mb, &item).await?);
+
+        let mut label_meta: HashMap<String, (u32, u32)> = HashMap::with_capacity(label_rows.len());
+        let mut user_labels: Vec<(String, String)> = Vec::new();
+        for row in label_rows {
+            let id: String = row.get(0);
+            let name: String = row.get(1);
+            let label_type: String = row.get(2);
+            let uv: i64 = row.get(3);
+            let un: i64 = row.get(4);
+            label_meta.insert(id.clone(), (uv.max(1) as u32, un.max(1) as u32));
+            if label_type == "user" {
+                user_labels.push((id, name));
+            }
+        }
+
+        // 2. Batch total & unseen counts across every label in a single GROUP BY query.
+        let count_rows = conn
+            .query(
+                "SELECT ml.label_id,
+                        COUNT(*) AS total,
+                        COUNT(mu.message_id) AS unseen
+                 FROM message_labels ml
+                 LEFT JOIN message_labels mu
+                    ON mu.mailbox_id = ml.mailbox_id
+                   AND mu.message_id = ml.message_id
+                   AND mu.label_id = $2
+                 WHERE ml.mailbox_id = $1
+                 GROUP BY ml.label_id",
+                &[&mb, &LABEL_UNREAD],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut label_counts: HashMap<String, (u32, u32)> =
+            HashMap::with_capacity(count_rows.len());
+        for row in count_rows {
+            let lid: String = row.get(0);
+            let total: i64 = row.get(1);
+            let unseen: i64 = row.get(2);
+            label_counts.insert(lid, (total.max(0) as u32, unseen.max(0) as u32));
+        }
+
+        // 3. Load `[Gmail]/All Mail` UID metadata + counts in a single query.
+        let all_row = conn
+            .query_one(
+                "SELECT im.uid_validity,
+                        im.uid_next,
+                        (SELECT COUNT(*) FROM messages m
+                         WHERE m.mailbox_id = $1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM message_labels ml
+                               WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN ($3, $4)
+                           )),
+                        (SELECT COUNT(*) FROM messages m
+                         WHERE m.mailbox_id = $1
+                           AND EXISTS (
+                               SELECT 1 FROM message_labels mu
+                               WHERE mu.mailbox_id = m.mailbox_id AND mu.message_id = m.id AND mu.label_id = $5
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM message_labels ml
+                               WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN ($3, $4)
+                           ))
+                 FROM imap_meta im
+                 WHERE im.mailbox_id = $1 AND im.mailbox_name = $2",
+                &[
+                    &mb,
+                    &ALL_MAIL_MAILBOX,
+                    &LABEL_TRASH,
+                    &LABEL_SPAM,
+                    &LABEL_UNREAD,
+                ],
+            )
+            .await
+            .map_err(pg_err)?;
+
+        let make_label_info = |id: &str, name: &str, special_use: Option<&str>| {
+            let (uid_validity, uid_next) = label_meta.get(id).copied().unwrap_or((1, 1));
+            let (messages, unseen) = label_counts.get(id).copied().unwrap_or((0, 0));
+            ImapMailboxInfo {
+                name: name.to_string(),
+                label_id: Some(id.to_string()),
+                special_use: special_use.map(ToString::to_string),
+                uid_validity,
+                uid_next,
+                messages,
+                unseen,
+            }
+        };
+
+        let mut mailboxes = Vec::with_capacity(7 + user_labels.len());
+        mailboxes.push(make_label_info(LABEL_INBOX, "INBOX", None));
+        mailboxes.push(ImapMailboxInfo {
+            name: ALL_MAIL_MAILBOX.to_string(),
+            label_id: None,
+            special_use: Some("\\All".to_string()),
+            uid_validity: all_row.get::<_, i64>(0).max(1) as u32,
+            uid_next: all_row.get::<_, i64>(1).max(1) as u32,
+            messages: all_row.get::<_, i64>(2).max(0) as u32,
+            unseen: all_row.get::<_, i64>(3).max(0) as u32,
+        });
+        mailboxes.push(make_label_info(LABEL_SENT, SENT_MAILBOX, Some("\\Sent")));
+        mailboxes.push(make_label_info(
+            LABEL_DRAFT,
+            DRAFTS_MAILBOX,
+            Some("\\Drafts"),
+        ));
+        mailboxes.push(make_label_info(LABEL_TRASH, TRASH_MAILBOX, Some("\\Trash")));
+        mailboxes.push(make_label_info(LABEL_SPAM, SPAM_MAILBOX, Some("\\Junk")));
+        mailboxes.push(make_label_info(
+            LABEL_STARRED,
+            STARRED_MAILBOX,
+            Some("\\Flagged"),
+        ));
+
+        for (id, name) in user_labels {
+            mailboxes.push(make_label_info(&id, &name, None));
         }
         Ok(mailboxes)
     }
@@ -4843,7 +5621,7 @@ impl MailStore for PostgresStore {
             ResolvedMailbox::AllMail => ALL_MAIL_MAILBOX.to_string(),
             ResolvedMailbox::Label { id, .. } => id.clone(),
         };
-        let since_i64 = since_modseq as i64;
+        let since_i64 = since_modseq.min(i64::MAX as u64) as i64;
         let rows = conn
             .query(
                 "SELECT imap_uid FROM imap_expunged_uids
@@ -4864,13 +5642,13 @@ impl MailStore for PostgresStore {
         let tx = conn.transaction().await.map_err(pg_err)?;
         let mb = self.mailbox_id.as_str();
 
-        // 1. Match by upstream_gmail_id
+        // 1. Match by upstream_gmail_id (lock matched row with FOR UPDATE)
         if let Some(ref ugid) = input.upstream_gmail_id {
             let trimmed_ugid = ugid.trim();
             if !trimmed_ugid.is_empty()
                 && let Some(row) = tx
                     .query_opt(
-                        "SELECT id FROM messages WHERE mailbox_id = $1 AND upstream_gmail_id = $2 LIMIT 1",
+                        "SELECT id FROM messages WHERE mailbox_id = $1 AND upstream_gmail_id = $2 LIMIT 1 FOR UPDATE",
                         &[&mb, &trimmed_ugid],
                     )
                     .await
@@ -4908,12 +5686,28 @@ impl MailStore for PostgresStore {
                 let labels_changed = !to_add.is_empty() || !to_remove.is_empty();
 
                 if flags_changed {
-                    tx.execute(
-                        "UPDATE messages SET is_answered = $1, is_deleted = $2 WHERE mailbox_id = $3 AND id = $4",
-                        &[&input.is_answered, &input.is_deleted, &mb, &existing_id],
-                    )
-                    .await
-                    .map_err(pg_err)?;
+                    if !labels_changed {
+                        let new_hid = bump_history_id(&tx, mb).await? as i64;
+                        tx.execute(
+                            "UPDATE messages SET is_answered = $1, is_deleted = $2, history_id = $3 WHERE mailbox_id = $4 AND id = $5",
+                            &[
+                                &input.is_answered,
+                                &input.is_deleted,
+                                &new_hid,
+                                &mb,
+                                &existing_id,
+                            ],
+                        )
+                        .await
+                        .map_err(pg_err)?;
+                    } else {
+                        tx.execute(
+                            "UPDATE messages SET is_answered = $1, is_deleted = $2 WHERE mailbox_id = $3 AND id = $4",
+                            &[&input.is_answered, &input.is_deleted, &mb, &existing_id],
+                        )
+                        .await
+                        .map_err(pg_err)?;
+                    }
                 }
 
                 let updated = if labels_changed {
@@ -4940,14 +5734,14 @@ impl MailStore for PostgresStore {
             }
         }
 
-        // 2. Match by normalized rfc822_message_id (dedup across Resend <-> Gmail)
+        // 2. Match by normalized rfc822_message_id (dedup across Resend <-> Gmail, locked FOR UPDATE)
         if let Some(norm) = input
             .rfc822_message_id
             .as_deref()
             .and_then(normalize_rfc_message_id)
             && let Some(row) = tx
                 .query_opt(
-                    "SELECT id FROM messages WHERE mailbox_id = $1 AND rfc822_message_id_norm = $2 LIMIT 1",
+                    "SELECT id FROM messages WHERE mailbox_id = $1 AND rfc822_message_id_norm = $2 LIMIT 1 FOR UPDATE",
                     &[&mb, &norm],
                 )
                 .await
@@ -5337,7 +6131,7 @@ impl MailStore for PostgresStore {
     ) -> AppResult<Vec<PendingApproval>> {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.as_str();
-        let limit_i64 = if limit == 0 { 20 } else { limit } as i64;
+        let limit_i64 = clamp_sql_limit(limit, 20, MAX_SQL_LIMIT);
         let now_ms = Utc::now().timestamp_millis();
 
         let rows = match status {
@@ -5605,7 +6399,7 @@ impl MailStore for PostgresStore {
     }
 
     async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>> {
-        let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+        let limit = clamp_sql_limit(query.limit, 50, MAX_SQL_LIMIT);
         let q_pattern = query
             .q
             .as_deref()
@@ -5760,6 +6554,12 @@ impl MailStore for PostgresStore {
         let created_at_ms = Utc::now().timestamp_millis();
         let expires_at_ms = created_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
         conn.execute(
+            "DELETE FROM idempotency_keys WHERE mailbox_id = $1 AND expires_at_ms <= $2",
+            &[&mb, &created_at_ms],
+        )
+        .await
+        .map_err(pg_err)?;
+        conn.execute(
             "INSERT INTO idempotency_keys (
                 mailbox_id, scope, key, response_json, created_at_ms, expires_at_ms
              ) VALUES ($1, $2, $3, $4, $5, $6)
@@ -5829,7 +6629,7 @@ impl MailStore for PostgresStore {
     async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>> {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.clone();
-        let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+        let limit = clamp_sql_limit(query.limit, 50, MAX_SQL_LIMIT);
         let action_filter = query
             .action
             .as_deref()
@@ -6076,7 +6876,7 @@ impl MailStore for PostgresStore {
     ) -> AppResult<Vec<ScheduledSend>> {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.as_str();
-        let limit_i64 = if limit == 0 { 20 } else { limit } as i64;
+        let limit_i64 = clamp_sql_limit(limit, 20, MAX_SQL_LIMIT);
         let rows = match status {
             None => conn
                 .query(
@@ -6516,4 +7316,39 @@ fn escape_pg_like(raw: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_postgres_connection_config_handles_sslmode_variants() {
+        let (_, tls_default) =
+            parse_postgres_connection_config("postgres://user:pass@localhost:5432/nogml").unwrap();
+        assert!(!tls_default);
+
+        let (_, tls_disable) = parse_postgres_connection_config(
+            "postgres://user:pass@localhost:5432/nogml?sslmode=disable",
+        )
+        .unwrap();
+        assert!(!tls_disable);
+
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let url = format!("postgres://user:pass@db.example.com:5432/nogml?sslmode={mode}");
+            let (_, use_tls) = parse_postgres_connection_config(&url).unwrap();
+            assert!(use_tls, "expected TLS enabled for sslmode={mode}");
+
+            let kv = format!("host=db.example.com dbname=nogml sslmode={mode}");
+            let (_, use_tls_kv) = parse_postgres_connection_config(&kv).unwrap();
+            assert!(use_tls_kv, "expected TLS enabled for libpq sslmode={mode}");
+        }
+
+        // Building a pool with sslmode=verify-full succeeds without attempting network I/O.
+        let pool = build_postgres_pool(
+            "postgres://user:pass@db.example.com:5432/nogml?sslmode=verify-full",
+        )
+        .expect("build TLS postgres pool");
+        assert!(pool.status().max_size > 0);
+    }
 }

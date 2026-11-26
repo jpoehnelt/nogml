@@ -26,6 +26,8 @@ pub use hybrid::{
     DEFAULT_MIN_VECTOR_SIMILARITY, DEFAULT_RRF_K, HybridSearchIndex, cosine_similarity,
     normalize_l2, prepare_message_embedding_text, rrf_fuse,
 };
+#[cfg(feature = "postgres")]
+pub use vector_store::PostgresVectorStore;
 pub use vector_store::{
     MemoryVectorStore, SqliteVectorStore, VectorStore, decode_f32_le, encode_f32_le,
 };
@@ -113,13 +115,41 @@ pub fn open_search_index(
                     &config.db_path,
                     &config.user_email,
                 )?),
-                StorageBackend::Memory | StorageBackend::Postgres => {
+                StorageBackend::Memory => {
                     Arc::new(MemoryVectorStore::for_mailbox_new(&config.user_email))
                 }
+                StorageBackend::Postgres => open_postgres_vector_store(config)?,
             };
             Ok(Arc::new(HybridSearchIndex::new(store, provider, vectors)))
         }
     }
+}
+
+#[cfg(feature = "postgres")]
+fn open_postgres_vector_store(config: &Config) -> AppResult<Arc<dyn VectorStore>> {
+    let url = config
+        .database_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            crate::error::AppError::Config(
+                "NOGML_DATABASE_URL / --database-url is required for hybrid search with NOGML_STORAGE=postgres"
+                    .to_string(),
+            )
+        })?;
+    Ok(Arc::new(PostgresVectorStore::from_url(
+        url,
+        &config.user_email,
+    )?))
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_vector_store(_config: &Config) -> AppResult<Arc<dyn VectorStore>> {
+    Err(crate::error::AppError::Config(
+        "Rebuild nogml with --features postgres to use hybrid search with Postgres storage"
+            .to_string(),
+    ))
 }
 
 /// Summary returned by [`reindex_mailbox`] and `nogml search reindex`.

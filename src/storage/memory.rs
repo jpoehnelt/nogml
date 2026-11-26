@@ -310,6 +310,11 @@ impl MemoryState {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(new_hex_id);
+        if self.messages.contains_key(&msg_id) {
+            return Err(AppError::Storage(format!(
+                "Message with id '{msg_id}' already exists"
+            )));
+        }
         let thread_id = self.resolve_thread_id(&input, &msg_id);
 
         let mut label_set = HashSet::new();
@@ -356,6 +361,7 @@ impl MemoryState {
             self.attachments.insert(msg_id.clone(), stored_atts);
         }
 
+        let unsubscribe = crate::mime::parse_unsubscribe_from_raw(&input.raw_rfc2822);
         let stored = StoredMessage {
             id: msg_id.clone(),
             thread_id: thread_id.clone(),
@@ -384,6 +390,7 @@ impl MemoryState {
             all_mail_uid,
             is_answered: input.is_answered,
             is_deleted: input.is_deleted,
+            unsubscribe,
         };
 
         self.messages.insert(msg_id.clone(), stored.clone());
@@ -1406,6 +1413,7 @@ impl MailStore for MemoryStore {
             .into_iter()
             .map(|a| AttachmentMeta {
                 id: a.id,
+                part_id: (!a.part_id.is_empty()).then_some(a.part_id),
                 filename: a.filename,
                 content_type: a.content_type,
                 size_bytes: a.size_bytes,
@@ -2818,9 +2826,19 @@ impl MailStore for MemoryStore {
                 .collect();
             let labels_changed = !to_add.is_empty() || !to_remove.is_empty();
 
-            if flags_changed && let Some(m) = state.messages.get_mut(&existing_id) {
-                m.is_answered = input.is_answered;
-                m.is_deleted = input.is_deleted;
+            if flags_changed {
+                let new_hid = if !labels_changed {
+                    Some(state.bump_history_id())
+                } else {
+                    None
+                };
+                if let Some(m) = state.messages.get_mut(&existing_id) {
+                    m.is_answered = input.is_answered;
+                    m.is_deleted = input.is_deleted;
+                    if let Some(hid) = new_hid {
+                        m.history_id = hid;
+                    }
+                }
             }
 
             let updated =
@@ -3296,6 +3314,9 @@ impl MailStore for MemoryStore {
         let mut state = self.write_state()?;
         let created_at_ms = Utc::now().timestamp_millis();
         let expires_at_ms = created_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
+        state
+            .idempotency_keys
+            .retain(|_, rec| rec.expires_at_ms > created_at_ms);
         state.idempotency_keys.insert(
             (scope.to_string(), key.to_string()),
             IdempotencyRecord {

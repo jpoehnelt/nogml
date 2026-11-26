@@ -568,6 +568,19 @@ fn parse_query_at(q: &str, now_ms: i64) -> SearchQuery {
     })
 }
 
+/// Returns `true` if any term in `query` inspects raw RFC 2822 MIME bytes (e.g. `filename:`).
+pub fn query_uses_filename(query: &SearchQuery) -> bool {
+    fn term_uses_filename(term: &SearchTerm) -> bool {
+        match term {
+            SearchTerm::Filename(_) => true,
+            SearchTerm::Not(inner) => term_uses_filename(inner),
+            SearchTerm::And(terms) | SearchTerm::Or(terms) => terms.iter().any(term_uses_filename),
+            _ => false,
+        }
+    }
+    query.terms.iter().any(term_uses_filename)
+}
+
 /// Evaluate a parsed [`SearchQuery`] against a [`StoredMessage`].
 pub fn matches_message(query: &SearchQuery, msg: &StoredMessage) -> bool {
     query.terms.iter().all(|term| eval_term(term, msg))
@@ -751,6 +764,7 @@ mod tests {
             all_mail_uid: 1,
             is_answered: false,
             is_deleted: false,
+            unsubscribe: None,
         }
     }
 

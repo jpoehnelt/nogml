@@ -2493,7 +2493,300 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_idempotency_keys_and_audit_log(base_store.for_mailbox(&mb_idem)).await;
     contract_snooze_and_scheduled_sends(base_store.clone(), &mb_sched_a, &mb_sched_b).await;
     contract_inbox_rules_crud(base_store.for_mailbox(&mb_rules)).await;
+    contract_storage_perf_and_parity(
+        base_store.for_mailbox(&format!("{prefix}-parity-{suffix}@contract.test")),
+    )
+    .await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
+}
+
+/// Regression contract suite for Issue #61:
+/// lowercase `trash`/`spam` filters, flag-only `history_id` bump, duplicate explicit ID rejection,
+/// `limit = usize::MAX` clamping, `AttachmentMeta.part_id`, persisted `UnsubscribeInfo`,
+/// `LIKE ESCAPE '\'`, BLOB-free list projections, batched `imap_list_mailboxes`, and idempotency pruning.
+async fn contract_storage_perf_and_parity(store: Arc<dyn MailStore>) {
+    let is_sql = matches!(store.backend_name(), "sqlite" | "postgres");
+
+    // 1. Duplicate explicit message ID must be rejected consistently across all backends
+    let mut dup_in = sample_message(
+        "Original",
+        "alice@example.com",
+        "Body one",
+        1_700_100_001_000,
+    );
+    dup_in.id = Some("dup_explicit_msg_1".to_string());
+    let first = store.insert_message(dup_in.clone()).await.unwrap();
+    assert_eq!(first.id, "dup_explicit_msg_1");
+    let dup_err = store.insert_message(dup_in).await;
+    assert!(
+        dup_err.is_err(),
+        "{} must reject duplicate explicit message id",
+        store.backend_name()
+    );
+
+    // 2. Persisted UnsubscribeInfo + AttachmentMeta.part_id + BLOB-free list projections
+    let mut newsletter = sample_message(
+        "Weekly Digest",
+        "news@digest.test",
+        "Top stories this week",
+        1_700_100_002_000,
+    );
+    newsletter.id = Some("msg_unsub_att".to_string());
+    newsletter.html_body = Some("<html><body>Huge HTML payload</body></html>".to_string());
+    newsletter.raw_rfc2822 = concat!(
+        "From: news@digest.test\r\n",
+        "To: owner@example.com\r\n",
+        "Subject: Weekly Digest\r\n",
+        "List-Unsubscribe: <https://digest.test/unsub?u=42>, <mailto:unsub@digest.test>\r\n",
+        "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+        "\r\n",
+        "Top stories this week\r\n"
+    )
+    .as_bytes()
+    .to_vec();
+    newsletter.attachments = vec![NewAttachmentInput {
+        part_id: "1.2".to_string(),
+        filename: Some("report.pdf".to_string()),
+        content_type: "application/pdf".to_string(),
+        content_id: None,
+        data: b"%PDF-1.4 sample".to_vec(),
+    }];
+    let stored_nl = store.insert_message(newsletter).await.unwrap();
+    let nl_unsub = stored_nl
+        .unsubscribe
+        .as_ref()
+        .expect("unsubscribe should be parsed at ingest time");
+    assert_eq!(
+        nl_unsub.https_url.as_deref(),
+        Some("https://digest.test/unsub?u=42")
+    );
+    assert!(nl_unsub.one_click);
+
+    // `list_attachment_meta` must expose `part_id` without requiring `get_attachment`
+    let att_metas = store.list_attachment_meta(&stored_nl.id).await.unwrap();
+    assert_eq!(att_metas.len(), 1);
+    assert_eq!(att_metas[0].part_id.as_deref(), Some("1.2"));
+    assert_eq!(att_metas[0].filename.as_deref(), Some("report.pdf"));
+
+    // List projection preserves persisted `unsubscribe` while omitting raw/html BLOBs on SQL backends
+    let list_page = store
+        .list_messages(&MessageListQuery {
+            max_results: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let listed_nl = list_page
+        .messages
+        .iter()
+        .find(|m| m.id == stored_nl.id)
+        .expect("newsletter in list_messages");
+    assert_eq!(listed_nl.unsubscribe, stored_nl.unsubscribe);
+    if is_sql {
+        assert!(
+            listed_nl.raw_rfc2822.is_empty(),
+            "SQL list_messages must omit raw_rfc2822 BLOB"
+        );
+        assert!(
+            listed_nl.html_body.is_none(),
+            "SQL list_messages must omit html_body"
+        );
+    }
+
+    // `get_message` still returns full raw_rfc2822 & html_body
+    let full_nl = store.get_message(&stored_nl.id).await.unwrap().unwrap();
+    assert!(!full_nl.raw_rfc2822.is_empty());
+    assert!(full_nl.html_body.is_some());
+    assert_eq!(full_nl.unsubscribe, stored_nl.unsubscribe);
+
+    // 3. Lowercase `trash` / `spam` label filters must match TRASH / SPAM consistently
+    let mut trashed_in = sample_message(
+        "Old Trash Item",
+        "trash@example.com",
+        "In trash",
+        1_700_100_003_000,
+    );
+    trashed_in.label_ids = vec![LABEL_TRASH.to_string()];
+    let trashed_msg = store.insert_message(trashed_in).await.unwrap();
+
+    let mut spam_in = sample_message(
+        "Spammy Promo",
+        "spam@example.com",
+        "Buy now",
+        1_700_100_004_000,
+    );
+    spam_in.label_ids = vec![LABEL_SPAM.to_string()];
+    let spam_msg = store.insert_message(spam_in).await.unwrap();
+
+    let lower_trash_msgs = store
+        .list_messages(&MessageListQuery {
+            label_ids: vec!["trash".to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lower_trash_msgs.messages.len(), 1);
+    assert_eq!(lower_trash_msgs.messages[0].id, trashed_msg.id);
+
+    let lower_spam_threads = store
+        .list_threads(&MessageListQuery {
+            label_ids: vec!["spam".to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lower_spam_threads.threads.len(), 1);
+    assert_eq!(lower_spam_threads.threads[0].id, spam_msg.thread_id);
+
+    let lower_trash_ai = store
+        .search_messages_ai(&AiSearchQuery {
+            labels: vec!["trash".to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lower_trash_ai.messages.len(), 1);
+    assert_eq!(lower_trash_ai.messages[0].id, trashed_msg.id);
+
+    let lower_spam_summaries = store
+        .list_thread_summaries(&AiThreadQuery {
+            label: Some("spam".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lower_spam_summaries.threads.len(), 1);
+    assert_eq!(lower_spam_summaries.threads[0].id, spam_msg.thread_id);
+
+    // 4. Flag-only upsert_synced_message bumps history_id (for IMAP MODSEQ)
+    let mut synced_in = sample_message(
+        "Synced Flags",
+        "sync@example.com",
+        "Synced content",
+        1_700_100_005_000,
+    );
+    synced_in.upstream_gmail_id = Some("gm_flag_only_1".to_string());
+    synced_in.is_answered = false;
+    let initial_sync = store
+        .upsert_synced_message(synced_in.clone())
+        .await
+        .unwrap();
+    assert_eq!(initial_sync.kind, UpsertOutcomeKind::Inserted);
+    let hid_before = initial_sync.message.history_id;
+
+    synced_in.is_answered = true;
+    let flag_update = store.upsert_synced_message(synced_in).await.unwrap();
+    assert_eq!(flag_update.kind, UpsertOutcomeKind::Updated);
+    assert!(flag_update.message.is_answered);
+    assert!(
+        flag_update.message.history_id > hid_before,
+        "flag-only upsert_synced_message must bump history_id (before={hid_before}, after={})",
+        flag_update.message.history_id
+    );
+
+    // 5. `limit = usize::MAX` must clamp safely without wrapping negative
+    let approvals = store
+        .list_pending_approvals(None, usize::MAX)
+        .await
+        .unwrap();
+    assert!(approvals.is_empty());
+    let contacts = store
+        .list_contacts(&ContactQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(contacts.is_empty());
+    let audit = store
+        .list_audit_log(&AuditLogQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(audit.is_empty());
+    let scheduled = store.list_scheduled_sends(None, usize::MAX).await.unwrap();
+    assert!(scheduled.is_empty());
+
+    // 6. LIKE wildcard characters (`%`, `_`) are escaped properly in `from:` filter
+    let pct_msg = store
+        .insert_message(sample_message(
+            "Discount",
+            "promo_100%@deals.test",
+            "Special offer",
+            1_700_100_006_000,
+        ))
+        .await
+        .unwrap();
+    let _other_msg = store
+        .insert_message(sample_message(
+            "Normal",
+            "promoX1000@deals.test",
+            "Other offer",
+            1_700_100_007_000,
+        ))
+        .await
+        .unwrap();
+    let literal_match = store
+        .search_messages_ai(&AiSearchQuery {
+            from: Some("promo_100%".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(literal_match.messages.len(), 1);
+    assert_eq!(literal_match.messages[0].id, pct_msg.id);
+
+    // 7. Batched `imap_list_mailboxes` reports accurate counts for builtins + custom user labels
+    let custom_lbl = store
+        .create_label(NewLabelInput {
+            name: "Projects/Alpha".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .modify_message_labels(&stored_nl.id, std::slice::from_ref(&custom_lbl.id), &[])
+        .await
+        .unwrap();
+    let mailboxes = store.imap_list_mailboxes().await.unwrap();
+    let alpha_mb = mailboxes
+        .iter()
+        .find(|m| m.name == "Projects/Alpha")
+        .expect("custom label in imap_list_mailboxes");
+    assert_eq!(alpha_mb.messages, 1);
+    assert_eq!(alpha_mb.unseen, 1);
+    let all_mail = mailboxes
+        .iter()
+        .find(|m| m.name == ALL_MAIL_MAILBOX)
+        .expect("All Mail in imap_list_mailboxes");
+    assert_eq!(all_mail.messages, 5);
+
+    // 8. Expired idempotency keys are pruned when writing a new key
+    store
+        .put_idempotency_key("send", "expired_key", r#"{"old":true}"#, -60)
+        .await
+        .unwrap();
+    store
+        .put_idempotency_key("send", "fresh_key", r#"{"new":true}"#, 300)
+        .await
+        .unwrap();
+    let now_ms = Utc::now().timestamp_millis();
+    assert!(
+        store
+            .get_idempotency_key("send", "expired_key", now_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_idempotency_key("send", "fresh_key", now_ms)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ============================================================================
@@ -2855,4 +3148,119 @@ async fn postgres_concurrent_connect_and_dml_never_deadlocks() {
     for handle in handles {
         handle.await.expect("concurrent task panicked");
     }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_vector_store_persists_embeddings_and_concurrent_delete_is_idempotent() {
+    use nogml::{
+        config::SearchBackend,
+        search_index::{PostgresVectorStore, VectorStore, open_search_index},
+        storage::PostgresStore,
+    };
+
+    let Ok(url) = std::env::var("NOGML_TEST_POSTGRES_URL") else {
+        eprintln!("Skipping Postgres vector/delete test (NOGML_TEST_POSTGRES_URL not set)");
+        return;
+    };
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let mb_a = format!("vec-a-{suffix}@postgres.test");
+    let mb_b = format!("vec-b-{suffix}@postgres.test");
+
+    // 1. PostgresVectorStore persists embeddings across fresh instances and isolates mailboxes.
+    let vs1 = PostgresVectorStore::from_url(&url, &mb_a).expect("PostgresVectorStore::from_url");
+    vs1.upsert("m1", "embed-v1", &[0.6, 0.8]).await.unwrap();
+    vs1.for_mailbox(&mb_b)
+        .upsert("m1", "embed-v1", &[1.0, 0.0])
+        .await
+        .unwrap();
+
+    let vs2 = PostgresVectorStore::from_url(&url, &mb_a).expect("second PostgresVectorStore");
+    let rows_a = vs2.list_for_model("embed-v1").await.unwrap();
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(rows_a[0].0, "m1");
+    assert!((rows_a[0].1[0] - 0.6).abs() < 1e-6);
+
+    let rows_b = vs2
+        .for_mailbox(&mb_b)
+        .list_for_model("embed-v1")
+        .await
+        .unwrap();
+    assert_eq!(rows_b.len(), 1);
+    assert!((rows_b[0].1[0] - 1.0).abs() < 1e-6);
+
+    vs2.remove("m1").await.unwrap();
+    assert!(vs2.list_for_model("embed-v1").await.unwrap().is_empty());
+    assert_eq!(
+        vs2.for_mailbox(&mb_b)
+            .list_for_model("embed-v1")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 2. open_search_index with StorageBackend::Postgres + SearchBackend::Hybrid builds cleanly.
+    let mut cfg = Config::for_test();
+    cfg.storage = StorageBackend::Postgres;
+    cfg.database_url = Some(url.clone());
+    cfg.user_email = mb_a.clone();
+    cfg.search_backend = SearchBackend::Hybrid;
+    cfg.embedding_base_url = Some("http://127.0.0.1:9".to_string());
+    let pg_store = Arc::new(PostgresStore::connect(&url, &mb_a).await.unwrap());
+    let hybrid = open_search_index(&cfg, pg_store.clone()).expect("hybrid postgres index");
+    assert_eq!(hybrid.backend_name(), "hybrid");
+
+    // 3. Concurrent delete_message records at most 1 MessageDeleted history event (FOR UPDATE + affected==1).
+    let msg = pg_store
+        .insert_message(sample_message(
+            "Concurrent Delete",
+            "alice@example.com",
+            "Delete race check",
+            1_700_200_000_000,
+        ))
+        .await
+        .unwrap();
+    let hid_before = pg_store.current_history_id().await.unwrap();
+
+    let mut del_handles = Vec::new();
+    for _ in 0..8 {
+        let s = pg_store.clone();
+        let id = msg.id.clone();
+        del_handles.push(tokio::spawn(
+            async move { s.delete_message(&id).await.unwrap() },
+        ));
+    }
+    let mut deleted_count = 0usize;
+    for h in del_handles {
+        if h.await.unwrap() {
+            deleted_count += 1;
+        }
+    }
+    assert_eq!(
+        deleted_count, 1,
+        "exactly one concurrent delete must succeed"
+    );
+
+    let hist = pg_store
+        .list_history(&HistoryListQuery {
+            start_history_id: hid_before,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let del_events = hist
+        .entries
+        .iter()
+        .filter(|e| e.kind == HistoryEventKind::MessageDeleted && e.message_id == msg.id)
+        .count();
+    assert_eq!(
+        del_events, 1,
+        "concurrent delete_message must record exactly one MessageDeleted history event"
+    );
 }
