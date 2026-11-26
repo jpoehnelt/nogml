@@ -24,9 +24,10 @@ use crate::{
     error::{AppError, AppResult},
     events::EventSource,
     models::{
-        AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
-        AiTriageRequest, LABEL_INBOX, PatchThreadAnnotationRequest, SyncTriggerRequest,
-        ThreadAnnotationPatch, UpsertThreadAnnotationRequest, default_extracted_object,
+        AiBatchTriageRequest, AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest,
+        AiSendEmailRequest, AiTriageRequest, LABEL_INBOX, PatchThreadAnnotationRequest,
+        SyncTriggerRequest, ThreadAnnotationPatch, UpsertThreadAnnotationRequest,
+        default_extracted_object,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord,
@@ -233,8 +234,8 @@ impl McpServer {
             | "lookup_contact"
             | "list_vips"
             | "sync_status" => AuthScope::Read,
-            "create_draft" | "triage_thread" | "annotate_thread" | "modify_labels"
-            | "sync_gmail" => AuthScope::Write,
+            "create_draft" | "triage_thread" | "batch_triage" | "annotate_thread"
+            | "modify_labels" | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
             "unsubscribe" => {
                 let is_dry_run = arguments
@@ -263,6 +264,7 @@ impl McpServer {
                     "send_email" | "send_draft" => "send",
                     "create_draft" => "draft",
                     "triage_thread" => "triage",
+                    "batch_triage" => "batch_triage",
                     "modify_labels" => "modify",
                     "unsubscribe" => "unsubscribe",
                     _ => "read",
@@ -289,6 +291,7 @@ impl McpServer {
                     "create_draft" => self.tool_create_draft(arguments).await,
                     "send_draft" => self.tool_send_draft(arguments).await,
                     "triage_thread" => self.tool_triage_thread(arguments).await,
+                    "batch_triage" => self.tool_batch_triage(arguments).await,
                     "annotate_thread" => self.tool_annotate_thread(arguments).await,
                     "get_thread_annotations" => self.tool_get_thread_annotations(arguments).await,
                     "modify_labels" => self.tool_modify_labels(arguments).await,
@@ -849,6 +852,17 @@ impl McpServer {
             &self.state,
             &parsed.thread_id,
             parsed.req,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
+    }
+
+    async fn tool_batch_triage(&self, args: Value) -> AppResult<Value> {
+        let req: AiBatchTriageRequest = serde_json::from_value(args)?;
+        ai::execute_batch_triage_with_context(
+            &self.state,
+            req,
             Some(self.principal.clone()),
             EventSource::Mcp,
         )
@@ -1624,6 +1638,75 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "batch_triage",
+            "description": "Preview (dry_run: true) or atomically apply bulk triage operations across multiple threads via explicit per-thread operations and/or a thread_ids list or Gmail q= query with a shared action, bounded by max_threads (default 100, hard ceiling 500).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "description": "Explicit per-thread triage operations",
+                        "items": {
+                            "type": "object",
+                            "required": ["thread_id"],
+                            "properties": {
+                                "thread_id": { "type": "string" },
+                                "archive": { "type": "boolean" },
+                                "mark_read": { "type": "boolean" },
+                                "mark_unread": { "type": "boolean" },
+                                "star": { "type": "boolean" },
+                                "trash": { "type": "boolean" },
+                                "add_labels": { "type": "array", "items": { "type": "string" } },
+                                "remove_labels": { "type": "array", "items": { "type": "string" } }
+                            }
+                        }
+                    },
+                    "thread_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Thread IDs to apply the shared triage action to"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Gmail q= search query selecting threads for the shared triage action"
+                    },
+                    "include_spam_trash": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include SPAM and TRASH threads when resolving query"
+                    },
+                    "action": {
+                        "type": "object",
+                        "description": "Shared triage action applied to thread_ids and/or query matches",
+                        "properties": {
+                            "archive": { "type": "boolean" },
+                            "mark_read": { "type": "boolean" },
+                            "mark_unread": { "type": "boolean" },
+                            "star": { "type": "boolean" },
+                            "trash": { "type": "boolean" },
+                            "add_labels": { "type": "array", "items": { "type": "string" } },
+                            "remove_labels": { "type": "array", "items": { "type": "string" } }
+                        }
+                    },
+                    "archive": { "type": "boolean" },
+                    "mark_read": { "type": "boolean" },
+                    "mark_unread": { "type": "boolean" },
+                    "star": { "type": "boolean" },
+                    "trash": { "type": "boolean" },
+                    "add_labels": { "type": "array", "items": { "type": "string" } },
+                    "remove_labels": { "type": "array", "items": { "type": "string" } },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview exact per-thread diffs with zero store writes, events, or audit logs" },
+                    "max_threads": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100, "description": "Maximum unique target threads allowed in one call" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "annotate_thread",
             "description": "Persist structured agent annotations and extracted JSON state on a thread. Merges provided fields and shallow-merges extracted JSON object keys by default (pass replace: true to overwrite).",
             "inputSchema": {
@@ -1868,7 +1951,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 18 tools
+        // tools/list advertises all 19 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1890,6 +1973,7 @@ mod tests {
             "create_draft",
             "send_draft",
             "triage_thread",
+            "batch_triage",
             "annotate_thread",
             "get_thread_annotations",
             "modify_labels",
@@ -1902,7 +1986,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
     }
 
     #[tokio::test]

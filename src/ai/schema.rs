@@ -171,6 +171,58 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                 }
             }
         },
+        "mail.batch_triage": {
+            "endpoint": "POST /v1/threads/batch_triage",
+            "mcp_tool": "batch_triage",
+            "description": "Preview (dry_run: true) or atomically apply bulk triage operations across multiple threads via explicit operations and/or thread_ids or Gmail q= query with a shared action, bounded by max_threads (default 100, ceiling 500).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["thread_id"],
+                            "properties": {
+                                "thread_id": { "type": "string" },
+                                "archive": { "type": "boolean" },
+                                "mark_read": { "type": "boolean" },
+                                "mark_unread": { "type": "boolean" },
+                                "star": { "type": "boolean" },
+                                "trash": { "type": "boolean" },
+                                "add_labels": { "type": "array", "items": { "type": "string" } },
+                                "remove_labels": { "type": "array", "items": { "type": "string" } }
+                            }
+                        }
+                    },
+                    "thread_ids": { "type": "array", "items": { "type": "string" } },
+                    "query": { "type": "string" },
+                    "include_spam_trash": { "type": "boolean", "default": false },
+                    "action": {
+                        "type": "object",
+                        "properties": {
+                            "archive": { "type": "boolean" },
+                            "mark_read": { "type": "boolean" },
+                            "mark_unread": { "type": "boolean" },
+                            "star": { "type": "boolean" },
+                            "trash": { "type": "boolean" },
+                            "add_labels": { "type": "array", "items": { "type": "string" } },
+                            "remove_labels": { "type": "array", "items": { "type": "string" } }
+                        }
+                    },
+                    "archive": { "type": "boolean" },
+                    "mark_read": { "type": "boolean" },
+                    "mark_unread": { "type": "boolean" },
+                    "star": { "type": "boolean" },
+                    "trash": { "type": "boolean" },
+                    "add_labels": { "type": "array", "items": { "type": "string" } },
+                    "remove_labels": { "type": "array", "items": { "type": "string" } },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "max_threads": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 },
+                    "fields": { "type": "string" }
+                }
+            }
+        },
         "mail.modify_labels": {
             "endpoint": "POST /v1/messages/modify",
             "mcp_tool": "modify_labels",
@@ -249,7 +301,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "description": "Filter by action (read, search, send, draft, triage, approve, reject, unsubscribe, modify, delete)" },
+                    "action": { "type": "string", "description": "Filter by action (read, search, send, draft, triage, batch_triage, approve, reject, unsubscribe, modify, delete)" },
                     "actor": { "type": "string", "description": "Filter by actor identity" },
                     "since": { "type": "string", "description": "Unix epoch milliseconds or RFC 3339 timestamp" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
@@ -304,6 +356,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "draft" | "create_draft" => "mail.draft",
             "send_draft" => "mail.send_draft",
             "triage" | "triage_thread" => "mail.triage",
+            "batch_triage" | "batch-triage" => "mail.batch_triage",
             "annotations" | "annotate_thread" | "get_thread_annotations" => "mail.annotations",
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
@@ -338,6 +391,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
         "endpoints": [
             "GET /v1/capabilities",
             "GET /v1/threads",
+            "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
             "GET /v1/threads/{id}/annotations",

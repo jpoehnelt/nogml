@@ -48,18 +48,20 @@ use crate::{
         parse_unsubscribe_from_raw, select_body_or_html_markdown, strip_quoted_text,
     },
     models::{
-        AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
-        AiTriageRequest, AiUnsubscribeRequest, AttachmentTextExtraction, CompactMessage,
-        ContactSummary, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED,
-        LABEL_TRASH, LABEL_UNREAD, PatchThreadAnnotationRequest, SyncTriggerRequest,
-        ThreadAnnotation, ThreadDetail, ThreadSummary, UnsubscribeInfo,
-        UpsertThreadAnnotationRequest, WaitingOn, truncate_to_millis,
+        AiBatchTriageRequest, AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest,
+        AiSendEmailRequest, AiTriageRequest, AiUnsubscribeRequest, AttachmentTextExtraction,
+        BatchTriageApplyResponse, BatchTriageDryRunResponse, BatchTriagePreviewItem,
+        BatchTriageThreadError, BatchTriageThreadResult, CompactMessage, ContactSummary,
+        EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH,
+        LABEL_UNREAD, PatchThreadAnnotationRequest, SyncTriggerRequest, ThreadAnnotation,
+        ThreadDetail, ThreadSummary, UnsubscribeInfo, UpsertThreadAnnotationRequest, WaitingOn,
+        truncate_to_millis,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactPatch, ContactQuery,
         ContactRecord, MessageListQuery, NewAttachmentInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredMessage, StoredThreadDetail, TriagePatch,
-        parse_simple_email_address, validate_and_normalize_contact_email,
+        NewPendingApprovalInput, PendingApproval, StoredLabel, StoredMessage, StoredThreadDetail,
+        TriagePatch, parse_simple_email_address, validate_and_normalize_contact_email,
     },
     sync::{self, SyncRunOptions},
     transport::{OutboundAttachment, OutboundMessage},
@@ -83,6 +85,10 @@ const DEFAULT_CONTACTS_LIMIT: usize = 50;
 const MAX_CONTACTS_LIMIT: usize = 200;
 const DEFAULT_AUDIT_LIMIT: usize = 50;
 const MAX_AUDIT_LIMIT: usize = 500;
+/// Default safety cap on unique target threads per `batch_triage` call.
+pub const DEFAULT_BATCH_TRIAGE_MAX_THREADS: usize = 100;
+/// Hard ceiling on unique target threads per `batch_triage` call.
+pub const HARD_MAX_BATCH_TRIAGE_THREADS: usize = 500;
 const DEFAULT_LIST_BODY_CHARS: usize = 1000;
 const SSE_REPLAY_LIMIT: usize = 1024;
 /// Default TTL (24 hours) for persisted send/draft idempotency keys.
@@ -167,7 +173,7 @@ pub fn router() -> Router<AppState> {
 
 /// Build the AI-first `/v1` router:
 /// - `GET /v1/capabilities`
-/// - `GET /v1/threads`, `GET /v1/threads/{id}`, `POST /v1/threads/{id}/triage`
+/// - `GET /v1/threads`, `POST /v1/threads/batch_triage`, `GET /v1/threads/{id}`, `POST /v1/threads/{id}/triage`
 /// - `GET /v1/messages`, `GET /v1/messages/{id}`, `GET /v1/messages/{id}/attachments/{attachment_id}`
 /// - `POST /v1/messages/send`, `POST /v1/messages/modify`
 /// - `GET /v1/drafts`, `POST /v1/drafts`, `POST /v1/drafts/{id}/send`, `DELETE /v1/drafts/{id}`
@@ -180,6 +186,7 @@ pub fn ai_router() -> Router<AppState> {
     Router::new()
         .route("/v1/capabilities", get(get_capabilities))
         .route("/v1/threads", get(list_threads))
+        .route("/v1/threads/batch_triage", post(batch_triage_handler))
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/triage", post(triage_thread_handler))
         .route(
@@ -1214,6 +1221,546 @@ pub async fn execute_triage_thread_with_context(
         "added_labels": add_labels,
         "removed_labels": remove_labels,
     }))
+}
+
+/// Execute atomic batch thread triage (shared across `/v1/threads/batch_triage`, MCP `batch_triage`, and CLI).
+pub async fn execute_batch_triage(state: &AppState, req: AiBatchTriageRequest) -> AppResult<Value> {
+    execute_batch_triage_with_context(state, req, None, EventSource::Api).await
+}
+
+/// Internal variant allowing callers (REST vs MCP) to tag the published [`EventSource`].
+pub async fn execute_batch_triage_with_source(
+    state: &AppState,
+    req: AiBatchTriageRequest,
+    source: EventSource,
+) -> AppResult<Value> {
+    execute_batch_triage_with_context(state, req, None, source).await
+}
+
+fn resolve_batch_shared_action(req: &AiBatchTriageRequest) -> Option<AiTriageRequest> {
+    let has_top_level = req.archive.is_some()
+        || req.mark_read.is_some()
+        || req.mark_unread.is_some()
+        || req.star.is_some()
+        || req.trash.is_some()
+        || !req.add_labels.is_empty()
+        || !req.remove_labels.is_empty();
+
+    match (&req.action, has_top_level) {
+        (Some(action), false) => Some(action.clone()),
+        (None, true) => Some(AiTriageRequest {
+            archive: req.archive,
+            mark_read: req.mark_read,
+            mark_unread: req.mark_unread,
+            star: req.star,
+            trash: req.trash,
+            add_labels: req.add_labels.clone(),
+            remove_labels: req.remove_labels.clone(),
+            dry_run: req.dry_run,
+        }),
+        (Some(action), true) => {
+            let mut merged = action.clone();
+            if merged.archive.is_none() {
+                merged.archive = req.archive;
+            }
+            if merged.mark_read.is_none() {
+                merged.mark_read = req.mark_read;
+            }
+            if merged.mark_unread.is_none() {
+                merged.mark_unread = req.mark_unread;
+            }
+            if merged.star.is_none() {
+                merged.star = req.star;
+            }
+            if merged.trash.is_none() {
+                merged.trash = req.trash;
+            }
+            merged.add_labels.extend(req.add_labels.iter().cloned());
+            merged
+                .remove_labels
+                .extend(req.remove_labels.iter().cloned());
+            Some(merged)
+        }
+        (None, false) => None,
+    }
+}
+
+fn resolve_mailbox_label_id(labels: &[StoredLabel], raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(exact) = labels.iter().find(|l| l.id == trimmed) {
+        return Some(exact.id.clone());
+    }
+    labels
+        .iter()
+        .find(|l| l.name.eq_ignore_ascii_case(trimmed))
+        .map(|l| l.id.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_resolved_triage_patch(
+    mailbox_labels: &[StoredLabel],
+    archive: Option<bool>,
+    mark_read: Option<bool>,
+    mark_unread: Option<bool>,
+    star: Option<bool>,
+    trash: Option<bool>,
+    extra_add: &[String],
+    extra_remove: &[String],
+) -> AppResult<(Vec<String>, Vec<String>)> {
+    if mark_read == Some(true) && mark_unread == Some(true) {
+        return Err(AppError::validation(
+            "Cannot set both mark_read and mark_unread to true",
+            Some("Specify only one of mark_read or mark_unread.".to_string()),
+        ));
+    }
+
+    for lbl in extra_add.iter().chain(extra_remove.iter()) {
+        validate_resource_id(lbl)?;
+    }
+
+    let (raw_add, raw_remove) = compute_triage_labels(
+        archive,
+        mark_read,
+        mark_unread,
+        star,
+        trash,
+        extra_add,
+        extra_remove,
+    );
+
+    let mut resolved_add = Vec::with_capacity(raw_add.len());
+    for lbl in &raw_add {
+        let lid = resolve_mailbox_label_id(mailbox_labels, lbl).ok_or_else(|| {
+            AppError::validation(
+                format!("Label not found: {lbl}"),
+                Some("Create the label first or use an existing label ID or name.".to_string()),
+            )
+        })?;
+        resolved_add.push(lid);
+    }
+
+    let mut resolved_remove = Vec::with_capacity(raw_remove.len());
+    for lbl in &raw_remove {
+        if let Some(lid) = resolve_mailbox_label_id(mailbox_labels, lbl) {
+            resolved_remove.push(lid);
+        }
+    }
+
+    dedup_preserve_order(&mut resolved_add);
+    dedup_preserve_order(&mut resolved_remove);
+    resolved_add.retain(|l| !resolved_remove.contains(l));
+
+    Ok((resolved_add, resolved_remove))
+}
+
+fn merge_thread_label_patch(
+    patches: &mut HashMap<String, (Vec<String>, Vec<String>)>,
+    order: &mut Vec<String>,
+    thread_id: String,
+    add: Vec<String>,
+    remove: Vec<String>,
+) {
+    if let Some((existing_add, existing_remove)) = patches.get_mut(&thread_id) {
+        for lbl in add {
+            existing_remove.retain(|r| r != &lbl);
+            if !existing_add.contains(&lbl) {
+                existing_add.push(lbl);
+            }
+        }
+        for lbl in remove {
+            existing_add.retain(|a| a != &lbl);
+            if !existing_remove.contains(&lbl) {
+                existing_remove.push(lbl);
+            }
+        }
+    } else {
+        order.push(thread_id.clone());
+        patches.insert(thread_id, (add, remove));
+    }
+}
+
+fn max_threads_exceeded_error(count_desc: String, effective_max: usize) -> AppError {
+    AppError::validation(
+        format!(
+            "Batch triage resolved {count_desc} unique thread(s), exceeding max_threads limit of {effective_max}"
+        ),
+        Some(format!(
+            "Narrow your query, split the batch, or raise max_threads (hard limit {HARD_MAX_BATCH_TRIAGE_THREADS})."
+        )),
+    )
+}
+
+fn thread_subject_for_triage(detail: &StoredThreadDetail, guard: bool) -> String {
+    let raw = detail
+        .messages
+        .iter()
+        .find_map(|m| (!m.subject.trim().is_empty()).then_some(m.subject.as_str()))
+        .unwrap_or("");
+    if guard {
+        sanitize_untrusted_text(raw)
+    } else {
+        raw.to_string()
+    }
+}
+
+fn thread_current_labels(detail: &StoredThreadDetail) -> Vec<String> {
+    let mut set = HashSet::new();
+    for msg in &detail.messages {
+        for lbl in &msg.label_ids {
+            set.insert(lbl.clone());
+        }
+    }
+    let mut labels: Vec<String> = set.into_iter().collect();
+    labels.sort();
+    labels
+}
+
+/// Variant accepting the authenticated [`Principal`] for audit attribution.
+pub async fn execute_batch_triage_with_context(
+    state: &AppState,
+    req: AiBatchTriageRequest,
+    principal: Option<Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    let channel = channel_for_source(source);
+
+    if req.max_threads == Some(0) {
+        return Err(AppError::validation(
+            "max_threads must be at least 1",
+            Some(format!(
+                "Provide a max_threads value between 1 and {HARD_MAX_BATCH_TRIAGE_THREADS}."
+            )),
+        ));
+    }
+    let effective_max_threads = req
+        .max_threads
+        .unwrap_or(DEFAULT_BATCH_TRIAGE_MAX_THREADS)
+        .min(HARD_MAX_BATCH_TRIAGE_THREADS);
+
+    let query_str = req
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if req.operations.is_empty() && req.thread_ids.is_empty() && query_str.is_none() {
+        return Err(AppError::validation(
+            "Batch triage requires at least one of 'operations', 'thread_ids', or 'query'",
+            Some(
+                "Provide 'operations' for per-thread actions, or 'thread_ids'/'query' with a shared triage action."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let shared_action = resolve_batch_shared_action(&req);
+    if (!req.thread_ids.is_empty() || query_str.is_some()) && shared_action.is_none() {
+        return Err(AppError::validation(
+            "A shared triage action is required when 'thread_ids' or 'query' is provided",
+            Some(
+                "Provide 'action' or top-level flags such as 'archive', 'mark_read', 'star', 'trash', 'add_labels', or 'remove_labels'."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    for tid in &req.thread_ids {
+        validate_resource_id(tid)?;
+    }
+    for op in &req.operations {
+        validate_resource_id(&op.thread_id)?;
+    }
+
+    let mailbox_labels = state.store.list_labels().await?;
+
+    let shared_patch = match shared_action {
+        Some(ref action) => Some(compute_resolved_triage_patch(
+            &mailbox_labels,
+            action.archive,
+            action.mark_read,
+            action.mark_unread,
+            action.star,
+            action.trash,
+            &action.add_labels,
+            &action.remove_labels,
+        )?),
+        None => None,
+    };
+
+    let mut resolved_ops: Vec<(String, Vec<String>, Vec<String>)> =
+        Vec::with_capacity(req.operations.len());
+    for op in &req.operations {
+        let (add, remove) = compute_resolved_triage_patch(
+            &mailbox_labels,
+            op.archive,
+            op.mark_read,
+            op.mark_unread,
+            op.star,
+            op.trash,
+            &op.add_labels,
+            &op.remove_labels,
+        )?;
+        resolved_ops.push((op.thread_id.clone(), add, remove));
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut patches: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut threads_by_id: HashMap<String, StoredThreadDetail> = HashMap::new();
+
+    if let Some(q) = query_str {
+        let (shared_add, shared_remove) = shared_patch
+            .as_ref()
+            .expect("validated shared_action presence for query");
+        let page_size = (effective_max_threads + 1).min(HARD_MAX_BATCH_TRIAGE_THREADS);
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let page = state
+                .store
+                .list_threads(&MessageListQuery {
+                    q: Some(q.to_string()),
+                    label_ids: Vec::new(),
+                    include_spam_trash: req.include_spam_trash,
+                    max_results: page_size,
+                    page_token: page_token.clone(),
+                })
+                .await?;
+
+            for detail in page.threads {
+                let tid = detail.id.clone();
+                threads_by_id.entry(tid.clone()).or_insert(detail);
+                merge_thread_label_patch(
+                    &mut patches,
+                    &mut order,
+                    tid,
+                    shared_add.clone(),
+                    shared_remove.clone(),
+                );
+                if order.len() > effective_max_threads {
+                    return Err(max_threads_exceeded_error(
+                        order.len().to_string(),
+                        effective_max_threads,
+                    ));
+                }
+            }
+
+            if let Some(next_token) = page.next_page_token {
+                if order.len() >= effective_max_threads {
+                    return Err(max_threads_exceeded_error(
+                        format!("more than {effective_max_threads}"),
+                        effective_max_threads,
+                    ));
+                }
+                page_token = Some(next_token);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if !req.thread_ids.is_empty() {
+        let (shared_add, shared_remove) = shared_patch
+            .as_ref()
+            .expect("validated shared_action presence for thread_ids");
+        for tid in &req.thread_ids {
+            merge_thread_label_patch(
+                &mut patches,
+                &mut order,
+                tid.clone(),
+                shared_add.clone(),
+                shared_remove.clone(),
+            );
+            if order.len() > effective_max_threads {
+                return Err(max_threads_exceeded_error(
+                    order.len().to_string(),
+                    effective_max_threads,
+                ));
+            }
+        }
+    }
+
+    for (tid, add, remove) in resolved_ops {
+        merge_thread_label_patch(&mut patches, &mut order, tid, add, remove);
+        if order.len() > effective_max_threads {
+            return Err(max_threads_exceeded_error(
+                order.len().to_string(),
+                effective_max_threads,
+            ));
+        }
+    }
+
+    // Validate existence of every target thread upfront before mutating anything.
+    for tid in &order {
+        if !threads_by_id.contains_key(tid) {
+            let detail = state
+                .store
+                .get_thread(tid)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Thread '{tid}' not found")))?;
+            threads_by_id.insert(tid.clone(), detail);
+        }
+    }
+
+    struct PlannedThreadTriage {
+        thread_id: String,
+        subject: String,
+        current_labels: Vec<String>,
+        labels_to_add: Vec<String>,
+        labels_to_remove: Vec<String>,
+        would_change: bool,
+    }
+
+    let guard = state.config.untrusted_content_guard;
+    let mut plans: Vec<PlannedThreadTriage> = Vec::with_capacity(order.len());
+
+    for tid in &order {
+        let detail = &threads_by_id[tid];
+        let (req_add, req_remove) = &patches[tid];
+        let subject = thread_subject_for_triage(detail, guard);
+        let current_labels = thread_current_labels(detail);
+
+        let labels_to_add: Vec<String> = req_add
+            .iter()
+            .filter(|lbl| detail.messages.iter().any(|m| !m.label_ids.contains(lbl)))
+            .cloned()
+            .collect();
+        let labels_to_remove: Vec<String> = req_remove
+            .iter()
+            .filter(|lbl| detail.messages.iter().any(|m| m.label_ids.contains(lbl)))
+            .cloned()
+            .collect();
+        let would_change = !labels_to_add.is_empty() || !labels_to_remove.is_empty();
+
+        plans.push(PlannedThreadTriage {
+            thread_id: tid.clone(),
+            subject,
+            current_labels,
+            labels_to_add,
+            labels_to_remove,
+            would_change,
+        });
+    }
+
+    if req.dry_run {
+        let preview: Vec<BatchTriagePreviewItem> = plans
+            .into_iter()
+            .map(|p| BatchTriagePreviewItem {
+                thread_id: p.thread_id,
+                subject: p.subject,
+                current_labels: p.current_labels,
+                labels_to_add: p.labels_to_add,
+                labels_to_remove: p.labels_to_remove,
+                would_change: p.would_change,
+            })
+            .collect();
+        let would_change_count = preview.iter().filter(|p| p.would_change).count();
+        let resp = BatchTriageDryRunResponse {
+            dry_run: true,
+            total_threads: preview.len(),
+            would_change_count,
+            preview,
+        };
+        return Ok(serde_json::to_value(resp)?);
+    }
+
+    let total_threads = plans.len();
+    let mut applied_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut modified_thread_ids: Vec<String> = Vec::new();
+    let mut errors: Vec<BatchTriageThreadError> = Vec::new();
+    let mut results: Vec<BatchTriageThreadResult> = Vec::with_capacity(total_threads);
+
+    for plan in plans {
+        if !plan.would_change {
+            skipped_count += 1;
+            results.push(BatchTriageThreadResult {
+                thread_id: plan.thread_id,
+                subject: plan.subject,
+                changed: false,
+                affected_message_ids: Vec::new(),
+                labels: plan.current_labels,
+                added_labels: Vec::new(),
+                removed_labels: Vec::new(),
+            });
+            continue;
+        }
+
+        match state
+            .store
+            .triage_thread(
+                &plan.thread_id,
+                &TriagePatch {
+                    add_labels: plan.labels_to_add.clone(),
+                    remove_labels: plan.labels_to_remove.clone(),
+                },
+            )
+            .await
+        {
+            Ok(triage_res) => {
+                applied_count += 1;
+                modified_thread_ids.push(triage_res.thread_id.clone());
+                for message_id in &triage_res.affected_message_ids {
+                    state.events.publish(
+                        source,
+                        MailEvent::MessageUpdated {
+                            message_id: message_id.clone(),
+                            thread_id: triage_res.thread_id.clone(),
+                            added_labels: plan.labels_to_add.clone(),
+                            removed_labels: plan.labels_to_remove.clone(),
+                        },
+                    );
+                }
+                results.push(BatchTriageThreadResult {
+                    thread_id: triage_res.thread_id,
+                    subject: plan.subject,
+                    changed: true,
+                    affected_message_ids: triage_res.affected_message_ids,
+                    labels: triage_res.labels,
+                    added_labels: plan.labels_to_add,
+                    removed_labels: plan.labels_to_remove,
+                });
+            }
+            Err(err) => {
+                errors.push(BatchTriageThreadError {
+                    thread_id: plan.thread_id,
+                    code: err.ai_code().to_string(),
+                    message: err.to_string(),
+                });
+            }
+        }
+    }
+
+    let outcome = if errors.is_empty() {
+        "ok"
+    } else {
+        "partial_error"
+    };
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "batch_triage",
+            modified_thread_ids,
+            outcome,
+            Some(format!(
+                "total={total_threads} applied={applied_count} skipped={skipped_count} errors={}",
+                errors.len()
+            )),
+        )
+        .await;
+
+    let resp = BatchTriageApplyResponse {
+        dry_run: false,
+        total_threads,
+        applied_count,
+        skipped_count,
+        errors,
+        results,
+    };
+    Ok(serde_json::to_value(resp)?)
 }
 
 /// Execute label modification (shared across `/v1/messages/modify` and MCP `modify_labels`).
@@ -2798,6 +3345,7 @@ async fn get_capabilities(
         "endpoints": [
             "GET /v1/capabilities",
             "GET /v1/threads",
+            "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
             "GET /v1/threads/{id}/annotations",
@@ -2955,6 +3503,22 @@ async fn get_thread(
 
     let value = serde_json::to_value(projected).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
+}
+
+async fn batch_triage_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<AiBatchTriageRequest>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_batch_triage_with_context(
+        &state,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 
 async fn triage_thread_handler(
