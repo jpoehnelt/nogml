@@ -249,7 +249,9 @@ nogml config check --config /etc/nogml/nogml.toml
 # 3. Re-encrypt all stored secrets across every mailbox under k2
 nogml crypto rotate-key --config /etc/nogml/nogml.toml
 
-# 4. Reload nogml, then remove k1 from encryption_previous_keys
+# 4. Reload nogml, remove k1 from encryption_previous_keys, and optionally set
+#    encryption_strict = true (or NOGML_ENCRYPTION_STRICT=true) to reject any
+#    unencrypted plaintext secrets on read
 ```
 
 ## Single-node Docker Compose with Caddy HTTPS

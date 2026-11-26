@@ -717,6 +717,15 @@ struct CommonConfigArgs {
     )]
     encryption_previous_keys: Vec<String>,
 
+    /// Reject unencrypted plaintext secrets on read when encryption at rest is enabled.
+    #[arg(
+        long,
+        env = "NOGML_ENCRYPTION_STRICT",
+        default_value_t = false,
+        global = true
+    )]
+    encryption_strict: bool,
+
     // --- Pluggable search & embeddings ---
     /// Search index backend (`store` [default] or `hybrid`).
     #[arg(
@@ -1702,6 +1711,9 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "encryption_previous_keys") {
             cfg.encryption_previous_keys = self.encryption_previous_keys;
+        }
+        if is_explicit(root_matches, "encryption_strict") {
+            cfg.encryption_strict = self.encryption_strict;
         }
         if is_explicit(root_matches, "search_backend") {
             cfg.search_backend = self.search_backend;

@@ -1395,6 +1395,31 @@ pub fn parse_strict_single_mailbox(raw: &str) -> Result<EmailAddress, String> {
     })
 }
 
+/// Parse a `list_history` keyset page token formatted as `<history_id>:<row_id>`.
+pub fn parse_history_page_token(token: Option<&str>) -> AppResult<Option<(u64, u64)>> {
+    let Some(raw) = token.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((hid_s, id_s)) = raw.split_once(':') else {
+        return Err(AppError::BadRequest(format!("Invalid pageToken: {raw}")));
+    };
+    let hid = hid_s
+        .parse::<u64>()
+        .map_err(|_| AppError::BadRequest(format!("Invalid pageToken: {raw}")))?;
+    let id = id_s
+        .parse::<u64>()
+        .map_err(|_| AppError::BadRequest(format!("Invalid pageToken: {raw}")))?;
+    if hid == 0 || id == 0 {
+        return Err(AppError::BadRequest(format!("Invalid pageToken: {raw}")));
+    }
+    Ok(Some((hid, id)))
+}
+
+/// Format a `list_history` keyset page token as `<history_id>:<row_id>`.
+pub fn format_history_page_token(history_id: u64, row_id: u64) -> String {
+    format!("{history_id}:{row_id}")
+}
+
 /// Helper to parse `"Name <a@b.com>"` or `"a@b.com"` into an `EmailAddress` for storage summaries.
 ///
 /// Enforces single-mailbox parsing so multi-address strings like
@@ -1427,6 +1452,17 @@ pub trait MailStore: Send + Sync {
     /// Return a lightweight `MailStore` handle sharing the underlying backend state/pool
     /// while isolating all reads and writes strictly to `mailbox_id`.
     fn for_mailbox(&self, mailbox_id: &str) -> Arc<dyn MailStore>;
+
+    /// Return all distinct normalized mailbox IDs persisted across `meta`, `settings`,
+    /// and `inbox_rules` (sorted and deduplicated).
+    async fn list_mailbox_ids(&self) -> AppResult<Vec<String>> {
+        let norm = crate::config::normalize_mailbox_id(self.mailbox_id());
+        if norm.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![norm])
+        }
+    }
 
     // --- Profile & History ---
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile>;

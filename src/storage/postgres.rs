@@ -48,9 +48,10 @@ use crate::{
         SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
         UpsertOutcome, UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
         apply_domain_update, apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
-        compute_xgm_label_delta, normalize_and_validate_domain, normalize_contact_email,
-        normalize_deliverability_domain, normalize_domain_lookup_key, normalize_inbox_rule_actions,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        compute_xgm_label_delta, format_history_page_token, normalize_and_validate_domain,
+        normalize_contact_email, normalize_deliverability_domain, normalize_domain_lookup_key,
+        normalize_inbox_rule_actions, normalize_optional_text, parse_history_page_token,
+        parse_simple_email_address, validate_and_normalize_contact_email,
         validate_and_normalize_suppression_email, validate_deliverability_domain,
     },
 };
@@ -1458,6 +1459,41 @@ fn str_to_history_kind(s: &str) -> AppResult<HistoryEventKind> {
             "Unknown history event kind: {other}"
         ))),
     }
+}
+
+fn build_postgres_list_history_sql(has_cursor: bool, kind_count: usize, sql_limit: bool) -> String {
+    let mut sql = String::from(
+        "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source
+         FROM history_events
+         WHERE mailbox_id = $1",
+    );
+    let mut next_param = 2usize;
+    if has_cursor {
+        sql.push_str(&format!(
+            " AND (history_id, id) > (${next_param}, ${})",
+            next_param + 1
+        ));
+        next_param += 2;
+    } else {
+        sql.push_str(&format!(" AND history_id > ${next_param}"));
+        next_param += 1;
+    }
+    if kind_count > 0 {
+        sql.push_str(" AND kind IN (");
+        for i in 0..kind_count {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("${}", next_param + i));
+        }
+        sql.push(')');
+        next_param += kind_count;
+    }
+    sql.push_str(" ORDER BY history_id ASC, id ASC");
+    if sql_limit {
+        sql.push_str(&format!(" LIMIT ${next_param}"));
+    }
+    sql
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3254,6 +3290,31 @@ impl MailStore for PostgresStore {
         })
     }
 
+    async fn list_mailbox_ids(&self) -> AppResult<Vec<String>> {
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT DISTINCT mailbox_id FROM meta
+                 UNION
+                 SELECT DISTINCT mailbox_id FROM settings
+                 UNION
+                 SELECT DISTINCT mailbox_id FROM inbox_rules
+                 ORDER BY mailbox_id ASC",
+                &[],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut ids = std::collections::BTreeSet::new();
+        for row in rows {
+            let raw: String = row.get(0);
+            let norm = crate::config::normalize_mailbox_id(&raw);
+            if !norm.is_empty() {
+                ids.insert(norm);
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let conn = self.ready_conn().await?;
         let email = if email_address.trim().is_empty() {
@@ -3301,14 +3362,8 @@ impl MailStore for PostgresStore {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.as_str();
         let current_hid = read_current_history_id(&conn, mb).await?;
-        let after_row_id: i64 = match query.page_token.as_deref() {
-            None => 0,
-            Some(s) if s.trim().is_empty() => 0,
-            Some(s) => s
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| AppError::BadRequest(format!("Invalid pageToken: {s}")))?,
-        };
+        let cursor = parse_history_page_token(query.page_token.as_deref())?;
+        let effective_cursor = cursor.filter(|(c_hid, _)| *c_hid > query.start_history_id);
         let max_results = if query.max_results == 0 {
             100
         } else {
@@ -3324,19 +3379,47 @@ impl MailStore for PostgresStore {
             _ => None,
         };
 
-        let start_hid_i64 = query.start_history_id.min(i64::MAX as u64) as i64;
-        let rows = conn
-            .query(
-                "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source
-                 FROM history_events
-                 WHERE mailbox_id = $1 AND history_id > $2 AND id > $3
-                 ORDER BY id ASC",
-                &[&mb, &start_hid_i64, &after_row_id],
-            )
-            .await
-            .map_err(pg_err)?;
+        let mut kind_filters: Vec<&'static str> = Vec::new();
+        for k in &query.history_types {
+            let s = history_kind_to_str(*k);
+            if !kind_filters.contains(&s) {
+                kind_filters.push(s);
+            }
+        }
+        let use_sql_limit = resolved_label_filter.is_none();
+        let sql = build_postgres_list_history_sql(
+            effective_cursor.is_some(),
+            kind_filters.len(),
+            use_sql_limit,
+        );
 
-        let mut matched: Vec<(i64, StoredHistoryEntry)> = Vec::new();
+        let start_hid_i64 = query.start_history_id.min(i64::MAX as u64) as i64;
+        let cursor_hid_i64 = effective_cursor
+            .map(|(h, _)| h.min(i64::MAX as u64) as i64)
+            .unwrap_or(0);
+        let cursor_id_i64 = effective_cursor
+            .map(|(_, id)| id.min(i64::MAX as u64) as i64)
+            .unwrap_or(0);
+        let limit_i64 = (max_results + 1) as i64;
+
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+        params.push(&mb);
+        if effective_cursor.is_some() {
+            params.push(&cursor_hid_i64);
+            params.push(&cursor_id_i64);
+        } else {
+            params.push(&start_hid_i64);
+        }
+        for kind_str in &kind_filters {
+            params.push(kind_str);
+        }
+        if use_sql_limit {
+            params.push(&limit_i64);
+        }
+
+        let rows = conn.query(&sql, &params).await.map_err(pg_err)?;
+
+        let mut matched: Vec<(u64, u64, StoredHistoryEntry)> = Vec::new();
         for row in rows {
             let row_id: i64 = row.get(0);
             let hid: i64 = row.get(1);
@@ -3360,10 +3443,13 @@ impl MailStore for PostgresStore {
             {
                 continue;
             }
+            let norm_hid = hid.max(1) as u64;
+            let norm_id = row_id.max(1) as u64;
             matched.push((
-                row_id,
+                norm_hid,
+                norm_id,
                 StoredHistoryEntry {
-                    history_id: hid.max(1) as u64,
+                    history_id: norm_hid,
                     kind,
                     message_id,
                     thread_id,
@@ -3382,11 +3468,13 @@ impl MailStore for PostgresStore {
             matched.truncate(max_results);
         }
         let next_page_token = if has_more {
-            matched.last().map(|(row_id, _)| row_id.to_string())
+            matched
+                .last()
+                .map(|(hid, row_id, _)| format_history_page_token(*hid, *row_id))
         } else {
             None
         };
-        let entries = matched.into_iter().map(|(_, e)| e).collect();
+        let entries = matched.into_iter().map(|(_, _, e)| e).collect();
 
         Ok(HistoryListPage {
             entries,

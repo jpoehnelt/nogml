@@ -35,10 +35,11 @@ use crate::{
         SuppressionQuery, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
         UpsertOutcome, UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
         apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip, compute_xgm_label_delta,
-        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
-        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
-        parse_simple_email_address, validate_and_normalize_contact_email,
-        validate_and_normalize_suppression_email, validate_deliverability_domain,
+        format_history_page_token, normalize_and_validate_domain, normalize_contact_email,
+        normalize_deliverability_domain, normalize_domain_lookup_key, normalize_inbox_rule_actions,
+        normalize_optional_text, parse_history_page_token, parse_simple_email_address,
+        validate_and_normalize_contact_email, validate_and_normalize_suppression_email,
+        validate_deliverability_domain,
     },
 };
 
@@ -1183,6 +1184,21 @@ impl MailStore for MemoryStore {
             deliverability_domain_states: self.deliverability_domain_states.clone(),
         })
     }
+
+    async fn list_mailbox_ids(&self) -> AppResult<Vec<String>> {
+        let map = self.mailboxes.read().unwrap_or_else(|e| e.into_inner());
+        let mut ids: std::collections::BTreeSet<String> = map
+            .keys()
+            .map(|k| crate::config::normalize_mailbox_id(k))
+            .filter(|k| !k.is_empty())
+            .collect();
+        let self_norm = crate::config::normalize_mailbox_id(&self.mailbox_id);
+        if !self_norm.is_empty() {
+            ids.insert(self_norm);
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let state = self.read_state()?;
         let email = if email_address.trim().is_empty() {
@@ -1217,14 +1233,8 @@ impl MailStore for MemoryStore {
             ));
         }
         let state = self.read_state()?;
-        let after_seq_id: u64 = match query.page_token.as_deref() {
-            None => 0,
-            Some(s) if s.trim().is_empty() => 0,
-            Some(s) => s
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| AppError::BadRequest(format!("Invalid pageToken: {s}")))?,
-        };
+        let cursor = parse_history_page_token(query.page_token.as_deref())?;
+        let effective_cursor = cursor.filter(|(c_hid, _)| *c_hid > query.start_history_id);
         let max_results = if query.max_results == 0 {
             100
         } else {
@@ -1239,9 +1249,16 @@ impl MailStore for MemoryStore {
             _ => None,
         };
 
-        let mut matched: Vec<(u64, StoredHistoryEntry)> = Vec::new();
-        for ev in &state.history_events {
-            if ev.entry.history_id <= query.start_history_id || ev.seq_id <= after_seq_id {
+        let mut ordered: Vec<&MemHistoryEvent> = state.history_events.iter().collect();
+        ordered.sort_by_key(|ev| (ev.entry.history_id, ev.seq_id));
+
+        let mut matched: Vec<(u64, u64, StoredHistoryEntry)> = Vec::new();
+        for ev in ordered {
+            if let Some((c_hid, c_id)) = effective_cursor {
+                if (ev.entry.history_id, ev.seq_id) <= (c_hid, c_id) {
+                    continue;
+                }
+            } else if ev.entry.history_id <= query.start_history_id {
                 continue;
             }
             if !query.history_types.is_empty() && !query.history_types.contains(&ev.entry.kind) {
@@ -1253,7 +1270,7 @@ impl MailStore for MemoryStore {
             {
                 continue;
             }
-            matched.push((ev.seq_id, ev.entry.clone()));
+            matched.push((ev.entry.history_id, ev.seq_id, ev.entry.clone()));
             if matched.len() > max_results {
                 break;
             }
@@ -1264,11 +1281,13 @@ impl MailStore for MemoryStore {
             matched.truncate(max_results);
         }
         let next_page_token = if has_more {
-            matched.last().map(|(seq_id, _)| seq_id.to_string())
+            matched
+                .last()
+                .map(|(hid, seq_id, _)| format_history_page_token(*hid, *seq_id))
         } else {
             None
         };
-        let entries = matched.into_iter().map(|(_, e)| e).collect();
+        let entries = matched.into_iter().map(|(_, _, e)| e).collect();
 
         Ok(HistoryListPage {
             entries,

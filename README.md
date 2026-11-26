@@ -301,6 +301,7 @@ Every CLI flag has a matching environment variable:
 | `NOGML_EMBEDDING_TIMEOUT_SECS` | `--embedding-timeout-secs` | `15` | HTTP timeout in seconds for embedding requests |
 | `NOGML_ENCRYPTION_KEY` | `--encryption-key` | *(disabled)* | Master AES-256-GCM key (`<kid>:<base64_or_hex>` or bare 32-byte key) for encrypting stored secrets at rest (`NOGML_ENCRYPTION_KEY_FILE` supported) |
 | `NOGML_ENCRYPTION_PREVIOUS_KEYS` | `--encryption-previous-keys` | *(empty)* | Comma-separated previous `<kid>:<key>` entries kept during zero-downtime key rotation (`NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE` supported) |
+| `NOGML_ENCRYPTION_STRICT` | `--encryption-strict` | `false` | When `true` with `NOGML_ENCRYPTION_KEY` set, reject unencrypted plaintext secrets on read (enable after running `nogml crypto rotate-key`) |
 | `NOGML_LOG_JSON` | `--log-json` | `false` | Emit JSON logs |
 
 ## Connecting clients

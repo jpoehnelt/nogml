@@ -937,3 +937,150 @@ async fn put_patch_send_as_and_patch_rule_encrypt_updated_secrets_and_env_file_w
         "rule-sec-v2"
     );
 }
+
+#[tokio::test]
+async fn strict_encryption_rejects_legacy_plaintext_until_rotated_and_disabled_rejects_enc_prefix()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("strict.db");
+
+    // 1. Disabled mode rejects creating a webhook_secret starting with reserved `enc:v1:` prefix
+    {
+        let cfg = Config {
+            storage: StorageBackend::Sqlite,
+            db_path: db_path.clone(),
+            user_email: "agent@example.com".to_string(),
+            default_domain: "example.com".to_string(),
+            allow_private_endpoints: true,
+            ..Config::default()
+        };
+        let state = AppState::from_config(cfg).unwrap();
+        let router = build_router(state);
+        let (st, _) = send_json(
+            &router,
+            Method::POST,
+            "/v1/rules",
+            Some(json!({
+                "name": "bad-prefix",
+                "match_query": "from:test@example.com",
+                "actions": {
+                    "webhook_url": "http://127.0.0.1:19999/hook",
+                    "webhook_secret": "enc:v1:k1:forged:payload"
+                }
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    // 2. Seed a legacy plaintext send_as row in a non-meta mailbox directly in SQLite
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let send_as_json = serde_json::to_string(&vec![nogml::models::SendAs {
+            send_as_email: "legacy@example.com".to_string(),
+            display_name: None,
+            reply_to_address: None,
+            signature: None,
+            is_primary: Some(true),
+            is_default: Some(true),
+            treat_as_alias: Some(false),
+            verification_status: Some("accepted".to_string()),
+            smtp_msa: Some(nogml::models::SmtpMsa {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                security_mode: Some("starttls".to_string()),
+                username: Some("legacy".to_string()),
+                password: Some("legacy-unencrypted-pw".to_string()),
+            }),
+        }])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (mailbox_id, key, value_json) VALUES (?1, 'send_as', ?2)",
+            ["legacy@example.com", send_as_json.as_str()],
+        )
+        .unwrap();
+    }
+
+    let (_, k1) = generate_formatted_key("k1").unwrap();
+
+    // 3. With encryption_strict = true BEFORE rotation, reading legacy plaintext fails
+    {
+        let cfg = Config {
+            storage: StorageBackend::Sqlite,
+            db_path: db_path.clone(),
+            user_email: "agent@example.com".to_string(),
+            default_domain: "example.com".to_string(),
+            encryption_key: Some(k1.clone()),
+            encryption_strict: true,
+            ..Config::default()
+        };
+        let state = AppState::from_config(cfg).unwrap();
+        let err = state
+            .for_mailbox("legacy@example.com")
+            .get_decrypted_settings()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+        assert!(err.to_string().contains("encryption_strict"));
+    }
+
+    // 4. Run `nogml crypto rotate-key` (with strict=false); non-meta settings mailbox is discovered & rotated
+    let rotate_out = clean_nogml_cmd()
+        .env("NOGML_ENCRYPTION_KEY", &k1)
+        .args([
+            "crypto",
+            "rotate-key",
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--user-email",
+            "agent@example.com",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rotate_out.status.success(),
+        "rotate-key failed: {}",
+        String::from_utf8_lossy(&rotate_out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&rotate_out.stdout).unwrap();
+    assert_eq!(report["ok"], json!(true));
+    assert_eq!(report["send_as_rotated"], json!(1));
+
+    // 5. Now with encryption_strict = true, reading succeeds
+    {
+        let cfg = Config {
+            storage: StorageBackend::Sqlite,
+            db_path: db_path.clone(),
+            user_email: "agent@example.com".to_string(),
+            default_domain: "example.com".to_string(),
+            encryption_key: Some(k1.clone()),
+            encryption_strict: true,
+            ..Config::default()
+        };
+        let state = AppState::from_config(cfg).unwrap();
+        let decrypted = state
+            .for_mailbox("legacy@example.com")
+            .get_decrypted_settings()
+            .await
+            .unwrap();
+        assert_eq!(
+            decrypted.send_as[0]
+                .smtp_msa
+                .as_ref()
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("legacy-unencrypted-pw")
+        );
+    }
+
+    // 6. `nogml config check` with NOGML_ENCRYPTION_STRICT=true and no key fails with exit 2
+    let bad_strict = clean_nogml_cmd()
+        .env("NOGML_ENCRYPTION_STRICT", "true")
+        .args(["config", "check"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_strict.status.code(), Some(2));
+    let check_json: Value = serde_json::from_slice(&bad_strict.stdout).unwrap();
+    assert_eq!(check_json["ok"], json!(false));
+}
