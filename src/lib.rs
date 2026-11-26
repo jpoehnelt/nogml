@@ -3,6 +3,7 @@
 
 pub mod ai;
 pub mod auth;
+pub mod auth_wizard;
 pub mod blob;
 pub mod config;
 pub mod error;
