@@ -17,8 +17,9 @@ use nogml::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactDirection,
         ContactInteraction, ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery,
         MailStore, MemoryStore, MessageListQuery, NewAttachmentInput, NewAuditLogEntry,
-        NewLabelInput, NewMessageInput, NewPendingApprovalInput, SqliteStore, SyncState,
-        TriagePatch, UpdateLabelInput, UpsertOutcomeKind, WatchSubscription, open_store,
+        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        ScheduledSendStatus, SqliteStore, SyncState, TriagePatch, UpdateLabelInput,
+        UpsertOutcomeKind, WatchSubscription, open_store,
     },
     transport::OutboundMessage,
 };
@@ -1830,6 +1831,304 @@ async fn contract_contacts_stats_vip_filtering_and_patch(store: Arc<dyn MailStor
     assert_eq!(limited[0].email, "ceo@acme.com");
 }
 
+async fn contract_snooze_and_scheduled_sends(
+    base_store: Arc<dyn MailStore>,
+    mb_a: &str,
+    mb_b: &str,
+) {
+    let store_a = base_store.for_mailbox(mb_a);
+    let store_b = base_store.for_mailbox(mb_b);
+
+    // --- Thread snooze: upsert, due_before filtering, cross-mailbox scan, isolation ---
+    let base_ts = 1_800_000_000_000i64;
+    let s1 = store_a
+        .snooze_thread("thr_snz_1", base_ts + 10_000)
+        .await
+        .unwrap();
+    assert_eq!(s1.thread_id, "thr_snz_1");
+    assert_eq!(s1.mailbox_id, mb_a);
+    assert_eq!(s1.snooze_until_ms, base_ts + 10_000);
+
+    // Re-snoozing updates the target timestamp
+    let s1_upd = store_a
+        .snooze_thread("thr_snz_1", base_ts + 5_000)
+        .await
+        .unwrap();
+    assert_eq!(s1_upd.snooze_until_ms, base_ts + 5_000);
+
+    store_a
+        .snooze_thread("thr_snz_2", base_ts + 30_000)
+        .await
+        .unwrap();
+    store_b
+        .snooze_thread("thr_snz_1", base_ts + 6_000)
+        .await
+        .unwrap();
+
+    // Per-mailbox listing and due_before cutoff
+    let all_a = store_a.list_snoozed_threads(None).await.unwrap();
+    assert_eq!(all_a.len(), 2);
+    assert_eq!(all_a[0].thread_id, "thr_snz_1");
+    assert_eq!(all_a[1].thread_id, "thr_snz_2");
+
+    let due_a = store_a
+        .list_snoozed_threads(Some(base_ts + 10_000))
+        .await
+        .unwrap();
+    assert_eq!(due_a.len(), 1);
+    assert_eq!(due_a[0].thread_id, "thr_snz_1");
+
+    // Cross-mailbox due scan returns due items from both mailboxes
+    let all_due = base_store
+        .list_all_due_snoozes(base_ts + 10_000)
+        .await
+        .unwrap();
+    assert!(
+        all_due
+            .iter()
+            .any(|s| s.mailbox_id == mb_a && s.thread_id == "thr_snz_1")
+    );
+    assert!(
+        all_due
+            .iter()
+            .any(|s| s.mailbox_id == mb_b && s.thread_id == "thr_snz_1")
+    );
+    assert!(
+        !all_due
+            .iter()
+            .any(|s| s.mailbox_id == mb_a && s.thread_id == "thr_snz_2")
+    );
+
+    // Unsnooze is scoped strictly to the active mailbox and returns false when absent
+    assert!(store_a.unsnooze_thread("thr_snz_1").await.unwrap());
+    assert!(!store_a.unsnooze_thread("thr_snz_1").await.unwrap());
+    assert_eq!(store_b.list_snoozed_threads(None).await.unwrap().len(), 1);
+    assert!(store_a.unsnooze_thread("thr_snz_2").await.unwrap());
+    assert!(store_b.unsnooze_thread("thr_snz_1").await.unwrap());
+
+    // --- Scheduled sends: create, get, list, claim due, cancel/complete/fail atomic transitions ---
+    let make_outbound = |from: &str, to: &str, subj: &str| OutboundMessage {
+        from: from.to_string(),
+        to: vec![to.to_string()],
+        subject: subj.to_string(),
+        text: Some("Scheduled body".to_string()),
+        raw_rfc2822: format!("From: {from}\r\nTo: {to}\r\nSubject: {subj}\r\n\r\nScheduled body")
+            .into_bytes(),
+        ..Default::default()
+    };
+
+    let sch_due_a = store_a
+        .create_scheduled_send(&NewScheduledSend {
+            id: None,
+            send_at_ms: base_ts + 1_000,
+            outbound_message: make_outbound(mb_a, "dest@example.com", "Due A"),
+            reply_to_message_id: None,
+            thread_id: Some("thr_sched_a".to_string()),
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap();
+    assert_eq!(sch_due_a.status, ScheduledSendStatus::Pending);
+    assert_eq!(sch_due_a.mailbox_id, mb_a);
+
+    // Duplicate explicit ID returns Conflict
+    let dup_err = store_a
+        .create_scheduled_send(&NewScheduledSend {
+            id: Some(sch_due_a.id.clone()),
+            send_at_ms: base_ts + 2_000,
+            outbound_message: make_outbound(mb_a, "dest@example.com", "Dup"),
+            reply_to_message_id: None,
+            thread_id: None,
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(dup_err, AppError::Conflict(_)));
+
+    let sch_cancel_a = store_a
+        .create_scheduled_send(&NewScheduledSend {
+            id: None,
+            send_at_ms: base_ts + 2_000,
+            outbound_message: make_outbound(mb_a, "dest@example.com", "Cancel A"),
+            reply_to_message_id: None,
+            thread_id: None,
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap();
+
+    let sch_fail_a = store_a
+        .create_scheduled_send(&NewScheduledSend {
+            id: None,
+            send_at_ms: base_ts + 3_000,
+            outbound_message: make_outbound(mb_a, "dest@example.com", "Fail A"),
+            reply_to_message_id: None,
+            thread_id: None,
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap();
+
+    let sch_future_a = store_a
+        .create_scheduled_send(&NewScheduledSend {
+            id: None,
+            send_at_ms: base_ts + 90_000,
+            outbound_message: make_outbound(mb_a, "dest@example.com", "Future A"),
+            reply_to_message_id: None,
+            thread_id: None,
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap();
+
+    let sch_due_b = store_b
+        .create_scheduled_send(&NewScheduledSend {
+            id: None,
+            send_at_ms: base_ts + 1_500,
+            outbound_message: make_outbound(mb_b, "dest@example.com", "Due B"),
+            reply_to_message_id: None,
+            thread_id: None,
+            created_at_ms: base_ts,
+        })
+        .await
+        .unwrap();
+
+    // Cross-mailbox isolation on get_scheduled_send
+    assert!(
+        store_a
+            .get_scheduled_send(&sch_due_a.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store_a
+            .get_scheduled_send(&sch_due_b.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // claim_due_scheduled_sends scans across all mailboxes and excludes future items
+    let due_claimed = base_store
+        .claim_due_scheduled_sends(base_ts + 5_000)
+        .await
+        .unwrap();
+    assert!(
+        due_claimed
+            .iter()
+            .any(|s| s.id == sch_due_a.id && s.mailbox_id == mb_a)
+    );
+    assert!(
+        due_claimed
+            .iter()
+            .any(|s| s.id == sch_due_b.id && s.mailbox_id == mb_b)
+    );
+    assert!(!due_claimed.iter().any(|s| s.id == sch_future_a.id));
+
+    // Atomic cancel Pending -> Canceled; second cancel returns Conflict; missing returns NotFound
+    let canceled = store_a
+        .cancel_scheduled_send(&sch_cancel_a.id)
+        .await
+        .unwrap();
+    assert_eq!(canceled.status, ScheduledSendStatus::Canceled);
+    let cancel_again = store_a
+        .cancel_scheduled_send(&sch_cancel_a.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(cancel_again, AppError::Conflict(_)));
+    let cancel_missing = store_a
+        .cancel_scheduled_send("sch_does_not_exist")
+        .await
+        .unwrap_err();
+    assert!(matches!(cancel_missing, AppError::NotFound(_)));
+
+    // Atomic complete Pending -> Sent; subsequent cancel or complete returns Conflict
+    let sent = store_a
+        .complete_scheduled_send(&sch_due_a.id, "msg_sent_1", "prov_1")
+        .await
+        .unwrap();
+    assert_eq!(sent.status, ScheduledSendStatus::Sent);
+    assert_eq!(sent.sent_message_id.as_deref(), Some("msg_sent_1"));
+    assert_eq!(sent.provider_message_id.as_deref(), Some("prov_1"));
+    assert!(matches!(
+        store_a
+            .cancel_scheduled_send(&sch_due_a.id)
+            .await
+            .unwrap_err(),
+        AppError::Conflict(_)
+    ));
+    assert!(matches!(
+        store_a
+            .complete_scheduled_send(&sch_due_a.id, "msg_sent_2", "prov_2")
+            .await
+            .unwrap_err(),
+        AppError::Conflict(_)
+    ));
+
+    // Atomic fail Pending -> Failed; subsequent cancel returns Conflict
+    let failed = store_a
+        .fail_scheduled_send(&sch_fail_a.id, "smtp 550")
+        .await
+        .unwrap();
+    assert_eq!(failed.status, ScheduledSendStatus::Failed);
+    assert_eq!(failed.last_error.as_deref(), Some("smtp 550"));
+    assert!(matches!(
+        store_a
+            .cancel_scheduled_send(&sch_fail_a.id)
+            .await
+            .unwrap_err(),
+        AppError::Conflict(_)
+    ));
+
+    // Status filtering and limit on list_scheduled_sends
+    let all_a = store_a.list_scheduled_sends(None, 20).await.unwrap();
+    assert_eq!(all_a.len(), 4);
+    assert_eq!(
+        store_a
+            .list_scheduled_sends(Some(ScheduledSendStatus::Pending), 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store_a
+            .list_scheduled_sends(Some(ScheduledSendStatus::Sent), 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store_a
+            .list_scheduled_sends(Some(ScheduledSendStatus::Canceled), 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store_a
+            .list_scheduled_sends(Some(ScheduledSendStatus::Failed), 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store_a.list_scheduled_sends(None, 2).await.unwrap().len(),
+        2
+    );
+
+    // Clean up remaining pending items so shared Postgres DB stays tidy
+    store_a
+        .cancel_scheduled_send(&sch_future_a.id)
+        .await
+        .unwrap();
+    store_b.cancel_scheduled_send(&sch_due_b.id).await.unwrap();
+}
+
 /// Master contract test runner executing every `MailStore` invariant suite on isolated mailboxes.
 async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &str) {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -1841,6 +2140,8 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     let mb_contacts = format!("{prefix}-contacts-{suffix}@contract.test");
     let mb_ann = format!("{prefix}-ann-{suffix}@contract.test");
     let mb_idem = format!("{prefix}-idem-{suffix}@contract.test");
+    let mb_sched_a = format!("{prefix}-sched-a-{suffix}@contract.test");
+    let mb_sched_b = format!("{prefix}-sched-b-{suffix}@contract.test");
     let mb_alice = format!("{prefix}-alice-{suffix}@contract.test");
     let mb_bob = format!("{prefix}-bob-{suffix}@contract.test");
 
@@ -1852,6 +2153,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_contacts_stats_vip_filtering_and_patch(base_store.for_mailbox(&mb_contacts)).await;
     contract_thread_annotations(base_store.for_mailbox(&mb_ann)).await;
     contract_idempotency_keys_and_audit_log(base_store.for_mailbox(&mb_idem)).await;
+    contract_snooze_and_scheduled_sends(base_store.clone(), &mb_sched_a, &mb_sched_b).await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
 }
 

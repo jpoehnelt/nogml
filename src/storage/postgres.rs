@@ -36,12 +36,12 @@ use crate::{
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
         IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
         MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
-        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
-        compute_contact_is_vip, normalize_contact_email, normalize_optional_text,
-        parse_simple_email_address, validate_and_normalize_contact_email,
+        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
+        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
+        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
+        VIP_REPLY_THRESHOLD, WatchSubscription, compute_contact_is_vip, normalize_contact_email,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -63,7 +63,7 @@ const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 4;
+const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -361,6 +361,38 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_action_ts
     ON audit_log (mailbox_id, action, timestamp_ms DESC, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_actor_ts
     ON audit_log (mailbox_id, actor, timestamp_ms DESC, seq DESC);
+
+CREATE TABLE IF NOT EXISTS snoozed_threads (
+    mailbox_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    snooze_until_ms BIGINT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_snoozed_threads_due
+    ON snoozed_threads (snooze_until_ms, mailbox_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_snoozed_threads_mailbox_due
+    ON snoozed_threads (mailbox_id, snooze_until_ms, thread_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_sends (
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    send_at_ms BIGINT NOT NULL,
+    outbound_message_json TEXT NOT NULL,
+    reply_to_message_id TEXT,
+    thread_id TEXT,
+    sent_message_id TEXT,
+    provider_message_id TEXT,
+    last_error TEXT,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_sends_mailbox_status_send_at
+    ON scheduled_sends (mailbox_id, status, send_at_ms, id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_sends_due_status
+    ON scheduled_sends (status, send_at_ms, mailbox_id, id);
 "#;
 
 /// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
@@ -3238,6 +3270,12 @@ impl MailStore for PostgresStore {
         )
         .await
         .map_err(pg_err)?;
+        tx.execute(
+            "DELETE FROM snoozed_threads WHERE mailbox_id = $1 AND thread_id = $2",
+            &[&mb, &thread_id],
+        )
+        .await
+        .map_err(pg_err)?;
         tx.commit().await.map_err(pg_err)?;
         Ok(true)
     }
@@ -5689,6 +5727,435 @@ impl MailStore for PostgresStore {
         }
         Ok(results)
     }
+
+    async fn snooze_thread(&self, thread_id: &str, until_ms: i64) -> AppResult<SnoozedThread> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let created_at_ms = Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO snoozed_threads (mailbox_id, thread_id, snooze_until_ms, created_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (mailbox_id, thread_id) DO UPDATE SET
+                snooze_until_ms = EXCLUDED.snooze_until_ms,
+                created_at_ms = EXCLUDED.created_at_ms",
+            &[&mb, &thread_id, &until_ms, &created_at_ms],
+        )
+        .await
+        .map_err(pg_err)?;
+        Ok(SnoozedThread {
+            thread_id: thread_id.to_string(),
+            mailbox_id: self.mailbox_id.clone(),
+            snooze_until_ms: until_ms,
+            created_at_ms,
+        })
+    }
+
+    async fn unsnooze_thread(&self, thread_id: &str) -> AppResult<bool> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let deleted = conn
+            .execute(
+                "DELETE FROM snoozed_threads WHERE mailbox_id = $1 AND thread_id = $2",
+                &[&mb, &thread_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_snoozed_threads(
+        &self,
+        due_before_ms: Option<i64>,
+    ) -> AppResult<Vec<SnoozedThread>> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let rows = match due_before_ms {
+            Some(cutoff) => conn
+                .query(
+                    "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                     FROM snoozed_threads
+                     WHERE mailbox_id = $1 AND snooze_until_ms <= $2
+                     ORDER BY snooze_until_ms ASC, thread_id ASC",
+                    &[&mb, &cutoff],
+                )
+                .await
+                .map_err(pg_err)?,
+            None => conn
+                .query(
+                    "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                     FROM snoozed_threads
+                     WHERE mailbox_id = $1
+                     ORDER BY snooze_until_ms ASC, thread_id ASC",
+                    &[&mb],
+                )
+                .await
+                .map_err(pg_err)?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| SnoozedThread {
+                thread_id: r.get(0),
+                mailbox_id: r.get(1),
+                snooze_until_ms: r.get(2),
+                created_at_ms: r.get(3),
+            })
+            .collect())
+    }
+
+    async fn list_all_due_snoozes(&self, now_ms: i64) -> AppResult<Vec<SnoozedThread>> {
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                 FROM snoozed_threads
+                 WHERE snooze_until_ms <= $1
+                 ORDER BY snooze_until_ms ASC, mailbox_id ASC, thread_id ASC",
+                &[&now_ms],
+            )
+            .await
+            .map_err(pg_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SnoozedThread {
+                thread_id: r.get(0),
+                mailbox_id: r.get(1),
+                snooze_until_ms: r.get(2),
+                created_at_ms: r.get(3),
+            })
+            .collect())
+    }
+
+    async fn create_scheduled_send(&self, input: &NewScheduledSend) -> AppResult<ScheduledSend> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let id = input
+            .id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("sch_{}", Uuid::new_v4().simple()));
+        let outbound_json = serde_json::to_string(&input.outbound_message)?;
+        let status_str = ScheduledSendStatus::Pending.as_str();
+
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO scheduled_sends (
+                    mailbox_id, id, status, send_at_ms, outbound_message_json,
+                    reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                    last_error, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, $8)",
+                &[
+                    &mb,
+                    &id,
+                    &status_str,
+                    &input.send_at_ms,
+                    &outbound_json,
+                    &input.reply_to_message_id,
+                    &input.thread_id,
+                    &input.created_at_ms,
+                ],
+            )
+            .await;
+        if let Err(err) = inserted {
+            if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' already exists"
+                )));
+            }
+            return Err(pg_err(err));
+        }
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(ScheduledSend {
+            id,
+            mailbox_id: self.mailbox_id.clone(),
+            status: ScheduledSendStatus::Pending,
+            send_at_ms: input.send_at_ms,
+            outbound_message: input.outbound_message.clone(),
+            reply_to_message_id: input.reply_to_message_id.clone(),
+            thread_id: input.thread_id.clone(),
+            sent_message_id: None,
+            provider_message_id: None,
+            last_error: None,
+            created_at_ms: input.created_at_ms,
+            updated_at_ms: input.created_at_ms,
+        })
+    }
+
+    async fn get_scheduled_send(&self, id: &str) -> AppResult<Option<ScheduledSend>> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let row = conn
+            .query_opt(
+                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                        last_error, created_at_ms, updated_at_ms
+                 FROM scheduled_sends
+                 WHERE mailbox_id = $1 AND id = $2",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        row.as_ref().map(scheduled_send_from_row).transpose()
+    }
+
+    async fn list_scheduled_sends(
+        &self,
+        status: Option<ScheduledSendStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduledSend>> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let limit_i64 = if limit == 0 { 20 } else { limit } as i64;
+        let rows = match status {
+            None => conn
+                .query(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = $1
+                     ORDER BY send_at_ms ASC, created_at_ms ASC, id ASC
+                     LIMIT $2",
+                    &[&mb, &limit_i64],
+                )
+                .await
+                .map_err(pg_err)?,
+            Some(st) => {
+                let status_str = st.as_str();
+                conn.query(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = $1 AND status = $2
+                     ORDER BY send_at_ms ASC, created_at_ms ASC, id ASC
+                     LIMIT $3",
+                    &[&mb, &status_str, &limit_i64],
+                )
+                .await
+                .map_err(pg_err)?
+            }
+        };
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            results.push(scheduled_send_from_row(row)?);
+        }
+        Ok(results)
+    }
+
+    async fn cancel_scheduled_send(&self, id: &str) -> AppResult<ScheduledSend> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let now_ms = Utc::now().timestamp_millis();
+        let tx = conn.transaction().await.map_err(pg_err)?;
+
+        let existing_row = tx
+            .query_opt(
+                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                        last_error, created_at_ms, updated_at_ms
+                 FROM scheduled_sends
+                 WHERE mailbox_id = $1 AND id = $2
+                 FOR UPDATE",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        let existing = scheduled_send_from_row(&existing_row)?;
+
+        if existing.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                existing.status
+            )));
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE scheduled_sends
+                 SET status = 'canceled', updated_at_ms = $1
+                 WHERE mailbox_id = $2 AND id = $3 AND status = 'pending'",
+                &[&now_ms, &mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if changed != 1 {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is no longer pending"
+            )));
+        }
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(ScheduledSend {
+            status: ScheduledSendStatus::Canceled,
+            updated_at_ms: now_ms,
+            ..existing
+        })
+    }
+
+    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>> {
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                        last_error, created_at_ms, updated_at_ms
+                 FROM scheduled_sends
+                 WHERE status = 'pending' AND send_at_ms <= $1
+                 ORDER BY send_at_ms ASC, created_at_ms ASC, mailbox_id ASC, id ASC",
+                &[&now_ms],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            results.push(scheduled_send_from_row(row)?);
+        }
+        Ok(results)
+    }
+
+    async fn complete_scheduled_send(
+        &self,
+        id: &str,
+        sent_message_id: &str,
+        provider_message_id: &str,
+    ) -> AppResult<ScheduledSend> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let now_ms = Utc::now().timestamp_millis();
+        let tx = conn.transaction().await.map_err(pg_err)?;
+
+        let existing_row = tx
+            .query_opt(
+                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                        last_error, created_at_ms, updated_at_ms
+                 FROM scheduled_sends
+                 WHERE mailbox_id = $1 AND id = $2
+                 FOR UPDATE",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        let existing = scheduled_send_from_row(&existing_row)?;
+
+        if existing.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                existing.status
+            )));
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE scheduled_sends
+                 SET status = 'sent',
+                     sent_message_id = $1,
+                     provider_message_id = $2,
+                     last_error = NULL,
+                     updated_at_ms = $3
+                 WHERE mailbox_id = $4 AND id = $5 AND status = 'pending'",
+                &[&sent_message_id, &provider_message_id, &now_ms, &mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if changed != 1 {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is no longer pending"
+            )));
+        }
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(ScheduledSend {
+            status: ScheduledSendStatus::Sent,
+            sent_message_id: Some(sent_message_id.to_string()),
+            provider_message_id: Some(provider_message_id.to_string()),
+            last_error: None,
+            updated_at_ms: now_ms,
+            ..existing
+        })
+    }
+
+    async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend> {
+        let mut conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let now_ms = Utc::now().timestamp_millis();
+        let tx = conn.transaction().await.map_err(pg_err)?;
+
+        let existing_row = tx
+            .query_opt(
+                "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                        reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                        last_error, created_at_ms, updated_at_ms
+                 FROM scheduled_sends
+                 WHERE mailbox_id = $1 AND id = $2
+                 FOR UPDATE",
+                &[&mb, &id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        let existing = scheduled_send_from_row(&existing_row)?;
+
+        if existing.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                existing.status
+            )));
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE scheduled_sends
+                 SET status = 'failed',
+                     last_error = $1,
+                     updated_at_ms = $2
+                 WHERE mailbox_id = $3 AND id = $4 AND status = 'pending'",
+                &[&error, &now_ms, &mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if changed != 1 {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is no longer pending"
+            )));
+        }
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(ScheduledSend {
+            status: ScheduledSendStatus::Failed,
+            last_error: Some(error.to_string()),
+            updated_at_ms: now_ms,
+            ..existing
+        })
+    }
+}
+
+fn scheduled_send_from_row(row: &Row) -> AppResult<ScheduledSend> {
+    let status_raw: String = row.get(2);
+    let status = ScheduledSendStatus::parse_str(&status_raw).ok_or_else(|| {
+        AppError::Storage(format!("Unknown scheduled_send status '{status_raw}'"))
+    })?;
+    let outbound_json: String = row.get(4);
+    let outbound_message = serde_json::from_str(&outbound_json)
+        .map_err(|e| AppError::Storage(format!("Corrupt outbound_message_json: {e}")))?;
+    Ok(ScheduledSend {
+        id: row.get(0),
+        mailbox_id: row.get(1),
+        status,
+        send_at_ms: row.get(3),
+        outbound_message,
+        reply_to_message_id: row.get(5),
+        thread_id: row.get(6),
+        sent_message_id: row.get(7),
+        provider_message_id: row.get(8),
+        last_error: row.get(9),
+        created_at_ms: row.get(10),
+        updated_at_ms: row.get(11),
+    })
 }
 
 fn contact_from_row(row: &Row) -> ContactRecord {

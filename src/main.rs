@@ -924,6 +924,9 @@ enum MailAction {
         /// Optional idempotency key to deduplicate retries for 24h.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Optional future RFC 3339 timestamp to schedule outbound delivery.
+        #[arg(long)]
+        send_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Create a draft email.
     Draft {
@@ -1737,6 +1740,7 @@ async fn run_remote_mail(
             reply_to,
             dry_run,
             idempotency_key,
+            send_at,
         } => {
             let mut req: AiSendEmailRequest = match payload {
                 Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
@@ -1750,6 +1754,7 @@ async fn run_remote_mail(
                     reply_to_message_id: reply_to,
                     dry_run,
                     idempotency_key: idempotency_key.clone(),
+                    send_at,
                 },
             };
             if dry_run {
@@ -1757,6 +1762,9 @@ async fn run_remote_mail(
             }
             if req.idempotency_key.is_none() && idempotency_key.is_some() {
                 req.idempotency_key = idempotency_key;
+            }
+            if req.send_at.is_none() && send_at.is_some() {
+                req.send_at = send_at;
             }
             let resp = with_optional_bearer(
                 client.post(format!("{base}/v1/messages/send")).json(&req),
@@ -2089,6 +2097,14 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 None
             };
 
+            let scheduler_handle = {
+                let scheduler_state = state.clone();
+                let scheduler_rx = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    ai::run_background_scheduler(scheduler_state, scheduler_rx).await;
+                })
+            };
+
             let router = build_router(state);
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -2103,6 +2119,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 })
                 .await;
 
+            let _ = scheduler_handle.await;
             if let Some(h) = imap_handle {
                 let _ = h.await;
             }
@@ -2704,6 +2721,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     reply_to,
                     dry_run,
                     idempotency_key,
+                    send_at,
                 } => {
                     let mut req: AiSendEmailRequest = match payload {
                         Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
@@ -2717,6 +2735,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                             reply_to_message_id: reply_to,
                             dry_run,
                             idempotency_key: idempotency_key.clone(),
+                            send_at,
                         },
                     };
                     if dry_run {
@@ -2724,6 +2743,9 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     }
                     if req.idempotency_key.is_none() && idempotency_key.is_some() {
                         req.idempotency_key = idempotency_key;
+                    }
+                    if req.send_at.is_none() && send_at.is_some() {
+                        req.send_at = send_at;
                     }
                     let res = ai::execute_send_email(&state, req).await?;
                     emit_output(res, fields.as_deref(), json_flag)?;

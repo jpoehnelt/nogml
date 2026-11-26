@@ -33,12 +33,12 @@ use crate::{
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
         IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
         MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
-        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
-        normalize_contact_email, normalize_optional_text, parse_simple_email_address,
-        validate_and_normalize_contact_email,
+        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
+        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
+        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
+        WatchSubscription, compute_contact_is_vip, normalize_contact_email,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -333,6 +333,38 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_action_ts
     ON audit_log (mailbox_id, action, timestamp_ms DESC, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_actor_ts
     ON audit_log (mailbox_id, actor, timestamp_ms DESC, seq DESC);
+
+CREATE TABLE IF NOT EXISTS snoozed_threads (
+    mailbox_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    snooze_until_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_snoozed_threads_due
+    ON snoozed_threads (snooze_until_ms, mailbox_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_snoozed_threads_mailbox_due
+    ON snoozed_threads (mailbox_id, snooze_until_ms, thread_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_sends (
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    send_at_ms INTEGER NOT NULL,
+    outbound_message_json TEXT NOT NULL,
+    reply_to_message_id TEXT,
+    thread_id TEXT,
+    sent_message_id TEXT,
+    provider_message_id TEXT,
+    last_error TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_sends_mailbox_status_send_at
+    ON scheduled_sends (mailbox_id, status, send_at_ms, id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_sends_due_status
+    ON scheduled_sends (status, send_at_ms, mailbox_id, id);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -3190,6 +3222,11 @@ impl MailStore for SqliteStore {
                 params![mb, &thread_id],
             )
             .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM snoozed_threads WHERE mailbox_id = ?1 AND thread_id = ?2",
+                params![mb, &thread_id],
+            )
+            .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
             Ok(true)
         })
@@ -5832,6 +5869,499 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn snooze_thread(&self, thread_id: &str, until_ms: i64) -> AppResult<SnoozedThread> {
+        let thread_id = thread_id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let created_at_ms = Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT INTO snoozed_threads (mailbox_id, thread_id, snooze_until_ms, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (mailbox_id, thread_id) DO UPDATE SET
+                    snooze_until_ms = excluded.snooze_until_ms,
+                    created_at_ms = excluded.created_at_ms",
+                params![mb, thread_id, until_ms, created_at_ms],
+            )
+            .map_err(sql_err)?;
+            Ok(SnoozedThread {
+                thread_id,
+                mailbox_id: mb.to_string(),
+                snooze_until_ms: until_ms,
+                created_at_ms,
+            })
+        })
+        .await
+    }
+
+    async fn unsnooze_thread(&self, thread_id: &str) -> AppResult<bool> {
+        let thread_id = thread_id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM snoozed_threads WHERE mailbox_id = ?1 AND thread_id = ?2",
+                    params![mb, thread_id],
+                )
+                .map_err(sql_err)?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+
+    async fn list_snoozed_threads(
+        &self,
+        due_before_ms: Option<i64>,
+    ) -> AppResult<Vec<SnoozedThread>> {
+        self.run_blocking(move |conn, mb| {
+            let mut results = Vec::new();
+            match due_before_ms {
+                Some(cutoff) => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                             FROM snoozed_threads
+                             WHERE mailbox_id = ?1 AND snooze_until_ms <= ?2
+                             ORDER BY snooze_until_ms ASC, thread_id ASC",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![mb, cutoff], |r| {
+                            Ok(SnoozedThread {
+                                thread_id: r.get(0)?,
+                                mailbox_id: r.get(1)?,
+                                snooze_until_ms: r.get(2)?,
+                                created_at_ms: r.get(3)?,
+                            })
+                        })
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        results.push(row.map_err(sql_err)?);
+                    }
+                }
+                None => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                             FROM snoozed_threads
+                             WHERE mailbox_id = ?1
+                             ORDER BY snooze_until_ms ASC, thread_id ASC",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![mb], |r| {
+                            Ok(SnoozedThread {
+                                thread_id: r.get(0)?,
+                                mailbox_id: r.get(1)?,
+                                snooze_until_ms: r.get(2)?,
+                                created_at_ms: r.get(3)?,
+                            })
+                        })
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        results.push(row.map_err(sql_err)?);
+                    }
+                }
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn list_all_due_snoozes(&self, now_ms: i64) -> AppResult<Vec<SnoozedThread>> {
+        self.run_blocking(move |conn, _mb| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT thread_id, mailbox_id, snooze_until_ms, created_at_ms
+                     FROM snoozed_threads
+                     WHERE snooze_until_ms <= ?1
+                     ORDER BY snooze_until_ms ASC, mailbox_id ASC, thread_id ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![now_ms], |r| {
+                    Ok(SnoozedThread {
+                        thread_id: r.get(0)?,
+                        mailbox_id: r.get(1)?,
+                        snooze_until_ms: r.get(2)?,
+                        created_at_ms: r.get(3)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(sql_err)?);
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn create_scheduled_send(&self, input: &NewScheduledSend) -> AppResult<ScheduledSend> {
+        let input = input.clone();
+        self.run_blocking(move |conn, mb| {
+            let id = input
+                .id
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("sch_{}", Uuid::new_v4().simple()));
+            let outbound_json = serde_json::to_string(&input.outbound_message)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let inserted = tx.execute(
+                "INSERT INTO scheduled_sends (
+                    mailbox_id, id, status, send_at_ms, outbound_message_json,
+                    reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                    last_error, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, ?8)",
+                params![
+                    mb,
+                    id,
+                    ScheduledSendStatus::Pending.as_str(),
+                    input.send_at_ms,
+                    outbound_json,
+                    input.reply_to_message_id,
+                    input.thread_id,
+                    input.created_at_ms,
+                ],
+            );
+            if let Err(err) = inserted {
+                if let rusqlite::Error::SqliteFailure(ref sf, _) = err
+                    && sf.code == rusqlite::ErrorCode::ConstraintViolation
+                {
+                    return Err(AppError::Conflict(format!(
+                        "Scheduled send '{id}' already exists"
+                    )));
+                }
+                return Err(sql_err(err));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            Ok(ScheduledSend {
+                id,
+                mailbox_id: mb.to_string(),
+                status: ScheduledSendStatus::Pending,
+                send_at_ms: input.send_at_ms,
+                outbound_message: input.outbound_message,
+                reply_to_message_id: input.reply_to_message_id,
+                thread_id: input.thread_id,
+                sent_message_id: None,
+                provider_message_id: None,
+                last_error: None,
+                created_at_ms: input.created_at_ms,
+                updated_at_ms: input.created_at_ms,
+            })
+        })
+        .await
+    }
+
+    async fn get_scheduled_send(&self, id: &str) -> AppResult<Option<ScheduledSend>> {
+        let id = id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let row = conn
+                .query_row(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
+                    scheduled_send_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            row.transpose()
+        })
+        .await
+    }
+
+    async fn list_scheduled_sends(
+        &self,
+        status: Option<ScheduledSendStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduledSend>> {
+        let limit = if limit == 0 { 20 } else { limit } as i64;
+        self.run_blocking(move |conn, mb| {
+            let mut results = Vec::new();
+            match status {
+                None => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                                    reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                                    last_error, created_at_ms, updated_at_ms
+                             FROM scheduled_sends
+                             WHERE mailbox_id = ?1
+                             ORDER BY send_at_ms ASC, created_at_ms ASC, id ASC
+                             LIMIT ?2",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![mb, limit], scheduled_send_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        results.push(row.map_err(sql_err)??);
+                    }
+                }
+                Some(st) => {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                                    reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                                    last_error, created_at_ms, updated_at_ms
+                             FROM scheduled_sends
+                             WHERE mailbox_id = ?1 AND status = ?2
+                             ORDER BY send_at_ms ASC, created_at_ms ASC, id ASC
+                             LIMIT ?3",
+                        )
+                        .map_err(sql_err)?;
+                    let rows = stmt
+                        .query_map(params![mb, st.as_str(), limit], scheduled_send_from_row)
+                        .map_err(sql_err)?;
+                    for row in rows {
+                        results.push(row.map_err(sql_err)??);
+                    }
+                }
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn cancel_scheduled_send(&self, id: &str) -> AppResult<ScheduledSend> {
+        let id = id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let now_ms = Utc::now().timestamp_millis();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = tx
+                .query_row(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
+                    scheduled_send_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))??;
+
+            if existing.status != ScheduledSendStatus::Pending {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is already {}",
+                    existing.status
+                )));
+            }
+
+            let changed = tx
+                .execute(
+                    "UPDATE scheduled_sends
+                     SET status = 'canceled', updated_at_ms = ?1
+                     WHERE mailbox_id = ?2 AND id = ?3 AND status = 'pending'",
+                    params![now_ms, mb, id],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is no longer pending"
+                )));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            Ok(ScheduledSend {
+                status: ScheduledSendStatus::Canceled,
+                updated_at_ms: now_ms,
+                ..existing
+            })
+        })
+        .await
+    }
+
+    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>> {
+        self.run_blocking(move |conn, _mb| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE status = 'pending' AND send_at_ms <= ?1
+                     ORDER BY send_at_ms ASC, created_at_ms ASC, mailbox_id ASC, id ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![now_ms], scheduled_send_from_row)
+                .map_err(sql_err)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(sql_err)??);
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn complete_scheduled_send(
+        &self,
+        id: &str,
+        sent_message_id: &str,
+        provider_message_id: &str,
+    ) -> AppResult<ScheduledSend> {
+        let id = id.to_string();
+        let sent_message_id = sent_message_id.to_string();
+        let provider_message_id = provider_message_id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let now_ms = Utc::now().timestamp_millis();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = tx
+                .query_row(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
+                    scheduled_send_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))??;
+
+            if existing.status != ScheduledSendStatus::Pending {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is already {}",
+                    existing.status
+                )));
+            }
+
+            let changed = tx
+                .execute(
+                    "UPDATE scheduled_sends
+                     SET status = 'sent',
+                         sent_message_id = ?1,
+                         provider_message_id = ?2,
+                         last_error = NULL,
+                         updated_at_ms = ?3
+                     WHERE mailbox_id = ?4 AND id = ?5 AND status = 'pending'",
+                    params![sent_message_id, provider_message_id, now_ms, mb, id],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is no longer pending"
+                )));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            Ok(ScheduledSend {
+                status: ScheduledSendStatus::Sent,
+                sent_message_id: Some(sent_message_id),
+                provider_message_id: Some(provider_message_id),
+                last_error: None,
+                updated_at_ms: now_ms,
+                ..existing
+            })
+        })
+        .await
+    }
+
+    async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend> {
+        let id = id.to_string();
+        let error = error.to_string();
+        self.run_blocking(move |conn, mb| {
+            let now_ms = Utc::now().timestamp_millis();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = tx
+                .query_row(
+                    "SELECT id, mailbox_id, status, send_at_ms, outbound_message_json,
+                            reply_to_message_id, thread_id, sent_message_id, provider_message_id,
+                            last_error, created_at_ms, updated_at_ms
+                     FROM scheduled_sends
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, id],
+                    scheduled_send_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))??;
+
+            if existing.status != ScheduledSendStatus::Pending {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is already {}",
+                    existing.status
+                )));
+            }
+
+            let changed = tx
+                .execute(
+                    "UPDATE scheduled_sends
+                     SET status = 'failed',
+                         last_error = ?1,
+                         updated_at_ms = ?2
+                     WHERE mailbox_id = ?3 AND id = ?4 AND status = 'pending'",
+                    params![error, now_ms, mb, id],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(AppError::Conflict(format!(
+                    "Scheduled send '{id}' is no longer pending"
+                )));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            Ok(ScheduledSend {
+                status: ScheduledSendStatus::Failed,
+                last_error: Some(error),
+                updated_at_ms: now_ms,
+                ..existing
+            })
+        })
+        .await
+    }
+}
+
+fn scheduled_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<ScheduledSend>> {
+    let id: String = row.get(0)?;
+    let mailbox_id: String = row.get(1)?;
+    let status_raw: String = row.get(2)?;
+    let send_at_ms: i64 = row.get(3)?;
+    let outbound_json: String = row.get(4)?;
+    let reply_to_message_id: Option<String> = row.get(5)?;
+    let thread_id: Option<String> = row.get(6)?;
+    let sent_message_id: Option<String> = row.get(7)?;
+    let provider_message_id: Option<String> = row.get(8)?;
+    let last_error: Option<String> = row.get(9)?;
+    let created_at_ms: i64 = row.get(10)?;
+    let updated_at_ms: i64 = row.get(11)?;
+
+    let parsed = (|| -> AppResult<ScheduledSend> {
+        let status = ScheduledSendStatus::parse_str(&status_raw).ok_or_else(|| {
+            AppError::Storage(format!("Unknown scheduled_send status '{status_raw}'"))
+        })?;
+        let outbound_message = serde_json::from_str(&outbound_json)
+            .map_err(|e| AppError::Storage(format!("Corrupt outbound_message_json: {e}")))?;
+        Ok(ScheduledSend {
+            id,
+            mailbox_id,
+            status,
+            send_at_ms,
+            outbound_message,
+            reply_to_message_id,
+            thread_id,
+            sent_message_id,
+            provider_message_id,
+            last_error,
+            created_at_ms,
+            updated_at_ms,
+        })
+    })();
+
+    Ok(parsed)
 }
 
 fn contact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRecord> {

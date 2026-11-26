@@ -95,6 +95,8 @@ pub struct AppState {
     pub resumable_uploads: Arc<ResumableUploadStore>,
     /// Tracks approval IDs currently being approved/rejected to prevent concurrent double-sends.
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
+    /// Tracks scheduled send IDs currently being dispatched or canceled to prevent concurrent races.
+    pub scheduled_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
     pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
     /// Per-`(mailbox_id, scope, idempotency_key)` single-flight locks preventing concurrent double-sends.
@@ -217,6 +219,7 @@ impl AppState {
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
@@ -298,6 +301,7 @@ impl AppState {
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
@@ -385,6 +389,7 @@ impl AppState {
             sync_lock,
             resumable_uploads: self.resumable_uploads.clone(),
             approval_in_flight: self.approval_in_flight.clone(),
+            scheduled_in_flight: self.scheduled_in_flight.clone(),
             used_oauth_codes: self.used_oauth_codes.clone(),
             idempotency_locks: self.idempotency_locks.clone(),
             primary_mailbox_id: self.primary_mailbox_id.clone(),

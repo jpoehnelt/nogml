@@ -1305,6 +1305,74 @@ mod tests {
         ) -> AppResult<Vec<crate::storage::AuditLogEntry>> {
             Ok(Vec::new())
         }
+        async fn snooze_thread(
+            &self,
+            _thread_id: &str,
+            _until_ms: i64,
+        ) -> AppResult<crate::storage::SnoozedThread> {
+            unreachable!()
+        }
+        async fn unsnooze_thread(&self, _thread_id: &str) -> AppResult<bool> {
+            Ok(false)
+        }
+        async fn list_snoozed_threads(
+            &self,
+            _due_before_ms: Option<i64>,
+        ) -> AppResult<Vec<crate::storage::SnoozedThread>> {
+            Ok(Vec::new())
+        }
+        async fn list_all_due_snoozes(
+            &self,
+            _now_ms: i64,
+        ) -> AppResult<Vec<crate::storage::SnoozedThread>> {
+            Ok(Vec::new())
+        }
+        async fn create_scheduled_send(
+            &self,
+            _input: &crate::storage::NewScheduledSend,
+        ) -> AppResult<crate::storage::ScheduledSend> {
+            unreachable!()
+        }
+        async fn get_scheduled_send(
+            &self,
+            _id: &str,
+        ) -> AppResult<Option<crate::storage::ScheduledSend>> {
+            Ok(None)
+        }
+        async fn list_scheduled_sends(
+            &self,
+            _status: Option<crate::storage::ScheduledSendStatus>,
+            _limit: usize,
+        ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
+            Ok(Vec::new())
+        }
+        async fn cancel_scheduled_send(
+            &self,
+            _id: &str,
+        ) -> AppResult<crate::storage::ScheduledSend> {
+            unreachable!()
+        }
+        async fn claim_due_scheduled_sends(
+            &self,
+            _now_ms: i64,
+        ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
+            Ok(Vec::new())
+        }
+        async fn complete_scheduled_send(
+            &self,
+            _id: &str,
+            _sent_message_id: &str,
+            _provider_message_id: &str,
+        ) -> AppResult<crate::storage::ScheduledSend> {
+            unreachable!()
+        }
+        async fn fail_scheduled_send(
+            &self,
+            _id: &str,
+            _error: &str,
+        ) -> AppResult<crate::storage::ScheduledSend> {
+            unreachable!()
+        }
     }
 
     fn test_state(
