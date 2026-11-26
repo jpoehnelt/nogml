@@ -21,11 +21,12 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LABEL_DRAFT, LABEL_INBOX,
-        LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, PopSettings,
-        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
-        UnsubscribeInfo, VacationSettings, WaitingOn, apply_thread_annotation_patch,
-        default_extracted_object, is_system_label, truncate_to_millis,
+        AttachmentMeta, AutoForwarding, Delegate, EmailAddress, ForwardingAddress, GmailFilter,
+        ImapSettings, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH,
+        LABEL_UNREAD, LabelColor, LanguageSettings, PopSettings, Profile, SYSTEM_LABEL_IDS, SendAs,
+        ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary, UnsubscribeInfo, VacationSettings,
+        WaitingOn, apply_thread_annotation_patch, default_extracted_object, is_system_label,
+        truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -964,6 +965,15 @@ fn ensure_mailbox_seeded(conn: &mut Connection, mailbox_id: &str) -> AppResult<(
     )?;
     seed_setting_if_missing(&tx, mailbox_id, "imap", &defaults.imap)?;
     seed_setting_if_missing(&tx, mailbox_id, "pop", &defaults.pop)?;
+    seed_setting_if_missing(&tx, mailbox_id, "filters", &defaults.filters)?;
+    seed_setting_if_missing(
+        &tx,
+        mailbox_id,
+        "forwarding_addresses",
+        &defaults.forwarding_addresses,
+    )?;
+    seed_setting_if_missing(&tx, mailbox_id, "delegates", &defaults.delegates)?;
+    seed_setting_if_missing(&tx, mailbox_id, "language", &defaults.language)?;
 
     tx.commit().map_err(sql_err)?;
     Ok(())
@@ -5909,6 +5919,87 @@ impl MailStore for SqliteStore {
         .await
     }
 
+    async fn set_message_upstream_ids(
+        &self,
+        id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<Option<StoredMessage>> {
+        let id = id.to_string();
+        let ugid = upstream_gmail_id.to_string();
+        let utid = upstream_thread_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        self.run_blocking(move |conn, mb| {
+            let updated = conn
+                .execute(
+                    "UPDATE messages
+                     SET upstream_gmail_id = ?1,
+                         upstream_thread_id = COALESCE(?2, upstream_thread_id)
+                     WHERE mailbox_id = ?3 AND id = ?4",
+                    params![&ugid, &utid, mb, &id],
+                )
+                .map_err(sql_err)?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            load_message_by_id(conn, mb, &id)
+        })
+        .await
+    }
+
+    async fn set_label_upstream_id(
+        &self,
+        id: &str,
+        upstream_label_id: &str,
+    ) -> AppResult<Option<StoredLabel>> {
+        let id = id.to_string();
+        let ulid = upstream_label_id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let updated = conn
+                .execute(
+                    "UPDATE labels SET upstream_label_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                    params![&ulid, mb, &id],
+                )
+                .map_err(sql_err)?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            load_label_with_counts(conn, mb, &id)
+        })
+        .await
+    }
+
+    async fn get_sync_metadata(&self, key: &str) -> AppResult<Option<String>> {
+        let full_key = format!("sync_meta:{key}");
+        self.run_blocking(move |conn, mb| {
+            conn.query_row(
+                "SELECT value_json FROM settings WHERE mailbox_id = ?1 AND key = ?2",
+                params![mb, &full_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    async fn put_sync_metadata(&self, key: &str, value_json: &str) -> AppResult<()> {
+        let full_key = format!("sync_meta:{key}");
+        let value = value_json.to_string();
+        self.run_blocking(move |conn, mb| {
+            conn.execute(
+                "INSERT INTO settings (mailbox_id, key, value_json) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(mailbox_id, key) DO UPDATE SET value_json = excluded.value_json",
+                params![mb, &full_key, &value],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn set_watch(&self, watch: WatchSubscription) -> AppResult<WatchSubscription> {
         self.run_blocking(move |conn, mb| {
             let labels_json = serde_json::to_string(&watch.label_ids)
@@ -5982,12 +6073,25 @@ impl MailStore for SqliteStore {
                 read_setting(conn, mb, "auto_forwarding")?.unwrap_or(defaults.auto_forwarding);
             let imap: ImapSettings = read_setting(conn, mb, "imap")?.unwrap_or(defaults.imap);
             let pop: PopSettings = read_setting(conn, mb, "pop")?.unwrap_or(defaults.pop);
+            let filters: Vec<GmailFilter> =
+                read_setting(conn, mb, "filters")?.unwrap_or(defaults.filters);
+            let forwarding_addresses: Vec<ForwardingAddress> =
+                read_setting(conn, mb, "forwarding_addresses")?
+                    .unwrap_or(defaults.forwarding_addresses);
+            let delegates: Vec<Delegate> =
+                read_setting(conn, mb, "delegates")?.unwrap_or(defaults.delegates);
+            let language: LanguageSettings =
+                read_setting(conn, mb, "language")?.unwrap_or(defaults.language);
             Ok(UserSettings {
                 send_as,
                 vacation,
                 auto_forwarding,
                 imap,
                 pop,
+                filters,
+                forwarding_addresses,
+                delegates,
+                language,
             })
         })
         .await
@@ -6003,6 +6107,15 @@ impl MailStore for SqliteStore {
             write_setting(&tx, mb, "auto_forwarding", &settings.auto_forwarding)?;
             write_setting(&tx, mb, "imap", &settings.imap)?;
             write_setting(&tx, mb, "pop", &settings.pop)?;
+            write_setting(&tx, mb, "filters", &settings.filters)?;
+            write_setting(
+                &tx,
+                mb,
+                "forwarding_addresses",
+                &settings.forwarding_addresses,
+            )?;
+            write_setting(&tx, mb, "delegates", &settings.delegates)?;
+            write_setting(&tx, mb, "language", &settings.language)?;
             tx.commit().map_err(sql_err)?;
             Ok(settings)
         })

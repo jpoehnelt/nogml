@@ -22,9 +22,10 @@ use crate::{
     config::{Config, StorageBackend},
     error::{AppError, AppResult},
     models::{
-        AttachmentMeta, AutoForwarding, ContactSummary, EmailAddress, ImapSettings, LABEL_DRAFT,
-        LABEL_STARRED, LABEL_UNREAD, LabelColor, PopSettings, Profile, SendAs, ThreadSummary,
-        UnsubscribeInfo, VacationSettings,
+        AttachmentMeta, AutoForwarding, ContactSummary, Delegate, EmailAddress, ForwardingAddress,
+        GmailFilter, ImapSettings, LABEL_DRAFT, LABEL_STARRED, LABEL_UNREAD, LabelColor,
+        LanguageSettings, PopSettings, Profile, SendAs, ThreadSummary, UnsubscribeInfo,
+        VacationSettings,
     },
     transport::OutboundMessage,
 };
@@ -1140,6 +1141,12 @@ pub fn apply_inbox_rule_patch(
     existing.updated_at_ms = now_ms;
     existing
 }
+fn default_language_settings() -> LanguageSettings {
+    LanguageSettings {
+        display_language: "en".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -1147,6 +1154,14 @@ pub struct UserSettings {
     pub auto_forwarding: AutoForwarding,
     pub imap: ImapSettings,
     pub pop: PopSettings,
+    #[serde(default)]
+    pub filters: Vec<GmailFilter>,
+    #[serde(default)]
+    pub forwarding_addresses: Vec<ForwardingAddress>,
+    #[serde(default)]
+    pub delegates: Vec<Delegate>,
+    #[serde(default = "default_language_settings")]
+    pub language: LanguageSettings,
 }
 
 impl UserSettings {
@@ -1181,6 +1196,10 @@ impl UserSettings {
                 access_window: Some("disabled".to_string()),
                 disposition: Some("leaveInInbox".to_string()),
             },
+            filters: Vec::new(),
+            forwarding_addresses: Vec::new(),
+            delegates: Vec::new(),
+            language: default_language_settings(),
         }
     }
 }
@@ -1608,6 +1627,40 @@ pub trait MailStore: Send + Sync {
     async fn get_sync_state(&self, account_key: &str) -> AppResult<Option<SyncState>>;
     async fn save_sync_state(&self, state: SyncState) -> AppResult<()>;
     async fn list_sync_states(&self) -> AppResult<Vec<SyncState>>;
+
+    /// Persist upstream Gmail message and optional thread IDs on an existing local message
+    /// (for example after `messages.import` pushback or `GmailApiTransport::send`).
+    async fn set_message_upstream_ids(
+        &self,
+        id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<Option<StoredMessage>> {
+        let _ = (id, upstream_gmail_id, upstream_thread_id);
+        Ok(None)
+    }
+
+    /// Persist `upstream_label_id` on an existing local custom label after `users.labels.create`.
+    async fn set_label_upstream_id(
+        &self,
+        id: &str,
+        upstream_label_id: &str,
+    ) -> AppResult<Option<StoredLabel>> {
+        let _ = (id, upstream_label_id);
+        Ok(None)
+    }
+
+    /// Read opaque per-mailbox sync metadata JSON stored under `key` (zero-schema KV).
+    async fn get_sync_metadata(&self, key: &str) -> AppResult<Option<String>> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Persist opaque per-mailbox sync metadata JSON under `key` (zero-schema KV).
+    async fn put_sync_metadata(&self, key: &str, value_json: &str) -> AppResult<()> {
+        let _ = (key, value_json);
+        Ok(())
+    }
 
     // --- Gmail Watch & User Settings (Superhuman compatibility) ---
     async fn set_watch(&self, watch: WatchSubscription) -> AppResult<WatchSubscription>;

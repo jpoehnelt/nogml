@@ -942,10 +942,10 @@ impl MailStore for TestMailStore {
         Ok(())
     }
     async fn get_settings(&self) -> AppResult<UserSettings> {
-        unimplemented!()
+        Ok(UserSettings::default_for_email(self.mailbox_id()))
     }
-    async fn save_settings(&self, _: UserSettings) -> AppResult<UserSettings> {
-        unimplemented!()
+    async fn save_settings(&self, settings: UserSettings) -> AppResult<UserSettings> {
+        Ok(settings)
     }
     async fn create_pending_approval(
         &self,

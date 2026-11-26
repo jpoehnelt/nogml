@@ -470,6 +470,94 @@ pub struct PopSettings {
     pub disposition: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCriteria {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negated_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_attachment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_chats: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_comparison: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_label_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_label_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailFilter {
+    #[serde(default)]
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<FilterCriteria>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<FilterAction>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListFiltersResponse {
+    pub filter: Vec<GmailFilter>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardingAddress {
+    #[serde(default)]
+    pub forwarding_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListForwardingAddressesResponse {
+    pub forwarding_addresses: Vec<ForwardingAddress>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Delegate {
+    #[serde(default)]
+    pub delegate_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDelegatesResponse {
+    pub delegates: Vec<Delegate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageSettings {
+    #[serde(default)]
+    pub display_language: String,
+}
+
 // ============================================================================
 // Resend API & Webhook Models
 // ============================================================================

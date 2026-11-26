@@ -1,14 +1,15 @@
 //! Lightweight async Tokio SMTP submission transport (`SmtpTransport`).
 //!
 //! Supports plaintext TCP (local relays and tests), `STARTTLS`, and implicit TLS (SMTPS)
-//! via `tokio-rustls` + `webpki-roots`, `EHLO`, `AUTH PLAIN` / `AUTH LOGIN`, `MAIL FROM`,
-//! `RCPT TO` across `to`/`cc`/`bcc`, RFC 5321 dot-stuffed `DATA` preserving verbatim
-//! `OutboundMessage.raw_rfc2822`, and `QUIT`.
+//! via `tokio-rustls` + `webpki-roots`, `EHLO`, `AUTH PLAIN` / `AUTH LOGIN` / `AUTH XOAUTH2`,
+//! `MAIL FROM`, `RCPT TO` across `to`/`cc`/`bcc`, RFC 5321 dot-stuffed `DATA` preserving
+//! verbatim `OutboundMessage.raw_rfc2822`, and `QUIT`.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
+use reqwest::Client;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
 use tokio::{
@@ -17,12 +18,14 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
     config::{Config, SmtpTlsMode},
     error::{AppError, AppResult},
     storage::parse_simple_email_address,
+    sync::gmail_api::{acquire_access_token, invalidate_access_token},
     transport::{
         MailTransport, OutboundMessage, SendOutcome, TransportCapabilities, ensure_raw_rfc2822,
     },
@@ -34,6 +37,87 @@ const SMTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SMTP_RESPONSE_LINES: usize = 128;
 const MAX_SMTP_LINE_BYTES: usize = 64 * 1024;
 
+/// OAuth2 credentials for SMTP `AUTH XOAUTH2` (for example `smtp.gmail.com:587`).
+///
+/// Implements a custom [`std::fmt::Debug`] that replaces all tokens and secrets
+/// with `"[REDACTED]"`.
+#[derive(Clone)]
+pub struct SmtpOAuth2Config {
+    pub access_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub refresh_token: Option<String>,
+    pub token_url: String,
+}
+
+impl std::fmt::Debug for SmtpOAuth2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |opt: &Option<String>| {
+            opt.as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|_| crate::secrets::REDACTED)
+        };
+        f.debug_struct("SmtpOAuth2Config")
+            .field("access_token", &redact(&self.access_token))
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redact(&self.client_secret))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("token_url", &self.token_url)
+            .finish()
+    }
+}
+
+impl SmtpOAuth2Config {
+    /// Returns `true` when refresh-token exchange is configured and no static access token overrides it.
+    pub fn can_refresh(&self) -> bool {
+        let has_static = self
+            .access_token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        !has_static
+            && self
+                .client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && self
+                .client_secret
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && self
+                .refresh_token
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    fn to_oauth_config(&self) -> Config {
+        Config {
+            gmail_access_token: self.access_token.clone(),
+            gmail_client_id: self.client_id.clone(),
+            gmail_client_secret: self.client_secret.clone(),
+            gmail_refresh_token: self.refresh_token.clone(),
+            gmail_oauth_token_url: self.token_url.clone(),
+            ..Config::default()
+        }
+    }
+
+    async fn acquire_token(&self, client: &Client) -> AppResult<String> {
+        let cfg = self.to_oauth_config();
+        acquire_access_token(client, &cfg).await
+    }
+
+    fn invalidate_cached_token(&self) {
+        let cfg = self.to_oauth_config();
+        invalidate_access_token(&cfg);
+    }
+}
+
+/// Encode a SASL `XOAUTH2` initial client response:
+/// `base64("user=<username>\x01auth=Bearer <access_token>\x01\x01")`.
+pub fn build_xoauth2_sasl_payload(username: &str, access_token: &str) -> String {
+    let raw = format!("user={username}\x01auth=Bearer {access_token}\x01\x01");
+    general_purpose::STANDARD.encode(raw.as_bytes())
+}
+
 /// Configuration for [`SmtpTransport`].
 #[derive(Clone)]
 pub struct SmtpConfig {
@@ -42,6 +126,7 @@ pub struct SmtpConfig {
     pub tls_mode: SmtpTlsMode,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub oauth2: Option<SmtpOAuth2Config>,
     pub helo_domain: String,
     pub default_from: String,
 }
@@ -61,6 +146,7 @@ impl std::fmt::Debug for SmtpConfig {
                     .filter(|s| !s.is_empty())
                     .map(|_| crate::secrets::REDACTED),
             )
+            .field("oauth2", &self.oauth2)
             .field("helo_domain", &self.helo_domain)
             .field("default_from", &self.default_from)
             .finish()
@@ -100,6 +186,55 @@ impl SmtpConfig {
             )));
         }
 
+        let has_password = config
+            .smtp_password
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let oauth2 = if let Some(tok) = config
+            .smtp_oauth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(SmtpOAuth2Config {
+                access_token: Some(tok.to_string()),
+                client_id: None,
+                client_secret: None,
+                refresh_token: None,
+                token_url: config.gmail_oauth_token_url.clone(),
+            })
+        } else if !has_password {
+            let has_gmail_static = config
+                .gmail_access_token
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_gmail_refresh = config
+                .gmail_client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                && config
+                    .gmail_client_secret
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && config
+                    .gmail_refresh_token
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+            if has_gmail_static || has_gmail_refresh {
+                Some(SmtpOAuth2Config {
+                    access_token: config.gmail_access_token.clone(),
+                    client_id: config.gmail_client_id.clone(),
+                    client_secret: config.gmail_client_secret.clone(),
+                    refresh_token: config.gmail_refresh_token.clone(),
+                    token_url: config.gmail_oauth_token_url.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             host,
             port: config.smtp_port,
@@ -111,6 +246,7 @@ impl SmtpConfig {
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string),
             password: config.smtp_password.clone(),
+            oauth2,
             helo_domain,
             default_from: config.user_email.clone(),
         })
@@ -157,6 +293,7 @@ struct EhloCapabilities {
     starttls: bool,
     auth_plain: bool,
     auth_login: bool,
+    auth_xoauth2: bool,
     auth_advertised: bool,
 }
 
@@ -178,6 +315,8 @@ impl EhloCapabilities {
                         caps.auth_plain = true;
                     } else if mech == "LOGIN" {
                         caps.auth_login = true;
+                    } else if mech == "XOAUTH2" {
+                        caps.auth_xoauth2 = true;
                     }
                 }
             }
@@ -612,8 +751,59 @@ impl MailTransport for SmtpTransport {
             caps = EhloCapabilities::from_response(&ehlo_tls_resp);
         }
 
-        // 4. Optional SMTP AUTH (PLAIN preferred, LOGIN fallback)
-        if let Some(username) = self.config.username.as_deref() {
+        // 4. Optional SMTP AUTH (XOAUTH2 when OAuth2 is configured; otherwise PLAIN / LOGIN)
+        if let Some(ref oauth2) = self.config.oauth2 {
+            if caps.auth_advertised && !caps.auth_xoauth2 {
+                return Err(AppError::Upstream {
+                    status: 502,
+                    message: format!(
+                        "SMTP server {}:{} did not advertise AUTH XOAUTH2",
+                        self.config.host, self.config.port
+                    ),
+                });
+            }
+            let auth_user = self
+                .config
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(mail_from.as_str());
+            if auth_user.is_empty() {
+                return Err(AppError::Config(
+                    "SMTP XOAUTH2 requires NOGML_SMTP_USERNAME or a sender email address"
+                        .to_string(),
+                ));
+            }
+            let http_client = Client::builder()
+                .timeout(SMTP_IO_TIMEOUT)
+                .build()
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to build HTTP client for XOAUTH2: {e}"))
+                })?;
+
+            let mut refreshed = false;
+            loop {
+                let access_token = oauth2.acquire_token(&http_client).await?;
+                let payload = build_xoauth2_sasl_payload(auth_user, &access_token);
+                let mut auth_resp = stream.command(&format!("AUTH XOAUTH2 {payload}")).await?;
+                if auth_resp.code == 334 {
+                    // Per Google XOAUTH2 SASL spec, send empty line to terminate challenge and read final error.
+                    auth_resp = stream.command("").await?;
+                }
+                if auth_resp.code == 235 {
+                    break;
+                }
+                if !refreshed && oauth2.can_refresh() {
+                    refreshed = true;
+                    oauth2.invalidate_cached_token();
+                    debug!("SMTP XOAUTH2 rejected; refreshing OAuth2 access token and retrying");
+                    continue;
+                }
+                expect_code(&auth_resp, &[235], "AUTH XOAUTH2")?;
+                break;
+            }
+        } else if let Some(username) = self.config.username.as_deref() {
             let password = self.config.password.as_deref().unwrap_or("");
             let use_login = caps.auth_advertised && !caps.auth_plain && caps.auth_login;
             if use_login {
@@ -971,5 +1161,186 @@ mod tests {
             ]
         );
         assert_eq!(captured.unstuffed_data, raw_mime);
+    }
+
+    #[test]
+    fn smtp_config_debug_redacts_oauth2_secrets() {
+        let mut cfg = Config::for_test();
+        cfg.smtp_host = "smtp.gmail.com".to_string();
+        cfg.smtp_port = 587;
+        cfg.smtp_username = Some("me@gmail.com".to_string());
+        cfg.smtp_oauth_token = Some("ya29.super-secret-oauth-token".to_string());
+
+        let scfg = SmtpConfig::from_config(&cfg).unwrap();
+        let dbg = format!("{scfg:?}");
+        assert!(dbg.contains("smtp.gmail.com"));
+        assert!(!dbg.contains("ya29.super-secret-oauth-token"));
+        assert!(dbg.contains(crate::secrets::REDACTED));
+    }
+
+    #[tokio::test]
+    async fn smtp_transport_authenticates_with_xoauth2_and_refreshes_expired_token() {
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        // Mock OAuth2 token server: first returns stale token, second returns fresh token.
+        let oauth_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "smtp-stale-token",
+                "expires_in": 3600
+            })))
+            .up_to_n_times(1)
+            .mount(&oauth_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "smtp-fresh-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&oauth_server)
+            .await;
+
+        let expected_stale = format!(
+            "AUTH XOAUTH2 {}",
+            build_xoauth2_sasl_payload("me@gmail.com", "smtp-stale-token")
+        );
+        let expected_fresh = format!(
+            "AUTH XOAUTH2 {}",
+            build_xoauth2_sasl_payload("me@gmail.com", "smtp-fresh-token")
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel();
+        let expected_stale_srv = expected_stale.clone();
+        let expected_fresh_srv = expected_fresh.clone();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            reader
+                .get_mut()
+                .write_all(b"220 smtp.gmail.com ESMTP ready\r\n")
+                .await
+                .unwrap();
+
+            let mut commands = Vec::new();
+            let mut awaiting_xoauth2_cancel = false;
+
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+                commands.push(trimmed.clone());
+
+                if awaiting_xoauth2_cancel {
+                    awaiting_xoauth2_cancel = false;
+                    reader
+                        .get_mut()
+                        .write_all(b"535 5.7.8 Username and Password not accepted\r\n")
+                        .await
+                        .unwrap();
+                    continue;
+                }
+
+                let upper = trimmed.to_ascii_uppercase();
+                if upper.starts_with("EHLO ") {
+                    reader
+                        .get_mut()
+                        .write_all(
+                            b"250-smtp.gmail.com at your service\r\n250 AUTH LOGIN PLAIN XOAUTH2\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else if trimmed == expected_stale_srv {
+                    awaiting_xoauth2_cancel = true;
+                    let challenge = general_purpose::STANDARD
+                        .encode(br#"{"status":"401","schemes":"Bearer","scope":"https://mail.google.com/"}"#);
+                    let resp = format!("334 {challenge}\r\n");
+                    reader.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                } else if trimmed == expected_fresh_srv {
+                    reader
+                        .get_mut()
+                        .write_all(b"235 2.7.0 Accepted\r\n")
+                        .await
+                        .unwrap();
+                } else if upper.starts_with("MAIL FROM:") || upper.starts_with("RCPT TO:") {
+                    reader
+                        .get_mut()
+                        .write_all(b"250 2.1.0 OK\r\n")
+                        .await
+                        .unwrap();
+                } else if upper == "DATA" {
+                    reader
+                        .get_mut()
+                        .write_all(b"354 Go ahead\r\n")
+                        .await
+                        .unwrap();
+                    loop {
+                        let mut dline = Vec::new();
+                        let dn = reader.read_until(b'\n', &mut dline).await.unwrap();
+                        if dn == 0 || dline == b".\r\n" || dline == b".\n" {
+                            break;
+                        }
+                    }
+                    reader
+                        .get_mut()
+                        .write_all(b"250 2.0.0 OK id=GMAIL-SMTP-77\r\n")
+                        .await
+                        .unwrap();
+                } else if upper == "QUIT" {
+                    reader
+                        .get_mut()
+                        .write_all(b"221 2.0.0 closing connection\r\n")
+                        .await
+                        .unwrap();
+                    break;
+                }
+            }
+            let _ = tx.send(commands);
+        });
+
+        let mut cfg = Config::for_test();
+        cfg.smtp_host = "127.0.0.1".to_string();
+        cfg.smtp_port = port;
+        cfg.smtp_tls_mode = SmtpTlsMode::None;
+        cfg.smtp_username = Some("me@gmail.com".to_string());
+        cfg.gmail_oauth_token_url = format!("{}/token", oauth_server.uri());
+        cfg.gmail_client_id = Some("smtp-xoauth2-cid".to_string());
+        cfg.gmail_client_secret = Some("smtp-xoauth2-secret".to_string());
+        cfg.gmail_refresh_token = Some("smtp-xoauth2-refresh".to_string());
+
+        let transport = SmtpTransport::from_config(&cfg).unwrap();
+        let outcome = transport
+            .send(
+                &OutboundMessage {
+                    from: "me@gmail.com".to_string(),
+                    to: vec!["bob@example.com".to_string()],
+                    subject: "XOAUTH2 test".to_string(),
+                    text: Some("Sent via XOAUTH2".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("SMTP XOAUTH2 send should succeed after refresh retry");
+
+        assert_eq!(outcome.provider, "smtp");
+        assert_eq!(outcome.provider_message_id, "GMAIL-SMTP-77");
+
+        let commands = rx.await.unwrap();
+        assert_eq!(commands[1], expected_stale);
+        assert_eq!(commands[2], ""); // SASL 334 cancellation
+        assert_eq!(commands[3], expected_fresh);
     }
 }

@@ -65,7 +65,7 @@ impl DomainProviderKind {
         match transport {
             TransportBackend::Ses => Self::Ses,
             TransportBackend::Resend => Self::Resend,
-            TransportBackend::Smtp => Self::Manual,
+            TransportBackend::Smtp | TransportBackend::Gmail => Self::Manual,
         }
     }
 }

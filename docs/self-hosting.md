@@ -88,6 +88,37 @@ nogml auth gmail \
 
 Pass `--no-browser` on headless or SSH hosts to print the authorization URL to stderr without launching a local browser. `nogml auth gmail` binds an ephemeral loopback callback (`http://127.0.0.1:<port>/callback`), verifies the CSRF `state`, exchanges the authorization code with the PKCE `code_verifier`, writes the refresh token with mode `0600`, and prints a redacted JSON summary with the `[sync]` `gmail_refresh_token = "file://..."` snippet. Raw tokens are never written to logs or stdout.
 
+### Native Gmail outbound transport and SMTP XOAUTH2
+
+To send outbound mail directly through Gmail using the same OAuth2 credentials, set `NOGML_TRANSPORT=gmail` or `transport = "gmail"` (equivalently `[transport] backend = "gmail"`) in `nogml.toml`:
+
+```toml
+transport = "gmail"
+
+[sync]
+mode = "api"
+bidirectional = true
+gmail_client_id = "your-client-id.apps.googleusercontent.com"
+gmail_client_secret = "file:///etc/nogml/secrets/gmail_client_secret"
+gmail_refresh_token = "file:///etc/nogml/secrets/gmail_refresh_token"
+```
+
+`GmailApiTransport` posts base64url-encoded RFC 5322 MIME messages to `/gmail/v1/users/me/messages/send`, sets `threadId` when replying to synced Gmail threads, refreshes expired OAuth2 tokens automatically on HTTP 401, and stores the returned Gmail message ID as `upstream_gmail_id` so subsequent sync passes do not create duplicates.
+
+If you prefer SMTP submission against `smtp.gmail.com:587` with OAuth2 instead of an App Password, set `transport = "smtp"` and provide `NOGML_SMTP_OAUTH_TOKEN` (`[smtp] oauth_token`) or leave `[smtp] password` unset while Gmail OAuth2 credentials are configured:
+
+```toml
+transport = "smtp"
+
+[smtp]
+host = "smtp.gmail.com"
+port = 587
+tls_mode = "starttls"
+username = "you@gmail.com"
+```
+
+When `sync.bidirectional = true` in Gmail API mode, `nogml` syncs upstream drafts (`users.drafts.list`/`get`), pushes local draft create/update/delete changes (`drafts.create`/`update`/`delete`), imports locally sent or imported messages lacking an `upstream_gmail_id` (`messages.import`), and pushes local custom label create/rename/delete mutations (`labels.create`/`patch`/`delete`).
+
 ### Multi-account sync, mailbox aliases, and shared mailboxes
 
 Configure multiple upstream Gmail sync accounts, inbound/outbound aliases, and shared team mailboxes in `nogml.toml` without separate cron jobs:
@@ -156,7 +187,7 @@ All secret fields support three non-plaintext mechanisms so secrets never need t
 - `file:///path/to/secret`: reads a UTF-8 file and trims trailing `\r\n`. Relative `file://` paths resolve relative to the `nogml.toml` directory.
 - `file://$CREDENTIALS_DIRECTORY/secret`: resolves against `systemd`'s `CREDENTIALS_DIRECTORY` environment variable set by `LoadCredential=`.
 - `env://VAR_NAME`: reads the named environment variable and fails with exit code `2` if unset.
-- `*_FILE` environment variables: standard Docker secrets, Kubernetes projected volume, and `systemd` convention (`RESEND_API_KEY_FILE`, `RESEND_WEBHOOK_SECRET_FILE`, `NOGML_AUTH_TOKENS_FILE`, `NOGML_SCOPED_TOKENS_FILE`, `NOGML_IMAP_PASSWORD_FILE`, `NOGML_DATABASE_URL_FILE`, `NOGML_BLOB_S3_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_WEBHOOK_SECRET_FILE`, `NOGML_SMTP_PASSWORD_FILE`, `NOGML_RSPAMD_PASSWORD_FILE`, `NOGML_LLM_TRIAGE_API_KEY_FILE`, `NOGML_EMBEDDING_API_KEY_FILE`, `NOGML_ENCRYPTION_KEY_FILE`, `NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE`, `NOGML_OAUTH2_CLIENT_SECRET_FILE`, `NOGML_OAUTH2_SIGNING_SECRET_FILE`, `GMAIL_CLIENT_SECRET_FILE`, `GMAIL_REFRESH_TOKEN_FILE`, `GMAIL_ACCESS_TOKEN_FILE`, `GMAIL_IMAP_PASSWORD_FILE`).
+- `*_FILE` environment variables: standard Docker secrets, Kubernetes projected volume, and `systemd` convention (`RESEND_API_KEY_FILE`, `RESEND_WEBHOOK_SECRET_FILE`, `NOGML_AUTH_TOKENS_FILE`, `NOGML_SCOPED_TOKENS_FILE`, `NOGML_IMAP_PASSWORD_FILE`, `NOGML_DATABASE_URL_FILE`, `NOGML_BLOB_S3_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_WEBHOOK_SECRET_FILE`, `NOGML_SMTP_PASSWORD_FILE`, `NOGML_SMTP_OAUTH_TOKEN_FILE`, `NOGML_RSPAMD_PASSWORD_FILE`, `NOGML_LLM_TRIAGE_API_KEY_FILE`, `NOGML_EMBEDDING_API_KEY_FILE`, `NOGML_ENCRYPTION_KEY_FILE`, `NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE`, `NOGML_OAUTH2_CLIENT_SECRET_FILE`, `NOGML_OAUTH2_SIGNING_SECRET_FILE`, `GMAIL_CLIENT_SECRET_FILE`, `GMAIL_REFRESH_TOKEN_FILE`, `GMAIL_ACCESS_TOKEN_FILE`, `GMAIL_IMAP_PASSWORD_FILE`).
 
 On Unix, `nogml config check` warns if any `file://` secret, `*_FILE` target, or IMAP TLS private key is readable by group or other (`mode & 0o077 != 0`). Restrict secret files with `chmod 0600`.
 

@@ -66,16 +66,17 @@ fn outbound_to_resend_request(
         if req.scheduled_at.is_none() {
             req.scheduled_at = msg.scheduled_at.clone();
         }
-        if !msg.tags.is_empty() {
-            req.tags = Some(
-                msg.tags
-                    .iter()
-                    .map(|(name, value)| ResendTag {
-                        name: name.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-            );
+        let public_tags: Vec<ResendTag> = msg
+            .tags
+            .iter()
+            .filter(|(name, _)| !name.starts_with("_nogml_"))
+            .map(|(name, value)| ResendTag {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        if !public_tags.is_empty() {
+            req.tags = Some(public_tags);
         }
         return Ok(req);
     }
@@ -119,19 +120,16 @@ fn outbound_to_resend_request(
         )
     };
 
-    let tags = if msg.tags.is_empty() {
-        None
-    } else {
-        Some(
-            msg.tags
-                .iter()
-                .map(|(name, value)| ResendTag {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-        )
-    };
+    let public_tags: Vec<ResendTag> = msg
+        .tags
+        .iter()
+        .filter(|(name, _)| !name.starts_with("_nogml_"))
+        .map(|(name, value)| ResendTag {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    let tags = (!public_tags.is_empty()).then_some(public_tags);
 
     let text = if msg.text.is_none() && msg.html.is_none() {
         Some(String::new())

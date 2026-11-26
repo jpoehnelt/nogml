@@ -1,9 +1,10 @@
 //! Upstream Gmail REST API v1 [`SyncSource`] (`SyncMode::Api`):
 //! - OAuth2 refresh token exchange (with in-memory caching) or static access token
-//! - Labels sync (`users.labels.list` -> `MailStore::upsert_upstream_label`)
+//! - Labels sync (`users.labels.list` -> `MailStore::upsert_upstream_label`) + custom label pushback (`create`/`patch`/`delete`)
 //! - Full backfill (`profile` -> paginated `messages.list` -> bounded-concurrency `messages.get?format=raw`)
 //! - Incremental sync (`history.list` with automatic HTTP 404 fallback to full backfill)
-//! - Optional bidirectional pushback (`messages.modify`, `messages.trash`, `messages.delete`)
+//! - Drafts sync (`users.drafts.list` + `users.drafts.get?format=raw` + `drafts.create`/`update`/`delete` pushback)
+//! - Optional bidirectional pushback (`messages.modify`, `messages.trash`, `messages.delete`, `messages.import`)
 
 use std::{
     collections::{HashMap, HashSet},
@@ -16,7 +17,9 @@ use base64::Engine as _;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
 use reqwest::{Client, Method, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -26,10 +29,13 @@ use crate::{
     events::{EventSource, MailEvent},
     imap::mime_fmt::parse_raw_to_new_message_input,
     models::{
-        ListHistoryResponse, ListLabelsResponse, ListMessagesResponse, Message,
-        ModifyMessageRequest, Profile, is_system_label,
+        Draft, LABEL_DRAFT, LABEL_SENT, Label, LabelColor, ListDraftsResponse, ListHistoryResponse,
+        ListLabelsResponse, ListMessagesResponse, Message, ModifyMessageRequest, Profile,
+        is_system_label,
     },
-    storage::{NewLabelInput, SyncState},
+    storage::{
+        MessageListQuery, NewLabelInput, StoredDraft, StoredLabel, StoredMessage, SyncState,
+    },
     sync::{
         LocalMutation, LocalMutationKind, PullReport, PushReport, SyncRunOptions, SyncSource,
         ingest_synced_message,
@@ -154,6 +160,266 @@ struct OAuthTokenResponse {
     expires_in: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct SyncedLabelRecord {
+    pub upstream_label_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_list_visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_list_visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<LabelColor>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct SyncedDraftRecord {
+    pub upstream_draft_id: String,
+    pub upstream_message_id: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GmailSyncMeta {
+    #[serde(default)]
+    pub labels: HashMap<String, SyncedLabelRecord>,
+    #[serde(default)]
+    pub drafts: HashMap<String, SyncedDraftRecord>,
+}
+
+async fn load_sync_meta(state: &AppState, account_key: &str) -> AppResult<GmailSyncMeta> {
+    let Some(raw) = state.store.get_sync_metadata(account_key).await? else {
+        return Ok(GmailSyncMeta::default());
+    };
+    match serde_json::from_str::<GmailSyncMeta>(&raw) {
+        Ok(meta) => Ok(meta),
+        Err(err) => {
+            warn!(%err, account_key, "Failed to parse stored GmailSyncMeta; starting fresh");
+            Ok(GmailSyncMeta::default())
+        }
+    }
+}
+
+async fn save_sync_meta(
+    state: &AppState,
+    account_key: &str,
+    meta: &GmailSyncMeta,
+) -> AppResult<()> {
+    let encoded = serde_json::to_string(meta)?;
+    state.store.put_sync_metadata(account_key, &encoded).await
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+async fn resolve_upstream_thread_id(state: &AppState, msg: &StoredMessage) -> Option<String> {
+    if let Some(ref utid) = msg.upstream_thread_id
+        && !utid.trim().is_empty()
+    {
+        return Some(utid.clone());
+    }
+    if let Ok(Some(thread)) = state.store.get_thread(&msg.thread_id).await {
+        for m in thread.messages {
+            if let Some(utid) = m.upstream_thread_id
+                && !utid.trim().is_empty()
+            {
+                return Some(utid);
+            }
+        }
+    }
+    None
+}
+
+async fn list_all_local_drafts(state: &AppState) -> AppResult<Vec<StoredDraft>> {
+    let mut all = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let page = state
+            .store
+            .list_drafts(&MessageListQuery {
+                include_spam_trash: true,
+                max_results: 500,
+                page_token: page_token.clone(),
+                ..Default::default()
+            })
+            .await?;
+        all.extend(page.drafts);
+        match page.next_page_token.filter(|s| !s.is_empty()) {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+async fn list_unsynced_import_messages(state: &AppState) -> AppResult<Vec<StoredMessage>> {
+    let mut candidates = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let page = state
+            .store
+            .list_messages(&MessageListQuery {
+                include_spam_trash: true,
+                max_results: 500,
+                page_token: page_token.clone(),
+                ..Default::default()
+            })
+            .await?;
+        for msg in page.messages {
+            if msg.upstream_gmail_id.is_some() {
+                continue;
+            }
+            if msg.label_ids.iter().any(|l| l == LABEL_DRAFT) {
+                continue;
+            }
+            let is_sent = msg.label_ids.iter().any(|l| l == LABEL_SENT);
+            let is_imported = matches!(
+                msg.source.as_str(),
+                "gmail_import" | "import" | "imap_append"
+            );
+            if is_sent || is_imported {
+                candidates.push(msg);
+            }
+        }
+        match page.next_page_token.filter(|s| !s.is_empty()) {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(candidates)
+}
+
+enum LabelPushAction {
+    Create(StoredLabel),
+    Patch {
+        local: StoredLabel,
+        upstream_id: String,
+    },
+    Delete {
+        local_id: String,
+        upstream_id: String,
+    },
+}
+
+enum DraftPushAction {
+    Create {
+        draft: StoredDraft,
+        raw_bytes: Vec<u8>,
+        content_hash: String,
+    },
+    Update {
+        draft: StoredDraft,
+        upstream_draft_id: String,
+        raw_bytes: Vec<u8>,
+        content_hash: String,
+    },
+    Delete {
+        local_draft_id: String,
+        upstream_draft_id: String,
+    },
+}
+
+fn plan_label_push_actions(
+    local_labels: &[StoredLabel],
+    meta: &GmailSyncMeta,
+) -> Vec<LabelPushAction> {
+    let mut actions = Vec::new();
+    let mut present_local_ids = HashSet::new();
+
+    for lbl in local_labels {
+        if is_system_label(&lbl.id) || lbl.label_type == "system" {
+            continue;
+        }
+        present_local_ids.insert(lbl.id.as_str());
+        match lbl.upstream_label_id.as_deref() {
+            None => {
+                actions.push(LabelPushAction::Create(lbl.clone()));
+            }
+            Some(up_id) => {
+                if let Some(prev) = meta.labels.get(&lbl.id) {
+                    let changed = prev.name != lbl.name
+                        || prev.message_list_visibility != lbl.message_list_visibility
+                        || prev.label_list_visibility != lbl.label_list_visibility
+                        || prev.color != lbl.color;
+                    if changed {
+                        actions.push(LabelPushAction::Patch {
+                            local: lbl.clone(),
+                            upstream_id: up_id.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for (local_id, rec) in &meta.labels {
+        if !present_local_ids.contains(local_id.as_str()) {
+            actions.push(LabelPushAction::Delete {
+                local_id: local_id.clone(),
+                upstream_id: rec.upstream_label_id.clone(),
+            });
+        }
+    }
+
+    actions
+}
+
+async fn plan_draft_push_actions(
+    state: &AppState,
+    meta: &GmailSyncMeta,
+) -> AppResult<Vec<DraftPushAction>> {
+    let local_drafts = list_all_local_drafts(state).await?;
+    let mut actions = Vec::new();
+    let mut present_ids = HashSet::new();
+
+    for summary_draft in local_drafts {
+        present_ids.insert(summary_draft.id.clone());
+        let Some(draft) = state.store.get_draft(&summary_draft.id).await? else {
+            continue;
+        };
+        let raw_bytes = state.load_raw_rfc2822(&draft.message).await?;
+        let content_hash = sha256_hex(&raw_bytes);
+        match meta.drafts.get(&draft.id) {
+            None => {
+                actions.push(DraftPushAction::Create {
+                    draft,
+                    raw_bytes,
+                    content_hash,
+                });
+            }
+            Some(prev) => {
+                if prev.content_hash != content_hash {
+                    actions.push(DraftPushAction::Update {
+                        draft,
+                        upstream_draft_id: prev.upstream_draft_id.clone(),
+                        raw_bytes,
+                        content_hash,
+                    });
+                }
+            }
+        }
+    }
+
+    for (local_draft_id, rec) in &meta.drafts {
+        if !present_ids.contains(local_draft_id) {
+            actions.push(DraftPushAction::Delete {
+                local_draft_id: local_draft_id.clone(),
+                upstream_draft_id: rec.upstream_draft_id.clone(),
+            });
+        }
+    }
+
+    Ok(actions)
+}
+
 /// Upstream Gmail REST API v1 [`SyncSource`] implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GmailApiSyncSource;
@@ -162,6 +428,10 @@ pub struct GmailApiSyncSource;
 impl SyncSource for GmailApiSyncSource {
     fn provider_name(&self) -> &'static str {
         "gmail_api"
+    }
+
+    fn supports_full_bidirectional_push(&self) -> bool {
+        true
     }
 
     fn account_key(&self, config: &Config) -> String {
@@ -186,11 +456,26 @@ impl SyncSource for GmailApiSyncSource {
         let auth = GmailAuth::acquire(&client, state.config.clone()).await?;
         let base = state.config.gmail_api_base_url.trim_end_matches('/');
         let user_id = encode_path_segment(&state.config.gmail_user_id);
+        let bidirectional = opts
+            .bidirectional
+            .unwrap_or(state.config.sync_bidirectional);
+        let account_key = self.account_key(&state.config);
+        let mut meta = load_sync_meta(state, &account_key).await?;
 
         let mut report = PullReport::default();
 
         // 1. Sync upstream user labels and build upstream_label_id -> local_label_id map.
-        let label_map = sync_labels(&client, base, &user_id, &auth, state, &mut report).await?;
+        let label_map = sync_labels(
+            &client,
+            base,
+            &user_id,
+            &auth,
+            state,
+            bidirectional,
+            &mut meta,
+            &mut report,
+        )
+        .await?;
 
         // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
         let mut need_full = opts.full || sync_state.last_history_id.is_none();
@@ -241,6 +526,22 @@ impl SyncSource for GmailApiSyncSource {
             report.history_id = Some(baseline_history);
         }
 
+        // 4. Sync upstream drafts (`users.drafts.list` + `users.drafts.get?format=raw`).
+        sync_drafts_pull(
+            &client,
+            base,
+            &user_id,
+            &auth,
+            &label_map,
+            state,
+            bidirectional,
+            &mut meta,
+            &mut report,
+        )
+        .await?;
+
+        save_sync_meta(state, &account_key, &meta).await?;
+
         sync_state.messages_synced = sync_state
             .messages_synced
             .saturating_add(report.messages_added);
@@ -252,7 +553,19 @@ impl SyncSource for GmailApiSyncSource {
         state: &AppState,
         changes: &[LocalMutation],
     ) -> AppResult<PushReport> {
-        if changes.is_empty() {
+        let account_key = self.account_key(&state.config);
+        let mut meta = load_sync_meta(state, &account_key).await?;
+
+        let local_labels = state.store.list_labels().await?;
+        let label_actions = plan_label_push_actions(&local_labels, &meta);
+        let import_candidates = list_unsynced_import_messages(state).await?;
+        let draft_actions = plan_draft_push_actions(state, &meta).await?;
+
+        if changes.is_empty()
+            && label_actions.is_empty()
+            && import_candidates.is_empty()
+            && draft_actions.is_empty()
+        {
             return Ok(PushReport::default());
         }
 
@@ -263,16 +576,143 @@ impl SyncSource for GmailApiSyncSource {
 
         // Build local_label_id -> upstream_label_id reverse mapping.
         let mut reverse_labels: HashMap<String, String> = HashMap::new();
-        for lbl in state.store.list_labels().await? {
+        for lbl in &local_labels {
             if is_system_label(&lbl.id) || lbl.label_type == "system" {
-                reverse_labels.insert(lbl.id.clone(), lbl.id);
-            } else if let Some(up_id) = lbl.upstream_label_id {
-                reverse_labels.insert(lbl.id, up_id);
+                reverse_labels.insert(lbl.id.clone(), lbl.id.clone());
+            } else if let Some(ref up_id) = lbl.upstream_label_id {
+                reverse_labels.insert(lbl.id.clone(), up_id.clone());
             }
         }
 
         let mut pushed = 0u64;
 
+        // 1. Push custom label create / patch / delete actions first so message/import pushes can map them.
+        for action in label_actions {
+            match action {
+                LabelPushAction::Create(local) => {
+                    let url = format!("{base}/gmail/v1/users/{user_id}/labels");
+                    let mut body_val = json!({
+                        "name": local.name,
+                    });
+                    if let Some(ref vis) = local.message_list_visibility {
+                        body_val["messageListVisibility"] = Value::String(vis.clone());
+                    }
+                    if let Some(ref vis) = local.label_list_visibility {
+                        body_val["labelListVisibility"] = Value::String(vis.clone());
+                    }
+                    if let Some(ref color) = local.color {
+                        body_val["color"] = serde_json::to_value(color)?;
+                    }
+                    let payload = serde_json::to_vec(&body_val)?;
+                    let (status, body) =
+                        request_with_retry(&client, Method::POST, &url, &auth, Some(payload))
+                            .await?;
+                    if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail labels.create({}) failed: {}",
+                                local.name,
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    let created: Label = serde_json::from_slice(&body)?;
+                    if !created.id.is_empty() {
+                        let _ = state
+                            .store
+                            .set_label_upstream_id(&local.id, &created.id)
+                            .await?;
+                        reverse_labels.insert(local.id.clone(), created.id.clone());
+                        meta.labels.insert(
+                            local.id.clone(),
+                            SyncedLabelRecord {
+                                upstream_label_id: created.id,
+                                name: local.name,
+                                message_list_visibility: local.message_list_visibility,
+                                label_list_visibility: local.label_list_visibility,
+                                color: local.color,
+                            },
+                        );
+                    }
+                    pushed += 1;
+                }
+                LabelPushAction::Patch { local, upstream_id } => {
+                    let url = format!(
+                        "{base}/gmail/v1/users/{user_id}/labels/{}",
+                        encode_path_segment(&upstream_id)
+                    );
+                    let mut body_val = json!({
+                        "id": upstream_id,
+                        "name": local.name,
+                    });
+                    if let Some(ref vis) = local.message_list_visibility {
+                        body_val["messageListVisibility"] = Value::String(vis.clone());
+                    }
+                    if let Some(ref vis) = local.label_list_visibility {
+                        body_val["labelListVisibility"] = Value::String(vis.clone());
+                    }
+                    if let Some(ref color) = local.color {
+                        body_val["color"] = serde_json::to_value(color)?;
+                    }
+                    let payload = serde_json::to_vec(&body_val)?;
+                    let (status, body) =
+                        request_with_retry(&client, Method::PATCH, &url, &auth, Some(payload))
+                            .await?;
+                    if status == StatusCode::NOT_FOUND {
+                        warn!(
+                            upstream_label_id = %upstream_id,
+                            "Skipping upstream Gmail label patch: label not found (404)"
+                        );
+                        continue;
+                    }
+                    if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail labels.patch({upstream_id}) failed: {}",
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    meta.labels.insert(
+                        local.id.clone(),
+                        SyncedLabelRecord {
+                            upstream_label_id: upstream_id,
+                            name: local.name,
+                            message_list_visibility: local.message_list_visibility,
+                            label_list_visibility: local.label_list_visibility,
+                            color: local.color,
+                        },
+                    );
+                    pushed += 1;
+                }
+                LabelPushAction::Delete {
+                    local_id,
+                    upstream_id,
+                } => {
+                    let url = format!(
+                        "{base}/gmail/v1/users/{user_id}/labels/{}",
+                        encode_path_segment(&upstream_id)
+                    );
+                    let (status, body) =
+                        request_with_retry(&client, Method::DELETE, &url, &auth, None).await?;
+                    if status != StatusCode::NOT_FOUND && !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail labels.delete({upstream_id}) failed: {}",
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    meta.labels.remove(&local_id);
+                    pushed += 1;
+                }
+            }
+        }
+
+        // 2. Push message label / trash / delete mutations.
         for mutation in changes {
             let encoded_id = encode_path_segment(&mutation.upstream_id);
             match &mutation.kind {
@@ -406,10 +846,154 @@ impl SyncSource for GmailApiSyncSource {
                     pushed += 1;
                 }
                 LocalMutationKind::AppendMessage { .. } => {
-                    // Handled by IMAP APPEND pushback (and future Gmail API pushback).
+                    // Gmail API handles unsynced Sent/imported messages in step 3 (`messages.import`)
+                    // and drafts in step 4 (`users.drafts.*`).
                 }
             }
         }
+
+        // 3. Push locally created Sent / imported messages without upstream_gmail_id via messages.import.
+        for summary_msg in import_candidates {
+            let Some(msg) = state.store.get_message(&summary_msg.id).await? else {
+                continue;
+            };
+            let raw_bytes = state.load_raw_rfc2822(&msg).await?;
+            let raw_b64 = crate::mime::encode_base64url(&raw_bytes);
+            let mapped_labels = map_local_to_upstream_labels(&msg.label_ids, &reverse_labels);
+            let mut body_val = json!({
+                "raw": raw_b64,
+            });
+            if !mapped_labels.is_empty() {
+                body_val["labelIds"] = serde_json::to_value(&mapped_labels)?;
+            }
+            if let Some(up_tid) = resolve_upstream_thread_id(state, &msg).await {
+                body_val["threadId"] = Value::String(up_tid);
+            }
+
+            let import_url = format!(
+                "{base}/gmail/v1/users/{user_id}/messages/import?internalDateSource=dateHeader&neverMarkSpam=true"
+            );
+            let payload = serde_json::to_vec(&body_val)?;
+            let (status, body) =
+                request_with_retry(&client, Method::POST, &import_url, &auth, Some(payload))
+                    .await?;
+            if !status.is_success() {
+                return Err(AppError::Upstream {
+                    status: status.as_u16(),
+                    message: format!(
+                        "Gmail messages.import({}) failed: {}",
+                        msg.id,
+                        String::from_utf8_lossy(&body)
+                    ),
+                });
+            }
+            let imported: Message = serde_json::from_slice(&body)?;
+            if !imported.id.is_empty() {
+                let up_tid =
+                    (!imported.thread_id.is_empty()).then_some(imported.thread_id.as_str());
+                let _ = state
+                    .store
+                    .set_message_upstream_ids(&msg.id, &imported.id, up_tid)
+                    .await?;
+            }
+            pushed += 1;
+        }
+
+        // 4. Push local draft create / update / delete actions.
+        for action in draft_actions {
+            match action {
+                DraftPushAction::Create {
+                    draft,
+                    raw_bytes,
+                    content_hash,
+                } => {
+                    let up_tid = resolve_upstream_thread_id(state, &draft.message).await;
+                    let created = push_create_draft(
+                        &client,
+                        base,
+                        &user_id,
+                        &auth,
+                        &raw_bytes,
+                        up_tid.as_deref(),
+                    )
+                    .await?;
+                    record_pushed_draft(state, &draft, &created, content_hash, &mut meta).await?;
+                    pushed += 1;
+                }
+                DraftPushAction::Update {
+                    draft,
+                    upstream_draft_id,
+                    raw_bytes,
+                    content_hash,
+                } => {
+                    let up_tid = resolve_upstream_thread_id(state, &draft.message).await;
+                    let url = format!(
+                        "{base}/gmail/v1/users/{user_id}/drafts/{}",
+                        encode_path_segment(&upstream_draft_id)
+                    );
+                    let mut msg_val = json!({
+                        "raw": crate::mime::encode_base64url(&raw_bytes),
+                    });
+                    if let Some(ref tid) = up_tid {
+                        msg_val["threadId"] = Value::String(tid.clone());
+                    }
+                    let payload = serde_json::to_vec(&json!({
+                        "id": upstream_draft_id,
+                        "message": msg_val,
+                    }))?;
+                    let (status, body) =
+                        request_with_retry(&client, Method::PUT, &url, &auth, Some(payload))
+                            .await?;
+                    let updated = if status == StatusCode::NOT_FOUND {
+                        push_create_draft(
+                            &client,
+                            base,
+                            &user_id,
+                            &auth,
+                            &raw_bytes,
+                            up_tid.as_deref(),
+                        )
+                        .await?
+                    } else if !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail drafts.update({upstream_draft_id}) failed: {}",
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    } else {
+                        serde_json::from_slice::<Draft>(&body)?
+                    };
+                    record_pushed_draft(state, &draft, &updated, content_hash, &mut meta).await?;
+                    pushed += 1;
+                }
+                DraftPushAction::Delete {
+                    local_draft_id,
+                    upstream_draft_id,
+                } => {
+                    let url = format!(
+                        "{base}/gmail/v1/users/{user_id}/drafts/{}",
+                        encode_path_segment(&upstream_draft_id)
+                    );
+                    let (status, body) =
+                        request_with_retry(&client, Method::DELETE, &url, &auth, None).await?;
+                    if status != StatusCode::NOT_FOUND && !status.is_success() {
+                        return Err(AppError::Upstream {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Gmail drafts.delete({upstream_draft_id}) failed: {}",
+                                String::from_utf8_lossy(&body)
+                            ),
+                        });
+                    }
+                    meta.drafts.remove(&local_draft_id);
+                    pushed += 1;
+                }
+            }
+        }
+
+        save_sync_meta(state, &account_key, &meta).await?;
 
         Ok(PushReport {
             messages_pushed: pushed,
@@ -424,7 +1008,7 @@ fn build_http_client() -> AppResult<Client> {
         .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))
 }
 
-fn encode_path_segment(seg: &str) -> String {
+pub(crate) fn encode_path_segment(seg: &str) -> String {
     url::form_urlencoded::byte_serialize(seg.as_bytes()).collect()
 }
 
@@ -510,12 +1094,15 @@ pub async fn acquire_access_token(client: &Client, config: &Config) -> AppResult
     Ok(parsed.access_token)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_labels(
     client: &Client,
     base: &str,
     user_id: &str,
     auth: &GmailAuth,
     state: &AppState,
+    bidirectional: bool,
+    meta: &mut GmailSyncMeta,
     report: &mut PullReport,
 ) -> AppResult<HashMap<String, String>> {
     let url = format!("{base}/gmail/v1/users/{user_id}/labels");
@@ -530,30 +1117,413 @@ async fn sync_labels(
         });
     }
     let resp: ListLabelsResponse = serde_json::from_slice(&body)?;
+    let local_labels = state.store.list_labels().await?;
+
+    let mut local_by_upstream: HashMap<String, StoredLabel> = HashMap::new();
+    let mut local_ids: HashSet<String> = HashSet::new();
+    for l in local_labels {
+        local_ids.insert(l.id.clone());
+        if let Some(ref up) = l.upstream_label_id {
+            local_by_upstream.insert(up.clone(), l);
+        }
+    }
+
+    let pending_local_deletes: HashSet<String> = if bidirectional {
+        meta.labels
+            .iter()
+            .filter(|(local_id, rec)| {
+                !local_ids.contains(*local_id)
+                    && !local_by_upstream.contains_key(&rec.upstream_label_id)
+            })
+            .map(|(_, rec)| rec.upstream_label_id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     let mut map = HashMap::new();
     for lbl in resp.labels {
         if is_system_label(&lbl.id) || lbl.label_type.as_deref() == Some("system") {
             map.insert(lbl.id.clone(), lbl.id);
             continue;
         }
+        if bidirectional && pending_local_deletes.contains(&lbl.id) {
+            debug!(
+                upstream_label_id = %lbl.id,
+                "Skipping pull of upstream label pending local deletion"
+            );
+            continue;
+        }
+
+        let up_name = if lbl.name.is_empty() {
+            lbl.id.clone()
+        } else {
+            lbl.name.clone()
+        };
+
+        if bidirectional
+            && let Some(existing) = local_by_upstream.get(&lbl.id)
+            && let Some(prev) = meta.labels.get(&existing.id)
+        {
+            let upstream_changed = up_name != prev.name
+                || lbl
+                    .message_list_visibility
+                    .as_ref()
+                    .is_some_and(|v| prev.message_list_visibility.as_ref() != Some(v))
+                || lbl
+                    .label_list_visibility
+                    .as_ref()
+                    .is_some_and(|v| prev.label_list_visibility.as_ref() != Some(v))
+                || lbl.color != prev.color;
+            let local_changed = existing.name != prev.name
+                || existing.message_list_visibility != prev.message_list_visibility
+                || existing.label_list_visibility != prev.label_list_visibility
+                || existing.color != prev.color;
+            if local_changed && !upstream_changed {
+                map.insert(lbl.id, existing.id.clone());
+                continue;
+            }
+        }
+
         let stored = state
             .store
             .upsert_upstream_label(NewLabelInput {
-                name: if lbl.name.is_empty() {
-                    lbl.id.clone()
-                } else {
-                    lbl.name
-                },
+                name: up_name,
                 message_list_visibility: lbl.message_list_visibility,
                 label_list_visibility: lbl.label_list_visibility,
                 color: lbl.color,
                 upstream_label_id: Some(lbl.id.clone()),
             })
             .await?;
+        meta.labels.insert(
+            stored.id.clone(),
+            SyncedLabelRecord {
+                upstream_label_id: lbl.id.clone(),
+                name: stored.name.clone(),
+                message_list_visibility: stored.message_list_visibility.clone(),
+                label_list_visibility: stored.label_list_visibility.clone(),
+                color: stored.color.clone(),
+            },
+        );
         map.insert(lbl.id, stored.id);
         report.labels_synced += 1;
     }
     Ok(map)
+}
+
+async fn push_create_draft(
+    client: &Client,
+    base: &str,
+    user_id: &str,
+    auth: &GmailAuth,
+    raw_bytes: &[u8],
+    upstream_thread_id: Option<&str>,
+) -> AppResult<Draft> {
+    let url = format!("{base}/gmail/v1/users/{user_id}/drafts");
+    let mut msg_val = json!({
+        "raw": crate::mime::encode_base64url(raw_bytes),
+    });
+    if let Some(tid) = upstream_thread_id.filter(|s| !s.trim().is_empty()) {
+        msg_val["threadId"] = Value::String(tid.to_string());
+    }
+    let payload = serde_json::to_vec(&json!({ "message": msg_val }))?;
+    let (status, body) =
+        request_with_retry(client, Method::POST, &url, auth, Some(payload)).await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream {
+            status: status.as_u16(),
+            message: format!(
+                "Gmail drafts.create failed: {}",
+                String::from_utf8_lossy(&body)
+            ),
+        });
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn record_pushed_draft(
+    state: &AppState,
+    local: &StoredDraft,
+    upstream: &Draft,
+    content_hash: String,
+    meta: &mut GmailSyncMeta,
+) -> AppResult<()> {
+    let up_msg_id = upstream
+        .message
+        .as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    let up_tid = upstream
+        .message
+        .as_ref()
+        .map(|m| m.thread_id.as_str())
+        .filter(|s| !s.is_empty());
+    if !up_msg_id.is_empty() {
+        let _ = state
+            .store
+            .set_message_upstream_ids(&local.message.id, &up_msg_id, up_tid)
+            .await?;
+    }
+    if !upstream.id.is_empty() {
+        meta.drafts.insert(
+            local.id.clone(),
+            SyncedDraftRecord {
+                upstream_draft_id: upstream.id.clone(),
+                upstream_message_id: up_msg_id,
+                content_hash,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_drafts_pull(
+    client: &Client,
+    base: &str,
+    user_id: &str,
+    auth: &GmailAuth,
+    label_map: &HashMap<String, String>,
+    state: &AppState,
+    bidirectional: bool,
+    meta: &mut GmailSyncMeta,
+    report: &mut PullReport,
+) -> AppResult<()> {
+    let mut page_token: Option<String> = None;
+    let mut listed = Vec::new();
+    let mut first_page = true;
+
+    loop {
+        let mut url = format!("{base}/gmail/v1/users/{user_id}/drafts?maxResults=500");
+        if let Some(ref pt) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&encode_path_segment(pt));
+        }
+
+        let (status, body) = get_with_retry(client, &url, auth).await?;
+        if first_page && status == StatusCode::NOT_FOUND {
+            debug!("Upstream Gmail drafts.list returned 404; skipping drafts pull");
+            return Ok(());
+        }
+        first_page = false;
+        if !status.is_success() {
+            return Err(AppError::Upstream {
+                status: status.as_u16(),
+                message: format!(
+                    "Gmail drafts.list failed: {}",
+                    String::from_utf8_lossy(&body)
+                ),
+            });
+        }
+        let page: ListDraftsResponse = serde_json::from_slice(&body)?;
+        for dref in page.drafts.unwrap_or_default() {
+            if !dref.id.is_empty() {
+                listed.push(dref);
+            }
+        }
+        match page.next_page_token.filter(|s| !s.is_empty()) {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+
+    let local_drafts = list_all_local_drafts(state).await?;
+    let local_draft_ids: HashSet<String> = local_drafts.iter().map(|d| d.id.clone()).collect();
+    let mut local_draft_by_up_msg: HashMap<String, String> = HashMap::new();
+    for d in &local_drafts {
+        if let Some(ref up_mid) = d.message.upstream_gmail_id {
+            local_draft_by_up_msg.insert(up_mid.clone(), d.id.clone());
+        }
+    }
+
+    let pending_local_deleted_drafts: HashSet<String> = if bidirectional {
+        meta.drafts
+            .iter()
+            .filter(|(local_id, _)| !local_draft_ids.contains(*local_id))
+            .map(|(_, rec)| rec.upstream_draft_id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let mut seen_upstream_draft_ids = HashSet::new();
+    for dref in listed {
+        seen_upstream_draft_ids.insert(dref.id.clone());
+        if bidirectional && pending_local_deleted_drafts.contains(&dref.id) {
+            debug!(
+                upstream_draft_id = %dref.id,
+                "Skipping pull of upstream draft pending local deletion"
+            );
+            continue;
+        }
+
+        let url = format!(
+            "{base}/gmail/v1/users/{user_id}/drafts/{}?format=raw",
+            encode_path_segment(&dref.id)
+        );
+        let (status, body) = get_with_retry(client, &url, auth).await?;
+        if status == StatusCode::NOT_FOUND {
+            continue;
+        }
+        if !status.is_success() {
+            return Err(AppError::Upstream {
+                status: status.as_u16(),
+                message: format!(
+                    "Gmail drafts.get({}) failed: {}",
+                    dref.id,
+                    String::from_utf8_lossy(&body)
+                ),
+            });
+        }
+
+        let draft: Draft = serde_json::from_slice(&body)?;
+        let Some(msg) = draft.message else {
+            continue;
+        };
+        let raw_b64 = msg.raw.unwrap_or_default();
+        let raw_bytes = decode_base64_tolerant(&raw_b64)?;
+        let upstream_hash = sha256_hex(&raw_bytes);
+        let up_msg_id = if msg.id.is_empty() {
+            dref.message.id.clone()
+        } else {
+            msg.id
+        };
+        let up_tid = (!msg.thread_id.is_empty()).then_some(msg.thread_id);
+        let internal_date_ms = msg
+            .internal_date
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok());
+        let mut mapped_labels = map_labels(msg.label_ids.as_deref().unwrap_or(&[]), label_map);
+        if !mapped_labels.iter().any(|l| l == LABEL_DRAFT) {
+            mapped_labels.push(LABEL_DRAFT.to_string());
+        }
+
+        // Check if already tracked in `meta.drafts`.
+        let existing_local_id = meta
+            .drafts
+            .iter()
+            .find(|(_, rec)| rec.upstream_draft_id == dref.id)
+            .map(|(lid, _)| lid.clone());
+
+        if let Some(local_id) = existing_local_id
+            && local_draft_ids.contains(&local_id)
+        {
+            if let Some(rec) = meta.drafts.get(&local_id)
+                && rec.content_hash == upstream_hash
+            {
+                report.messages_deduplicated += 1;
+                continue;
+            }
+            let input = parse_raw_to_new_message_input(
+                raw_bytes,
+                mapped_labels,
+                internal_date_ms,
+                "gmail_api",
+                (!up_msg_id.is_empty()).then_some(up_msg_id.clone()),
+                up_tid,
+                false,
+                false,
+            );
+            let updated = state.store.update_draft(&local_id, input).await?;
+            state.post_store_message(&updated.message).await?;
+            meta.drafts.insert(
+                local_id,
+                SyncedDraftRecord {
+                    upstream_draft_id: dref.id,
+                    upstream_message_id: up_msg_id,
+                    content_hash: upstream_hash,
+                },
+            );
+            report.messages_updated += 1;
+            continue;
+        }
+
+        // Dedup against an existing local draft already linked to this upstream message ID.
+        if !up_msg_id.is_empty()
+            && let Some(local_id) = local_draft_by_up_msg.get(&up_msg_id).cloned()
+        {
+            meta.drafts.insert(
+                local_id,
+                SyncedDraftRecord {
+                    upstream_draft_id: dref.id,
+                    upstream_message_id: up_msg_id,
+                    content_hash: upstream_hash,
+                },
+            );
+            report.messages_deduplicated += 1;
+            continue;
+        }
+
+        // If `messages.list` already ingested the bare draft message (without a drafts row),
+        // remove that bare message so `create_draft` stores it cleanly as a draft without duplicating upstream_gmail_id.
+        if !up_msg_id.is_empty()
+            && state
+                .store
+                .find_message_by_upstream_id(&up_msg_id)
+                .await?
+                .is_some()
+        {
+            let _ = state
+                .store
+                .delete_message_by_upstream_id(&up_msg_id)
+                .await?;
+        }
+
+        let input = parse_raw_to_new_message_input(
+            raw_bytes,
+            mapped_labels,
+            internal_date_ms,
+            "gmail_api",
+            (!up_msg_id.is_empty()).then_some(up_msg_id.clone()),
+            up_tid,
+            false,
+            false,
+        );
+        let created = state.store.create_draft(input).await?;
+        state.post_store_message(&created.message).await?;
+        meta.drafts.insert(
+            created.id,
+            SyncedDraftRecord {
+                upstream_draft_id: dref.id,
+                upstream_message_id: up_msg_id,
+                content_hash: upstream_hash,
+            },
+        );
+        report.messages_added += 1;
+    }
+
+    // Reconcile drafts deleted upstream (only when unmodified locally).
+    let stale_local_ids: Vec<(String, String)> = meta
+        .drafts
+        .iter()
+        .filter(|(_, rec)| !seen_upstream_draft_ids.contains(&rec.upstream_draft_id))
+        .map(|(lid, rec)| (lid.clone(), rec.content_hash.clone()))
+        .collect();
+
+    for (local_id, prev_hash) in stale_local_ids {
+        match state.store.get_draft(&local_id).await? {
+            Some(local_draft) => {
+                let current_raw = state.load_raw_rfc2822(&local_draft.message).await?;
+                if sha256_hex(&current_raw) == prev_hash {
+                    let att_ids = state
+                        .collect_external_attachment_ids(&local_draft.message.id)
+                        .await;
+                    if state.store.delete_draft(&local_id).await? {
+                        let _ = state
+                            .post_delete_message(&local_draft.message.id, &att_ids)
+                            .await;
+                        report.messages_deleted += 1;
+                    }
+                    meta.drafts.remove(&local_id);
+                }
+            }
+            None => {
+                meta.drafts.remove(&local_id);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 enum IncrementalOutcome {

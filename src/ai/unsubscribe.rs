@@ -854,6 +854,8 @@ async fn execute_mailto_unsubscribe(
 
     let outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
     let send_outcome = state.transport.send(&outbound_msg, None).await?;
+    let (upstream_gmail_id, upstream_thread_id) =
+        crate::transport::upstream_gmail_ids_from_send(&send_outcome, None);
 
     let stored = state
         .store
@@ -875,8 +877,8 @@ async fn execute_mailto_unsubscribe(
             in_reply_to: None,
             references_header: None,
             resend_id: Some(send_outcome.provider_message_id.clone()),
-            upstream_gmail_id: None,
-            upstream_thread_id: None,
+            upstream_gmail_id,
+            upstream_thread_id,
             source: "local".to_string(),
             is_answered: false,
             is_deleted: false,

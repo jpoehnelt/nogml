@@ -670,10 +670,22 @@ pub async fn execute_send_email_with_context(
 
     let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
     outbound_msg.idempotency_key = idempotency_key.clone();
+    let resolved_upstream_tid = crate::transport::resolve_outbound_upstream_thread_id(
+        state.store.as_ref(),
+        resolved.thread_id.as_deref(),
+        resolved.in_reply_to.as_deref(),
+        resolved.references.as_deref(),
+    )
+    .await;
+    if let Some(ref up_tid) = resolved_upstream_tid {
+        outbound_msg.set_upstream_thread_id(up_tid);
+    }
     let send_outcome = state
         .transport
         .send(&outbound_msg, idempotency_key.as_deref())
         .await?;
+    let (upstream_gmail_id, upstream_thread_id) =
+        crate::transport::upstream_gmail_ids_from_send(&send_outcome, resolved_upstream_tid);
 
     let stored = state
         .store
@@ -695,8 +707,8 @@ pub async fn execute_send_email_with_context(
             in_reply_to: resolved.in_reply_to.clone(),
             references_header: resolved.references.clone(),
             resend_id: Some(send_outcome.provider_message_id.clone()),
-            upstream_gmail_id: None,
-            upstream_thread_id: None,
+            upstream_gmail_id,
+            upstream_thread_id,
             source: "local".to_string(),
             is_answered: false,
             is_deleted: false,
@@ -1211,7 +1223,19 @@ pub async fn execute_send_draft_with_context(
 
     let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
     outbound_msg.attachments = outbound_attachments;
+    let resolved_upstream_tid = crate::transport::resolve_outbound_upstream_thread_id(
+        state.store.as_ref(),
+        Some(&msg.thread_id),
+        msg.in_reply_to.as_deref(),
+        msg.references_header.as_deref(),
+    )
+    .await;
+    if let Some(ref up_tid) = resolved_upstream_tid {
+        outbound_msg.set_upstream_thread_id(up_tid);
+    }
     let send_outcome = state.transport.send(&outbound_msg, None).await?;
+    let (upstream_gmail_id, upstream_thread_id) =
+        crate::transport::upstream_gmail_ids_from_send(&send_outcome, resolved_upstream_tid);
 
     let _ = state.store.delete_draft(draft_id).await?;
     let _ = state.post_delete_message(&msg.id, &old_att_ids).await;
@@ -1236,8 +1260,8 @@ pub async fn execute_send_draft_with_context(
             in_reply_to: msg.in_reply_to.clone(),
             references_header: msg.references_header.clone(),
             resend_id: Some(send_outcome.provider_message_id.clone()),
-            upstream_gmail_id: None,
-            upstream_thread_id: None,
+            upstream_gmail_id,
+            upstream_thread_id,
             source: "local".to_string(),
             is_answered: false,
             is_deleted: false,
@@ -2302,7 +2326,28 @@ pub async fn execute_approve_approval(
     // invoking the transport so concurrent multi-node replicas can never double-send.
     let approval = state.store.claim_pending_approval(id, now_ms).await?;
 
-    let outbound = &approval.outbound_message;
+    let mut outbound = approval.outbound_message.clone();
+    let in_reply_to_lookup = outbound
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("in-reply-to"))
+        .map(|(_, v)| v.clone());
+    let references_lookup = outbound
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("references"))
+        .map(|(_, v)| v.clone());
+    let resolved_upstream_tid = crate::transport::resolve_outbound_upstream_thread_id(
+        state.store.as_ref(),
+        approval.thread_id.as_deref(),
+        in_reply_to_lookup.as_deref(),
+        references_lookup.as_deref(),
+    )
+    .await;
+    if let Some(ref up_tid) = resolved_upstream_tid {
+        outbound.set_upstream_thread_id(up_tid);
+    }
+    let outbound = &outbound;
     let idempotency_key = format!("approval-{id}");
     let send_outcome = match state.transport.send(outbound, Some(&idempotency_key)).await {
         Ok(outcome) => outcome,
@@ -2311,6 +2356,8 @@ pub async fn execute_approve_approval(
             return Err(err);
         }
     };
+    let (upstream_gmail_id, upstream_thread_id) =
+        crate::transport::upstream_gmail_ids_from_send(&send_outcome, resolved_upstream_tid);
 
     let raw_rfc2822 = crate::transport::ensure_raw_rfc2822(outbound, &state.config.user_email)?;
     let text_body = outbound.text.clone().unwrap_or_default();
@@ -2385,8 +2432,8 @@ pub async fn execute_approve_approval(
             in_reply_to,
             references_header,
             resend_id: Some(send_outcome.provider_message_id.clone()),
-            upstream_gmail_id: None,
-            upstream_thread_id: None,
+            upstream_gmail_id,
+            upstream_thread_id,
             source: "local".to_string(),
             is_answered: false,
             is_deleted: false,
