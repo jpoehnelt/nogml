@@ -10,8 +10,9 @@ use nogml::{
     error::AppError,
     events::{EventBridge, EventBus, EventEnvelope, EventSource, MailEvent},
     models::{
-        LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD,
-        LabelColor, SYSTEM_LABEL_IDS, ThreadAnnotation, ThreadAnnotationPatch, WaitingOn,
+        LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
+        LABEL_TRASH, LABEL_UNREAD, LabelColor, SYSTEM_LABEL_IDS, ThreadAnnotation,
+        ThreadAnnotationPatch, WaitingOn,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactDirection,
@@ -725,6 +726,99 @@ async fn contract_imap_uids_flags_move_expunge_vanished(store: Arc<dyn MailStore
         missing,
         nogml::storage::ImapStoreFlagsOutcome::NotFound
     ));
+
+    // Atomic `imap_store_xgm_labels` CAS: NotFound on deleted message, UNREAD preserved,
+    // and concurrent writers racing on the same UNCHANGEDSINCE allow strictly one winner.
+    let missing_xgm = store
+        .imap_store_xgm_labels(
+            &msg_a.id,
+            nogml::storage::ImapFlagAction::Add,
+            &[LABEL_IMPORTANT.to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        missing_xgm,
+        nogml::storage::ImapStoreFlagsOutcome::NotFound
+    ));
+
+    let lbl_race_a = store
+        .create_label(NewLabelInput {
+            name: "RaceA".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let lbl_race_b = store
+        .create_label(NewLabelInput {
+            name: "RaceB".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Ensure msg_b has UNREAD before testing UNREAD preservation + concurrent CAS.
+    let msg_b_fresh = store
+        .modify_message_labels(&msg_b.id, &[LABEL_UNREAD.to_string()], &[])
+        .await
+        .unwrap();
+    let race_modseq = msg_b_fresh.history_id.max(1);
+
+    // Defense-in-depth: passing LABEL_UNREAD to imap_store_xgm_labels must not remove UNREAD.
+    let unread_guard = store
+        .imap_store_xgm_labels(
+            &msg_b.id,
+            nogml::storage::ImapFlagAction::Remove,
+            &[LABEL_UNREAD.to_string()],
+            Some(race_modseq),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unread_guard,
+        nogml::storage::ImapStoreFlagsOutcome::Updated(ref m)
+            if m.label_ids.contains(&LABEL_UNREAD.to_string())
+    ));
+
+    // Concurrent UNCHANGEDSINCE CAS race: both writers target `race_modseq`; strictly one wins.
+    let (res_a, res_b) = tokio::join!(
+        store.imap_store_xgm_labels(
+            &msg_b.id,
+            nogml::storage::ImapFlagAction::Add,
+            std::slice::from_ref(&lbl_race_a.id),
+            Some(race_modseq),
+        ),
+        store.imap_store_xgm_labels(
+            &msg_b.id,
+            nogml::storage::ImapFlagAction::Add,
+            std::slice::from_ref(&lbl_race_b.id),
+            Some(race_modseq),
+        ),
+    );
+    let (res_a, res_b) = (res_a.unwrap(), res_b.unwrap());
+    let updated_count = usize::from(matches!(
+        res_a,
+        nogml::storage::ImapStoreFlagsOutcome::Updated(_)
+    )) + usize::from(matches!(
+        res_b,
+        nogml::storage::ImapStoreFlagsOutcome::Updated(_)
+    ));
+    let modified_count = usize::from(matches!(
+        res_a,
+        nogml::storage::ImapStoreFlagsOutcome::Modified
+    )) + usize::from(matches!(
+        res_b,
+        nogml::storage::ImapStoreFlagsOutcome::Modified
+    ));
+    assert_eq!(
+        updated_count, 1,
+        "exactly one concurrent X-GM-LABELS writer must win UNCHANGEDSINCE CAS"
+    );
+    assert_eq!(
+        modified_count, 1,
+        "losing concurrent X-GM-LABELS writer must receive Modified"
+    );
 }
 
 async fn contract_fts_ai_search_and_cursor_pagination(store: Arc<dyn MailStore>) {

@@ -233,6 +233,26 @@ pub async fn handle_connection(
                 }
                 continue;
             }
+            Ok(ReadCommandOutcome::NonSyncLiteralTooLarge { tag, size }) => {
+                let limit = cmd_limits.max_non_sync_literal_bytes;
+                let detail = if size > limit {
+                    format!("Literal exceeds {limit} bytes")
+                } else {
+                    format!("Literal size {size} exceeds command limit")
+                };
+                let resp = if let Some(t) = tag
+                    .map(|s| sanitize_imap_text(&s))
+                    .filter(|s| !s.is_empty())
+                {
+                    format!(
+                        "{t} NO [TOOBIG] {detail}\r\n* BYE [TOOBIG] Closing connection after oversized non-synchronizing literal\r\n"
+                    )
+                } else {
+                    format!("* BYE [TOOBIG] {detail}\r\n")
+                };
+                let _ = write_flush(&mut reader, resp.as_bytes()).await;
+                break;
+            }
             Err(err) => {
                 debug!(%err, "IMAP command read/parse error");
                 let safe_err = sanitize_imap_text(&err.to_string());
@@ -3278,7 +3298,20 @@ impl ImapSession {
                 return Ok(());
             }
 
-            // Custom user label: find existing by exact name, case-insensitive name, or ID.
+            if existing_labels.iter().any(|l| {
+                l.label_type != "user"
+                    && (l.id.eq_ignore_ascii_case(trimmed) || l.name.eq_ignore_ascii_case(trimmed))
+            }) {
+                let safe = sanitize_imap_text(trimmed);
+                write_flush(
+                    stream,
+                    format!("{tag} NO Unsupported Gmail system label {safe}\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Custom user label: find existing by exact name, case-insensitive name, or user label ID.
             let found_id = existing_labels
                 .iter()
                 .find(|l| l.label_type == "user" && l.name == trimmed)
@@ -3287,7 +3320,11 @@ impl ImapSession {
                         .iter()
                         .find(|l| l.label_type == "user" && l.name.eq_ignore_ascii_case(trimmed))
                 })
-                .or_else(|| existing_labels.iter().find(|l| l.id == trimmed))
+                .or_else(|| {
+                    existing_labels
+                        .iter()
+                        .find(|l| l.label_type == "user" && l.id == trimmed)
+                })
                 .map(|l| l.id.clone());
 
             let resolved_id = match found_id {
@@ -3352,56 +3389,29 @@ impl ImapSession {
                 continue;
             }
 
-            let Some(current_msg) = self.state.store.get_message(&snap_entry.message_id).await?
-            else {
-                continue;
-            };
-
-            if let Some(limit) = unchanged_since
-                && current_msg.history_id.max(1) > limit
+            // Atomic CAS against fresh DB `history_id` + skip concurrently deleted messages.
+            let updated = match self
+                .state
+                .store
+                .imap_store_xgm_labels(
+                    &snap_entry.message_id,
+                    action,
+                    &target_label_ids,
+                    unchanged_since,
+                )
+                .await?
             {
-                modified_ids.push(key);
-                continue;
-            }
-
-            let (add_labels, remove_labels): (Vec<String>, Vec<String>) = match action {
-                ImapFlagAction::Add => (target_label_ids.clone(), Vec::new()),
-                ImapFlagAction::Remove => (Vec::new(), target_label_ids.clone()),
-                ImapFlagAction::Replace => {
-                    let target_set: HashSet<&str> =
-                        target_label_ids.iter().map(String::as_str).collect();
-                    let current_set: HashSet<&str> =
-                        current_msg.label_ids.iter().map(String::as_str).collect();
-                    let add: Vec<String> = target_label_ids
-                        .iter()
-                        .filter(|id| !current_set.contains(id.as_str()))
-                        .cloned()
-                        .collect();
-                    // Preserve LABEL_UNREAD because \Seen controls UNREAD, not X-GM-LABELS.
-                    let remove: Vec<String> = current_msg
-                        .label_ids
-                        .iter()
-                        .filter(|id| {
-                            id.as_str() != LABEL_UNREAD && !target_set.contains(id.as_str())
-                        })
-                        .cloned()
-                        .collect();
-                    (add, remove)
+                ImapStoreFlagsOutcome::Updated(msg) => *msg,
+                ImapStoreFlagsOutcome::Modified => {
+                    modified_ids.push(key);
+                    continue;
+                }
+                ImapStoreFlagsOutcome::NotFound => {
+                    continue;
                 }
             };
 
-            // modify_message_labels updates modseq (history_id) and records HistoryEvent with
-            // HistorySource::Local ("local") so upstream Gmail sync pushes the label mutation.
-            let updated = if add_labels.is_empty() && remove_labels.is_empty() {
-                current_msg.clone()
-            } else {
-                self.state
-                    .store
-                    .modify_message_labels(&snap_entry.message_id, &add_labels, &remove_labels)
-                    .await?
-            };
-
-            let old_set: HashSet<&str> = current_msg.label_ids.iter().map(String::as_str).collect();
+            let old_set: HashSet<&str> = snap_entry.label_ids.iter().map(String::as_str).collect();
             let new_set: HashSet<&str> = updated.label_ids.iter().map(String::as_str).collect();
             let added: Vec<String> = new_set
                 .difference(&old_set)
@@ -3437,10 +3447,13 @@ impl ImapSession {
                     parts.push(format!("UID {}", new_entry.uid));
                 }
                 parts.push(format!("X-GM-LABELS ({labels_str})"));
-                parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                if self.condstore_enabled {
+                    parts.push(format!("MODSEQ ({})", new_entry.modseq()));
+                }
                 let line = format!("* {} FETCH ({})\r\n", new_entry.seq, parts.join(" "));
                 write_flush(stream, line.as_bytes()).await?;
             } else if unchanged_since.is_some() {
+                // RFC 7162 Section 3.1.3: .SILENT with UNCHANGEDSINCE still reports new MODSEQ.
                 let mut parts = Vec::new();
                 if is_uid {
                     parts.push(format!("UID {}", new_entry.uid));
@@ -4059,7 +4072,7 @@ fn format_xgm_labels(label_ids: &[String], name_map: &HashMap<String, String>) -
             LABEL_IMPORTANT => out.push("\\Important".to_string()),
             other => {
                 let name = name_map.get(other).map(String::as_str).unwrap_or(other);
-                out.push(imap_quote(name));
+                out.push(imap_string(name));
             }
         }
     }
@@ -5004,5 +5017,33 @@ mod tests {
         let mut ok_not: Vec<ImapArg> = (0..10).map(|_| ImapArg::Atom("NOT".to_string())).collect();
         ok_not.push(ImapArg::Atom("SEEN".to_string()));
         assert!(parse_search_criteria(&ok_not, 10, 10).is_ok());
+    }
+
+    #[test]
+    fn format_xgm_labels_uses_literals_for_non_ascii_and_quotes_for_ascii() {
+        let mut names = HashMap::new();
+        names.insert("Label_ascii".to_string(), "Work/Urgent".to_string());
+        names.insert("Label_utf8".to_string(), "Café/重要".to_string());
+        names.insert("Label_jp".to_string(), "日本語".to_string());
+
+        let formatted = format_xgm_labels(
+            &[
+                LABEL_UNREAD.to_string(),
+                LABEL_INBOX.to_string(),
+                "Label_ascii".to_string(),
+                "Label_utf8".to_string(),
+                "Label_jp".to_string(),
+            ],
+            &names,
+        );
+        let utf8_len = "Café/重要".len();
+        let jp_len = "日本語".len();
+        assert_eq!(
+            formatted,
+            format!("\\Inbox \"Work/Urgent\" {{{utf8_len}}}\r\nCafé/重要 {{{jp_len}}}\r\n日本語")
+        );
+        // Verify no quoted string contains non-ASCII bytes.
+        assert!(!formatted.contains("\"Café/重要\""));
+        assert!(!formatted.contains("\"日本語\""));
     }
 }

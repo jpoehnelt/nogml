@@ -120,8 +120,16 @@ pub enum ReadCommandOutcome {
     Empty,
     /// Client closed the connection cleanly.
     Eof,
-    /// Client sent a literal larger than `max_literal_bytes` (with parsed tag if available).
+    /// Client sent a synchronizing `{N}` literal larger than `max_literal_bytes` (with parsed tag
+    /// if available). Connection remains synchronized because `+ Ready` was not sent.
     LiteralTooLarge {
+        tag: Option<String>,
+        size: usize,
+    },
+    /// Client sent a non-synchronizing `{N+}` literal exceeding RFC 7888 `LITERAL-` or command
+    /// limits (with parsed tag if available). The server must reply with `<tag> NO [TOOBIG] ...`
+    /// and `* BYE [TOOBIG] ...` and close the connection because stream framing may have desynced.
+    NonSyncLiteralTooLarge {
         tag: Option<String>,
         size: usize,
     },
@@ -189,11 +197,10 @@ where
             )));
         }
 
-        if first_tag.is_none() {
-            first_tag = line.split_whitespace().next().map(str::to_string);
-        }
-
         if let Some((prefix, lit_len, non_sync)) = parse_trailing_literal(&line) {
+            if first_tag.is_none() {
+                first_tag = prefix.split_whitespace().next().map(str::to_string);
+            }
             if !prefix.is_empty() {
                 chunks.push(RawChunk::Text(prefix.to_string()));
             }
@@ -212,21 +219,23 @@ where
             }
             if non_sync && lit_len > limits.max_non_sync_literal_bytes {
                 // RFC 7888 LITERAL-: non-synchronizing literals > 4096 bytes are rejected
-                // with TOOBIG; abort connection since client may already be streaming payload bytes.
-                return Err(AppError::PayloadTooLarge(format!(
-                    "[TOOBIG] Non-synchronizing literal size {lit_len} exceeds LITERAL- limit of {} bytes",
-                    limits.max_non_sync_literal_bytes
-                )));
+                // with [TOOBIG]; caller emits `<tag> NO [TOOBIG] ...` + `* BYE [TOOBIG] ...`
+                // and closes the connection since the client may already be streaming payload bytes.
+                return Ok(ReadCommandOutcome::NonSyncLiteralTooLarge {
+                    tag: first_tag,
+                    size: lit_len,
+                });
             }
             if lit_len > limits.max_literal_bytes
                 || total_bytes.saturating_add(lit_len) > limits.max_command_bytes
             {
                 // For synchronizing literals we haven't sent continuation, so client won't send payload.
-                // For non-sync literals, abort connection since stream framing would desync.
+                // For non-sync literals, emit [TOOBIG] and abort connection since stream framing would desync.
                 if non_sync {
-                    return Err(AppError::PayloadTooLarge(format!(
-                        "[TOOBIG] IMAP literal size {lit_len} exceeds limit"
-                    )));
+                    return Ok(ReadCommandOutcome::NonSyncLiteralTooLarge {
+                        tag: first_tag,
+                        size: lit_len,
+                    });
                 }
                 return Ok(ReadCommandOutcome::LiteralTooLarge {
                     tag: first_tag,
@@ -823,14 +832,21 @@ mod tests {
             } if t == "A1"
         ));
 
-        // 2. Pre-auth LITERAL+ > 16 KiB returns PayloadTooLarge so framing aborts.
+        // 2. Pre-auth LITERAL- > 4096 returns NonSyncLiteralTooLarge so caller sends [TOOBIG] + BYE.
         let (mut client, server) = tokio::io::duplex(4096);
         let mut reader = BufReader::new(server);
         client.write_all(b"A2 LOGIN {20000+}\r\n").await.unwrap();
-        let err = read_command_with_limits(&mut reader, ReadCommandLimits::pre_auth(40_000_000))
-            .await
-            .expect_err("oversized LITERAL+ must fail");
-        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+        let outcome =
+            read_command_with_limits(&mut reader, ReadCommandLimits::pre_auth(40_000_000))
+                .await
+                .expect("oversized LITERAL- should return structured outcome");
+        assert!(matches!(
+            outcome,
+            ReadCommandOutcome::NonSyncLiteralTooLarge {
+                tag: Some(ref t),
+                size: 20000
+            } if t == "A2"
+        ));
 
         // 3. Cumulative command byte cap across multiple literals.
         let (mut client, server) = tokio::io::duplex(64 * 1024);
@@ -849,13 +865,19 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let err = read_command_with_limits(&mut reader, limits)
+        let outcome = read_command_with_limits(&mut reader, limits)
             .await
-            .expect_err("cumulative cap must reject second literal");
-        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+            .expect("cumulative cap should return NonSyncLiteralTooLarge");
+        assert!(matches!(
+            outcome,
+            ReadCommandOutcome::NonSyncLiteralTooLarge {
+                tag: Some(ref t),
+                size: 4000
+            } if t == "A3"
+        ));
         let _ = writer.await;
 
-        // 4. RFC 7888 LITERAL-: {4096+} succeeds, {4097+} fails with TOOBIG.
+        // 4. RFC 7888 LITERAL-: {4096+} succeeds, {4097+} returns NonSyncLiteralTooLarge.
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let mut reader = BufReader::new(server);
         let payload_4096 = "a".repeat(LITERAL_MINUS_MAX_BYTES);
@@ -881,11 +903,17 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let mut reader = BufReader::new(server);
         client.write_all(b"A4C CMD {4097+}\r\n").await.unwrap();
-        let err =
+        let outcome =
             read_command_with_limits(&mut reader, ReadCommandLimits::authenticated(40_000_000))
                 .await
-                .expect_err("4097-byte LITERAL- must be rejected");
-        assert!(matches!(err, AppError::PayloadTooLarge(ref msg) if msg.contains("[TOOBIG]")));
+                .expect("4097-byte LITERAL- should return structured NonSyncLiteralTooLarge");
+        assert!(matches!(
+            outcome,
+            ReadCommandOutcome::NonSyncLiteralTooLarge {
+                tag: Some(ref t),
+                size: 4097
+            } if t == "A4C"
+        ));
 
         // 4. Max literal count cap (> 16 literals).
         let (mut client, server) = tokio::io::duplex(64 * 1024);

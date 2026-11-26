@@ -529,18 +529,26 @@ async fn pre_auth_dos_oversized_literal_and_nested_parens_and_search_depth_rejec
         "expected * BAD for deep parens, got {bad_nest:?}"
     );
 
-    // 3. Pre-auth oversized LITERAL+ closes connection immediately without allocating.
+    // 3. Pre-auth oversized LITERAL- emits `<tag> NO [TOOBIG]` + `* BYE [TOOBIG]` and closes immediately without allocating.
     reader
         .get_mut()
         .write_all(b"P3 LOGIN {20000+}\r\n")
         .await
         .unwrap();
     reader.get_mut().flush().await.unwrap();
-    let lit_plus_err = read_line_timeout(&mut reader).await.unwrap();
-    assert!(lit_plus_err.starts_with("* BAD"), "got {lit_plus_err:?}");
+    let lit_plus_no = read_line_timeout(&mut reader).await.unwrap();
+    assert!(
+        lit_plus_no.starts_with("P3 NO [TOOBIG] "),
+        "expected tagged NO [TOOBIG], got {lit_plus_no:?}"
+    );
+    let lit_plus_bye = read_line_timeout(&mut reader).await.unwrap();
+    assert!(
+        lit_plus_bye.starts_with("* BYE [TOOBIG] "),
+        "expected untagged BYE [TOOBIG], got {lit_plus_bye:?}"
+    );
     assert!(
         read_line_timeout(&mut reader).await.is_none(),
-        "server must close connection after oversized LITERAL+"
+        "server must close connection after oversized LITERAL-"
     );
 
     // 4. Authenticated deeply nested SEARCH NOT chain rejected with BAD.

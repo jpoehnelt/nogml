@@ -462,14 +462,50 @@ impl ImapFlagSet {
     }
 }
 
-/// Outcome of an atomic [`MailStore::imap_store_flags`] operation.
+/// Outcome of an atomic [`MailStore::imap_store_flags`] or [`MailStore::imap_store_xgm_labels`]
+/// operation.
 #[derive(Debug, Clone)]
 pub enum ImapStoreFlagsOutcome {
     Updated(Box<StoredMessage>),
     /// Atomic `UNCHANGEDSINCE` precondition failed because current `MODSEQ > unchanged_since`.
     Modified,
-    /// Message was concurrently deleted before flags could be updated.
+    /// Message was concurrently deleted before flags or labels could be updated.
     NotFound,
+}
+
+/// Compute `(add_labels, remove_labels)` for an IMAP `STORE X-GM-LABELS` mutation while
+/// preserving `LABEL_UNREAD` (which is governed exclusively by `\Seen`).
+pub fn compute_xgm_label_delta(
+    current_label_ids: &[String],
+    action: ImapFlagAction,
+    target_label_ids: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let filtered_targets: Vec<String> = target_label_ids
+        .iter()
+        .filter(|id| id.as_str() != LABEL_UNREAD)
+        .cloned()
+        .collect();
+    match action {
+        ImapFlagAction::Add => (filtered_targets, Vec::new()),
+        ImapFlagAction::Remove => (Vec::new(), filtered_targets),
+        ImapFlagAction::Replace => {
+            let target_set: std::collections::HashSet<&str> =
+                filtered_targets.iter().map(String::as_str).collect();
+            let current_set: std::collections::HashSet<&str> =
+                current_label_ids.iter().map(String::as_str).collect();
+            let add: Vec<String> = filtered_targets
+                .iter()
+                .filter(|id| !current_set.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let remove: Vec<String> = current_label_ids
+                .iter()
+                .filter(|id| id.as_str() != LABEL_UNREAD && !target_set.contains(id.as_str()))
+                .cloned()
+                .collect();
+            (add, remove)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1549,6 +1585,31 @@ pub trait MailStore: Send + Sync {
                 next.deleted,
             )
             .await?;
+        Ok(ImapStoreFlagsOutcome::Updated(Box::new(updated)))
+    }
+    /// Atomically apply an IMAP `STORE X-GM-LABELS` mutation with optional RFC 7162
+    /// `UNCHANGEDSINCE` CAS.
+    async fn imap_store_xgm_labels(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        label_ids: &[String],
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let Some(old_msg) = self.get_message(message_id).await? else {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        };
+        if let Some(limit) = unchanged_since
+            && old_msg.history_id.max(1) > limit
+        {
+            return Ok(ImapStoreFlagsOutcome::Modified);
+        }
+        let (add, rem) = compute_xgm_label_delta(&old_msg.label_ids, action, label_ids);
+        let updated = if add.is_empty() && rem.is_empty() {
+            old_msg
+        } else {
+            self.modify_message_labels(message_id, &add, &rem).await?
+        };
         Ok(ImapStoreFlagsOutcome::Updated(Box::new(updated)))
     }
     /// Expunges messages marked `is_deleted` in `mailbox_name` and returns their 1-based sequence numbers (pre-expunge).
