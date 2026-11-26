@@ -44,8 +44,9 @@ use crate::{
     events::{EventEnvelope, EventSource, MailEvent},
     mime::{
         ComposeEmailInput, DEFAULT_ATTACHMENT_MAX_BYTES, apply_fields_mask, build_rfc2822,
-        extract_attachment_text, generate_snippet, oversize_attachment_extraction,
-        parse_unsubscribe_from_raw, select_body_or_html_markdown, strip_quoted_text,
+        extract_attachment_text, extract_html_links, generate_snippet,
+        oversize_attachment_extraction, parse_unsubscribe_from_raw, select_body_or_html_markdown,
+        strip_quoted_text, strip_tracking_pixels,
     },
     models::{
         AiBatchTriageRequest, AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest,
@@ -68,9 +69,10 @@ use crate::{
 };
 
 pub use safety::{
-    ConfigOutboundPolicy, OutboundCheck, OutboundDecision, OutboundPolicy, PolicyCheck,
-    check_recipients_policy, clamp_max_body_chars, evaluate_send_dry_run, sanitize_untrusted_text,
-    untrusted_meta, validate_email_header, validate_resource_id,
+    ConfigOutboundPolicy, DlpOutboundPolicy, FirstContactPolicy, OutboundCheck, OutboundDecision,
+    OutboundPolicy, OutboundPolicyChain, PolicyCheck, check_recipients_policy,
+    clamp_max_body_chars, evaluate_send_dry_run, open_outbound_policy, sanitize_untrusted_text,
+    scan_dlp_findings, scan_dlp_text, untrusted_meta, validate_email_header, validate_resource_id,
 };
 pub use schema::runtime_schema;
 pub use unsubscribe::{
@@ -354,7 +356,9 @@ pub async fn execute_send_email_with_context(
         subject: resolved.subject.clone(),
         text: resolved.text.clone(),
         html: resolved.html.clone(),
+        attachment_filenames: Vec::new(),
         thread_id: resolved.thread_id.clone(),
+        mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send: false,
         agent_policy,
     };
@@ -488,6 +492,7 @@ pub async fn execute_send_email_with_context(
                 },
             );
 
+            let preview_snippet = safe_hold_preview_snippet(&state.config, &snippet);
             let approval = enqueue_pending_approval(
                 state,
                 reason,
@@ -497,7 +502,7 @@ pub async fn execute_send_email_with_context(
                 Some(draft.message.thread_id.clone()),
                 Some(draft.id.clone()),
                 now_ms,
-                &snippet,
+                preview_snippet,
                 source,
             )
             .await?;
@@ -507,7 +512,7 @@ pub async fn execute_send_email_with_context(
                 Some(&draft.id),
                 Some(&draft.message.id),
                 Some(&draft.message.thread_id),
-                &snippet,
+                preview_snippet,
             );
             if let Some(ref key) = idempotency_key {
                 let encoded = serde_json::to_string(&resp)?;
@@ -830,6 +835,17 @@ pub async fn execute_send_draft_with_context(
         .ok_or_else(|| AppError::NotFound(format!("Draft '{draft_id}' not found")))?;
 
     let msg = &draft.message;
+    let attachment_filenames: Vec<String> = if msg.has_attachments {
+        state
+            .store
+            .list_attachment_meta(&msg.id)
+            .await?
+            .into_iter()
+            .filter_map(|m| m.filename)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     if req.dry_run {
         let preview = safety::evaluate_resolved_dry_run(
@@ -840,6 +856,7 @@ pub async fn execute_send_draft_with_context(
             Some(&msg.subject),
             (!msg.text_body.is_empty()).then_some(msg.text_body.as_str()),
             msg.html_body.as_deref(),
+            &attachment_filenames,
             None,
             Some(&msg.thread_id),
             msg.in_reply_to.as_deref(),
@@ -896,7 +913,9 @@ pub async fn execute_send_draft_with_context(
         subject: resolved.subject.clone(),
         text: resolved.text.clone(),
         html: resolved.html.clone(),
+        attachment_filenames,
         thread_id: resolved.thread_id.clone(),
+        mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send: true,
         agent_policy,
     };
@@ -965,6 +984,7 @@ pub async fn execute_send_draft_with_context(
             }
 
             let now_ms = Utc::now().timestamp_millis();
+            let preview_snippet = safe_hold_preview_snippet(&state.config, &msg.snippet);
             let approval = enqueue_pending_approval(
                 state,
                 reason,
@@ -974,7 +994,7 @@ pub async fn execute_send_draft_with_context(
                 Some(msg.thread_id.clone()),
                 Some(draft.id.clone()),
                 now_ms,
-                &msg.snippet,
+                preview_snippet,
                 source,
             )
             .await?;
@@ -995,7 +1015,7 @@ pub async fn execute_send_draft_with_context(
                 Some(&draft.id),
                 Some(&msg.id),
                 Some(&msg.thread_id),
-                &msg.snippet,
+                preview_snippet,
             ));
         }
         OutboundDecision::Allow => {}
@@ -2414,7 +2434,12 @@ pub fn to_compact_message(
 
     let html = if include_body && include_html {
         msg.html_body.as_deref().map(|raw_html| {
-            let cleaned = clean(raw_html);
+            let processed = if guard {
+                strip_tracking_pixels(raw_html)
+            } else {
+                raw_html.to_string()
+            };
+            let cleaned = clean(&processed);
             if cleaned.chars().count() > effective_cap {
                 cleaned.chars().take(effective_cap).collect()
             } else {
@@ -2423,6 +2448,24 @@ pub fn to_compact_message(
         })
     } else {
         None
+    };
+
+    let links = if include_body {
+        msg.html_body
+            .as_deref()
+            .map(|raw_html| {
+                let mut extracted = extract_html_links(raw_html);
+                if guard {
+                    for link in &mut extracted {
+                        link.display_text = sanitize_untrusted_text(&link.display_text);
+                        link.href = sanitize_untrusted_text(&link.href);
+                    }
+                }
+                extracted
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
 
     let unsubscribe = sanitize_unsubscribe(parse_unsubscribe_from_raw(&msg.raw_rfc2822), guard);
@@ -2447,6 +2490,7 @@ pub fn to_compact_message(
         text_truncated,
         text_total_chars,
         html,
+        links,
         in_reply_to: msg.in_reply_to.clone(),
         rfc_message_id: msg.rfc822_message_id.clone(),
         unsubscribe,
@@ -2868,6 +2912,16 @@ pub(crate) async fn enqueue_pending_approval(
 
     spawn_approval_webhook(&state.config, &approval, snippet);
     Ok(approval)
+}
+
+fn safe_hold_preview_snippet<'a>(config: &Config, snippet: &'a str) -> &'a str {
+    if config.dlp_action != crate::config::DlpAction::Off
+        && !safety::scan_dlp_text(snippet).is_empty()
+    {
+        "[redacted by DLP policy]"
+    } else {
+        snippet
+    }
 }
 
 pub(crate) fn build_hold_response(
@@ -3381,6 +3435,8 @@ async fn get_capabilities(
             "draft_only": cfg.draft_only,
             "draft_only_action": cfg.draft_only_action,
             "require_approval": cfg.require_approval,
+            "first_contact_approval": cfg.first_contact_approval,
+            "dlp_action": cfg.dlp_action,
             "approval_ttl_secs": cfg.approval_ttl_secs,
             "approval_webhook_enabled": cfg.approval_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty()),
             "allowed_recipients_enabled": !cfg.allowed_recipients.is_empty(),
@@ -3400,6 +3456,7 @@ async fn get_capabilities(
         "imap_enabled": cfg.imap_bind.is_some() || cfg.imap_tls_bind.is_some(),
         "oauth2_enabled": cfg.oauth2_enabled(),
         "active_filters": active_filters,
+        "active_outbound_policies": state.outbound_policy.active_policies(),
         "backends": {
             "storage": state.store.backend_name(),
             "blob": state.blobs.backend_name(),

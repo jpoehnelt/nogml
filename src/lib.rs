@@ -38,7 +38,7 @@ use axum::{
 use tokio::sync::Mutex;
 
 use crate::{
-    ai::safety::{ConfigOutboundPolicy, OutboundPolicy},
+    ai::safety::{OutboundPolicy, open_outbound_policy},
     auth::{AuthProvider, Principal, StaticTokenAuthProvider},
     blob::{
         BlobStore, InlineBlobStore, PrefixedBlobStore, attachment_blob_key, is_external_blob_store,
@@ -191,8 +191,7 @@ impl AppState {
         let search = open_search_index(&config, store.clone())?;
         let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
-        let outbound_policy: Arc<dyn OutboundPolicy> =
-            Arc::new(ConfigOutboundPolicy::from_config(&config));
+        let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
         let sync_lock = Arc::new(Mutex::new(()));
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
@@ -280,8 +279,7 @@ impl AppState {
             Ok(s) => s,
             Err(_) => Arc::new(StoreSearchIndex::new(store.clone())),
         };
-        let outbound_policy: Arc<dyn OutboundPolicy> =
-            Arc::new(ConfigOutboundPolicy::from_config(&config));
+        let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
         let sync_lock = Arc::new(Mutex::new(()));
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
@@ -343,6 +341,10 @@ impl AppState {
             .search
             .for_mailbox(&target)
             .unwrap_or_else(|| self.search.clone());
+        let outbound_policy = self
+            .outbound_policy
+            .for_mailbox(&target)
+            .unwrap_or_else(|| self.outbound_policy.clone());
         let events = self.events.for_mailbox(&target);
 
         let config = if self.config.user_email.eq_ignore_ascii_case(&target) {
@@ -377,7 +379,7 @@ impl AppState {
             filter: self.filter.clone(),
             auth: self.auth.clone(),
             search,
-            outbound_policy: self.outbound_policy.clone(),
+            outbound_policy,
             resend: self.resend.clone(),
             events,
             sync_lock,

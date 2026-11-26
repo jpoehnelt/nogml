@@ -717,6 +717,13 @@ pub struct UntrustedMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractedLink {
+    pub display_text: String,
+    pub href: String,
+    pub domain_mismatch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContactSummary {
     pub email: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -760,6 +767,8 @@ pub struct CompactMessage {
     pub text_total_chars: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<ExtractedLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

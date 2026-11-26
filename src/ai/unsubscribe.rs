@@ -682,7 +682,9 @@ async fn execute_one_click_post(
         subject: format!("Unsubscribe: {message_subject}"),
         text: Some(RFC8058_ONE_CLICK_BODY.to_string()),
         html: None,
+        attachment_filenames: Vec::new(),
         thread_id: None,
+        mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send: false,
         agent_policy: agent_policy.clone(),
     };
@@ -889,7 +891,9 @@ async fn execute_mailto_unsubscribe(
         subject: resolved.subject.clone(),
         text: resolved.text.clone(),
         html: None,
+        attachment_filenames: Vec::new(),
         thread_id: None,
+        mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send: false,
         agent_policy: agent_policy.clone(),
     };
