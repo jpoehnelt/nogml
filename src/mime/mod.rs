@@ -3,7 +3,9 @@
 //!
 //! Owned by the `mime-search` worker.
 
+mod attachments;
 mod fields;
+mod markdown;
 mod payload;
 mod text;
 mod unsubscribe;
@@ -30,7 +32,13 @@ use crate::{
     storage::{NewAttachmentInput, parse_simple_email_address},
 };
 
+pub use attachments::{
+    CalendarEvent, DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_ATTACHMENT_MAX_CHARS,
+    HARD_ATTACHMENT_MAX_CHARS, clamp_attachment_max_chars, extract_attachment_text,
+    extract_pdf_text_streams, oversize_attachment_extraction, parse_ics_events, unfold_ics_lines,
+};
 pub use fields::apply_fields_mask;
+pub use markdown::{decode_html_entities, html_to_markdown, select_body_or_html_markdown};
 pub use payload::build_gmail_payload;
 pub use text::{generate_snippet, sanitize_untrusted_text, strip_quoted_text};
 pub use unsubscribe::{
@@ -250,12 +258,16 @@ pub fn parse_rfc2822(raw: &[u8]) -> AppResult<ParsedEmail> {
     let text_body = if !text_parts.is_empty() {
         text_parts.join("\n")
     } else if let Some(ref html) = html_body {
-        mail_parser::html_to_text(html).trim().to_string()
+        html_to_markdown(html)
     } else {
         String::new()
     };
 
-    let snippet = generate_snippet(&text_body, html_body.as_deref());
+    let snippet = if !text_parts.is_empty() {
+        generate_snippet(&text_body, html_body.as_deref())
+    } else {
+        generate_snippet("", html_body.as_deref())
+    };
     let attachments = payload::collect_attachments_with_part_ids(message.root_part());
 
     Ok(ParsedEmail {

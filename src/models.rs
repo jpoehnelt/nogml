@@ -686,7 +686,32 @@ pub struct UnsubscribeInfo {
     pub post_body: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentTextExtraction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub extracted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub truncated: bool,
+    pub total_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<UntrustedMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UntrustedMeta {
     pub untrusted_external_content: bool,
 }
@@ -707,8 +732,12 @@ pub struct CompactMessage {
     pub has_attachments: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments_meta: Option<Vec<AttachmentMeta>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments_text: Option<Vec<AttachmentTextExtraction>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_format: Option<String>,
     pub text_truncated: bool,
     pub text_total_chars: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -59,6 +59,23 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                     "strip_quotes": { "type": "boolean", "default": false },
                     "include_html": { "type": "boolean", "default": false },
                     "include_attachments_meta": { "type": "boolean", "default": true },
+                    "extract_attachment_text": { "type": "boolean", "default": false },
+                    "attachment_max_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 20000 },
+                    "fields": { "type": "string" }
+                }
+            }
+        },
+        "mail.attachment_text": {
+            "endpoint": "GET /v1/messages/{id}/attachments/{attachment_id}/text",
+            "mcp_tool": "read_attachment_text",
+            "description": "Extract readable text or structured calendar data from a message attachment with strict byte and character ceilings.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id", "attachment_id"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "attachment_id": { "type": "string" },
+                    "max_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 20000 },
                     "fields": { "type": "string" }
                 }
             }
@@ -226,6 +243,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "search" | "search_emails" => "mail.search",
             "threads" | "list_threads" => "mail.threads",
             "read" | "read_email" | "read_thread" => "mail.read",
+            "attachment_text" | "read_attachment_text" => "mail.attachment_text",
             "send" | "send_email" => "mail.send",
             "draft" | "create_draft" => "mail.draft",
             "send_draft" => "mail.send_draft",
@@ -267,6 +285,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",
             "GET /v1/messages/{id}/attachments/{attachment_id}",
+            "GET /v1/messages/{id}/attachments/{attachment_id}/text",
             "POST /v1/messages/send",
             "POST /v1/messages/modify",
             "GET /v1/drafts",

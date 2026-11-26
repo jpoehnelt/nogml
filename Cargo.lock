@@ -1403,6 +1403,7 @@ dependencies = [
  "chrono",
  "clap",
  "deadpool-postgres",
+ "flate2",
  "futures-util",
  "hmac 0.12.1",
  "http",
