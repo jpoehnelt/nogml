@@ -124,6 +124,31 @@ gmail_refresh_token = "file:///etc/nogml/secrets/bob_refresh"
 - `[mailboxes.aliases]` (or `NOGML_MAILBOX_ALIASES=j@example.com=justin@example.com,sales@example.com=team@example.com`) routes Resend and SES webhook recipients to their target mailbox and allows sending from configured aliases via `From` / Gmail `settings/sendAs`.
 - Scoped tokens with `shared_mailboxes` can read and send in those mailboxes via `/gmail/v1/users/<shared>/...`, `X-Nogml-Mailbox: <shared>` on `/v1/*` and `POST /mcp`, and IMAP `LOGIN`, `AUTHENTICATE PLAIN`, or `AUTHENTICATE XOAUTH2`, while remaining blocked (`403`) from all other mailboxes.
 
+### Bring-your-own-domain (BYOD) onboarding and verified From guard
+
+Register custom sending and receiving domains dynamically without restarting `nogml` using `/v1/domains` or `nogml domains`. Domains are stored in the `domains` table across SQLite, Memory, and PostgreSQL and backed by a pluggable `DomainProvider` (`ses`, `resend`, or `manual`).
+
+```bash
+# Register a custom domain via REST (returns required DKIM, SPF, MX, and DMARC DNS records)
+curl -fsS -X POST http://127.0.0.1:8080/v1/domains \
+  -H "Authorization: Bearer ${NOGML_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"acme.io","provider":"ses","catch_all_mailbox":"team@example.com"}'
+
+# Re-check live verification status against AWS SESv2 or Resend
+curl -fsS -X POST http://127.0.0.1:8080/v1/domains/acme.io/verify \
+  -H "Authorization: Bearer ${NOGML_TOKEN}"
+
+# Or manage domains from the CLI
+nogml domains add acme.io --provider resend --catch-all team@example.com
+nogml domains verify acme.io
+nogml domains list
+```
+
+- **Anti-spoofing (`require_verified_from_domain`)**: Set `[safety] require_verified_from_domain = true` (or `NOGML_REQUIRE_VERIFIED_FROM_DOMAIN=true` / `--require-verified-from-domain`) so outbound sends reject any `From` address whose domain is neither `default_domain` nor a `verified` domain owned by the sender's mailbox (returning HTTP `403` with error code `unverified_from_domain`).
+- **Dynamic catch-all inbound routing**: When a Resend or SES inbound webhook delivers to an address with no explicit `mailbox_aliases` or local mailbox match, `nogml` checks whether the recipient domain is a `verified` BYOD domain with `catch_all_mailbox` configured and routes the message to that mailbox. Explicit aliases always take precedence, and unverified domains never trigger catch-all routing.
+- **Tenant isolation**: Non-admin tokens can only list, inspect, verify, update, and delete domains owned by mailboxes they can access. Attempting to register a domain already owned by another mailbox returns `409 Conflict`, and manually overriding verification status on a `manual` domain requires `admin` scope.
+
 ### Secret reference formats
 
 All secret fields support three non-plaintext mechanisms so secrets never need to be checked into `nogml.toml` or exposed in process command lines:

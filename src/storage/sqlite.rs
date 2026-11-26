@@ -30,17 +30,19 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        ContactRecord, DnsRecord, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
+        DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
         HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
         ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
         InboxRuleActions, InboxRulePatch, MAX_SQL_LIMIT, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        MessageListQuery, NewAuditLogEntry, NewDomainInput, NewInboxRule, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
         ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
         StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
         TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription, apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
-        normalize_contact_email, normalize_inbox_rule_actions, normalize_optional_text,
+        WatchSubscription, apply_domain_update, apply_inbox_rule_patch, clamp_sql_limit,
+        compute_contact_is_vip, normalize_and_validate_domain, normalize_contact_email,
+        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
         parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
@@ -385,6 +387,29 @@ CREATE TABLE IF NOT EXISTS inbox_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_rules_mailbox_created
     ON inbox_rules (mailbox_id, created_at_ms ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS domains (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL UNIQUE,
+    mailbox_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_domain_id TEXT,
+    status TEXT NOT NULL,
+    dns_records_json TEXT NOT NULL,
+    dkim_verified INTEGER NOT NULL DEFAULT 0,
+    spf_verified INTEGER NOT NULL DEFAULT 0,
+    dmarc_verified INTEGER NOT NULL DEFAULT 0,
+    mx_verified INTEGER NOT NULL DEFAULT 0,
+    catch_all_mailbox TEXT,
+    created_at_ms INTEGER NOT NULL,
+    verified_at_ms INTEGER,
+    last_checked_at_ms INTEGER,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_domains_mailbox_created
+    ON domains (mailbox_id, created_at_ms ASC, domain ASC);
+CREATE INDEX IF NOT EXISTS idx_domains_status
+    ON domains (status, domain);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -7427,6 +7452,298 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn create_domain(&self, input: NewDomainInput) -> AppResult<DomainRecord> {
+        let domain = normalize_and_validate_domain(&input.domain)?;
+        let mailbox_id = crate::config::normalize_mailbox_id(&input.mailbox_id);
+        if mailbox_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "Domain mailbox_id must not be empty".to_string(),
+            ));
+        }
+        let catch_all_mailbox = input
+            .catch_all_mailbox
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let provider_domain_id = normalize_optional_text(input.provider_domain_id.as_deref());
+        let last_error = normalize_optional_text(input.last_error.as_deref());
+
+        let now = truncate_to_millis(Utc::now());
+        let verified_at = (input.status == DomainStatus::Verified).then_some(now);
+        let id = input
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("dom_{}", new_hex_id()));
+        let dns_records_json = serde_json::to_string(&input.dns_records)?;
+
+        let record = DomainRecord {
+            id: id.clone(),
+            domain: domain.clone(),
+            mailbox_id: mailbox_id.clone(),
+            provider: input.provider,
+            provider_domain_id: provider_domain_id.clone(),
+            status: input.status,
+            dns_records: input.dns_records,
+            dkim_verified: input.dkim_verified,
+            spf_verified: input.spf_verified,
+            dmarc_verified: input.dmarc_verified,
+            mx_verified: input.mx_verified,
+            catch_all_mailbox: catch_all_mailbox.clone(),
+            created_at: now,
+            verified_at,
+            last_checked_at: None,
+            last_error: last_error.clone(),
+        };
+
+        self.run_blocking(move |conn, _mb| {
+            let res = conn.execute(
+                "INSERT INTO domains (
+                     id, domain, mailbox_id, provider, provider_domain_id, status,
+                     dns_records_json, dkim_verified, spf_verified, dmarc_verified, mx_verified,
+                     catch_all_mailbox, created_at_ms, verified_at_ms, last_checked_at_ms, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    &record.id,
+                    &record.domain,
+                    &record.mailbox_id,
+                    record.provider.as_str(),
+                    &record.provider_domain_id,
+                    record.status.as_str(),
+                    &dns_records_json,
+                    i64::from(record.dkim_verified),
+                    i64::from(record.spf_verified),
+                    i64::from(record.dmarc_verified),
+                    i64::from(record.mx_verified),
+                    &record.catch_all_mailbox,
+                    record.created_at.timestamp_millis(),
+                    record.verified_at.map(|t| t.timestamp_millis()),
+                    record.last_checked_at.map(|t| t.timestamp_millis()),
+                    &record.last_error,
+                ],
+            );
+            match res {
+                Ok(_) => Ok(record),
+                Err(rusqlite::Error::SqliteFailure(sf, _))
+                    if sf.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    Err(AppError::Conflict(format!(
+                        "Domain '{}' is already registered",
+                        record.domain
+                    )))
+                }
+                Err(err) => Err(sql_err(err)),
+            }
+        })
+        .await
+    }
+
+    async fn get_domain(&self, domain: &str) -> AppResult<Option<DomainRecord>> {
+        let key = normalize_domain_lookup_key(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.run_blocking(move |conn, _mb| {
+            let row = conn
+                .query_row(
+                    "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                            dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                            mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                            last_checked_at_ms, last_error
+                     FROM domains
+                     WHERE domain = ?1",
+                    params![&key],
+                    domain_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            row.transpose()
+        })
+        .await
+    }
+
+    async fn list_domains(&self, mailbox_id: Option<&str>) -> AppResult<Vec<DomainRecord>> {
+        let filter_mb = mailbox_id
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        self.run_blocking(move |conn, _mb| {
+            let mut results = Vec::new();
+            if let Some(mb) = filter_mb {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                                dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                                mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                                last_checked_at_ms, last_error
+                         FROM domains
+                         WHERE mailbox_id = ?1
+                         ORDER BY created_at_ms ASC, domain ASC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![&mb], domain_from_row)
+                    .map_err(sql_err)?;
+                for row in rows {
+                    results.push(row.map_err(sql_err)??);
+                }
+            } else {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                                dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                                mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                                last_checked_at_ms, last_error
+                         FROM domains
+                         ORDER BY created_at_ms ASC, domain ASC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt.query_map([], domain_from_row).map_err(sql_err)?;
+                for row in rows {
+                    results.push(row.map_err(sql_err)??);
+                }
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn update_domain(&self, domain: &str, update: &DomainUpdate) -> AppResult<DomainRecord> {
+        let key = normalize_domain_lookup_key(domain);
+        let update = update.clone();
+        self.run_blocking(move |conn, _mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = tx
+                .query_row(
+                    "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                            dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                            mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                            last_checked_at_ms, last_error
+                     FROM domains
+                     WHERE domain = ?1",
+                    params![&key],
+                    domain_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| AppError::NotFound(format!("Domain '{key}' not found")))??;
+
+            let updated = apply_domain_update(existing, &update);
+            let dns_records_json = serde_json::to_string(&updated.dns_records)?;
+
+            tx.execute(
+                "UPDATE domains
+                 SET provider_domain_id = ?1,
+                     status = ?2,
+                     dns_records_json = ?3,
+                     dkim_verified = ?4,
+                     spf_verified = ?5,
+                     dmarc_verified = ?6,
+                     mx_verified = ?7,
+                     catch_all_mailbox = ?8,
+                     verified_at_ms = ?9,
+                     last_checked_at_ms = ?10,
+                     last_error = ?11
+                 WHERE domain = ?12",
+                params![
+                    &updated.provider_domain_id,
+                    updated.status.as_str(),
+                    &dns_records_json,
+                    i64::from(updated.dkim_verified),
+                    i64::from(updated.spf_verified),
+                    i64::from(updated.dmarc_verified),
+                    i64::from(updated.mx_verified),
+                    &updated.catch_all_mailbox,
+                    updated.verified_at.map(|t| t.timestamp_millis()),
+                    updated.last_checked_at.map(|t| t.timestamp_millis()),
+                    &updated.last_error,
+                    &key,
+                ],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(updated)
+        })
+        .await
+    }
+
+    async fn delete_domain(&self, domain: &str) -> AppResult<bool> {
+        let key = normalize_domain_lookup_key(domain);
+        if key.is_empty() {
+            return Ok(false);
+        }
+        self.run_blocking(move |conn, _mb| {
+            let affected = conn
+                .execute("DELETE FROM domains WHERE domain = ?1", params![&key])
+                .map_err(sql_err)?;
+            Ok(affected > 0)
+        })
+        .await
+    }
+}
+
+fn domain_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<DomainRecord>> {
+    let id: String = row.get(0)?;
+    let domain: String = row.get(1)?;
+    let mailbox_id: String = row.get(2)?;
+    let provider_raw: String = row.get(3)?;
+    let provider_domain_id: Option<String> = row.get(4)?;
+    let status_raw: String = row.get(5)?;
+    let dns_records_json: String = row.get(6)?;
+    let dkim_verified: i64 = row.get(7)?;
+    let spf_verified: i64 = row.get(8)?;
+    let dmarc_verified: i64 = row.get(9)?;
+    let mx_verified: i64 = row.get(10)?;
+    let catch_all_mailbox: Option<String> = row.get(11)?;
+    let created_at_ms: i64 = row.get(12)?;
+    let verified_at_ms: Option<i64> = row.get(13)?;
+    let last_checked_at_ms: Option<i64> = row.get(14)?;
+    let last_error: Option<String> = row.get(15)?;
+
+    let Some(provider) = DomainProviderKind::parse_str(&provider_raw) else {
+        return Ok(Err(AppError::Storage(format!(
+            "Unknown domain provider '{provider_raw}'"
+        ))));
+    };
+    let Some(status) = DomainStatus::parse_str(&status_raw) else {
+        return Ok(Err(AppError::Storage(format!(
+            "Unknown domain status '{status_raw}'"
+        ))));
+    };
+    let dns_records: Vec<DnsRecord> = match serde_json::from_str(&dns_records_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Err(AppError::Storage(format!(
+                "Corrupt domains dns_records_json: {e}"
+            ))));
+        }
+    };
+    let created_at = DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
+    let verified_at = verified_at_ms.and_then(DateTime::from_timestamp_millis);
+    let last_checked_at = last_checked_at_ms.and_then(DateTime::from_timestamp_millis);
+
+    Ok(Ok(DomainRecord {
+        id,
+        domain,
+        mailbox_id,
+        provider,
+        provider_domain_id,
+        status,
+        dns_records,
+        dkim_verified: dkim_verified != 0,
+        spf_verified: spf_verified != 0,
+        dmarc_verified: dmarc_verified != 0,
+        mx_verified: mx_verified != 0,
+        catch_all_mailbox,
+        created_at,
+        verified_at,
+        last_checked_at,
+        last_error,
+    }))
 }
 
 fn scheduled_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<ScheduledSend>> {

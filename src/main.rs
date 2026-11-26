@@ -347,6 +347,15 @@ struct CommonConfigArgs {
     )]
     first_contact_approval: bool,
 
+    /// Reject outbound sends whose From domain is neither the primary domain nor a verified BYOD domain owned by the sender's mailbox.
+    #[arg(
+        long,
+        env = "NOGML_REQUIRE_VERIFIED_FROM_DOMAIN",
+        default_value_t = false,
+        global = true
+    )]
+    require_verified_from_domain: bool,
+
     /// Outbound secret/PII DLP scanner action (`off`, `hold`, or `deny`).
     #[arg(long, env = "NOGML_DLP_ACTION", default_value = "off", global = true)]
     dlp_action: DlpAction,
@@ -732,6 +741,12 @@ enum Command {
         shell: clap_complete::Shell,
     },
 
+    /// Manage BYOD custom sending and receiving domains (`add`, `list`, `get`, `verify`, `delete`).
+    Domains {
+        #[command(subcommand)]
+        action: DomainCommand,
+    },
+
     /// Mail operations (auto-JSON when piped or `--json` is passed).
     Mail {
         /// Target a running `nogml` server instead of opening the local store directly.
@@ -752,6 +767,45 @@ enum Command {
 
         #[command(subcommand)]
         action: MailAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainCommand {
+    /// Register a custom domain and print required DNS records.
+    Add {
+        /// Domain name (e.g. `example.com`).
+        domain: String,
+        /// Provider (`ses`, `resend`, or `manual`; defaults to active transport).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Owner mailbox email address (defaults to configured `user_email`).
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Optional catch-all mailbox receiving unmatched inbound mail once verified.
+        #[arg(long)]
+        catch_all: Option<String>,
+    },
+    /// List registered custom domains.
+    List {
+        /// Optional owner mailbox filter.
+        #[arg(long)]
+        mailbox: Option<String>,
+    },
+    /// Inspect status and DNS records for a custom domain.
+    Get {
+        /// Domain name.
+        domain: String,
+    },
+    /// Trigger or refresh live verification status against the domain's provider.
+    Verify {
+        /// Domain name.
+        domain: String,
+    },
+    /// Remove a custom domain from its upstream provider and local store.
+    Delete {
+        /// Domain name.
+        domain: String,
     },
 }
 
@@ -1397,6 +1451,9 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "first_contact_approval") {
             cfg.first_contact_approval = self.first_contact_approval;
+        }
+        if is_explicit(root_matches, "require_verified_from_domain") {
+            cfg.require_verified_from_domain = self.require_verified_from_domain;
         }
         if is_explicit(root_matches, "dlp_action") {
             cfg.dlp_action = self.dlp_action;
@@ -2894,6 +2951,74 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "nogml", &mut std::io::stdout());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Domains { action } => {
+            let loaded = cli
+                .common
+                .load_layered(None, &matches, None, cli.log_json)?;
+            let config = finalize_runtime_config(loaded, true)?;
+            let state = AppState::from_config_async(config).await?;
+            let out = match action {
+                DomainCommand::Add {
+                    domain,
+                    provider,
+                    mailbox,
+                    catch_all,
+                } => {
+                    let provider_kind = match provider.as_deref() {
+                        Some(raw) => {
+                            let parsed = nogml::domains::DomainProviderKind::parse_str(raw)
+                                .ok_or_else(|| {
+                                    AppError::validation(
+                                        format!(
+                                            "Invalid domain provider '{raw}': expected 'ses', 'resend', or 'manual'"
+                                        ),
+                                        None,
+                                    )
+                                })?;
+                            Some(parsed)
+                        }
+                        None => None,
+                    };
+                    let rec = nogml::domains::execute_create_domain(
+                        &state,
+                        nogml::domains::CreateDomainRequest {
+                            domain,
+                            provider: provider_kind,
+                            mailbox_id: mailbox,
+                            catch_all_mailbox: catch_all,
+                        },
+                        None,
+                        "cli",
+                    )
+                    .await?;
+                    serde_json::to_value(rec)?
+                }
+                DomainCommand::List { mailbox } => {
+                    let domains =
+                        nogml::domains::execute_list_domains(&state, mailbox.as_deref(), None)
+                            .await?;
+                    json!({
+                        "domains": domains,
+                        "count": domains.len(),
+                    })
+                }
+                DomainCommand::Get { domain } => {
+                    let rec = nogml::domains::execute_get_domain(&state, &domain, None).await?;
+                    serde_json::to_value(rec)?
+                }
+                DomainCommand::Verify { domain } => {
+                    let rec =
+                        nogml::domains::execute_verify_domain(&state, &domain, None, "cli").await?;
+                    serde_json::to_value(rec)?
+                }
+                DomainCommand::Delete { domain } => {
+                    nogml::domains::execute_delete_domain(&state, &domain, None, "cli").await?
+                }
+            };
+            emit_output(out, None, false)?;
             Ok(ExitCode::SUCCESS)
         }
 

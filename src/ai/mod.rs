@@ -83,9 +83,10 @@ pub use reply_context::{
 };
 pub use safety::{
     ConfigOutboundPolicy, DlpOutboundPolicy, FirstContactPolicy, OutboundCheck, OutboundDecision,
-    OutboundPolicy, OutboundPolicyChain, PolicyCheck, check_recipients_policy,
-    clamp_max_body_chars, evaluate_send_dry_run, open_outbound_policy, sanitize_untrusted_text,
-    scan_dlp_findings, scan_dlp_text, untrusted_meta, validate_email_header, validate_resource_id,
+    OutboundPolicy, OutboundPolicyChain, PolicyCheck, VerifiedFromDomainPolicy,
+    check_recipients_policy, clamp_max_body_chars, evaluate_send_dry_run, open_outbound_policy,
+    sanitize_untrusted_text, scan_dlp_findings, scan_dlp_text, untrusted_meta,
+    validate_email_header, validate_resource_id,
 };
 pub use scheduler::{
     DEFAULT_SCHEDULER_INTERVAL_SECS, SchedulerTickReport, execute_cancel_scheduled_send,
@@ -275,6 +276,17 @@ pub fn ai_router() -> Router<AppState> {
             patch(patch_rule_handler).delete(delete_rule_handler),
         )
         .route("/v1/rules/{id}/test", post(test_rule_handler))
+        .route(
+            "/v1/domains",
+            get(list_domains_handler).post(create_domain_handler),
+        )
+        .route(
+            "/v1/domains/{domain}",
+            get(get_domain_handler)
+                .patch(patch_domain_handler)
+                .delete(delete_domain_handler),
+        )
+        .route("/v1/domains/{domain}/verify", post(verify_domain_handler))
         .route("/v1/audit", get(list_audit_handler))
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
@@ -3649,6 +3661,12 @@ async fn get_capabilities(
             "PATCH /v1/rules/{id}",
             "DELETE /v1/rules/{id}",
             "POST /v1/rules/{id}/test",
+            "GET /v1/domains",
+            "POST /v1/domains",
+            "GET /v1/domains/{domain}",
+            "PATCH /v1/domains/{domain}",
+            "DELETE /v1/domains/{domain}",
+            "POST /v1/domains/{domain}/verify",
             "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",
@@ -3661,6 +3679,7 @@ async fn get_capabilities(
             "draft_only_action": cfg.draft_only_action,
             "require_approval": cfg.require_approval,
             "first_contact_approval": cfg.first_contact_approval,
+            "require_verified_from_domain": cfg.require_verified_from_domain,
             "dlp_action": cfg.dlp_action,
             "approval_ttl_secs": cfg.approval_ttl_secs,
             "approval_webhook_enabled": cfg.approval_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty()),
@@ -4894,4 +4913,116 @@ async fn test_rule_handler(
 ) -> Result<Json<Value>, AiError> {
     let body = rules::execute_test_rule(&state, &id, params.limit).await?;
     Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListDomainsParams {
+    mailbox_id: Option<String>,
+    fields: Option<String>,
+}
+
+async fn list_domains_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(params): Query<ListDomainsParams>,
+) -> Result<Json<Value>, AiError> {
+    let domains = crate::domains::execute_list_domains(
+        &state,
+        params.mailbox_id.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )
+    .await?;
+    let body = json!({
+        "domains": domains,
+        "count": domains.len(),
+    });
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn create_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<crate::domains::CreateDomainRequest>,
+) -> Result<(StatusCode, Json<Value>), AiError> {
+    let created = crate::domains::execute_create_domain(
+        &state,
+        req,
+        principal.as_ref().map(|Extension(p)| p),
+        "/v1",
+    )
+    .await?;
+    let body = serde_json::to_value(created).map_err(AppError::from)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(project_fields(body, query.fields.as_deref())?),
+    ))
+}
+
+async fn get_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let record = crate::domains::execute_get_domain(
+        &state,
+        &domain,
+        principal.as_ref().map(|Extension(p)| p),
+    )
+    .await?;
+    let body = serde_json::to_value(record).map_err(AppError::from)?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn patch_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<crate::domains::PatchDomainRequest>,
+) -> Result<Json<Value>, AiError> {
+    let updated = crate::domains::execute_patch_domain(
+        &state,
+        &domain,
+        req,
+        principal.as_ref().map(|Extension(p)| p),
+        "/v1",
+    )
+    .await?;
+    let body = serde_json::to_value(updated).map_err(AppError::from)?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn verify_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let updated = crate::domains::execute_verify_domain(
+        &state,
+        &domain,
+        principal.as_ref().map(|Extension(p)| p),
+        "/v1",
+    )
+    .await?;
+    let body = serde_json::to_value(updated).map_err(AppError::from)?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn delete_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let body = crate::domains::execute_delete_domain(
+        &state,
+        &domain,
+        principal.as_ref().map(|Extension(p)| p),
+        "/v1",
+    )
+    .await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
 }

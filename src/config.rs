@@ -566,6 +566,10 @@ pub struct Config {
     pub require_approval: bool,
     /// When `true`, `FirstContactPolicy` holds outbound sends to recipients with no prior sent history.
     pub first_contact_approval: bool,
+    /// When `true`, outbound sends reject `From` domains that are neither the configured
+    /// primary domain nor a `verified` BYOD domain owned by the sender's mailbox.
+    #[serde(default)]
+    pub require_verified_from_domain: bool,
     /// Action taken by `DlpOutboundPolicy` when secrets or sensitive PII are detected (`off`, `hold`, `deny`).
     pub dlp_action: DlpAction,
     /// Time-to-live in seconds for pending human approval requests (default 86400s / 24h).
@@ -742,6 +746,7 @@ impl Default for Config {
             draft_only_action: DraftOnlyAction::Block,
             require_approval: false,
             first_contact_approval: false,
+            require_verified_from_domain: false,
             dlp_action: DlpAction::Off,
             approval_ttl_secs: 86_400,
             approval_webhook_url: None,
@@ -1086,6 +1091,7 @@ impl Config {
             draft_only_action,
             require_approval,
             first_contact_approval,
+            require_verified_from_domain,
             dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
@@ -1247,6 +1253,7 @@ impl Config {
                 "draft_only_action": draft_only_action,
                 "require_approval": require_approval,
                 "first_contact_approval": first_contact_approval,
+                "require_verified_from_domain": require_verified_from_domain,
                 "dlp_action": dlp_action,
                 "approval_ttl_secs": approval_ttl_secs,
                 "approval_webhook_url": approval_webhook_url
@@ -1773,6 +1780,7 @@ impl fmt::Debug for Config {
             draft_only_action,
             require_approval,
             first_contact_approval,
+            require_verified_from_domain,
             dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
@@ -1903,6 +1911,7 @@ impl fmt::Debug for Config {
             .field("draft_only_action", draft_only_action)
             .field("require_approval", require_approval)
             .field("first_contact_approval", first_contact_approval)
+            .field("require_verified_from_domain", require_verified_from_domain)
             .field("dlp_action", dlp_action)
             .field("approval_ttl_secs", approval_ttl_secs)
             .field(
@@ -2229,6 +2238,7 @@ pub struct SafetyTomlConfig {
     pub draft_only_action: Option<DraftOnlyAction>,
     pub require_approval: Option<bool>,
     pub first_contact_approval: Option<bool>,
+    pub require_verified_from_domain: Option<bool>,
     pub dlp_action: Option<DlpAction>,
     pub approval_ttl_secs: Option<u64>,
     pub approval_webhook_url: Option<String>,
@@ -2248,6 +2258,10 @@ impl std::fmt::Debug for SafetyTomlConfig {
             .field("draft_only_action", &self.draft_only_action)
             .field("require_approval", &self.require_approval)
             .field("first_contact_approval", &self.first_contact_approval)
+            .field(
+                "require_verified_from_domain",
+                &self.require_verified_from_domain,
+            )
             .field("dlp_action", &self.dlp_action)
             .field("approval_ttl_secs", &self.approval_ttl_secs)
             .field(
@@ -2677,6 +2691,9 @@ impl TomlConfig {
         }
         if let Some(v) = self.safety.first_contact_approval {
             cfg.first_contact_approval = v;
+        }
+        if let Some(v) = self.safety.require_verified_from_domain {
+            cfg.require_verified_from_domain = v;
         }
         if let Some(v) = self.safety.dlp_action {
             cfg.dlp_action = v;
@@ -3324,6 +3341,7 @@ draft_only = true
 draft_only_action = "block"
 require_approval = false
 first_contact_approval = false
+require_verified_from_domain = false
 dlp_action = "off"
 approval_ttl_secs = 86400
 # allowed_recipients = ["@{default_domain}"]

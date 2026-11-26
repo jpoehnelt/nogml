@@ -387,13 +387,137 @@ pub fn open_outbound_policy(config: &Config, store: Arc<dyn MailStore>) -> Arc<d
     }
 
     if config.first_contact_approval {
-        policies.push(Arc::new(FirstContactPolicy::new(store)));
+        policies.push(Arc::new(FirstContactPolicy::new(store.clone())));
+    }
+
+    if config.require_verified_from_domain {
+        policies.push(Arc::new(VerifiedFromDomainPolicy::from_config(
+            config, store,
+        )));
     }
 
     if policies.len() == 1 {
         policies.pop().expect("single policy")
     } else {
         Arc::new(OutboundPolicyChain::new(policies))
+    }
+}
+
+/// Outbound anti-spoofing policy that rejects any send whose `From:` domain is
+/// neither the configured primary domain (`config.default_domain`) nor a `verified`
+/// BYOD domain owned by the sender's mailbox in `MailStore`.
+#[derive(Clone)]
+pub struct VerifiedFromDomainPolicy {
+    store: Arc<dyn MailStore>,
+    primary_domain: String,
+}
+
+impl VerifiedFromDomainPolicy {
+    pub fn new(store: Arc<dyn MailStore>, primary_domain: impl Into<String>) -> Self {
+        Self {
+            store,
+            primary_domain: crate::domains::normalize_domain_lookup_key(&primary_domain.into()),
+        }
+    }
+
+    pub fn from_config(config: &Config, store: Arc<dyn MailStore>) -> Self {
+        Self::new(store, config.default_domain.clone())
+    }
+
+    /// Check whether `from_addr` is permitted for `sender_mailbox` under the verified-domain policy.
+    pub async fn is_from_domain_verified(
+        store: &dyn MailStore,
+        primary_domain: &str,
+        sender_mailbox: &str,
+        from_addr: &str,
+    ) -> AppResult<Result<String, String>> {
+        let email = extract_email_address(from_addr);
+        let from_domain = crate::domains::normalize_domain_lookup_key(
+            &crate::storage::extract_email_domain(&email),
+        );
+        if from_domain.is_empty() {
+            return Ok(Err(String::new()));
+        }
+        let primary_norm = crate::domains::normalize_domain_lookup_key(primary_domain);
+        if !primary_norm.is_empty() && from_domain == primary_norm {
+            return Ok(Ok(from_domain));
+        }
+
+        if let Some(rec) = store.get_domain(&from_domain).await?
+            && rec.status == crate::domains::DomainStatus::Verified
+            && rec.mailbox_id.eq_ignore_ascii_case(sender_mailbox.trim())
+        {
+            return Ok(Ok(from_domain));
+        }
+
+        Ok(Err(from_domain))
+    }
+}
+
+#[async_trait]
+impl OutboundPolicy for VerifiedFromDomainPolicy {
+    async fn evaluate(&self, check: &OutboundCheck) -> AppResult<OutboundDecision> {
+        let sender_mailbox = check
+            .mailbox_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.store.mailbox_id());
+
+        match Self::is_from_domain_verified(
+            self.store.as_ref(),
+            &self.primary_domain,
+            sender_mailbox,
+            &check.from,
+        )
+        .await?
+        {
+            Ok(_) => Ok(OutboundDecision::Allow),
+            Err(domain) => {
+                let reason = if domain.is_empty() {
+                    "Outbound send blocked: From address is missing a valid domain".to_string()
+                } else {
+                    format!(
+                        "Outbound send blocked: From domain '{domain}' is neither the primary domain '{}' nor a verified domain owned by mailbox '{sender_mailbox}'",
+                        self.primary_domain
+                    )
+                };
+                let hint = if domain.is_empty() {
+                    Some("Specify a valid From address on a verified domain.".to_string())
+                } else {
+                    Some(format!(
+                        "Register and verify '{domain}' via POST /v1/domains and POST /v1/domains/{domain}/verify before sending."
+                    ))
+                };
+                Ok(OutboundDecision::Deny {
+                    code: "unverified_from_domain".to_string(),
+                    reason,
+                    hint,
+                })
+            }
+        }
+    }
+
+    fn policy_checks(&self, _check: &OutboundCheck) -> Vec<PolicyCheck> {
+        vec![PolicyCheck {
+            rule: "verified_from_domain".to_string(),
+            passed: true,
+            detail: format!(
+                "require_verified_from_domain is enabled (primary domain '{}')",
+                self.primary_domain
+            ),
+        }]
+    }
+
+    fn for_mailbox(&self, mailbox_id: &str) -> Option<Arc<dyn OutboundPolicy>> {
+        Some(Arc::new(Self::new(
+            self.store.for_mailbox(mailbox_id),
+            self.primary_domain.clone(),
+        )))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "verified_from_domain"
     }
 }
 
@@ -1198,6 +1322,52 @@ pub async fn resolve_authorized_from(
         return Ok(raw.to_string());
     }
 
+    // Authorize addresses belonging to a verified BYOD domain owned by this mailbox.
+    let from_domain = crate::domains::normalize_domain_lookup_key(
+        &crate::storage::extract_email_domain(&parsed.email),
+    );
+    if !from_domain.is_empty()
+        && let Ok(Some(domain_rec)) = state.store.get_domain(&from_domain).await
+    {
+        if domain_rec.status == crate::domains::DomainStatus::Verified
+            && domain_rec.mailbox_id.eq_ignore_ascii_case(mailbox_id)
+        {
+            return Ok(raw.to_string());
+        }
+        if state.config.require_verified_from_domain {
+            return Err(AppError::PolicyDenied {
+                code: "unverified_from_domain".to_string(),
+                message: format!(
+                    "From domain '{from_domain}' is not verified for mailbox '{mailbox_id}'"
+                ),
+                hint: Some(format!(
+                    "Verify '{from_domain}' via POST /v1/domains/{from_domain}/verify before sending."
+                )),
+                details: Some(serde_json::json!({
+                    "domain": from_domain,
+                    "status": domain_rec.status.as_str(),
+                })),
+            });
+        }
+    } else if state.config.require_verified_from_domain {
+        let primary_domain =
+            crate::domains::normalize_domain_lookup_key(&state.config.default_domain);
+        if !from_domain.is_empty() && from_domain != primary_domain {
+            return Err(AppError::PolicyDenied {
+                code: "unverified_from_domain".to_string(),
+                message: format!(
+                    "From domain '{from_domain}' is not verified for mailbox '{mailbox_id}'"
+                ),
+                hint: Some(format!(
+                    "Register and verify '{from_domain}' via POST /v1/domains and POST /v1/domains/{from_domain}/verify before sending."
+                )),
+                details: Some(serde_json::json!({
+                    "domain": from_domain,
+                })),
+            });
+        }
+    }
+
     Err(AppError::Forbidden(format!(
         "Sender address '{}' is not authorized for mailbox '{}'",
         parsed.email, mailbox_id
@@ -1452,6 +1622,38 @@ pub async fn evaluate_resolved_dry_run(
         agent_policy: agent_policy.cloned(),
     };
     checks.extend(state.outbound_policy.policy_checks(&outbound_check));
+
+    if state.config.require_verified_from_domain {
+        let verified = VerifiedFromDomainPolicy::is_from_domain_verified(
+            state.store.as_ref(),
+            &state.config.default_domain,
+            state.mailbox_id(),
+            &resolved.from,
+        )
+        .await?;
+        let passed = verified.is_ok();
+        let detail = match verified {
+            Ok(d) => format!(
+                "From domain '{d}' is verified for mailbox '{}'",
+                state.mailbox_id()
+            ),
+            Err(d) => format!(
+                "From domain '{d}' is neither the primary domain '{}' nor a verified domain owned by mailbox '{}'",
+                state.config.default_domain,
+                state.mailbox_id()
+            ),
+        };
+        if let Some(existing) = checks.iter_mut().find(|c| c.rule == "verified_from_domain") {
+            existing.passed = passed;
+            existing.detail = detail;
+        } else {
+            checks.push(PolicyCheckResult {
+                rule: "verified_from_domain".to_string(),
+                passed,
+                detail,
+            });
+        }
+    }
 
     let effective_draft_only =
         state.config.draft_only || agent_policy.and_then(|p| p.draft_only).unwrap_or(false);

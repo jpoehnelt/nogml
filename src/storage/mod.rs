@@ -26,6 +26,11 @@ use crate::{
     transport::OutboundMessage,
 };
 
+pub use crate::domains::{
+    DnsRecord, DnsRecordPurpose, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
+    NewDomainInput, apply_domain_update, normalize_and_validate_domain,
+    normalize_domain_lookup_key,
+};
 pub use crate::models::{ThreadAnnotation, ThreadAnnotationPatch, WaitingOn};
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]
@@ -1693,6 +1698,13 @@ pub trait MailStore: Send + Sync {
     async fn list_inbox_rules(&self) -> AppResult<Vec<InboxRule>>;
     async fn patch_inbox_rule(&self, id: &str, patch: &InboxRulePatch) -> AppResult<InboxRule>;
     async fn delete_inbox_rule(&self, id: &str) -> AppResult<()>;
+
+    // --- BYOD Custom Domains ---
+    async fn create_domain(&self, input: NewDomainInput) -> AppResult<DomainRecord>;
+    async fn get_domain(&self, domain: &str) -> AppResult<Option<DomainRecord>>;
+    async fn list_domains(&self, mailbox_id: Option<&str>) -> AppResult<Vec<DomainRecord>>;
+    async fn update_domain(&self, domain: &str, update: &DomainUpdate) -> AppResult<DomainRecord>;
+    async fn delete_domain(&self, domain: &str) -> AppResult<bool>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).
