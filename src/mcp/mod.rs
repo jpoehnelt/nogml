@@ -222,6 +222,17 @@ impl McpServer {
             | "sync_status" => AuthScope::Read,
             "create_draft" | "triage_thread" | "modify_labels" | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
+            "unsubscribe" => {
+                let is_dry_run = arguments
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if is_dry_run && !self.principal.has_scope(AuthScope::Send) {
+                    AuthScope::Write
+                } else {
+                    AuthScope::Send
+                }
+            }
             unknown => {
                 return Err(RpcError::new(
                     ERR_INVALID_PARAMS,
@@ -245,6 +256,7 @@ impl McpServer {
                     "send_draft" => self.tool_send_draft(arguments).await,
                     "triage_thread" => self.tool_triage_thread(arguments).await,
                     "modify_labels" => self.tool_modify_labels(arguments).await,
+                    "unsubscribe" => self.tool_unsubscribe(arguments).await,
                     "list_labels" => self.tool_list_labels().await,
                     "sync_gmail" => self.tool_sync_gmail(arguments).await,
                     "sync_status" => self.tool_sync_status().await,
@@ -694,6 +706,28 @@ impl McpServer {
     async fn tool_modify_labels(&self, args: Value) -> AppResult<Value> {
         let req: AiModifyLabelsRequest = serde_json::from_value(args)?;
         ai::execute_modify_labels_with_source(&self.state, req, EventSource::Mcp).await
+    }
+
+    async fn tool_unsubscribe(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            message_id: String,
+            #[serde(default)]
+            dry_run: bool,
+            #[serde(default)]
+            prefer_mailto: bool,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        ai::execute_unsubscribe_with_source(
+            &self.state,
+            Some(self.principal.clone()),
+            &parsed.message_id,
+            parsed.dry_run,
+            parsed.prefer_mailto,
+            EventSource::Mcp,
+        )
+        .await
     }
 
     async fn tool_list_labels(&self) -> AppResult<Value> {
@@ -1293,6 +1327,25 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "unsubscribe",
+            "description": "Unsubscribe from a mailing list or newsletter using RFC 8058 one-click HTTPS POST or mailto: fallback. Enforces SSRF protection, outbound safety policies (draft_only, require_approval, allowed_recipients), and supports dry_run preview.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id"],
+                "properties": {
+                    "message_id": { "type": "string", "description": "ID of the message containing List-Unsubscribe headers" },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview the exact HTTP POST or mailto action without sending network requests or mail" },
+                    "prefer_mailto": { "type": "boolean", "default": false, "description": "Prefer the mailto: unsubscribe URI over RFC 8058 one-click HTTPS POST when both exist" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "list_labels",
             "description": "List all system and user mailbox labels with total and unread counts.",
             "inputSchema": {
@@ -1420,7 +1473,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 12 tools
+        // tools/list advertises all 13 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1442,13 +1495,14 @@ mod tests {
             "send_draft",
             "triage_thread",
             "modify_labels",
+            "unsubscribe",
             "list_labels",
             "sync_gmail",
             "sync_status",
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
     }
 
     #[tokio::test]

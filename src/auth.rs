@@ -455,6 +455,18 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
         return None;
     }
 
+    // `POST /v1/messages/{id}/unsubscribe` enforces `Write` (for `dry_run: true`) or `Send`
+    // (for execution) inside the handler after parsing the JSON body.
+    if method == Method::POST
+        && let Some(rest) = normalized
+            .strip_prefix("/v1/messages/")
+            .and_then(|s| s.strip_suffix("/unsubscribe"))
+        && !rest.is_empty()
+        && !rest.contains('/')
+    {
+        return None;
+    }
+
     if method == Method::GET || method == Method::HEAD {
         return Some(AuthScope::Read);
     }
@@ -974,6 +986,10 @@ mod tests {
         );
         assert_eq!(required_http_scope(&Method::POST, "/mcp"), None);
         assert_eq!(required_http_scope(&Method::POST, "/batch/gmail/v1"), None);
+        assert_eq!(
+            required_http_scope(&Method::POST, "/v1/messages/m1/unsubscribe"),
+            None
+        );
     }
 
     #[tokio::test]

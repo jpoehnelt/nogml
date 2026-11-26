@@ -149,6 +149,20 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                 }
             }
         },
+        "mail.unsubscribe": {
+            "endpoint": "POST /v1/messages/{id}/unsubscribe",
+            "mcp_tool": "unsubscribe",
+            "description": "Unsubscribe from a mailing list via RFC 8058 one-click HTTPS POST or mailto: with SSRF protection, outbound policy enforcement, and dry_run preview.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "prefer_mailto": { "type": "boolean", "default": false }
+                }
+            }
+        },
         "mail.labels": {
             "endpoint": "GET /v1/labels",
             "mcp_tool": "list_labels",
@@ -217,6 +231,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "send_draft" => "mail.send_draft",
             "triage" | "triage_thread" => "mail.triage",
             "modify" | "modify_labels" => "mail.modify_labels",
+            "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
             "approvals" | "approve" | "reject" => "mail.approvals",
             "watch" | "events" => "mail.watch",
@@ -250,6 +265,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "POST /v1/threads/{id}/triage",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
+            "POST /v1/messages/{id}/unsubscribe",
             "GET /v1/messages/{id}/attachments/{attachment_id}",
             "POST /v1/messages/send",
             "POST /v1/messages/modify",

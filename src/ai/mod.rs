@@ -8,6 +8,7 @@ pub mod safety;
 pub mod schema;
 #[cfg(test)]
 pub(crate) mod tests;
+pub mod unsubscribe;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -42,12 +43,14 @@ use crate::{
     error::{AiError, AppError, AppResult},
     events::{EventEnvelope, EventSource, MailEvent},
     mime::{
-        ComposeEmailInput, apply_fields_mask, build_rfc2822, generate_snippet, strip_quoted_text,
+        ComposeEmailInput, apply_fields_mask, build_rfc2822, generate_snippet,
+        parse_unsubscribe_from_raw, strip_quoted_text,
     },
     models::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
-        AiTriageRequest, CompactMessage, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT,
-        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest, ThreadDetail,
+        AiTriageRequest, AiUnsubscribeRequest, CompactMessage, EmailAddress, LABEL_DRAFT,
+        LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest,
+        ThreadDetail, UnsubscribeInfo,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, MessageListQuery, NewAttachmentInput,
@@ -64,6 +67,11 @@ pub use safety::{
     untrusted_meta, validate_email_header, validate_resource_id,
 };
 pub use schema::runtime_schema;
+pub use unsubscribe::{
+    ParsedMailto, ValidatedUnsubscribeUrl, execute_unsubscribe, execute_unsubscribe_with_source,
+    is_globally_routable_ip, parse_mailto_uri, validate_unsubscribe_https_url,
+    validate_unsubscribe_https_url_static,
+};
 
 const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
@@ -96,6 +104,10 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/messages/send", post(send_message_handler))
         .route("/v1/messages/modify", post(modify_messages_handler))
         .route("/v1/messages/{id}", get(get_message))
+        .route(
+            "/v1/messages/{id}/unsubscribe",
+            post(unsubscribe_message_handler),
+        )
         .route(
             "/v1/messages/{id}/attachments/{attachment_id}",
             get(get_attachment_handler),
@@ -1260,6 +1272,8 @@ pub fn to_compact_message(
         None
     };
 
+    let unsubscribe = sanitize_unsubscribe(parse_unsubscribe_from_raw(&msg.raw_rfc2822), guard);
+
     CompactMessage {
         id: msg.id.clone(),
         thread_id: msg.thread_id.clone(),
@@ -1279,8 +1293,18 @@ pub fn to_compact_message(
         html,
         in_reply_to: msg.in_reply_to.clone(),
         rfc_message_id: msg.rfc822_message_id.clone(),
+        unsubscribe,
         meta: untrusted_meta(config),
     }
+}
+
+fn sanitize_unsubscribe(info: Option<UnsubscribeInfo>, guard: bool) -> Option<UnsubscribeInfo> {
+    let mut info = info?;
+    if guard {
+        info.https_url = info.https_url.map(|u| sanitize_untrusted_text(&u));
+        info.mailto = info.mailto.map(|m| sanitize_untrusted_text(&m));
+    }
+    Some(info)
 }
 
 /// Build a full [`ThreadDetail`] with compact messages, participants, labels, optional attachment metadata, and `_meta`.
@@ -1347,6 +1371,15 @@ pub async fn build_thread_detail(
                 compact.attachments_meta = Some(meta);
             }
         }
+        if compact.unsubscribe.is_none()
+            && msg.raw_rfc2822.is_empty()
+            && let Ok(raw) = state.load_raw_rfc2822(msg).await
+        {
+            compact.unsubscribe = sanitize_unsubscribe(
+                parse_unsubscribe_from_raw(&raw),
+                state.config.untrusted_content_guard,
+            );
+        }
 
         compact_messages.push(compact);
     }
@@ -1393,6 +1426,15 @@ pub async fn build_compact_message_with_meta(
         if !meta.is_empty() {
             compact.attachments_meta = Some(meta);
         }
+    }
+    if compact.unsubscribe.is_none()
+        && msg.raw_rfc2822.is_empty()
+        && let Ok(raw) = state.load_raw_rfc2822(msg).await
+    {
+        compact.unsubscribe = sanitize_unsubscribe(
+            parse_unsubscribe_from_raw(&raw),
+            state.config.untrusted_content_guard,
+        );
     }
     Ok(compact)
 }
@@ -1466,7 +1508,7 @@ impl Drop for ApprovalInFlightGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn enqueue_pending_approval(
+pub(crate) async fn enqueue_pending_approval(
     state: &AppState,
     reason: String,
     principal: Option<Principal>,
@@ -1517,7 +1559,7 @@ async fn enqueue_pending_approval(
     Ok(approval)
 }
 
-fn build_hold_response(
+pub(crate) fn build_hold_response(
     approval: &PendingApproval,
     draft_id: Option<&str>,
     message_id: Option<&str>,
@@ -1620,7 +1662,7 @@ fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: 
     });
 }
 
-fn build_outbound_rfc2822(
+pub(crate) fn build_outbound_rfc2822(
     resolved: &safety::ResolvedOutbound,
     rfc_message_id: &str,
 ) -> AppResult<Vec<u8>> {
@@ -1642,7 +1684,11 @@ fn build_outbound_rfc2822(
     build_rfc2822(&input)
 }
 
-fn validate_recipients_syntax(to: &[String], cc: &[String], bcc: &[String]) -> AppResult<()> {
+pub(crate) fn validate_recipients_syntax(
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+) -> AppResult<()> {
     for (field, list) in [("to", to), ("cc", cc), ("bcc", bcc)] {
         for addr in list {
             validate_email_header(field, addr)?;
@@ -1657,7 +1703,7 @@ fn validate_recipients_syntax(to: &[String], cc: &[String], bcc: &[String]) -> A
     Ok(())
 }
 
-fn policy_deny_to_error(code: String, reason: String, hint: Option<String>) -> AppError {
+pub(crate) fn policy_deny_to_error(code: String, reason: String, hint: Option<String>) -> AppError {
     if code == "draft_only_mode" {
         AppError::DraftOnlyBlocked {
             hint: hint.unwrap_or(reason),
@@ -1672,7 +1718,7 @@ fn policy_deny_to_error(code: String, reason: String, hint: Option<String>) -> A
     }
 }
 
-fn build_outbound_message(
+pub(crate) fn build_outbound_message(
     resolved: &safety::ResolvedOutbound,
     rfc_message_id: &str,
     raw_rfc2822: &[u8],
@@ -1960,6 +2006,7 @@ async fn get_capabilities(
             "POST /v1/threads/{id}/triage",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
+            "POST /v1/messages/{id}/unsubscribe",
             "GET /v1/messages/{id}/attachments/{attachment_id}",
             "POST /v1/messages/send",
             "POST /v1/messages/modify",
@@ -2177,6 +2224,32 @@ async fn get_message(
 
     let value = serde_json::to_value(compact).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
+}
+
+async fn unsubscribe_message_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    body: Bytes,
+) -> Result<Response, AiError> {
+    let req: AiUnsubscribeRequest = parse_optional_json(&body)?;
+    let res = execute_unsubscribe_with_source(
+        &state,
+        principal.map(|Extension(p)| p),
+        &id,
+        req.dry_run,
+        req.prefer_mailto,
+        EventSource::Api,
+    )
+    .await?;
+    let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let projected = project_fields(res, query.fields.as_deref())?;
+    Ok((status, Json(projected)).into_response())
 }
 
 async fn get_attachment_handler(
