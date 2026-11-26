@@ -48,9 +48,9 @@ use crate::{
         SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
         UpsertOutcome, UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
         apply_domain_update, apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
-        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
-        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
-        parse_simple_email_address, validate_and_normalize_contact_email,
+        compute_xgm_label_delta, normalize_and_validate_domain, normalize_contact_email,
+        normalize_deliverability_domain, normalize_domain_lookup_key, normalize_inbox_rule_actions,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
         validate_and_normalize_suppression_email, validate_deliverability_domain,
     },
 };
@@ -5480,6 +5480,63 @@ impl MailStore for PostgresStore {
             .map_err(pg_err)?;
             msg.history_id = new_hid;
         }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(ImapStoreFlagsOutcome::Updated(Box::new(msg)))
+    }
+
+    async fn imap_store_xgm_labels(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        label_ids: &[String],
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+
+        // Acquire a row-level lock so UNCHANGEDSINCE check and label update are atomic under READ COMMITTED.
+        let locked = tx
+            .query_opt(
+                "SELECT id FROM messages WHERE mailbox_id = $1 AND id = $2 FOR UPDATE",
+                &[&mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if locked.is_none() {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        }
+
+        let Some(old_msg) = load_message_by_id(&tx, mb, message_id).await? else {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        };
+        if let Some(limit) = unchanged_since
+            && old_msg.history_id.max(1) > limit
+        {
+            return Ok(ImapStoreFlagsOutcome::Modified);
+        }
+
+        let (add_labels, remove_labels) =
+            compute_xgm_label_delta(&old_msg.label_ids, action, label_ids);
+        let mut resolved_add = Vec::with_capacity(add_labels.len());
+        for l in &add_labels {
+            let lid = resolve_existing_label_id(&tx, mb, l)
+                .await?
+                .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
+            resolved_add.push(lid);
+        }
+        let mut resolved_remove = Vec::with_capacity(remove_labels.len());
+        for l in &remove_labels {
+            if let Some(lid) = resolve_existing_label_id(&tx, mb, l).await? {
+                resolved_remove.push(lid);
+            }
+        }
+        let msg = if resolved_add.is_empty() && resolved_remove.is_empty() {
+            old_msg
+        } else {
+            modify_message_labels_resolved_tx(&tx, mb, message_id, &resolved_add, &resolved_remove)
+                .await?
+        };
         tx.commit().await.map_err(pg_err)?;
         Ok(ImapStoreFlagsOutcome::Updated(Box::new(msg)))
     }

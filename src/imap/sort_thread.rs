@@ -1,7 +1,8 @@
 //! RFC 5256 `SORT` and `THREAD` (`REFERENCES`, `ORDEREDSUBJECT`) parsing,
 //! base-subject extraction, sorting, threading, and response tree formatting.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 
 use mail_parser::MessageParser;
 
@@ -11,6 +12,11 @@ use crate::{
     mime::normalize_message_id,
     storage::StoredMessage,
 };
+
+/// Maximum number of normalized Message-ID tokens retained from `References`/`In-Reply-To`
+/// per message during IMAP `THREAD REFERENCES`. Retains the thread root plus the most recent
+/// tail so deep hostile `References:` headers cannot build unbounded container chains.
+pub const MAX_THREAD_REFERENCES_PER_MESSAGE: usize = 128;
 
 /// RFC 5256 Section 3 sort key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,9 +183,11 @@ pub fn extract_base_subject_with_flag(raw: &str) -> (String, bool) {
             // Step 2: Remove trailing "(fwd)" (case-insensitive) and whitespace.
             loop {
                 let trimmed = s.trim_end();
-                if trimmed.len() >= 5 && trimmed[trimmed.len() - 5..].eq_ignore_ascii_case("(fwd)")
+                if let Some(prefix_len) = trimmed.len().checked_sub(5)
+                    && trimmed.as_bytes()[prefix_len..].eq_ignore_ascii_case(b"(fwd)")
                 {
-                    s = trimmed[..trimmed.len() - 5].trim_end().to_string();
+                    // Safe: the trailing 5 bytes are ASCII "(fwd)", so `prefix_len` is a UTF-8 char boundary.
+                    s = trimmed[..prefix_len].trim_end().to_string();
                     had_refwd = true;
                 } else {
                     if trimmed.len() != s.len() {
@@ -219,9 +227,13 @@ pub fn extract_base_subject_with_flag(raw: &str) -> (String, bool) {
         // Step 6: If subject begins with "[fwd:" and ends with "]", strip wrapper and repeat.
         let trimmed = s.trim();
         if trimmed.len() >= 6
-            && trimmed[..5].eq_ignore_ascii_case("[fwd:")
+            && trimmed
+                .as_bytes()
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"[fwd:"))
             && trimmed.ends_with(']')
         {
+            // Safe: "[fwd:" is 5 ASCII bytes and "]" is 1 ASCII byte.
             s = trimmed[5..trimmed.len() - 1].trim().to_string();
             had_refwd = true;
             continue;
@@ -258,10 +270,16 @@ fn strip_subj_leader(s: &str) -> Option<&str> {
     while let Some(after_blob) = strip_subj_blob(cur) {
         cur = after_blob.trim_start();
     }
-    let lower = cur.to_ascii_lowercase();
-    let after_kw = if lower.starts_with("fwd") {
+    let bytes = cur.as_bytes();
+    let after_kw = if bytes
+        .get(..3)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"fwd"))
+    {
         &cur[3..]
-    } else if lower.starts_with("re") || lower.starts_with("fw") {
+    } else if bytes
+        .get(..2)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"re") || b.eq_ignore_ascii_case(b"fw"))
+    {
         &cur[2..]
     } else {
         return None;
@@ -310,67 +328,106 @@ pub fn message_sent_date_ms(msg: Option<&StoredMessage>, fallback_internal_ms: i
 }
 
 /// Extract ordered, deduplicated normalized Message-IDs from `References` and `In-Reply-To`.
+///
+/// Caps output at [`MAX_THREAD_REFERENCES_PER_MESSAGE`] entries while keeping the first (root)
+/// reference and the most recent tail so huge hostile `References:` headers stay bounded in both
+/// memory and tree depth.
 pub fn extract_references_list(msg: &StoredMessage) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut seen = HashSet::new();
+    struct BoundedRefs<'a> {
+        self_id: Option<&'a str>,
+        max_tail: usize,
+        root: Option<String>,
+        tail: VecDeque<String>,
+        tail_set: HashSet<String>,
+    }
+
+    impl BoundedRefs<'_> {
+        fn push_norm(&mut self, norm: String) {
+            if self.self_id == Some(norm.as_str()) {
+                return;
+            }
+            if self.root.is_none() {
+                self.root = Some(norm);
+                return;
+            }
+            if self.root.as_deref() == Some(norm.as_str()) || self.tail_set.contains(&norm) {
+                return;
+            }
+            if self.max_tail == 0 {
+                return;
+            }
+            if self.tail.len() >= self.max_tail
+                && let Some(evicted) = self.tail.pop_front()
+            {
+                self.tail_set.remove(&evicted);
+            }
+            self.tail_set.insert(norm.clone());
+            self.tail.push_back(norm);
+        }
+
+        fn push_from_header(&mut self, raw: &str) {
+            let mut rest = raw;
+            while let Some(lt) = rest.find('<') {
+                let after_lt = &rest[lt..];
+                let Some(gt) = after_lt.find('>') else {
+                    break;
+                };
+                let token = &after_lt[..=gt];
+                if let Some(norm) = normalize_message_id(token) {
+                    self.push_norm(norm);
+                }
+                rest = &after_lt[gt + 1..];
+            }
+        }
+    }
+
     let self_id = msg
         .rfc822_message_id
         .as_deref()
         .and_then(normalize_message_id);
-
-    let mut push_from_header = |raw: &str| {
-        let mut rest = raw;
-        while let Some(lt) = rest.find('<') {
-            let after_lt = &rest[lt..];
-            let Some(gt) = after_lt.find('>') else {
-                break;
-            };
-            let token = &after_lt[..=gt];
-            if let Some(norm) = normalize_message_id(token)
-                && self_id.as_deref() != Some(norm.as_str())
-                && seen.insert(norm.clone())
-            {
-                refs.push(norm);
-            }
-            rest = &after_lt[gt + 1..];
-        }
+    let mut acc = BoundedRefs {
+        self_id: self_id.as_deref(),
+        max_tail: MAX_THREAD_REFERENCES_PER_MESSAGE.saturating_sub(1),
+        root: None,
+        tail: VecDeque::new(),
+        tail_set: HashSet::new(),
     };
 
     if let Some(ref raw_refs) = msg.references_header {
-        push_from_header(raw_refs);
+        acc.push_from_header(raw_refs);
     }
     if let Some(ref irt) = msg.in_reply_to {
         if irt.contains('<') {
-            push_from_header(irt);
+            acc.push_from_header(irt);
         } else if let Some(norm) = normalize_message_id(irt) {
-            push_from_header(&norm);
+            acc.push_norm(norm);
         }
     }
 
     // Fallback: parse from raw RFC 2822 bytes if stored columns were empty.
-    if refs.is_empty()
+    if acc.root.is_none()
         && !msg.raw_rfc2822.is_empty()
         && let Some(parsed) = MessageParser::new().parse(&msg.raw_rfc2822)
     {
         if let Some(ref_list) = parsed.references() {
             for raw_ref in ref_list.iter() {
-                if let Some(norm) = normalize_message_id(raw_ref)
-                    && self_id.as_deref() != Some(norm.as_str())
-                    && seen.insert(norm.clone())
-                {
-                    refs.push(norm);
+                if let Some(norm) = normalize_message_id(raw_ref) {
+                    acc.push_norm(norm);
                 }
             }
         }
         if let Some(irt) = parsed.in_reply_to().and_then(|l| l.first())
             && let Some(norm) = normalize_message_id(irt)
-            && self_id.as_deref() != Some(norm.as_str())
-            && seen.insert(norm.clone())
         {
-            refs.push(norm);
+            acc.push_norm(norm);
         }
     }
 
+    let mut refs = Vec::with_capacity(acc.tail.len() + usize::from(acc.root.is_some()));
+    if let Some(r) = acc.root {
+        refs.push(r);
+    }
+    refs.extend(acc.tail);
     refs
 }
 
@@ -582,7 +639,7 @@ pub fn thread_references(items: &[ThreadMessageItem]) -> String {
 
     // Step 4: Sort roots and children by date so subject gathering is deterministic.
     for &r in &roots {
-        sort_children_recursive(&mut containers, items, r);
+        sort_children_iterative(&mut containers, items, r);
     }
     roots.sort_by_key(|&r| subtree_sort_key(&containers, items, r));
 
@@ -713,7 +770,7 @@ pub fn thread_references(items: &[ThreadMessageItem]) -> String {
 
     // Step 6: Sort children at every level and sort final roots by sent date ascending.
     for &r in &final_roots {
-        sort_children_recursive(&mut containers, items, r);
+        sort_children_iterative(&mut containers, items, r);
     }
     final_roots.sort_by_key(|&r| subtree_sort_key(&containers, items, r));
 
@@ -726,6 +783,9 @@ pub fn thread_references(items: &[ThreadMessageItem]) -> String {
 }
 
 fn is_ancestor(containers: &[Container], candidate_ancestor: usize, mut node: usize) -> bool {
+    if containers[candidate_ancestor].children.is_empty() {
+        return false;
+    }
     let mut steps = 0usize;
     while let Some(parent) = containers[node].parent {
         if parent == candidate_ancestor {
@@ -740,66 +800,78 @@ fn is_ancestor(containers: &[Container], candidate_ancestor: usize, mut node: us
     false
 }
 
-fn prune_children(containers: &mut [Container], c_idx: usize) {
-    let children = std::mem::take(&mut containers[c_idx].children);
-    let mut kept = Vec::with_capacity(children.len());
-    for ch in children {
-        prune_children(containers, ch);
-        if containers[ch].item_idx.is_none() {
-            let grandchildren = std::mem::take(&mut containers[ch].children);
-            for g in grandchildren {
-                containers[g].parent = Some(c_idx);
-                kept.push(g);
-            }
-        } else {
-            kept.push(ch);
+fn prune_children(containers: &mut [Container], root: usize) {
+    let mut order = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        order.push(node);
+        for &ch in &containers[node].children {
+            stack.push(ch);
         }
     }
-    containers[c_idx].children = kept;
+
+    for node in order.into_iter().rev() {
+        let children = std::mem::take(&mut containers[node].children);
+        let mut kept = Vec::with_capacity(children.len());
+        for ch in children {
+            if containers[ch].item_idx.is_none() {
+                let grandchildren = std::mem::take(&mut containers[ch].children);
+                for g in grandchildren {
+                    containers[g].parent = Some(node);
+                    kept.push(g);
+                }
+            } else {
+                kept.push(ch);
+            }
+        }
+        containers[node].children = kept;
+    }
 }
 
 fn subtree_sort_key(
     containers: &[Container],
     items: &[ThreadMessageItem],
-    c_idx: usize,
+    root: usize,
 ) -> (i64, u32) {
-    if let Some(idx) = containers[c_idx].item_idx {
-        let item = &items[idx];
-        return (item.sent_date_ms, item.seq);
+    let mut best = (i64::MAX, u32::MAX);
+    let mut stack = vec![root];
+    while let Some(c_idx) = stack.pop() {
+        if let Some(idx) = containers[c_idx].item_idx {
+            let item = &items[idx];
+            let key = (item.sent_date_ms, item.seq);
+            if key < best {
+                best = key;
+            }
+        } else {
+            stack.extend_from_slice(&containers[c_idx].children);
+        }
     }
-    containers[c_idx]
-        .children
-        .iter()
-        .map(|&ch| subtree_sort_key(containers, items, ch))
-        .min()
-        .unwrap_or((i64::MAX, u32::MAX))
+    best
 }
 
-fn sort_children_recursive(
-    containers: &mut [Container],
-    items: &[ThreadMessageItem],
-    c_idx: usize,
-) {
-    let mut children = std::mem::take(&mut containers[c_idx].children);
-    for &ch in &children {
-        sort_children_recursive(containers, items, ch);
+fn sort_children_iterative(containers: &mut [Container], items: &[ThreadMessageItem], root: usize) {
+    let mut stack = vec![root];
+    while let Some(c_idx) = stack.pop() {
+        let mut children = std::mem::take(&mut containers[c_idx].children);
+        children.sort_by_key(|&ch| subtree_sort_key(containers, items, ch));
+        stack.extend_from_slice(&children);
+        containers[c_idx].children = children;
     }
-    children.sort_by_key(|&ch| subtree_sort_key(containers, items, ch));
-    containers[c_idx].children = children;
 }
 
 fn root_subject_info(
     containers: &[Container],
     items: &[ThreadMessageItem],
-    c_idx: usize,
+    root: usize,
 ) -> Option<(String, bool)> {
-    if let Some(idx) = containers[c_idx].item_idx {
-        let item = &items[idx];
-        return Some((item.base_subject.clone(), item.is_reply_or_fwd));
-    }
-    for &ch in &containers[c_idx].children {
-        if let Some(info) = root_subject_info(containers, items, ch) {
-            return Some(info);
+    let mut stack = vec![root];
+    while let Some(c_idx) = stack.pop() {
+        if let Some(idx) = containers[c_idx].item_idx {
+            let item = &items[idx];
+            return Some((item.base_subject.clone(), item.is_reply_or_fwd));
+        }
+        for &ch in containers[c_idx].children.iter().rev() {
+            stack.push(ch);
         }
     }
     None
@@ -808,55 +880,66 @@ fn root_subject_info(
 fn root_thread_id(
     containers: &[Container],
     items: &[ThreadMessageItem],
-    c_idx: usize,
+    root: usize,
 ) -> Option<String> {
-    if let Some(idx) = containers[c_idx].item_idx {
-        return Some(items[idx].thread_id.clone());
-    }
-    for &ch in &containers[c_idx].children {
-        if let Some(tid) = root_thread_id(containers, items, ch) {
-            return Some(tid);
+    let mut stack = vec![root];
+    while let Some(c_idx) = stack.pop() {
+        if let Some(idx) = containers[c_idx].item_idx {
+            return Some(items[idx].thread_id.clone());
+        }
+        for &ch in containers[c_idx].children.iter().rev() {
+            stack.push(ch);
         }
     }
     None
 }
 
+enum FormatFrame {
+    List(usize),
+    Members(usize),
+    CloseParen,
+    Space,
+}
+
 fn format_thread_list(
     containers: &[Container],
     items: &[ThreadMessageItem],
-    c_idx: usize,
+    root: usize,
     out: &mut String,
 ) {
-    out.push('(');
-    format_thread_members(containers, items, c_idx, out);
-    out.push(')');
-}
-
-fn format_thread_members(
-    containers: &[Container],
-    items: &[ThreadMessageItem],
-    c_idx: usize,
-    out: &mut String,
-) {
-    let c = &containers[c_idx];
-    if let Some(idx) = c.item_idx {
-        out.push_str(&items[idx].out_id.to_string());
-        match c.children.len() {
-            0 => {}
-            1 => {
-                out.push(' ');
-                format_thread_members(containers, items, c.children[0], out);
+    let mut stack = vec![FormatFrame::List(root)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            FormatFrame::CloseParen => out.push(')'),
+            FormatFrame::Space => out.push(' '),
+            FormatFrame::List(c_idx) => {
+                out.push('(');
+                stack.push(FormatFrame::CloseParen);
+                stack.push(FormatFrame::Members(c_idx));
             }
-            _ => {
-                out.push(' ');
-                for &child in &c.children {
-                    format_thread_list(containers, items, child, out);
+            FormatFrame::Members(c_idx) => {
+                let c = &containers[c_idx];
+                if let Some(idx) = c.item_idx {
+                    let _ = write!(out, "{}", items[idx].out_id);
+                    match c.children.len() {
+                        0 => {}
+                        1 => {
+                            stack.push(FormatFrame::Members(c.children[0]));
+                            stack.push(FormatFrame::Space);
+                        }
+                        _ => {
+                            for &child in c.children.iter().rev() {
+                                stack.push(FormatFrame::List(child));
+                            }
+                            stack.push(FormatFrame::Space);
+                        }
+                    }
+                } else {
+                    for &child in c.children.iter().rev() {
+                        stack.push(FormatFrame::List(child));
+                    }
                 }
             }
-        }
-    } else {
-        for &child in &c.children {
-            format_thread_list(containers, items, child, out);
         }
     }
 }
@@ -970,5 +1053,156 @@ mod tests {
 
         assert_eq!(thread_references(&items), "(10 (20 30)(40))((50)(60))");
         assert_eq!(thread_ordered_subject(&items), "(10 20 30 40)(50 60)");
+    }
+
+    #[test]
+    fn base_subject_extraction_handles_multibyte_utf8_without_panicking() {
+        // len = 9 bytes; `len - 5 = 4` lands mid-codepoint in UTF-8.
+        assert_eq!(
+            extract_base_subject_with_flag("日本語"),
+            ("日本語".to_string(), false)
+        );
+        // len = 6 bytes; `len - 5 = 1` lands mid-codepoint in UTF-8.
+        assert_eq!(
+            extract_base_subject_with_flag("ééé"),
+            ("ééé".to_string(), false)
+        );
+        // len >= 6 and ends with ']'; byte 5 lands mid-codepoint in "日" + "本".
+        assert_eq!(
+            extract_base_subject_with_flag("日本語aaaaa]"),
+            ("日本語aaaaa]".to_string(), false)
+        );
+        // 4-byte emoji characters across boundary offsets.
+        assert_eq!(
+            extract_base_subject_with_flag("🔥🚀✨🎉"),
+            ("🔥🚀✨🎉".to_string(), false)
+        );
+        // Valid markers around multibyte subjects still strip cleanly.
+        assert_eq!(
+            extract_base_subject_with_flag("Re: 日本語 (fwd)"),
+            ("日本語".to_string(), true)
+        );
+        assert_eq!(
+            extract_base_subject_with_flag("[fwd: Re: 日本語]"),
+            ("日本語".to_string(), true)
+        );
+        assert_eq!(
+            extract_base_subject_with_flag("[🔥] Fwd: ééé (FWD)"),
+            ("ééé".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn extract_references_list_caps_at_limit_preserving_root_and_recent_tail() {
+        let count = 25_000usize;
+        let refs_header: String = (0..count)
+            .map(|i| format!("<r{i}@ex>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let msg = StoredMessage {
+            id: "m1".to_string(),
+            thread_id: "t1".to_string(),
+            label_ids: Vec::new(),
+            raw_rfc2822: Vec::new(),
+            snippet: String::new(),
+            history_id: 1,
+            internal_date_ms: 1_000,
+            size_estimate: 0,
+            subject: "Stress".to_string(),
+            from_addr: "alice@example.com".to_string(),
+            to_addrs: Vec::new(),
+            cc_addrs: Vec::new(),
+            bcc_addrs: Vec::new(),
+            text_body: String::new(),
+            html_body: None,
+            has_attachments: false,
+            rfc822_message_id: Some("<r24999@ex>".to_string()),
+            in_reply_to: Some("<r24998@ex>".to_string()),
+            references_header: Some(refs_header.clone()),
+            resend_id: None,
+            delivery_status: None,
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "test".to_string(),
+            is_answered: false,
+            is_deleted: false,
+            all_mail_uid: 1,
+            unsubscribe: None,
+        };
+
+        let extracted = extract_references_list(&msg);
+        assert_eq!(extracted.len(), MAX_THREAD_REFERENCES_PER_MESSAGE);
+        assert_eq!(extracted.first().map(String::as_str), Some("<r0@ex>"));
+        // <r24999@ex> is self_id so excluded; tail ends with <r24998@ex> (deduplicated with In-Reply-To).
+        assert_eq!(extracted.last().map(String::as_str), Some("<r24998@ex>"));
+        let expected_second = format!("<r{}@ex>", 24_999 - (MAX_THREAD_REFERENCES_PER_MESSAGE - 1));
+        assert_eq!(extracted[1], expected_second);
+
+        // Also verify raw_rfc2822 fallback caps identically.
+        let mut raw_msg = msg;
+        raw_msg.references_header = None;
+        raw_msg.in_reply_to = None;
+        raw_msg.raw_rfc2822 = format!(
+            "From: a@ex\r\nMessage-ID: <leaf@ex>\r\nReferences: {refs_header}\r\nSubject: Raw\r\n\r\nBody"
+        )
+        .into_bytes();
+        raw_msg.rfc822_message_id = Some("<leaf@ex>".to_string());
+        let extracted_raw = extract_references_list(&raw_msg);
+        assert_eq!(extracted_raw.len(), MAX_THREAD_REFERENCES_PER_MESSAGE);
+        assert_eq!(extracted_raw.first().map(String::as_str), Some("<r0@ex>"));
+        assert_eq!(
+            extracted_raw.last().map(String::as_str),
+            Some("<r24999@ex>")
+        );
+    }
+
+    #[test]
+    fn thread_references_handles_25000_reference_chain_without_stack_overflow() {
+        // Run on a constrained 512 KiB stack so any recursive tree traversal would overflow.
+        let handle = std::thread::Builder::new()
+            .name("thread-references-stress".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                // Case 1: Single message with a 25,000-element References chain (dummy container chain).
+                let refs: Vec<String> = (0..25_000).map(|i| format!("<d{i}@ex>")).collect();
+                let single = vec![ThreadMessageItem {
+                    out_id: 42,
+                    seq: 1,
+                    sent_date_ms: 1_000,
+                    base_subject: "deep dummy".to_string(),
+                    is_reply_or_fwd: true,
+                    message_id: Some("<leaf@ex>".to_string()),
+                    references: refs,
+                    thread_id: "t-deep".to_string(),
+                }];
+                assert_eq!(thread_references(&single), "(42)");
+
+                // Case 2: 25,000 real chained messages forming a 25,000-deep live thread.
+                let chain: Vec<ThreadMessageItem> = (0..25_000u32)
+                    .map(|i| ThreadMessageItem {
+                        out_id: i + 1,
+                        seq: i + 1,
+                        sent_date_ms: i64::from(i) * 1000,
+                        base_subject: "deep chain".to_string(),
+                        is_reply_or_fwd: i > 0,
+                        message_id: Some(format!("<m{i}@ex>")),
+                        references: if i == 0 {
+                            Vec::new()
+                        } else {
+                            vec![format!("<m{}@ex>", i - 1)]
+                        },
+                        thread_id: "t-chain".to_string(),
+                    })
+                    .collect();
+                let formatted = thread_references(&chain);
+                assert!(formatted.starts_with("(1 2 3 "));
+                assert!(formatted.ends_with(" 24999 25000)"));
+            })
+            .expect("spawn stress thread");
+
+        handle
+            .join()
+            .expect("25,000-deep THREAD REFERENCES must not overflow stack");
     }
 }

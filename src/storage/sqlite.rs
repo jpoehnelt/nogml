@@ -44,7 +44,7 @@ use crate::{
         StoredThreadDetail, SuppressionEntry, SuppressionQuery, SuppressionReason,
         SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
         UpsertOutcome, UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
-        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
+        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip, compute_xgm_label_delta,
         normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
         normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
         parse_simple_email_address, validate_and_normalize_contact_email,
@@ -5235,6 +5235,58 @@ impl MailStore for SqliteStore {
                 .map_err(sql_err)?;
                 msg.history_id = new_hid;
             }
+            tx.commit().map_err(sql_err)?;
+            Ok(ImapStoreFlagsOutcome::Updated(Box::new(msg)))
+        })
+        .await
+    }
+
+    async fn imap_store_xgm_labels(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        label_ids: &[String],
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let message_id = message_id.to_string();
+        let label_ids = label_ids.to_vec();
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let Some(old_msg) = load_message_by_id(&tx, mb, &message_id)? else {
+                return Ok(ImapStoreFlagsOutcome::NotFound);
+            };
+            if let Some(limit) = unchanged_since
+                && old_msg.history_id.max(1) > limit
+            {
+                return Ok(ImapStoreFlagsOutcome::Modified);
+            }
+            let (add_labels, remove_labels) =
+                compute_xgm_label_delta(&old_msg.label_ids, action, &label_ids);
+            let mut resolved_add = Vec::with_capacity(add_labels.len());
+            for l in &add_labels {
+                let lid = resolve_existing_label_id(&tx, mb, l)?
+                    .ok_or_else(|| AppError::BadRequest(format!("Label not found: {l}")))?;
+                resolved_add.push(lid);
+            }
+            let mut resolved_remove = Vec::with_capacity(remove_labels.len());
+            for l in &remove_labels {
+                if let Some(lid) = resolve_existing_label_id(&tx, mb, l)? {
+                    resolved_remove.push(lid);
+                }
+            }
+            let msg = if resolved_add.is_empty() && resolved_remove.is_empty() {
+                old_msg
+            } else {
+                modify_message_labels_resolved_tx(
+                    &tx,
+                    mb,
+                    &message_id,
+                    &resolved_add,
+                    &resolved_remove,
+                )?
+            };
             tx.commit().map_err(sql_err)?;
             Ok(ImapStoreFlagsOutcome::Updated(Box::new(msg)))
         })

@@ -2266,7 +2266,8 @@ async fn test_imap_xgm_raw_search_and_xgm_labels_store_and_search() {
         "expected UID 2 for after: + to:, got {r6:?}"
     );
 
-    // 2. UID STORE +X-GM-LABELS: system label + auto-created custom label + HistoryEvent(local) + MODSEQ
+    // 2. UID STORE +X-GM-LABELS: system label + auto-created custom label + HistoryEvent(local).
+    // CONDSTORE has not been enabled yet, so untagged FETCH must NOT include MODSEQ (RFC 7162 §3.1.3).
     let before_hid = store.current_history_id().await.unwrap();
     let st_add = send_cmd(
         &mut reader,
@@ -2281,11 +2282,83 @@ async fn test_imap_xgm_raw_search_and_xgm_labels_store_and_search() {
                 && l.contains("X-GM-LABELS (")
                 && l.contains("\\Important")
                 && l.contains("\"Work/Urgent\"")
-                && l.contains("MODSEQ (")
+                && !l.contains("MODSEQ (")
         }),
-        "expected FETCH with X-GM-LABELS and MODSEQ, got {st_add:?}"
+        "expected FETCH with X-GM-LABELS and no MODSEQ before CONDSTORE enabled, got {st_add:?}"
     );
     assert!(st_add.last().unwrap().starts_with("ST1 OK"));
+
+    // 2b. STORE +/-X-GM-LABELS ("UNREAD") must be rejected and must NOT mutate LABEL_UNREAD.
+    let bad_unread_rem =
+        send_cmd(&mut reader, "UN1", r#"UID STORE 1 -X-GM-LABELS ("UNREAD")"#).await;
+    assert!(
+        bad_unread_rem.last().unwrap().starts_with("UN1 NO"),
+        "removing UNREAD via X-GM-LABELS must be rejected, got {bad_unread_rem:?}"
+    );
+    let bad_unread_add =
+        send_cmd(&mut reader, "UN2", r#"UID STORE 2 +X-GM-LABELS ("UNREAD")"#).await;
+    assert!(
+        bad_unread_add.last().unwrap().starts_with("UN2 NO"),
+        "adding UNREAD via X-GM-LABELS must be rejected, got {bad_unread_add:?}"
+    );
+    let bad_unread_lower =
+        send_cmd(&mut reader, "UN3", r#"UID STORE 2 +X-GM-LABELS ("unread")"#).await;
+    assert!(
+        bad_unread_lower.last().unwrap().starts_with("UN3 NO"),
+        "adding lowercase unread via X-GM-LABELS must be rejected, got {bad_unread_lower:?}"
+    );
+    let unseen_before_condstore = send_cmd(&mut reader, "UN4", "UID SEARCH UNSEEN").await;
+    assert!(
+        unseen_before_condstore
+            .iter()
+            .any(|l| l.trim() == "* SEARCH 1 3"),
+        "UNREAD state must remain unchanged after rejected X-GM-LABELS mutations, got {unseen_before_condstore:?}"
+    );
+
+    // 2c. Non-ASCII custom label is emitted as an RFC 3501 literal in FETCH/STORE X-GM-LABELS
+    // rather than raw UTF-8 bytes inside a quoted string.
+    let utf8_label = "Café/重要";
+    let utf8_len = utf8_label.len();
+    let st_utf8 = send_cmd(
+        &mut reader,
+        "UTF1",
+        &format!("UID STORE 2 +X-GM-LABELS ({{{utf8_len}+}}\r\n{utf8_label})"),
+    )
+    .await;
+    let st_utf8_wire = st_utf8.concat();
+    assert!(
+        st_utf8_wire.contains(&format!("{{{utf8_len}}}\r\n{utf8_label}")),
+        "expected RFC 3501 literal for non-ASCII X-GM-LABELS in STORE, got {st_utf8_wire:?}"
+    );
+    assert!(
+        !st_utf8_wire.contains(&format!("\"{utf8_label}\"")),
+        "non-ASCII X-GM-LABELS must not be emitted inside quoted string, got {st_utf8_wire:?}"
+    );
+    let fetch_utf8 = send_cmd(&mut reader, "UTF2", "UID FETCH 2 (X-GM-LABELS)").await;
+    let fetch_utf8_wire = fetch_utf8.concat();
+    assert!(
+        fetch_utf8_wire.contains(&format!("{{{utf8_len}}}\r\n{utf8_label}")),
+        "expected RFC 3501 literal for non-ASCII X-GM-LABELS in FETCH, got {fetch_utf8_wire:?}"
+    );
+    assert!(
+        !fetch_utf8_wire.contains(&format!("\"{utf8_label}\"")),
+        "non-ASCII X-GM-LABELS in FETCH must not be quoted, got {fetch_utf8_wire:?}"
+    );
+
+    // Clean up non-ASCII label from UID 2 before continuing CONDSTORE checks.
+    let _ = send_cmd(
+        &mut reader,
+        "UTF3",
+        &format!("UID STORE 2 -X-GM-LABELS.SILENT ({{{utf8_len}+}}\r\n{utf8_label})"),
+    )
+    .await;
+
+    // Re-select INBOX with (CONDSTORE) so subsequent STORE X-GM-LABELS responses include MODSEQ (RFC 7162 §3.1.3).
+    let sel_cond = send_cmd(&mut reader, "EN1", "SELECT INBOX (CONDSTORE)").await;
+    assert!(
+        sel_cond.last().unwrap().starts_with("EN1 OK"),
+        "SELECT INBOX (CONDSTORE) must succeed, got {sel_cond:?}"
+    );
 
     let after_hid = store.current_history_id().await.unwrap();
     assert!(
@@ -2991,19 +3064,122 @@ async fn test_imap_esearch_sasl_ir_and_literal_minus() {
         "5000-byte sync literal must succeed, got {sync_resp:?}"
     );
 
-    // Non-synchronizing {4097+} exceeds LITERAL- 4096-byte cap -> * BAD [TOOBIG] + close.
+    // Non-synchronizing {4097+} exceeds LITERAL- 4096-byte cap ->
+    // `<tag> NO [TOOBIG] ...\r\n` + `* BYE [TOOBIG] ...\r\n` + close.
     reader
         .get_mut()
         .write_all(b"LM3 APPEND INBOX {4097+}\r\n")
         .await
         .unwrap();
     reader.get_mut().flush().await.unwrap();
-    let mut err_line = String::new();
-    reader.read_line(&mut err_line).await.unwrap();
+    let mut no_line = String::new();
+    reader.read_line(&mut no_line).await.unwrap();
     assert!(
-        err_line.starts_with("* BAD") && err_line.contains("[TOOBIG]"),
-        "expected * BAD [TOOBIG] for 4097-byte LITERAL-, got {err_line:?}"
+        no_line.starts_with("LM3 NO [TOOBIG] "),
+        "expected tagged NO [TOOBIG] for 4097-byte LITERAL-, got {no_line:?}"
+    );
+    let mut bye_line = String::new();
+    reader.read_line(&mut bye_line).await.unwrap();
+    assert!(
+        bye_line.starts_with("* BYE [TOOBIG] "),
+        "expected untagged BYE [TOOBIG] for 4097-byte LITERAL-, got {bye_line:?}"
+    );
+    let mut eof_line = String::new();
+    let eof_bytes = reader.read_line(&mut eof_line).await.unwrap();
+    assert_eq!(
+        eof_bytes, 0,
+        "connection must close after [TOOBIG] BYE, got {eof_line:?}"
     );
 
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_sort_and_thread_utf8_subjects_and_25000_references() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+
+    // Subjects specifically crafted so byte offsets `len - 5` and `5` land mid-codepoint in UTF-8.
+    let utf8_subjects = ["日本語", "ééé", "日本語aaaaa]", "Re: 日本語 (fwd)"];
+    for (idx, subj) in utf8_subjects.iter().enumerate() {
+        let raw = format!(
+            "From: sender{idx}@example.com\r\nTo: agent@example.com\r\nDate: Mon, 0{} Jun 2026 10:00:00 +0000\r\nMessage-ID: <utf8-{idx}@example.com>\r\nSubject: {subj}\r\n\r\nBody {idx}\r\n",
+            idx + 1
+        )
+        .into_bytes();
+        let mut input = crate::imap::mime_fmt::parse_raw_to_new_message_input(
+            raw,
+            vec![LABEL_INBOX.to_string()],
+            Some(1_780_000_000_000 + (idx as i64) * 1000),
+            "test",
+            None,
+            None,
+            false,
+            false,
+        );
+        input.subject = (*subj).to_string();
+        store.insert_message(input).await.unwrap();
+    }
+
+    // Hostile message with 25,000 References tokens (must not overflow Tokio worker stack).
+    let huge_refs: String = (0..25_000)
+        .map(|i| format!("<r{i}@ex>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut hostile = crate::imap::mime_fmt::parse_raw_to_new_message_input(
+        b"From: hostile@example.com\r\nTo: agent@example.com\r\nDate: Fri, 05 Jun 2026 10:00:00 +0000\r\nMessage-ID: <hostile@example.com>\r\nSubject: Deep Ref\r\n\r\nBody\r\n".to_vec(),
+        vec![LABEL_INBOX.to_string()],
+        Some(1_780_000_010_000),
+        "test",
+        None,
+        None,
+        false,
+        false,
+    );
+    hostile.references_header = Some(huge_refs);
+    store.insert_message(hostile).await.unwrap();
+
+    let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    assert!(login.last().unwrap().starts_with("L1 OK"));
+    let sel = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l.contains("* 5 EXISTS")));
+
+    let sort_resp = send_cmd(&mut reader, "SR1", "UID SORT (SUBJECT) UTF-8 ALL").await;
+    assert!(
+        sort_resp.iter().any(|l| l.starts_with("* SORT ")),
+        "UID SORT (SUBJECT) on multibyte UTF-8 subjects must succeed, got {sort_resp:?}"
+    );
+    assert!(sort_resp.last().unwrap().starts_with("SR1 OK"));
+
+    let thread_ref_resp = send_cmd(&mut reader, "TH1", "UID THREAD REFERENCES UTF-8 ALL").await;
+    assert!(
+        thread_ref_resp.iter().any(|l| l.starts_with("* THREAD ")),
+        "UID THREAD REFERENCES with 25,000 refs + UTF-8 subjects must succeed, got {thread_ref_resp:?}"
+    );
+    assert!(thread_ref_resp.last().unwrap().starts_with("TH1 OK"));
+
+    let thread_os_resp = send_cmd(&mut reader, "TH2", "UID THREAD ORDEREDSUBJECT UTF-8 ALL").await;
+    assert!(
+        thread_os_resp.iter().any(|l| l.starts_with("* THREAD ")),
+        "UID THREAD ORDEREDSUBJECT with UTF-8 subjects must succeed, got {thread_os_resp:?}"
+    );
+    assert!(thread_os_resp.last().unwrap().starts_with("TH2 OK"));
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
     let _ = shutdown_tx.send(true);
 }
