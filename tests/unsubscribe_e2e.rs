@@ -729,3 +729,86 @@ async fn unsubscribe_enforces_scopes_and_rejects_messages_without_headers() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(err["error"]["code"], "validation_error");
 }
+
+#[tokio::test]
+async fn one_click_unsubscribe_enforces_allowed_recipients_and_first_contact_policy() {
+    let one_click_raw = concat!(
+        "From: Promo <promo@external.example>\r\n",
+        "To: agent@example.com\r\n",
+        "Subject: Weekly deals\r\n",
+        "List-Unsubscribe: <https://93.184.216.34/unsub>\r\n",
+        "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+        "\r\n",
+        "Deals.\r\n"
+    );
+
+    // 1. allowed_recipients blocks one-click POST targeting a non-allowlisted host
+    let mut cfg_allow = Config::for_test();
+    cfg_allow.allowed_recipients = vec!["@company.com".to_string()];
+    let (app_allow, store_allow, _sent) = build_test_app(cfg_allow);
+    seed_raw_message(
+        &store_allow,
+        "m_oc_allow",
+        "Promo <promo@external.example>",
+        "Weekly deals",
+        one_click_raw.as_bytes(),
+    )
+    .await;
+
+    let (st_dry, dry) = json_request(
+        &app_allow,
+        "POST",
+        "/v1/messages/m_oc_allow/unsubscribe",
+        None,
+        Some(json!({ "dry_run": true })),
+    )
+    .await;
+    assert_eq!(st_dry, StatusCode::OK);
+    assert_eq!(dry["would_succeed"], false);
+
+    let (st, err) = json_request(
+        &app_allow,
+        "POST",
+        "/v1/messages/m_oc_allow/unsubscribe",
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(err["error"]["code"], "recipient_not_allowed");
+
+    // 2. first_contact_approval blocks direct one-click POST without firing any HTTP request
+    let mut cfg_fc = Config::for_test();
+    cfg_fc.first_contact_approval = true;
+    let (app_fc, store_fc, _sent_fc) = build_test_app(cfg_fc);
+    seed_raw_message(
+        &store_fc,
+        "m_oc_fc",
+        "Promo <promo@external.example>",
+        "Weekly deals",
+        one_click_raw.as_bytes(),
+    )
+    .await;
+
+    let (st_dry, dry_fc) = json_request(
+        &app_fc,
+        "POST",
+        "/v1/messages/m_oc_fc/unsubscribe",
+        None,
+        Some(json!({ "dry_run": true })),
+    )
+    .await;
+    assert_eq!(st_dry, StatusCode::OK);
+    assert_eq!(dry_fc["would_succeed"], false);
+
+    let (st, err) = json_request(
+        &app_fc,
+        "POST",
+        "/v1/messages/m_oc_fc/unsubscribe",
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(err["error"]["code"], "approval_required");
+}

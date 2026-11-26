@@ -355,7 +355,7 @@ pub struct WatchResponse {
 
 // --- Gmail Settings (Superhuman compatibility) ---
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmtpMsa {
     pub host: String,
@@ -366,6 +366,25 @@ pub struct SmtpMsa {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for SmtpMsa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpMsa")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("security_mode", &self.security_mode)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

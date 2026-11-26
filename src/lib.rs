@@ -100,8 +100,9 @@ pub struct AppState {
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks scheduled send IDs currently being dispatched or canceled to prevent concurrent races.
     pub scheduled_in_flight: Arc<StdMutex<HashSet<String>>>,
-    /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
-    pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
+    /// Tracks redeemed single-use local OAuth2 authorization code JTIs mapped to their expiry
+    /// Unix timestamp (seconds), pruned on write to prevent unbounded growth.
+    pub used_oauth_codes: Arc<Mutex<HashMap<String, i64>>>,
     /// Shared operational metrics exported at `GET /metrics`.
     pub metrics: Arc<Metrics>,
     /// Broadcast receiver signaled (`true`) when the server begins graceful shutdown.
@@ -232,7 +233,7 @@ impl AppState {
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
-            used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            used_oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             shutdown,
             shutdown_tx: Arc::new(shutdown_tx),
@@ -319,7 +320,7 @@ impl AppState {
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
-            used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            used_oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             shutdown,
             shutdown_tx: Arc::new(shutdown_tx),

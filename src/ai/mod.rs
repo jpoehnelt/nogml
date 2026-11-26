@@ -1140,17 +1140,64 @@ pub async fn execute_send_draft_with_context(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("<{}@{}>", Uuid::new_v4(), state.config.default_domain));
 
-    let raw_rfc2822 = if msg.raw_rfc2822.is_empty() {
-        build_outbound_rfc2822(&resolved, &rfc_message_id)?
+    let mut old_att_ids = Vec::new();
+    let mut loaded_attachments: Vec<NewAttachmentInput> = Vec::new();
+    let mut outbound_attachments: Vec<OutboundAttachment> = Vec::new();
+    if msg.has_attachments {
+        let metas = state.store.list_attachment_meta(&msg.id).await?;
+        for (idx, meta) in metas.into_iter().enumerate() {
+            old_att_ids.push(meta.id.clone());
+            if let Some(att) = state.store.get_attachment(&msg.id, &meta.id).await? {
+                let data = state.load_attachment_bytes(&att).await?;
+                outbound_attachments.push(OutboundAttachment {
+                    filename: att.filename.clone(),
+                    content_type: att.content_type.clone(),
+                    content_id: att.content_id.clone(),
+                    data: data.clone(),
+                });
+                loaded_attachments.push(NewAttachmentInput {
+                    part_id: if att.part_id.is_empty() {
+                        format!("att_{}", idx + 1)
+                    } else {
+                        att.part_id
+                    },
+                    filename: att.filename,
+                    content_type: att.content_type,
+                    content_id: att.content_id,
+                    data,
+                });
+            }
+        }
+    }
+
+    let raw_loaded = state.load_raw_rfc2822(msg).await?;
+    let raw_rfc2822 = if raw_loaded.is_empty() {
+        let input = ComposeEmailInput {
+            from: resolved.from.clone(),
+            to: resolved.to.clone(),
+            cc: resolved.cc.clone(),
+            bcc: resolved.bcc.clone(),
+            reply_to: Vec::new(),
+            subject: resolved.subject.clone(),
+            text: resolved.text.clone(),
+            html: resolved.html.clone(),
+            message_id: Some(rfc_message_id.clone()),
+            in_reply_to: resolved.in_reply_to.clone(),
+            references: resolved.references.clone(),
+            extra_headers: HashMap::new(),
+            attachments: loaded_attachments.clone(),
+        };
+        build_rfc2822(&input)?
     } else {
-        state.load_raw_rfc2822(msg).await?
+        raw_loaded
     };
 
-    let outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+    let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+    outbound_msg.attachments = outbound_attachments;
     let send_outcome = state.transport.send(&outbound_msg, None).await?;
 
     let _ = state.store.delete_draft(draft_id).await?;
-    let _ = state.post_delete_message(&msg.id, &[]).await;
+    let _ = state.post_delete_message(&msg.id, &old_att_ids).await;
 
     let stored = state
         .store
@@ -1177,7 +1224,7 @@ pub async fn execute_send_draft_with_context(
             source: "local".to_string(),
             is_answered: false,
             is_deleted: false,
-            attachments: Vec::new(),
+            attachments: loaded_attachments,
         })
         .await?;
 
@@ -3011,6 +3058,7 @@ pub(crate) async fn enqueue_pending_approval(
 
     let expires_at =
         DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
+    let event_subject = safe_hold_subject(&state.config, &approval);
 
     state.events.publish(
         source,
@@ -3018,15 +3066,31 @@ pub(crate) async fn enqueue_pending_approval(
             approval_id: approval.id.clone(),
             reason: approval.reason.clone(),
             to: approval.outbound_message.to.clone(),
-            subject: approval.outbound_message.subject.clone(),
+            subject: event_subject.clone(),
             thread_id: approval.thread_id.clone(),
             draft_id: approval.draft_id.clone(),
             expires_at,
         },
     );
 
-    spawn_approval_webhook(&state.config, &approval, snippet);
+    spawn_approval_webhook(&state.config, &approval, &event_subject, snippet);
     Ok(approval)
+}
+
+const DLP_REDACTED_SUBJECT: &str = "[REDACTED: DLP policy hold]";
+
+fn is_dlp_hold(config: &Config, approval: &PendingApproval) -> bool {
+    config.dlp_action != crate::config::DlpAction::Off
+        && (approval.reason.contains("DLP policy")
+            || !safety::scan_dlp_text(&approval.outbound_message.subject).is_empty())
+}
+
+fn safe_hold_subject(config: &Config, approval: &PendingApproval) -> String {
+    if is_dlp_hold(config, approval) {
+        DLP_REDACTED_SUBJECT.to_string()
+    } else {
+        approval.outbound_message.subject.clone()
+    }
 }
 
 fn safe_hold_preview_snippet<'a>(config: &Config, snippet: &'a str) -> &'a str {
@@ -3048,6 +3112,13 @@ pub(crate) fn build_hold_response(
 ) -> Value {
     let expires_at =
         DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
+    let response_subject = if approval.reason.contains("DLP policy")
+        || !safety::scan_dlp_text(&approval.outbound_message.subject).is_empty()
+    {
+        DLP_REDACTED_SUBJECT
+    } else {
+        approval.outbound_message.subject.as_str()
+    };
     json!({
         "status": "pending_approval",
         "held_for_approval": true,
@@ -3061,19 +3132,24 @@ pub(crate) fn build_hold_response(
         "to": approval.outbound_message.to,
         "cc": approval.outbound_message.cc,
         "bcc": approval.outbound_message.bcc,
-        "subject": approval.outbound_message.subject,
+        "subject": response_subject,
         "preview": {
             "from": approval.outbound_message.from,
             "to": approval.outbound_message.to,
             "cc": approval.outbound_message.cc,
             "bcc": approval.outbound_message.bcc,
-            "subject": approval.outbound_message.subject,
+            "subject": response_subject,
             "snippet": snippet,
         },
     })
 }
 
-fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: &str) {
+fn spawn_approval_webhook(
+    config: &Config,
+    approval: &PendingApproval,
+    safe_subject: &str,
+    snippet: &str,
+) {
     let Some(webhook_url) = config
         .approval_webhook_url
         .clone()
@@ -3083,12 +3159,13 @@ fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: 
         return;
     };
 
+    let redacted_webhook_url = crate::secrets::redact_url_for_log(&webhook_url);
     let expires_at =
         DateTime::from_timestamp_millis(approval.expires_at_ms).unwrap_or_else(Utc::now);
     let to_summary = approval.outbound_message.to.join(", ");
     let slack_text = format!(
         "Email approval required ({}): To: {} | Subject: {} | Reason: {}",
-        approval.id, to_summary, approval.outbound_message.subject, approval.reason
+        approval.id, to_summary, safe_subject, approval.reason
     );
 
     let payload = json!({
@@ -3107,7 +3184,7 @@ fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: 
             "to": approval.outbound_message.to,
             "cc": approval.outbound_message.cc,
             "bcc": approval.outbound_message.bcc,
-            "subject": approval.outbound_message.subject,
+            "subject": safe_subject,
             "snippet": snippet,
         },
     });
@@ -3130,13 +3207,18 @@ fn spawn_approval_webhook(config: &Config, approval: &PendingApproval, snippet: 
             Ok(resp) => {
                 warn!(
                     status = %resp.status(),
-                    %webhook_url,
+                    webhook_url = %redacted_webhook_url,
                     %approval_id,
                     "Approval webhook returned non-success status"
                 );
             }
             Err(err) => {
-                warn!(%err, %webhook_url, %approval_id, "Failed to deliver approval webhook");
+                warn!(
+                    %err,
+                    webhook_url = %redacted_webhook_url,
+                    %approval_id,
+                    "Failed to deliver approval webhook"
+                );
             }
         }
     });

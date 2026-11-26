@@ -862,3 +862,242 @@ async fn e2e_cli_mail_approvals_local_and_remote() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn e2e_approvals_endpoints_require_admin_scope() {
+    use nogml::auth::{AuthScope, ScopedTokenConfig};
+
+    let mut cfg = Config::for_test();
+    cfg.require_approval = true;
+    cfg.scoped_tokens = vec![
+        ScopedTokenConfig {
+            token: "tok-read".to_string(),
+            mailbox_id: None,
+            scopes: vec![AuthScope::Read],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
+        ScopedTokenConfig {
+            token: "tok-send".to_string(),
+            mailbox_id: None,
+            scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
+        ScopedTokenConfig {
+            token: "tok-admin".to_string(),
+            mailbox_id: None,
+            scopes: vec![AuthScope::Admin],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
+    ];
+
+    let store = Arc::new(MemoryStore::new(&cfg.user_email));
+    let (transport, _sent_log) = RecordingTransport::new();
+    let resend = Arc::new(HttpResendClient::from_config(&cfg));
+    let state = AppState::with_backends(cfg, store, resend).with_transport(Arc::new(transport));
+    let app = build_router(state);
+
+    let send_with_tok =
+        |method: &'static str, uri: String, tok: &'static str, body: Option<Value>| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("authorization", format!("Bearer {tok}"));
+                let req_body = if let Some(val) = body {
+                    builder = builder.header("content-type", "application/json");
+                    Body::from(val.to_string())
+                } else {
+                    Body::empty()
+                };
+                let resp = app.oneshot(builder.body(req_body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, val)
+            }
+        };
+
+    // Send-scoped token triggers a pending approval
+    let (st, held) = send_with_tok(
+        "POST",
+        "/v1/messages/send".to_string(),
+        "tok-send",
+        Some(json!({
+            "to": ["partner@example.com"],
+            "subject": "Sensitive hold",
+            "text": "Confidential payload"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let approval_id = held["approval_id"].as_str().unwrap().to_string();
+
+    // Read-only and Send-only (non-Admin) tokens MUST receive 403 on list/get/approve/reject
+    for tok in ["tok-read", "tok-send"] {
+        let (st, _) = send_with_tok("GET", "/v1/approvals".to_string(), tok, None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "GET /v1/approvals for {tok}");
+
+        let (st, _) = send_with_tok("GET", format!("/v1/approvals/{approval_id}"), tok, None).await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "GET /v1/approvals/{{id}} for {tok}"
+        );
+
+        let (st, _) = send_with_tok(
+            "POST",
+            format!("/v1/approvals/{approval_id}/approve"),
+            tok,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "approve for {tok}");
+    }
+
+    // Admin token succeeds on list and get
+    let (st, list) = send_with_tok("GET", "/v1/approvals".to_string(), "tok-admin", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list["count"], 1);
+
+    let (st, detail) = send_with_tok(
+        "GET",
+        format!("/v1/approvals/{approval_id}"),
+        "tok-admin",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["id"], approval_id);
+}
+
+#[tokio::test]
+async fn e2e_draft_send_allow_preserves_attachments_on_transport_and_sent_copy() {
+    use nogml::storage::NewAttachmentInput;
+
+    let cfg = Config::for_test();
+    let store = Arc::new(MemoryStore::new(&cfg.user_email));
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let (transport, sent_log) = RecordingTransport::new();
+    let resend = Arc::new(HttpResendClient::from_config(&cfg));
+    let state = AppState::with_backends(cfg, store.clone(), resend)
+        .with_blobs(blobs.clone())
+        .with_transport(Arc::new(transport));
+    let app = build_router(state.clone());
+
+    let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n".to_vec();
+    let csv_bytes = b"col1,col2\n1,2\n".to_vec();
+
+    // Seed a draft with two attachments and offload them via post_store_message
+    let draft = store
+        .create_draft(NewMessageInput {
+            id: None,
+            thread_id: None,
+            label_ids: vec!["DRAFT".to_string()],
+            raw_rfc2822: Vec::new(),
+            snippet: "Please see attached report.".to_string(),
+            internal_date_ms: 1_700_000_000_000,
+            subject: "Monthly report".to_string(),
+            from_addr: "agent@example.com".to_string(),
+            to_addrs: vec!["cfo@example.com".to_string()],
+            cc_addrs: Vec::new(),
+            bcc_addrs: Vec::new(),
+            text_body: "Please see attached report.".to_string(),
+            html_body: None,
+            rfc822_message_id: Some("<draft-att-1@example.com>".to_string()),
+            in_reply_to: None,
+            references_header: None,
+            resend_id: None,
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "local".to_string(),
+            is_answered: false,
+            is_deleted: false,
+            attachments: vec![
+                NewAttachmentInput {
+                    part_id: "att_1".to_string(),
+                    filename: Some("report.pdf".to_string()),
+                    content_type: "application/pdf".to_string(),
+                    content_id: None,
+                    data: pdf_bytes.clone(),
+                },
+                NewAttachmentInput {
+                    part_id: "att_2".to_string(),
+                    filename: Some("metrics.csv".to_string()),
+                    content_type: "text/csv".to_string(),
+                    content_id: None,
+                    data: csv_bytes.clone(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    state.post_store_message(&draft.message).await.unwrap();
+
+    // Send the draft on the Allow path
+    let (status, resp) = http_json(
+        &app,
+        "POST",
+        &format!("/v1/drafts/{}/send", draft.id),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "draft send failed: {resp}");
+    assert_eq!(resp["status"], "sent");
+    let sent_id = resp["message_id"].as_str().unwrap().to_string();
+
+    // 1. Transport MUST have received both attachments with exact bytes
+    {
+        let dispatches = sent_log.lock().unwrap();
+        assert_eq!(dispatches.len(), 1);
+        let outbound = &dispatches[0].0;
+        assert_eq!(outbound.attachments.len(), 2);
+        assert_eq!(
+            outbound.attachments[0].filename.as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(outbound.attachments[0].content_type, "application/pdf");
+        assert_eq!(outbound.attachments[0].data, pdf_bytes);
+        assert_eq!(
+            outbound.attachments[1].filename.as_deref(),
+            Some("metrics.csv")
+        );
+        assert_eq!(outbound.attachments[1].content_type, "text/csv");
+        assert_eq!(outbound.attachments[1].data, csv_bytes);
+    }
+
+    // 2. SENT message copy in store MUST persist both attachments with exact bytes
+    let sent_msg = store.get_message(&sent_id).await.unwrap().unwrap();
+    assert!(sent_msg.label_ids.contains(&LABEL_SENT.to_string()));
+    assert!(sent_msg.has_attachments);
+    let sent_metas = store.list_attachment_meta(&sent_id).await.unwrap();
+    assert_eq!(sent_metas.len(), 2);
+
+    let first_att = store
+        .get_attachment(&sent_id, &sent_metas[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_att.filename.as_deref(), Some("report.pdf"));
+    assert_eq!(
+        state.load_attachment_bytes(&first_att).await.unwrap(),
+        pdf_bytes
+    );
+
+    let second_att = store
+        .get_attachment(&sent_id, &sent_metas[1].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_att.filename.as_deref(), Some("metrics.csv"));
+    assert_eq!(
+        state.load_attachment_bytes(&second_att).await.unwrap(),
+        csv_bytes
+    );
+}

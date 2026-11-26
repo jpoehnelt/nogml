@@ -399,6 +399,21 @@ fn select_method(
     ))
 }
 
+fn one_click_policy_recipient(raw_url: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
+        return Vec::new();
+    };
+    let synthetic = match parsed.host() {
+        Some(url::Host::Domain(domain)) => format!("unsubscribe@{}", domain.trim_end_matches('.')),
+        Some(url::Host::Ipv4(ip)) => format!("unsubscribe@{ip}"),
+        Some(url::Host::Ipv6(ip)) => {
+            format!("unsubscribe@{}.invalid", ip.to_string().replace(':', "-"))
+        }
+        None => return Vec::new(),
+    };
+    vec![synthetic]
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_one_click_post(
     state: &AppState,
@@ -410,9 +425,10 @@ async fn execute_one_click_post(
     agent_policy: Option<crate::auth::AgentPolicyOverride>,
     warnings: &mut Vec<String>,
 ) -> AppResult<Value> {
+    let policy_recipients = one_click_policy_recipient(url);
     let outbound_check = OutboundCheck {
         from: state.config.user_email.clone(),
-        to: Vec::new(),
+        to: policy_recipients,
         cc: Vec::new(),
         bcc: Vec::new(),
         subject: format!("Unsubscribe: {message_subject}"),
@@ -473,6 +489,16 @@ async fn execute_one_click_post(
                 check.detail = "require_approval is enabled; direct RFC 8058 one-click HTTP POST is blocked without approval".to_string();
                 warnings.push(
                     "require_approval=true blocks direct one-click HTTP POST; pass prefer_mailto: true to queue a mailto: unsubscribe for human approval."
+                        .to_string(),
+                );
+            } else if check.rule == "first_contact_approval"
+                && state.config.first_contact_approval
+                && !effective_draft_only
+            {
+                check.passed = false;
+                check.detail = "first_contact_approval is enabled; direct RFC 8058 one-click HTTP POST is blocked without approval".to_string();
+                warnings.push(
+                    "first_contact_approval=true blocks direct one-click HTTP POST; pass prefer_mailto: true to queue a mailto: unsubscribe for human approval."
                         .to_string(),
                 );
             }

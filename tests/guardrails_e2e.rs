@@ -582,3 +582,202 @@ dlp_action = "deny"
     assert!(cfg.first_contact_approval);
     assert_eq!(cfg.dlp_action, DlpAction::Deny);
 }
+
+#[tokio::test]
+async fn e2e_strict_single_recipient_parser_blocks_multi_address_bypass() {
+    let mut cfg = Config::for_test();
+    cfg.allowed_recipients = vec!["@company.com".to_string()];
+    cfg.max_send_recipients = 1;
+    cfg.first_contact_approval = true;
+    let (app, _state, sent_log) = build_test_app(cfg);
+
+    for malformed in [
+        "external@other.example, <alice@company.com>",
+        "<alice@company.com>, external@other.example",
+        "<alice@company.com> trailing",
+        "<alice@company.com> <evil@other.example>",
+        "external@other.example <alice@company.com>",
+        "Alice; Bob <alice@company.com>",
+        "alice@company.com, evil@other.example",
+        "\"evil@other.example\" <alice@company.com>",
+    ] {
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/messages/send",
+            None,
+            Some(json!({
+                "to": [malformed],
+                "subject": "Bypass attempt",
+                "text": "Must be rejected"
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "malformed recipient '{malformed}' must fail with 400, got {status}: {body}"
+        );
+    }
+    assert!(sent_log.lock().unwrap().is_empty());
+
+    // Valid quoted display name with comma and single allowed recipient passes syntax & allowlist
+    // (held by first_contact_approval -> 202, not rejected as 400 or 403).
+    let (status, body) = send_json(
+        &app,
+        "POST",
+        "/v1/messages/send",
+        None,
+        Some(json!({
+            "to": ["\"Smith, Alice\" <alice@company.com>"],
+            "subject": "Legit single recipient",
+            "text": "Hello Alice"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "expected 202, got {body}");
+    assert!(sent_log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn e2e_policy_precedence_draft_only_never_promoted_to_approval_queue() {
+    use nogml::config::DraftOnlyAction;
+
+    // 1. Server-level draft_only=true (Downgrade) + first_contact_approval=true + dlp_action=Hold
+    //    MUST downgrade to local draft, NEVER create a pending approval!
+    let mut cfg = Config::for_test();
+    cfg.draft_only = true;
+    cfg.draft_only_action = DraftOnlyAction::Downgrade;
+    cfg.first_contact_approval = true;
+    cfg.dlp_action = DlpAction::Hold;
+    let (app, state, sent_log) = build_test_app(cfg);
+
+    let (status, resp) = send_json(
+        &app,
+        "POST",
+        "/v1/messages/send",
+        None,
+        Some(json!({
+            "to": ["stranger@external.example"],
+            "subject": "Draft only precedence test",
+            "text": "SSN 123-45-6789 should still not promote draft_only into approval queue"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected downgrade 200, got {resp}");
+    assert_eq!(resp["status"], json!("draft_created"));
+    assert_eq!(resp["downgraded_from_send"], json!(true));
+    assert!(sent_log.lock().unwrap().is_empty());
+    let approvals = state.store.list_pending_approvals(None, 20).await.unwrap();
+    assert!(
+        approvals.is_empty(),
+        "draft_only downgrade must never enqueue an approval"
+    );
+
+    // 2. Deny still outranks DowngradeToDraft (dlp_action=Deny + draft_only=Downgrade -> 403)
+    let mut cfg_deny = Config::for_test();
+    cfg_deny.draft_only = true;
+    cfg_deny.draft_only_action = DraftOnlyAction::Downgrade;
+    cfg_deny.dlp_action = DlpAction::Deny;
+    let (app_deny, _state_deny, sent_deny) = build_test_app(cfg_deny);
+    let (status, resp) = send_json(
+        &app_deny,
+        "POST",
+        "/v1/messages/send",
+        None,
+        Some(json!({
+            "to": ["stranger@external.example"],
+            "subject": "DLP deny beats downgrade",
+            "text": "SSN 123-45-6789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(resp["error"]["code"], json!("dlp_blocked"));
+    assert!(sent_deny.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn e2e_dlp_hold_redacts_subject_in_approval_webhook_and_events() {
+    use nogml::events::MailEvent;
+    use std::time::Duration;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/dlp-hook"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .expect(1)
+        .mount(&webhook_server)
+        .await;
+
+    let secret_in_subject = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+    let mut cfg = Config::for_test();
+    cfg.dlp_action = DlpAction::Hold;
+    cfg.approval_webhook_url = Some(format!("{}/dlp-hook", webhook_server.uri()));
+    let (app, state, sent_log) = build_test_app(cfg);
+    let mut events_rx = state.events.subscribe();
+
+    let (status, held) = send_json(
+        &app,
+        "POST",
+        "/v1/messages/send",
+        None,
+        Some(json!({
+            "to": ["ops@example.com"],
+            "subject": format!("Rotate key {secret_in_subject} ASAP"),
+            "text": "Body text without secret"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(held["subject"], json!("[REDACTED: DLP policy hold]"));
+    assert_eq!(
+        held["preview"]["subject"],
+        json!("[REDACTED: DLP policy hold]")
+    );
+    assert!(!held.to_string().contains(&secret_in_subject));
+    assert!(sent_log.lock().unwrap().is_empty());
+
+    // EventBus ApprovalRequested MUST carry redacted subject
+    let mut saw_event = false;
+    while let Ok(env) = events_rx.try_recv() {
+        if let MailEvent::ApprovalRequested { subject, .. } = env.event {
+            assert_eq!(subject, "[REDACTED: DLP policy hold]");
+            assert!(!subject.contains(&secret_in_subject));
+            saw_event = true;
+        }
+    }
+    assert!(saw_event, "expected MailEvent::ApprovalRequested");
+
+    // Approval webhook POST MUST carry redacted subject and never leak secret
+    let mut reqs = Vec::new();
+    for _ in 0..40 {
+        let received = webhook_server.received_requests().await.unwrap();
+        if !received.is_empty() {
+            reqs = received;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(reqs.len(), 1);
+    let hook_body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(
+        !hook_body.contains(&secret_in_subject),
+        "webhook leaked DLP subject secret: {hook_body}"
+    );
+    let hook_json: Value = serde_json::from_str(&hook_body).unwrap();
+    assert_eq!(
+        hook_json["message"]["subject"],
+        json!("[REDACTED: DLP policy hold]")
+    );
+    assert!(
+        hook_json["text"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED: DLP policy hold]")
+    );
+}

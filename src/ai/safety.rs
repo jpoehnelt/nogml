@@ -98,8 +98,8 @@ pub trait OutboundPolicy: Send + Sync {
 fn decision_severity(decision: &OutboundDecision) -> u8 {
     match decision {
         OutboundDecision::Allow => 0,
-        OutboundDecision::DowngradeToDraft { .. } => 1,
-        OutboundDecision::HoldForApproval { .. } => 2,
+        OutboundDecision::HoldForApproval { .. } => 1,
+        OutboundDecision::DowngradeToDraft { .. } => 2,
         OutboundDecision::Deny { .. } => 3,
     }
 }
@@ -110,7 +110,8 @@ fn decision_severity(decision: &OutboundDecision) -> u8 {
 /// - `Deny` short-circuits immediately.
 /// - Errors propagate immediately.
 /// - Otherwise returns the highest-severity (first on ties) non-`Allow` decision
-///   (`HoldForApproval` > `DowngradeToDraft` > `Allow`).
+///   (`Deny` > `DowngradeToDraft` > `HoldForApproval` > `Allow`), so a `draft_only`
+///   downgrade is never promoted into the approval queue.
 #[derive(Clone, Default)]
 pub struct OutboundPolicyChain(pub Vec<Arc<dyn OutboundPolicy>>);
 
@@ -216,7 +217,8 @@ impl FirstContactPolicy {
         let mut first_contacts = Vec::new();
 
         for raw in recipients {
-            let addr = extract_email_address(raw);
+            let parsed = validate_single_recipient(raw)?;
+            let addr = parsed.email.trim().to_ascii_lowercase();
             if addr.is_empty() || !seen.insert(addr.clone()) {
                 continue;
             }
@@ -760,6 +762,9 @@ impl OutboundPolicy for ConfigOutboundPolicy {
     async fn evaluate(&self, check: &OutboundCheck) -> AppResult<OutboundDecision> {
         let policy = check.agent_policy.as_ref();
         let all = check.all_recipients();
+        for addr in &all {
+            validate_single_recipient(addr)?;
+        }
         let total = all.len();
         let max_recipients = self.effective_max_send_recipients(policy);
         if total > max_recipients {
@@ -943,6 +948,40 @@ pub fn validate_email_header(name: &str, value: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Strictly validate a single recipient mailbox (`"user@example.com"` or `"Name <user@example.com>"`).
+///
+/// Rejects multi-address lists, trailing tokens after `>`, multiple `<...>` pairs, and
+/// unquoted `,`, `;`, `<`, `>`, or `@` in display names.
+pub fn validate_single_recipient(raw: &str) -> AppResult<crate::models::EmailAddress> {
+    crate::storage::parse_strict_single_mailbox(raw).map_err(|reason| {
+        AppError::validation(
+            format!("Invalid recipient email address: {reason}"),
+            Some(
+                "Provide a single valid email address per recipient entry such as user@example.com or \"Name <user@example.com>\"."
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// Validate and canonicalize a single recipient into `"user@example.com"` or `"Name <user@example.com>"`
+/// (quoting display names containing `,`, `;`, `"`, or `\`).
+pub fn canonicalize_recipient(raw: &str) -> AppResult<String> {
+    let parsed = validate_single_recipient(raw)?;
+    match parsed.name {
+        None => Ok(parsed.email),
+        Some(name) => {
+            if name.contains(',') || name.contains(';') || name.contains('"') || name.contains('\\')
+            {
+                let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+                Ok(format!("\"{escaped}\" <{}>", parsed.email))
+            } else {
+                Ok(format!("{name} <{}>", parsed.email))
+            }
+        }
+    }
+}
+
 /// Extract a normalized lowercase bare email address from either `"Name <a@b.com>"` or `"a@b.com"`.
 pub fn extract_email_address(raw: &str) -> String {
     parse_simple_email_address(raw)
@@ -951,36 +990,9 @@ pub fn extract_email_address(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Validate basic RFC 5322 email syntax (allowing `@localhost` for local testing).
+/// Validate strict single-mailbox RFC 5322 email syntax (allowing `@localhost` for local testing).
 pub fn is_valid_email_syntax(raw: &str) -> bool {
-    if raw.trim().is_empty() || raw.contains('\r') || raw.contains('\n') || raw.contains('\0') {
-        return false;
-    }
-    let email = extract_email_address(raw);
-    let mut parts = email.split('@');
-    let Some(local) = parts.next() else {
-        return false;
-    };
-    let Some(domain) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.len() > 255 {
-        return false;
-    }
-    if local.chars().any(|c| c.is_whitespace() || c.is_control())
-        || domain.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return false;
-    }
-    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
-        return false;
-    }
-    domain
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    validate_single_recipient(raw).is_ok()
 }
 
 /// Check whether `recipient` matches an allowlist rule:
@@ -988,7 +1000,10 @@ pub fn is_valid_email_syntax(raw: &str) -> bool {
 /// - Exact domain: `@example.com`
 /// - Subdomain wildcard: `*.example.com` (or `@*.example.com`)
 pub fn recipient_matches_rule(recipient: &str, rule: &str) -> bool {
-    let email = extract_email_address(recipient);
+    let Ok(parsed) = validate_single_recipient(recipient) else {
+        return false;
+    };
+    let email = parsed.email.to_ascii_lowercase();
     let Some((_, domain)) = email.split_once('@') else {
         return false;
     };
@@ -1400,17 +1415,22 @@ pub async fn evaluate_resolved_dry_run(
         );
     }
 
-    if state.config.require_approval && !state.config.draft_only {
+    if state.config.require_approval && !effective_draft_only {
         warnings.push(
             "require_approval=true: executing this send will hold the email in the pending approval queue until a human approves it.".to_string(),
         );
     }
 
     if state.config.first_contact_approval && !effective_draft_only {
+        let valid_recipients: Vec<String> = all_recipients
+            .iter()
+            .filter(|addr| is_valid_email_syntax(addr))
+            .cloned()
+            .collect();
         let first_contacts = FirstContactPolicy::find_first_contact_recipients(
             state.store.as_ref(),
             &resolved.from,
-            &all_recipients,
+            &valid_recipients,
         )
         .await?;
         if !first_contacts.is_empty() {
@@ -1421,7 +1441,7 @@ pub async fn evaluate_resolved_dry_run(
         }
     }
 
-    if state.config.dlp_action == DlpAction::Hold {
+    if state.config.dlp_action == DlpAction::Hold && !effective_draft_only {
         let findings = scan_dlp_findings(&outbound_check);
         if !findings.is_empty() {
             warnings.push(format!(
@@ -1583,8 +1603,16 @@ mod tests {
         assert_eq!(checks[1].rule, "p2");
         assert_eq!(checks[2].rule, "p3");
 
-        // HoldForApproval outranks DowngradeToDraft; first HoldForApproval wins on ties.
-        let hold_chain = OutboundPolicyChain::new(vec![
+        // DowngradeToDraft outranks HoldForApproval so draft_only is never promoted into approvals;
+        // first decision wins on ties.
+        let downgrade_chain = OutboundPolicyChain::new(vec![
+            Arc::new(CountingPolicy {
+                name: "hold1",
+                decision: OutboundDecision::HoldForApproval {
+                    reason: "first hold".into(),
+                },
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
             Arc::new(CountingPolicy {
                 name: "draft",
                 decision: OutboundDecision::DowngradeToDraft {
@@ -1592,6 +1620,25 @@ mod tests {
                 },
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
+            Arc::new(CountingPolicy {
+                name: "hold2",
+                decision: OutboundDecision::HoldForApproval {
+                    reason: "second hold".into(),
+                },
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ]);
+        assert_eq!(
+            downgrade_chain
+                .evaluate(&OutboundCheck::default())
+                .await
+                .unwrap(),
+            OutboundDecision::DowngradeToDraft {
+                reason: "downgrade".into()
+            }
+        );
+
+        let hold_tie_chain = OutboundPolicyChain::new(vec![
             Arc::new(CountingPolicy {
                 name: "hold1",
                 decision: OutboundDecision::HoldForApproval {
@@ -1608,7 +1655,7 @@ mod tests {
             }),
         ]);
         assert_eq!(
-            hold_chain
+            hold_tie_chain
                 .evaluate(&OutboundCheck::default())
                 .await
                 .unwrap(),

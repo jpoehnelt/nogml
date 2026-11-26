@@ -1573,6 +1573,13 @@ async fn watch_stop_and_all_settings_crud() {
         send_as_email: "alias@example.com".to_string(),
         display_name: Some("Alias".to_string()),
         signature: Some("<p>Sig</p>".to_string()),
+        smtp_msa: Some(crate::models::SmtpMsa {
+            host: "smtp.alias.example".to_string(),
+            port: 587,
+            security_mode: Some("starttls".to_string()),
+            username: Some("alias-user".to_string()),
+            password: Some("super-secret-msa-pw".to_string()),
+        }),
         ..Default::default()
     };
     let res = app
@@ -1586,6 +1593,38 @@ async fn watch_stop_and_all_settings_crud() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    let created = json_body(res).await;
+    assert!(created["smtpMsa"]["password"].is_null());
+    assert!(!created.to_string().contains("super-secret-msa-pw"));
+
+    // GET list & GET single sendAs MUST strip smtpMsa.password
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/gmail/v1/users/me/settings/sendAs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let listed = json_body(res).await;
+    assert!(!listed.to_string().contains("super-secret-msa-pw"));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/gmail/v1/users/me/settings/sendAs/alias@example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let fetched = json_body(res).await;
+    assert_eq!(fetched["smtpMsa"]["host"], "smtp.alias.example");
+    assert!(fetched["smtpMsa"]["password"].is_null());
+    assert!(!fetched.to_string().contains("super-secret-msa-pw"));
 
     let res = app
         .clone()

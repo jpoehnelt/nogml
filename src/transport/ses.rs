@@ -52,7 +52,7 @@ const SNS_CERT_CACHE_TTL: Duration = Duration::from_secs(3600);
 const SNS_CERT_CACHE_MAX_ENTRIES: usize = 64;
 
 /// Configuration for [`SesTransport`] and S3 inbound fetches.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SesConfig {
     pub region: String,
     pub endpoint: String,
@@ -63,6 +63,43 @@ pub struct SesConfig {
     pub s3_endpoint_custom: bool,
     pub webhook_secret: Option<String>,
     pub default_from: String,
+}
+
+impl std::fmt::Debug for SesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SesConfig")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self
+                    .secret_access_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field(
+                "session_token",
+                &self
+                    .session_token
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_endpoint_custom", &self.s3_endpoint_custom)
+            .field(
+                "webhook_secret",
+                &self
+                    .webhook_secret
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("default_from", &self.default_from)
+            .finish()
+    }
 }
 
 impl SesConfig {
@@ -139,11 +176,27 @@ impl SesConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct AwsCredentials<'a> {
     access_key_id: &'a str,
     secret_access_key: &'a str,
     session_token: Option<&'a str>,
+}
+
+impl std::fmt::Debug for AwsCredentials<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &crate::secrets::REDACTED)
+            .field(
+                "session_token",
+                &self
+                    .session_token
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .finish()
+    }
 }
 
 /// Headers produced by AWS Signature Version 4 signing.
@@ -529,12 +582,26 @@ impl MailTransport for SesTransport {
             ));
         }
 
+        let canonical_from = crate::ai::safety::validate_single_recipient(&from)?.email;
+        let canonical_to: Vec<String> = to
+            .iter()
+            .map(|r| crate::ai::safety::validate_single_recipient(r).map(|a| a.email))
+            .collect::<AppResult<_>>()?;
+        let canonical_cc: Vec<String> = cc
+            .iter()
+            .map(|r| crate::ai::safety::validate_single_recipient(r).map(|a| a.email))
+            .collect::<AppResult<_>>()?;
+        let canonical_bcc: Vec<String> = bcc
+            .iter()
+            .map(|r| crate::ai::safety::validate_single_recipient(r).map(|a| a.email))
+            .collect::<AppResult<_>>()?;
+
         let payload_obj = SesSendEmailRequest {
-            from_email_address: from,
+            from_email_address: canonical_from,
             destination: SesDestination {
-                to_addresses: to,
-                cc_addresses: cc,
-                bcc_addresses: bcc,
+                to_addresses: canonical_to,
+                cc_addresses: canonical_cc,
+                bcc_addresses: canonical_bcc,
             },
             content: SesEmailContent {
                 raw: SesRawMessage {
@@ -2337,6 +2404,48 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ses_transport_rejects_multi_address_recipient_and_redacts_credentials_debug() {
+        let creds = AwsCredentials {
+            access_key_id: "AKIA_TEST",
+            secret_access_key: "super-secret-aws-key",
+            session_token: Some("super-secret-aws-session"),
+        };
+        let creds_dbg = format!("{creds:?}");
+        assert!(!creds_dbg.contains("super-secret-aws-key"));
+        assert!(!creds_dbg.contains("super-secret-aws-session"));
+        assert!(creds_dbg.contains(crate::secrets::REDACTED));
+
+        let transport = SesTransport::new(SesConfig {
+            region: "us-east-1".to_string(),
+            endpoint: "http://127.0.0.1:9".to_string(),
+            access_key_id: Some("AKIA_TEST".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: None,
+            s3_endpoint: "http://127.0.0.1:9".to_string(),
+            s3_endpoint_custom: true,
+            webhook_secret: None,
+            default_from: "agent@example.com".to_string(),
+        });
+        let err = transport
+            .send(
+                &OutboundMessage {
+                    from: "agent@example.com".to_string(),
+                    to: vec!["external@other.example, <alice@company.com>".to_string()],
+                    subject: "Bypass".to_string(),
+                    text: Some("No".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid recipient"),
+            "unexpected error: {err}"
         );
     }
 }

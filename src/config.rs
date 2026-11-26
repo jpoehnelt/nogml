@@ -228,6 +228,10 @@ pub struct Config {
     pub oauth2_client_secret: Option<String>,
     /// HMAC-SHA256 (`HS256`) signing secret for local OAuth2 JWT access/refresh tokens.
     pub oauth2_signing_secret: Option<String>,
+    /// Allowlisted OAuth2 `redirect_uri` values permitted on `GET /oauth2/authorize`
+    /// (`NOGML_OAUTH2_REDIRECT_URIS` / `--oauth2-redirect-uris` / `[oauth2].redirect_uris`).
+    #[serde(default)]
+    pub oauth2_redirect_uris: Vec<String>,
     /// Primary mailbox email address (returned by `/profile` and used as default `From`).
     pub user_email: String,
     /// Additional local mailbox email addresses hosted by this instance (`NOGML_MAILBOXES` / `--mailboxes`).
@@ -403,6 +407,7 @@ impl Default for Config {
             oauth2_client_id: None,
             oauth2_client_secret: None,
             oauth2_signing_secret: None,
+            oauth2_redirect_uris: Vec::new(),
             user_email: "me@localhost".to_string(),
             mailboxes: Vec::new(),
             default_domain: "localhost".to_string(),
@@ -649,6 +654,7 @@ impl Config {
             oauth2_client_id,
             oauth2_client_secret,
             oauth2_signing_secret,
+            oauth2_redirect_uris,
             user_email,
             mailboxes,
             default_domain,
@@ -789,6 +795,7 @@ impl Config {
                 "client_id": oauth2_client_id,
                 "client_secret": redact_opt(oauth2_client_secret),
                 "signing_secret": redact_opt(oauth2_signing_secret),
+                "redirect_uris": oauth2_redirect_uris,
             },
             "transport": {
                 "backend": transport,
@@ -824,7 +831,10 @@ impl Config {
                 "first_contact_approval": first_contact_approval,
                 "dlp_action": dlp_action,
                 "approval_ttl_secs": approval_ttl_secs,
-                "approval_webhook_url": approval_webhook_url,
+                "approval_webhook_url": approval_webhook_url
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(crate::secrets::redact_url_for_log),
                 "allowed_recipients": allowed_recipients,
                 "max_send_recipients": max_send_recipients,
                 "default_max_body_chars": default_max_body_chars,
@@ -862,7 +872,10 @@ impl Config {
                 "gmail_imap_mailbox": gmail_imap_mailbox,
             },
             "watch": {
-                "webhook_url": watch_webhook_url,
+                "webhook_url": watch_webhook_url
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(crate::secrets::redact_url_for_log),
             },
             "filters": {
                 "auth_results": filter_auth_results,
@@ -1236,6 +1249,7 @@ impl fmt::Debug for Config {
             oauth2_client_id,
             oauth2_client_secret,
             oauth2_signing_secret,
+            oauth2_redirect_uris,
             user_email,
             mailboxes,
             default_domain,
@@ -1353,6 +1367,7 @@ impl fmt::Debug for Config {
                 "oauth2_signing_secret",
                 &redacted_opt(oauth2_signing_secret),
             )
+            .field("oauth2_redirect_uris", oauth2_redirect_uris)
             .field("user_email", user_email)
             .field("mailboxes", mailboxes)
             .field("default_domain", default_domain)
@@ -1387,7 +1402,13 @@ impl fmt::Debug for Config {
             .field("first_contact_approval", first_contact_approval)
             .field("dlp_action", dlp_action)
             .field("approval_ttl_secs", approval_ttl_secs)
-            .field("approval_webhook_url", approval_webhook_url)
+            .field(
+                "approval_webhook_url",
+                &approval_webhook_url
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(crate::secrets::redact_url_for_log),
+            )
             .field("allowed_recipients", allowed_recipients)
             .field("max_send_recipients", max_send_recipients)
             .field("default_max_body_chars", default_max_body_chars)
@@ -1419,7 +1440,13 @@ impl fmt::Debug for Config {
             .field("sync_query", sync_query)
             .field("sync_max_messages", sync_max_messages)
             .field("sync_bidirectional", sync_bidirectional)
-            .field("watch_webhook_url", watch_webhook_url)
+            .field(
+                "watch_webhook_url",
+                &watch_webhook_url
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(crate::secrets::redact_url_for_log),
+            )
             .field("filter_auth_results", filter_auth_results)
             .field("filter_dmarc_fail_action", filter_dmarc_fail_action)
             .field("filter_spf_fail_action", filter_spf_fail_action)
@@ -1482,7 +1509,19 @@ pub struct ServerTomlConfig {
     pub log_json: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+fn redacted_opt_debug(opt: &Option<String>) -> Option<&'static str> {
+    opt.as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|_| crate::secrets::REDACTED)
+}
+
+fn redacted_url_opt_debug(opt: &Option<String>) -> Option<String> {
+    opt.as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(crate::secrets::redact_url_for_log)
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageTomlConfig {
     pub backend: Option<StorageBackend>,
@@ -1490,7 +1529,17 @@ pub struct StorageTomlConfig {
     pub database_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for StorageTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageTomlConfig")
+            .field("backend", &self.backend)
+            .field("db_path", &self.db_path)
+            .field("database_url", &redacted_opt_debug(&self.database_url))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlobTomlConfig {
     pub backend: Option<BlobBackend>,
@@ -1505,7 +1554,30 @@ pub struct BlobTomlConfig {
     pub s3_force_path_style: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for BlobTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobTomlConfig")
+            .field("backend", &self.backend)
+            .field("dir", &self.dir)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_region", &self.s3_region)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("s3_access_key_id", &self.s3_access_key_id)
+            .field(
+                "s3_secret_access_key",
+                &redacted_opt_debug(&self.s3_secret_access_key),
+            )
+            .field(
+                "s3_session_token",
+                &redacted_opt_debug(&self.s3_session_token),
+            )
+            .field("s3_force_path_style", &self.s3_force_path_style)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthTomlConfig {
     pub user_email: Option<String>,
@@ -1516,12 +1588,40 @@ pub struct AuthTomlConfig {
     pub scoped_tokens: Option<Vec<ScopedTokenConfig>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for AuthTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_tokens: Option<Vec<&'static str>> = self
+            .tokens
+            .as_ref()
+            .map(|list| list.iter().map(|_| crate::secrets::REDACTED).collect());
+        f.debug_struct("AuthTomlConfig")
+            .field("user_email", &self.user_email)
+            .field("mailboxes", &self.mailboxes)
+            .field("default_domain", &self.default_domain)
+            .field("tokens", &redacted_tokens)
+            .field("scoped_tokens", &self.scoped_tokens)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OAuth2TomlConfig {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub signing_secret: Option<String>,
+    pub redirect_uris: Option<Vec<String>>,
+}
+
+impl std::fmt::Debug for OAuth2TomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2TomlConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted_opt_debug(&self.client_secret))
+            .field("signing_secret", &redacted_opt_debug(&self.signing_secret))
+            .field("redirect_uris", &self.redirect_uris)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1530,7 +1630,7 @@ pub struct TransportTomlConfig {
     pub backend: Option<TransportBackend>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResendTomlConfig {
     pub api_key: Option<String>,
@@ -1538,7 +1638,17 @@ pub struct ResendTomlConfig {
     pub webhook_secret: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for ResendTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResendTomlConfig")
+            .field("api_key", &redacted_opt_debug(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("webhook_secret", &redacted_opt_debug(&self.webhook_secret))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SesTomlConfig {
     pub region: Option<String>,
@@ -1552,7 +1662,26 @@ pub struct SesTomlConfig {
     pub allowed_s3_buckets: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for SesTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SesTomlConfig")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &redacted_opt_debug(&self.secret_access_key),
+            )
+            .field("session_token", &redacted_opt_debug(&self.session_token))
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("webhook_secret", &redacted_opt_debug(&self.webhook_secret))
+            .field("allowed_topic_arns", &self.allowed_topic_arns)
+            .field("allowed_s3_buckets", &self.allowed_s3_buckets)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmtpTomlConfig {
     pub host: Option<String>,
@@ -1563,7 +1692,20 @@ pub struct SmtpTomlConfig {
     pub helo_domain: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for SmtpTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpTomlConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls_mode", &self.tls_mode)
+            .field("username", &self.username)
+            .field("password", &redacted_opt_debug(&self.password))
+            .field("helo_domain", &self.helo_domain)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SafetyTomlConfig {
     pub draft_only: Option<bool>,
@@ -1582,7 +1724,31 @@ pub struct SafetyTomlConfig {
     pub allow_insecure_webhooks: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for SafetyTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafetyTomlConfig")
+            .field("draft_only", &self.draft_only)
+            .field("draft_only_action", &self.draft_only_action)
+            .field("require_approval", &self.require_approval)
+            .field("first_contact_approval", &self.first_contact_approval)
+            .field("dlp_action", &self.dlp_action)
+            .field("approval_ttl_secs", &self.approval_ttl_secs)
+            .field(
+                "approval_webhook_url",
+                &redacted_url_opt_debug(&self.approval_webhook_url),
+            )
+            .field("allowed_recipients", &self.allowed_recipients)
+            .field("max_send_recipients", &self.max_send_recipients)
+            .field("default_max_body_chars", &self.default_max_body_chars)
+            .field("untrusted_content_guard", &self.untrusted_content_guard)
+            .field("webhook_allowed_hosts", &self.webhook_allowed_hosts)
+            .field("allow_private_endpoints", &self.allow_private_endpoints)
+            .field("allow_insecure_webhooks", &self.allow_insecure_webhooks)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImapTomlConfig {
     pub bind: Option<SocketAddr>,
@@ -1593,7 +1759,20 @@ pub struct ImapTomlConfig {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for ImapTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImapTomlConfig")
+            .field("bind", &self.bind)
+            .field("tls_bind", &self.tls_bind)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("username", &self.username)
+            .field("password", &redacted_opt_debug(&self.password))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncTomlConfig {
     pub mode: Option<SyncMode>,
@@ -1616,10 +1795,55 @@ pub struct SyncTomlConfig {
     pub gmail_imap_mailbox: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for SyncTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncTomlConfig")
+            .field("mode", &self.mode)
+            .field("interval_secs", &self.interval_secs)
+            .field("query", &self.query)
+            .field("max_messages", &self.max_messages)
+            .field("bidirectional", &self.bidirectional)
+            .field("gmail_client_id", &self.gmail_client_id)
+            .field(
+                "gmail_client_secret",
+                &redacted_opt_debug(&self.gmail_client_secret),
+            )
+            .field(
+                "gmail_refresh_token",
+                &redacted_opt_debug(&self.gmail_refresh_token),
+            )
+            .field(
+                "gmail_access_token",
+                &redacted_opt_debug(&self.gmail_access_token),
+            )
+            .field("gmail_user_id", &self.gmail_user_id)
+            .field("gmail_api_base_url", &self.gmail_api_base_url)
+            .field("gmail_oauth_token_url", &self.gmail_oauth_token_url)
+            .field("gmail_imap_host", &self.gmail_imap_host)
+            .field("gmail_imap_port", &self.gmail_imap_port)
+            .field("gmail_imap_tls", &self.gmail_imap_tls)
+            .field("gmail_imap_user", &self.gmail_imap_user)
+            .field(
+                "gmail_imap_password",
+                &redacted_opt_debug(&self.gmail_imap_password),
+            )
+            .field("gmail_imap_mailbox", &self.gmail_imap_mailbox)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WatchTomlConfig {
     pub webhook_url: Option<String>,
+}
+
+impl std::fmt::Debug for WatchTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchTomlConfig")
+            .field("webhook_url", &redacted_url_opt_debug(&self.webhook_url))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1633,7 +1857,7 @@ pub struct FiltersTomlConfig {
     pub llm_triage: LlmTriageTomlConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RspamdTomlConfig {
     pub url: Option<String>,
@@ -1644,7 +1868,20 @@ pub struct RspamdTomlConfig {
     pub fail_closed: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for RspamdTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RspamdTomlConfig")
+            .field("url", &self.url)
+            .field("password", &redacted_opt_debug(&self.password))
+            .field("timeout_ms", &self.timeout_ms)
+            .field("spam_threshold", &self.spam_threshold)
+            .field("reject_action", &self.reject_action)
+            .field("fail_closed", &self.fail_closed)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmTriageTomlConfig {
     pub base_url: Option<String>,
@@ -1654,7 +1891,19 @@ pub struct LlmTriageTomlConfig {
     pub max_body_chars: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl std::fmt::Debug for LlmTriageTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmTriageTomlConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &redacted_opt_debug(&self.api_key))
+            .field("model", &self.model)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_body_chars", &self.max_body_chars)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchTomlConfig {
     pub backend: Option<SearchBackend>,
@@ -1662,6 +1911,21 @@ pub struct SearchTomlConfig {
     pub embedding_api_key: Option<String>,
     pub embedding_model: Option<String>,
     pub embedding_timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for SearchTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchTomlConfig")
+            .field("backend", &self.backend)
+            .field("embedding_base_url", &self.embedding_base_url)
+            .field(
+                "embedding_api_key",
+                &redacted_opt_debug(&self.embedding_api_key),
+            )
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_timeout_secs", &self.embedding_timeout_secs)
+            .finish()
+    }
 }
 
 /// Metadata returned when applying a [`TomlConfig`] onto a [`Config`].
@@ -1783,6 +2047,13 @@ impl TomlConfig {
         }
         if let Some(ref v) = self.oauth2.signing_secret {
             cfg.oauth2_signing_secret = Some(v.clone());
+        }
+        if let Some(ref v) = self.oauth2.redirect_uris {
+            cfg.oauth2_redirect_uris = v
+                .iter()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
         }
 
         // [transport]
@@ -2248,6 +2519,18 @@ pub fn validate_config(
                 .to_string(),
         );
     }
+    for (idx, uri) in config.oauth2_redirect_uris.iter().enumerate() {
+        let trimmed = uri.trim();
+        if trimmed.is_empty() || trimmed.contains('\r') || trimmed.contains('\n') {
+            errors.push(format!(
+                "oauth2.redirect_uris[{idx}] must be a non-empty single-line URI"
+            ));
+        } else if url::Url::parse(trimmed).is_err() {
+            errors.push(format!(
+                "oauth2.redirect_uris[{idx}] ('{trimmed}') must be a valid absolute URI"
+            ));
+        }
+    }
 
     for (idx, st) in config.scoped_tokens.iter().enumerate() {
         if st.token.trim().is_empty() {
@@ -2491,6 +2774,14 @@ mod tests {
         cfg.rspamd_password = Some("super-secret-rspamd".to_string());
         cfg.llm_triage_api_key = Some("super-secret-llm".to_string());
         cfg.embedding_api_key = Some("super-secret-embed".to_string());
+        cfg.approval_webhook_url = Some(
+            "https://user:approval-pass@hooks.slack.com/services/T0/B0/SUPER_SECRET_APPROVAL?token=qsec"
+                .to_string(),
+        );
+        cfg.watch_webhook_url = Some(
+            "https://watch-user:watch-pass@discord.com:8443/api/webhooks/123/SUPER_SECRET_WATCH?wait=true"
+                .to_string(),
+        );
 
         let debug_out = format!("{cfg:?}");
         let summary_out = cfg.redacted_summary().to_string();
@@ -2517,6 +2808,11 @@ mod tests {
             "super-secret-rspamd",
             "super-secret-llm",
             "super-secret-embed",
+            "approval-pass",
+            "SUPER_SECRET_APPROVAL",
+            "qsec",
+            "watch-pass",
+            "SUPER_SECRET_WATCH",
         ] {
             assert!(
                 !debug_out.contains(leaked),
@@ -2528,8 +2824,139 @@ mod tests {
             );
         }
 
+        assert!(debug_out.contains("https://hooks.slack.com/[REDACTED]"));
+        assert!(debug_out.contains("https://discord.com:8443/[REDACTED]"));
+        assert!(summary_out.contains("https://hooks.slack.com/[REDACTED]"));
+        assert!(summary_out.contains("https://discord.com:8443/[REDACTED]"));
         assert!(debug_out.contains(REDACTED));
         assert!(summary_out.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacted_debug_across_toml_oauth2_transport_filter_and_model_structs() {
+        let toml_raw = r#"
+[storage]
+database_url = "postgres://u:toml-db-secret@localhost/db"
+[blob]
+s3_secret_access_key = "toml-s3-secret"
+s3_session_token = "toml-s3-session"
+[auth]
+tokens = ["toml-auth-tok"]
+[oauth2]
+client_id = "cid"
+client_secret = "toml-oauth-csec"
+signing_secret = "toml-oauth-ssec"
+redirect_uris = ["http://127.0.0.1:8080/cb"]
+[resend]
+api_key = "toml-resend-key"
+webhook_secret = "toml-resend-whsec"
+[ses]
+secret_access_key = "toml-ses-secret"
+session_token = "toml-ses-session"
+webhook_secret = "toml-ses-whsec"
+[smtp]
+password = "toml-smtp-pass"
+[safety]
+approval_webhook_url = "https://hooks.slack.com/services/T/B/toml-approval-secret"
+[imap]
+password = "toml-imap-pass"
+[sync]
+gmail_client_secret = "toml-gmail-csec"
+gmail_refresh_token = "toml-gmail-rt"
+gmail_access_token = "toml-gmail-at"
+gmail_imap_password = "toml-gmail-imap"
+[watch]
+webhook_url = "https://discord.com/api/webhooks/1/toml-watch-secret"
+[filters.rspamd]
+password = "toml-rspamd-pass"
+[filters.llm_triage]
+api_key = "toml-llm-key"
+[search]
+embedding_api_key = "toml-embed-key"
+"#;
+        let parsed = TomlConfig::from_toml_str(toml_raw).unwrap();
+        let toml_dbg = format!("{parsed:?}");
+        for secret in [
+            "toml-db-secret",
+            "toml-s3-secret",
+            "toml-s3-session",
+            "toml-auth-tok",
+            "toml-oauth-csec",
+            "toml-oauth-ssec",
+            "toml-resend-key",
+            "toml-resend-whsec",
+            "toml-ses-secret",
+            "toml-ses-session",
+            "toml-ses-whsec",
+            "toml-smtp-pass",
+            "toml-approval-secret",
+            "toml-imap-pass",
+            "toml-gmail-csec",
+            "toml-gmail-rt",
+            "toml-gmail-at",
+            "toml-gmail-imap",
+            "toml-watch-secret",
+            "toml-rspamd-pass",
+            "toml-llm-key",
+            "toml-embed-key",
+        ] {
+            assert!(
+                !toml_dbg.contains(secret),
+                "TomlConfig Debug leaked '{secret}': {toml_dbg}"
+            );
+        }
+
+        let mut cfg = Config::for_test();
+        parsed.apply_to(&mut cfg);
+        assert_eq!(
+            cfg.oauth2_redirect_uris,
+            vec!["http://127.0.0.1:8080/cb".to_string()]
+        );
+
+        let verifier = crate::oauth2::OAuth2Verifier::from_config(&cfg).unwrap();
+        let verifier_dbg = format!("{verifier:?}");
+        assert!(!verifier_dbg.contains("toml-oauth-ssec"));
+        assert!(verifier_dbg.contains(REDACTED));
+
+        let ses_cfg = crate::transport::ses::SesConfig::from_config(&cfg).unwrap();
+        let ses_dbg = format!("{ses_cfg:?}");
+        assert!(!ses_dbg.contains("toml-ses-secret"));
+        assert!(!ses_dbg.contains("toml-ses-session"));
+        assert!(!ses_dbg.contains("toml-ses-whsec"));
+        assert!(ses_dbg.contains(REDACTED));
+
+        let smtp_cfg = crate::transport::smtp::SmtpConfig::from_config(&cfg).unwrap();
+        let smtp_dbg = format!("{smtp_cfg:?}");
+        assert!(!smtp_dbg.contains("toml-smtp-pass"));
+        assert!(smtp_dbg.contains(REDACTED));
+
+        let resend_client = crate::resend::HttpResendClient::from_config(&cfg);
+        let resend_dbg = format!("{resend_client:?}");
+        assert!(!resend_dbg.contains("toml-resend-key"));
+        assert!(resend_dbg.contains(REDACTED));
+
+        let mut rspamd = crate::filter::rspamd::RspamdConfig::new("http://127.0.0.1:11333");
+        rspamd.password = Some("rspamd-direct-secret".to_string());
+        let rspamd_dbg = format!("{rspamd:?}");
+        assert!(!rspamd_dbg.contains("rspamd-direct-secret"));
+        assert!(rspamd_dbg.contains(REDACTED));
+
+        let mut llm = crate::filter::llm::LlmTriageConfig::new("https://api.example.com/v1", "m1");
+        llm.api_key = Some("llm-direct-secret".to_string());
+        let llm_dbg = format!("{llm:?}");
+        assert!(!llm_dbg.contains("llm-direct-secret"));
+        assert!(llm_dbg.contains(REDACTED));
+
+        let msa = crate::models::SmtpMsa {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            security_mode: Some("starttls".to_string()),
+            username: Some("u".to_string()),
+            password: Some("msa-direct-secret".to_string()),
+        };
+        let msa_dbg = format!("{msa:?}");
+        assert!(!msa_dbg.contains("msa-direct-secret"));
+        assert!(msa_dbg.contains(REDACTED));
     }
 
     #[test]

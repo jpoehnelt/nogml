@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Configuration for [`RspamdFilter`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RspamdConfig {
     pub base_url: String,
     pub password: Option<String>,
@@ -27,6 +27,26 @@ pub struct RspamdConfig {
     pub spam_threshold: Option<f32>,
     pub reject_action: RspamdRejectAction,
     pub fail_closed: bool,
+}
+
+impl std::fmt::Debug for RspamdConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RspamdConfig")
+            .field("base_url", &self.base_url)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("timeout", &self.timeout)
+            .field("spam_threshold", &self.spam_threshold)
+            .field("reject_action", &self.reject_action)
+            .field("fail_closed", &self.fail_closed)
+            .finish()
+    }
 }
 
 impl RspamdConfig {

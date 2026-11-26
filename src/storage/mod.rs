@@ -1041,22 +1041,167 @@ impl UserSettings {
     }
 }
 
-/// Helper to parse `"Name <a@b.com>"` or `"a@b.com"` into an `EmailAddress` for storage summaries.
-pub fn parse_simple_email_address(raw: &str) -> EmailAddress {
-    let trimmed = raw.trim();
-    if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>'))
-        && lt < gt
+fn is_valid_bare_addr_spec(email: &str) -> bool {
+    let mut parts = email.split('@');
+    let Some(local) = parts.next() else {
+        return false;
+    };
+    let Some(domain) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.len() > 255 {
+        return false;
+    }
+    if local.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                ',' | ';' | '<' | '>' | '"' | '\\' | '(' | ')' | ':' | '[' | ']'
+            )
+    }) || domain.chars().any(|c| c.is_whitespace() || c.is_control())
     {
-        let name = trimmed[..lt].trim().trim_matches('"').trim();
-        let email = trimmed[lt + 1..gt].trim();
-        return EmailAddress {
-            name: (!name.is_empty()).then(|| name.to_string()),
-            email: email.to_string(),
-        };
+        return false;
+    }
+    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+        return false;
+    }
+    domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+fn parse_quoted_display_name(raw: &str) -> Result<String, String> {
+    let mut chars = raw.chars();
+    if chars.next() != Some('"') {
+        return Err("Display name does not start with '\"'".to_string());
+    }
+    let mut unescaped = String::new();
+    let mut escaped = false;
+    let mut closed = false;
+    for ch in chars {
+        if closed {
+            return Err("Unexpected characters after closing quote in display name".to_string());
+        }
+        if escaped {
+            if matches!(ch, '<' | '>' | '@' | '\r' | '\n' | '\0') || ch.is_control() {
+                return Err("Disallowed character in quoted display name".to_string());
+            }
+            unescaped.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            closed = true;
+        } else {
+            if matches!(ch, '<' | '>' | '@' | '\r' | '\n' | '\0') || ch.is_control() {
+                return Err("Disallowed character in quoted display name".to_string());
+            }
+            unescaped.push(ch);
+        }
+    }
+    if !closed || escaped {
+        return Err("Unclosed quoted display name".to_string());
+    }
+    Ok(unescaped.trim().to_string())
+}
+
+/// Strictly parse a single RFC 5322 mailbox (`"addr@example.com"`, `"<addr@example.com>"`,
+/// `"Name <addr@example.com>"`, or `"\"Last, First\" <addr@example.com>"`).
+///
+/// Rejects multi-address lists, trailing tokens after `>`, multiple `<...>` pairs,
+/// and unquoted `,`, `;`, `<`, `>`, `@`, `"`, `\`, `(`, `)` inside display names.
+pub fn parse_strict_single_mailbox(raw: &str) -> Result<EmailAddress, String> {
+    if raw.contains('\r') || raw.contains('\n') || raw.contains('\0') {
+        return Err("Recipient contains disallowed CR/LF/NUL characters".to_string());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Recipient address must not be empty".to_string());
+    }
+    if trimmed
+        .bytes()
+        .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+    {
+        return Err("Recipient contains disallowed control characters".to_string());
+    }
+
+    let has_lt = trimmed.contains('<');
+    let has_gt = trimmed.contains('>');
+    if !has_lt && !has_gt {
+        if !is_valid_bare_addr_spec(trimmed) {
+            return Err(format!("Invalid email address '{trimmed}'"));
+        }
+        return Ok(EmailAddress {
+            name: None,
+            email: trimmed.to_string(),
+        });
+    }
+
+    if !trimmed.ends_with('>') {
+        return Err(format!(
+            "Recipient '{trimmed}' has unexpected trailing characters after '>'"
+        ));
+    }
+    let lt_count = trimmed.bytes().filter(|&b| b == b'<').count();
+    let gt_count = trimmed.bytes().filter(|&b| b == b'>').count();
+    if lt_count != 1 || gt_count != 1 {
+        return Err(format!(
+            "Recipient '{trimmed}' must contain exactly one '<...>' mailbox"
+        ));
+    }
+
+    let lt = trimmed.find('<').expect("checked lt_count == 1");
+    let gt = trimmed.len() - 1;
+    if lt >= gt {
+        return Err(format!("Malformed angle-bracket recipient '{trimmed}'"));
+    }
+
+    let display_raw = trimmed[..lt].trim();
+    let email_raw = trimmed[lt + 1..gt].trim();
+    if !is_valid_bare_addr_spec(email_raw) {
+        return Err(format!(
+            "Invalid email address '{email_raw}' inside '<...>'"
+        ));
+    }
+
+    let name = if display_raw.is_empty() {
+        None
+    } else if display_raw.starts_with('"') {
+        let parsed = parse_quoted_display_name(display_raw)?;
+        (!parsed.is_empty()).then_some(parsed)
+    } else {
+        if display_raw.chars().any(|c| {
+            matches!(c, ',' | ';' | '<' | '>' | '@' | '"' | '\\' | '(' | ')') || c.is_control()
+        }) {
+            return Err(format!(
+                "Recipient display name '{display_raw}' contains disallowed unquoted characters"
+            ));
+        }
+        Some(display_raw.to_string())
+    };
+
+    Ok(EmailAddress {
+        name,
+        email: email_raw.to_string(),
+    })
+}
+
+/// Helper to parse `"Name <a@b.com>"` or `"a@b.com"` into an `EmailAddress` for storage summaries.
+///
+/// Enforces single-mailbox parsing so multi-address strings like
+/// `"external@other.example, <alice@company.com>"` are never silently truncated to
+/// `alice@company.com`.
+pub fn parse_simple_email_address(raw: &str) -> EmailAddress {
+    if let Ok(parsed) = parse_strict_single_mailbox(raw) {
+        return parsed;
     }
     EmailAddress {
         name: None,
-        email: trimmed.to_string(),
+        email: raw.trim().to_string(),
     }
 }
 

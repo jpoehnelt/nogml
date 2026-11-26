@@ -7,7 +7,7 @@
 //! without an external identity provider.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -82,10 +82,19 @@ pub struct OAuth2Claims {
 }
 
 /// Runtime HS256 JWT verifier derived from [`Config`] for [`crate::auth::StaticTokenAuthProvider`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuth2Verifier {
     client_id: String,
     signing_secret: String,
+}
+
+impl std::fmt::Debug for OAuth2Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2Verifier")
+            .field("client_id", &self.client_id)
+            .field("signing_secret", &crate::secrets::REDACTED)
+            .finish()
+    }
 }
 
 impl OAuth2Verifier {
@@ -314,6 +323,7 @@ pub fn mint_refresh_token_for_mailbox(
     sign_jwt(&claims, secret)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mint_auth_code(
     config: &Config,
     mailbox_id: &str,
@@ -322,6 +332,7 @@ fn mint_auth_code(
     redirect_uri: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    agent_policy: Option<AgentPolicyOverride>,
 ) -> AppResult<String> {
     let client_id = config
         .oauth2_client_id
@@ -349,7 +360,7 @@ fn mint_auth_code(
         redirect_uri,
         code_challenge,
         code_challenge_method,
-        agent_policy: None,
+        agent_policy,
     };
     sign_jwt(&claims, secret)
 }
@@ -519,6 +530,27 @@ async fn well_known_metadata(State(state): State<AppState>, headers: HeaderMap) 
     }
 
     let origin = derive_origin(&headers, &state.config);
+    let has_client_secret = state
+        .config
+        .oauth2_client_secret
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
+    let grant_types: &[&str] = if has_client_secret {
+        &["authorization_code", "refresh_token", "client_credentials"]
+    } else {
+        &["authorization_code", "refresh_token"]
+    };
+    let auth_methods: &[&str] = if has_client_secret {
+        &["client_secret_post", "client_secret_basic"]
+    } else {
+        &["none"]
+    };
+    let pkce_methods: &[&str] = if has_client_secret {
+        &["S256", "plain"]
+    } else {
+        &["S256"]
+    };
+
     (
         StatusCode::OK,
         Json(json!({
@@ -527,16 +559,8 @@ async fn well_known_metadata(State(state): State<AppState>, headers: HeaderMap) 
             "token_endpoint": format!("{origin}/oauth2/token"),
             "userinfo_endpoint": format!("{origin}/oauth2/v3/userinfo"),
             "response_types_supported": ["code"],
-            "grant_types_supported": [
-                "authorization_code",
-                "refresh_token",
-                "client_credentials"
-            ],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-                "none"
-            ],
+            "grant_types_supported": grant_types,
+            "token_endpoint_auth_methods_supported": auth_methods,
             "scopes_supported": [
                 "read",
                 "write",
@@ -548,7 +572,7 @@ async fn well_known_metadata(State(state): State<AppState>, headers: HeaderMap) 
                 "https://www.googleapis.com/auth/gmail.compose",
                 "https://www.googleapis.com/auth/gmail.send"
             ],
-            "code_challenge_methods_supported": ["S256", "plain"],
+            "code_challenge_methods_supported": pkce_methods,
         })),
     )
         .into_response()
@@ -568,11 +592,20 @@ struct AuthorizeParams {
 
 async fn authorize_handler(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     if !state.config.oauth2_enabled() {
         return oauth2_disabled_response();
     }
+
+    let Some(Extension(principal)) = principal else {
+        return oauth2_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Authentication required to authorize OAuth2 requests",
+        );
+    };
 
     if params.response_type.as_deref() != Some("code") {
         return oauth2_error(
@@ -608,10 +641,42 @@ async fn authorize_handler(
         );
     }
 
-    let scopes = match parse_oauth2_scopes(params.scope.as_deref()) {
-        Ok(s) => s,
-        Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_scope", msg),
+    // Cap requested scopes to a subset of the authenticated principal's scopes.
+    let (scopes, scope_str) = if params
+        .scope
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        let requested = match parse_oauth2_scopes(params.scope.as_deref()) {
+            Ok(s) => s,
+            Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_scope", msg),
+        };
+        if !requested.iter().all(|s| principal.has_scope(*s)) {
+            return oauth2_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "Requested scope exceeds authenticated principal authorization",
+            );
+        }
+        (requested, params.scope.clone())
+    } else {
+        if principal.scopes.is_empty() {
+            return oauth2_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "Authenticated principal holds no scopes",
+            );
+        }
+        let default_scopes = principal.scopes.clone();
+        let formatted = format_oauth2_scopes(&default_scopes);
+        (default_scopes, Some(formatted))
     };
+
+    let has_client_secret = state
+        .config
+        .oauth2_client_secret
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
 
     if let Some(ref method) = params.code_challenge_method
         && !matches!(method.as_str(), "S256" | "plain")
@@ -623,41 +688,120 @@ async fn authorize_handler(
         );
     }
 
-    let parsed_redirect = if let Some(ref raw_uri) = params.redirect_uri {
-        if raw_uri.contains('\r') || raw_uri.contains('\n') {
+    // Public clients (no oauth2_client_secret) MUST use PKCE with S256.
+    if !has_client_secret {
+        let challenge_ok = params
+            .code_challenge
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|c| !c.is_empty());
+        let method_ok = params.code_challenge_method.as_deref() == Some("S256");
+        if !challenge_ok || !method_ok {
             return oauth2_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Invalid redirect_uri",
+                "Public OAuth2 clients require PKCE with code_challenge and code_challenge_method=S256",
             );
         }
-        match url::Url::parse(raw_uri) {
-            Ok(parsed) => Some(parsed),
-            Err(_) => {
+    }
+
+    // Validate redirect_uri strictly against the configured oauth2_redirect_uris allowlist.
+    let allowlist: Vec<&str> = state
+        .config
+        .oauth2_redirect_uris
+        .iter()
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .collect();
+
+    let requested_redirect = params
+        .redirect_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let parsed_redirect = match (allowlist.is_empty(), requested_redirect) {
+        (false, None) => {
+            return oauth2_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing required redirect_uri parameter",
+            );
+        }
+        (true, Some(_)) => {
+            return oauth2_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "redirect_uri is not permitted unless oauth2_redirect_uris is configured",
+            );
+        }
+        (true, None) => None,
+        (false, Some(raw_uri)) => {
+            if raw_uri.contains('\r') || raw_uri.contains('\n') {
                 return oauth2_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    "redirect_uri must be a valid absolute URI",
+                    "Invalid redirect_uri",
+                );
+            }
+            if !allowlist.contains(&raw_uri) {
+                return oauth2_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "redirect_uri is not in the configured oauth2_redirect_uris allowlist",
+                );
+            }
+            match url::Url::parse(raw_uri) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    return oauth2_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "redirect_uri must be a valid absolute URI",
+                    );
+                }
+            }
+        }
+    };
+
+    // Bind authorization code to authenticated principal's mailbox (or allow Admin to specify login_hint).
+    let target_mailbox = match params
+        .login_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => principal.mailbox_id.clone(),
+        Some(hint) => {
+            let norm = crate::config::normalize_mailbox_id(hint);
+            if norm.eq_ignore_ascii_case(&principal.mailbox_id) {
+                principal.mailbox_id.clone()
+            } else if principal.has_scope(AuthScope::Admin) {
+                match resolve_oauth2_mailbox(&state.config, Some(hint)) {
+                    Ok(mb) => mb,
+                    Err(msg) => {
+                        return oauth2_error(StatusCode::BAD_REQUEST, "invalid_request", msg);
+                    }
+                }
+            } else {
+                return oauth2_error(
+                    StatusCode::FORBIDDEN,
+                    "access_denied",
+                    "Insufficient scope to authorize another mailbox",
                 );
             }
         }
-    } else {
-        None
-    };
-
-    let target_mailbox = match resolve_oauth2_mailbox(&state.config, params.login_hint.as_deref()) {
-        Ok(mb) => mb,
-        Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_request", msg),
     };
 
     let code = match mint_auth_code(
         &state.config,
         &target_mailbox,
         scopes.clone(),
-        params.scope.clone(),
-        params.redirect_uri.clone(),
+        scope_str,
+        requested_redirect.map(str::to_string),
         params.code_challenge.clone(),
         params.code_challenge_method.clone(),
+        principal.agent_policy.clone(),
     ) {
         Ok(c) => c,
         Err(err) => {
@@ -822,12 +966,13 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
         );
     }
 
-    if let Some(expected_secret) = state
+    let configured_client_secret = state
         .config
         .oauth2_client_secret
         .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+
+    if let Some(expected_secret) = configured_client_secret {
         let Some(provided_secret) = client_secret else {
             return oauth2_error(
                 StatusCode::UNAUTHORIZED,
@@ -893,6 +1038,21 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                     "redirect_uri does not match authorization request",
                 );
             }
+            // Public clients (no oauth2_client_secret) require PKCE S256 on redemption as well.
+            if configured_client_secret.is_none()
+                && (claims
+                    .code_challenge
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+                    || claims.code_challenge_method.as_deref() != Some("S256"))
+            {
+                return oauth2_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "Public OAuth2 clients require PKCE S256 authorization codes",
+                );
+            }
             if let Some(ref challenge) = claims.code_challenge {
                 let method = claims.code_challenge_method.as_deref().unwrap_or("plain");
                 let Some(verifier) = req.code_verifier.as_deref().filter(|s| !s.is_empty()) else {
@@ -910,10 +1070,12 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                     );
                 }
             }
-            // Enforce single-use authorization codes.
+            // Enforce single-use authorization codes and prune expired JTIs on write.
             {
+                let now = Utc::now().timestamp();
                 let mut used = state.used_oauth_codes.lock().await;
-                if !used.insert(claims.jti.clone()) {
+                used.retain(|_, exp| *exp > now);
+                if used.insert(claims.jti.clone(), claims.exp).is_some() {
                     return oauth2_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_grant",
@@ -976,6 +1138,13 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
             (claims.sub, granted_scopes, scope_out, claims.agent_policy)
         }
         "client_credentials" => {
+            if configured_client_secret.is_none() {
+                return oauth2_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "grant_type=client_credentials requires oauth2_client_secret to be configured",
+                );
+            }
             let scopes = match parse_oauth2_scopes(req.scope.as_deref()) {
                 Ok(s) => s,
                 Err(msg) => return oauth2_error(StatusCode::BAD_REQUEST, "invalid_scope", msg),
