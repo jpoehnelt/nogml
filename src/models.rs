@@ -1083,6 +1083,111 @@ pub struct AiTriageRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiBatchTriageOperation {
+    pub thread_id: String,
+    #[serde(default)]
+    pub archive: Option<bool>,
+    #[serde(default)]
+    pub mark_read: Option<bool>,
+    #[serde(default)]
+    pub mark_unread: Option<bool>,
+    #[serde(default)]
+    pub star: Option<bool>,
+    #[serde(default)]
+    pub trash: Option<bool>,
+    #[serde(default)]
+    pub add_labels: Vec<String>,
+    #[serde(default)]
+    pub remove_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiBatchTriageRequest {
+    /// Explicit per-thread triage operations.
+    #[serde(default)]
+    pub operations: Vec<AiBatchTriageOperation>,
+    /// Explicit thread IDs to apply the shared triage action to.
+    #[serde(default)]
+    pub thread_ids: Vec<String>,
+    /// Optional Gmail `q=` search query resolving threads for the shared triage action.
+    #[serde(default, alias = "q")]
+    pub query: Option<String>,
+    /// Include `SPAM` and `TRASH` threads when resolving `query` (default `false`).
+    #[serde(default)]
+    pub include_spam_trash: bool,
+    /// Shared triage action applied to threads resolved from `thread_ids` and/or `query`.
+    #[serde(default)]
+    pub action: Option<AiTriageRequest>,
+    /// Top-level shorthand triage flags applied when `action` is omitted (or merged with `action`).
+    #[serde(default)]
+    pub archive: Option<bool>,
+    #[serde(default)]
+    pub mark_read: Option<bool>,
+    #[serde(default)]
+    pub mark_unread: Option<bool>,
+    #[serde(default)]
+    pub star: Option<bool>,
+    #[serde(default)]
+    pub trash: Option<bool>,
+    #[serde(default)]
+    pub add_labels: Vec<String>,
+    #[serde(default)]
+    pub remove_labels: Vec<String>,
+    /// Preview exact per-thread diffs without modifying storage, emitting events, or writing audit logs.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Maximum unique target threads permitted in one call (default 100, hard ceiling 500).
+    #[serde(default)]
+    pub max_threads: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTriagePreviewItem {
+    pub thread_id: String,
+    pub subject: String,
+    pub current_labels: Vec<String>,
+    pub labels_to_add: Vec<String>,
+    pub labels_to_remove: Vec<String>,
+    pub would_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTriageDryRunResponse {
+    pub dry_run: bool,
+    pub total_threads: usize,
+    pub would_change_count: usize,
+    pub preview: Vec<BatchTriagePreviewItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTriageThreadResult {
+    pub thread_id: String,
+    pub subject: String,
+    pub changed: bool,
+    pub affected_message_ids: Vec<String>,
+    pub labels: Vec<String>,
+    pub added_labels: Vec<String>,
+    pub removed_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTriageThreadError {
+    pub thread_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTriageApplyResponse {
+    pub dry_run: bool,
+    pub total_threads: usize,
+    pub applied_count: usize,
+    pub skipped_count: usize,
+    pub errors: Vec<BatchTriageThreadError>,
+    pub results: Vec<BatchTriageThreadResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiModifyLabelsRequest {
     #[serde(default)]
     pub message_ids: Vec<String>,

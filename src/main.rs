@@ -35,7 +35,7 @@ use nogml::{
     error::{AppError, AppResult},
     events::EventSource,
     gmail, imap, mcp,
-    models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
+    models::{AiBatchTriageRequest, AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
     secrets::{
         SecretResolutionReport, ValueOrigin, generate_bearer_token, read_secret_file,
@@ -954,6 +954,41 @@ enum MailAction {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Batch triage multiple threads via query, thread IDs, or raw JSON payload (supports `--dry-run`).
+    BatchTriage {
+        /// Raw JSON payload (`{...}` or `@-` to read from stdin).
+        #[arg(long)]
+        payload: Option<String>,
+        /// Optional Gmail `q=` search query selecting threads.
+        #[arg(long)]
+        query: Option<String>,
+        /// Comma-separated thread IDs to apply the shared action to.
+        #[arg(long, value_delimiter = ',')]
+        thread_ids: Vec<String>,
+        /// Include SPAM and TRASH threads when resolving `--query`.
+        #[arg(long, default_value_t = false)]
+        include_spam_trash: bool,
+        #[arg(long)]
+        archive: Option<bool>,
+        #[arg(long)]
+        mark_read: Option<bool>,
+        #[arg(long)]
+        mark_unread: Option<bool>,
+        #[arg(long)]
+        star: Option<bool>,
+        #[arg(long)]
+        trash: Option<bool>,
+        #[arg(long, value_delimiter = ',')]
+        add_labels: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        remove_labels: Vec<String>,
+        /// Safety ceiling on unique target threads (default 100, max 500).
+        #[arg(long)]
+        max_threads: Option<usize>,
+        /// Preview per-thread diffs with zero store writes, events, or audit logs.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// List available labels.
     Labels,
     /// Manage pending human-in-the-loop outbound approvals.
@@ -963,7 +998,7 @@ enum MailAction {
     },
     /// Query the immutable agent and API audit log (newest-first).
     Audit {
-        /// Filter by action (`read`, `search`, `send`, `draft`, `triage`, `approve`, `reject`, `unsubscribe`, `modify`, `delete`).
+        /// Filter by action (`read`, `search`, `send`, `draft`, `triage`, `batch_triage`, `approve`, `reject`, `unsubscribe`, `modify`, `delete`).
         #[arg(long)]
         action: Option<String>,
         /// Filter by actor identity.
@@ -1775,6 +1810,57 @@ async fn run_remote_mail(
             let resp = with_optional_bearer(
                 client
                     .post(format!("{base}/v1/threads/{encoded_tid}/triage"))
+                    .json(&req),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::BatchTriage {
+            payload,
+            query,
+            thread_ids,
+            include_spam_trash,
+            archive,
+            mark_read,
+            mark_unread,
+            star,
+            trash,
+            add_labels,
+            remove_labels,
+            max_threads,
+            dry_run,
+        } => {
+            let mut req: AiBatchTriageRequest = match payload {
+                Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
+                None => AiBatchTriageRequest {
+                    operations: Vec::new(),
+                    thread_ids,
+                    query,
+                    include_spam_trash,
+                    action: None,
+                    archive,
+                    mark_read,
+                    mark_unread,
+                    star,
+                    trash,
+                    add_labels,
+                    remove_labels,
+                    dry_run,
+                    max_threads,
+                },
+            };
+            if dry_run {
+                req.dry_run = true;
+            }
+            if max_threads.is_some() && req.max_threads.is_none() {
+                req.max_threads = max_threads;
+            }
+            let resp = with_optional_bearer(
+                client
+                    .post(format!("{base}/v1/threads/batch_triage"))
                     .json(&req),
                 bearer_token,
             )
@@ -2679,6 +2765,49 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                         },
                     )
                     .await?;
+                    emit_output(res, fields.as_deref(), json_flag)?;
+                }
+                MailAction::BatchTriage {
+                    payload,
+                    query,
+                    thread_ids,
+                    include_spam_trash,
+                    archive,
+                    mark_read,
+                    mark_unread,
+                    star,
+                    trash,
+                    add_labels,
+                    remove_labels,
+                    max_threads,
+                    dry_run,
+                } => {
+                    let mut req: AiBatchTriageRequest = match payload {
+                        Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
+                        None => AiBatchTriageRequest {
+                            operations: Vec::new(),
+                            thread_ids,
+                            query,
+                            include_spam_trash,
+                            action: None,
+                            archive,
+                            mark_read,
+                            mark_unread,
+                            star,
+                            trash,
+                            add_labels,
+                            remove_labels,
+                            dry_run,
+                            max_threads,
+                        },
+                    };
+                    if dry_run {
+                        req.dry_run = true;
+                    }
+                    if max_threads.is_some() && req.max_threads.is_none() {
+                        req.max_threads = max_threads;
+                    }
+                    let res = ai::execute_batch_triage(&state, req).await?;
                     emit_output(res, fields.as_deref(), json_flag)?;
                 }
                 MailAction::Labels => {
