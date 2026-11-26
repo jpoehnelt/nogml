@@ -28,7 +28,7 @@ use crate::{
         transport::{InboundEnvelope, IngestOutcome},
     },
     storage::NewAttachmentInput,
-    transport::ingest_inbound_rfc2822_with_config,
+    transport::ingest_inbound_rfc2822_with_cipher,
 };
 
 /// Headers managed directly by `mail-builder` that should not be duplicated via `extra_headers`.
@@ -578,12 +578,13 @@ pub async fn handle_email_received(
     if target_mailboxes.len() == 1 {
         let mb = &target_mailboxes[0];
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822_with_config(
+        let outcome = ingest_inbound_rfc2822_with_cipher(
             mb_state.store.as_ref(),
             &mb_state.events,
             filter,
             base_envelope,
             &mb_state.config,
+            mb_state.cipher.as_ref(),
         )
         .await?;
 
@@ -645,12 +646,13 @@ pub async fn handle_email_received(
 
     for mb in &target_mailboxes {
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822_with_config(
+        let outcome = ingest_inbound_rfc2822_with_cipher(
             mb_state.store.as_ref(),
             &mb_state.events,
             filter,
             base_envelope.clone(),
             &mb_state.config,
+            mb_state.cipher.as_ref(),
         )
         .await?;
 

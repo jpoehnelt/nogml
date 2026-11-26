@@ -31,6 +31,7 @@ use nogml::{
         RspamdRejectAction, SearchBackend, SmtpTlsMode, StorageBackend, SyncMode, TomlConfig,
         TransportBackend, render_starter_toml, validate_config,
     },
+    crypto::{DEFAULT_KEY_ID, generate_formatted_key, rotate_secrets},
     ensure_crypto_provider,
     error::{AppError, AppResult},
     events::EventSource,
@@ -610,6 +611,20 @@ struct CommonConfigArgs {
     )]
     llm_triage_max_body_chars: usize,
 
+    // --- Encryption at rest ---
+    /// Master AES-256-GCM encryption key (`<kid>:<base64_or_hex_key>` or bare 32-byte key).
+    #[arg(long, env = "NOGML_ENCRYPTION_KEY", global = true)]
+    encryption_key: Option<String>,
+
+    /// Comma-separated previous AES-256-GCM encryption keys (`<kid>:<key>`) for zero-downtime key rotation.
+    #[arg(
+        long,
+        env = "NOGML_ENCRYPTION_PREVIOUS_KEYS",
+        value_delimiter = ',',
+        global = true
+    )]
+    encryption_previous_keys: Vec<String>,
+
     // --- Pluggable search & embeddings ---
     /// Search index backend (`store` [default] or `hybrid`).
     #[arg(
@@ -677,6 +692,12 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
+    },
+
+    /// Encryption at rest key management (`generate-key`, `rotate-key`).
+    Crypto {
+        #[command(subcommand)]
+        action: CryptoCommand,
     },
 
     /// Interactive Gmail OAuth2 consent and least-privilege scoped token setup (`gmail`, `mint-token`).
@@ -823,6 +844,27 @@ enum ConfigCommand {
 
     /// Validate layered config, secret references, and IMAP TLS files, printing redacted JSON.
     Check(Box<ServeArgs>),
+}
+
+#[derive(Debug, Subcommand)]
+enum CryptoCommand {
+    /// Generate a cryptographically random 32-byte AES-256-GCM key (`<kid>:<base64>`).
+    GenerateKey {
+        /// Key identifier prefix stored in `enc:v1:<kid>:...` envelopes.
+        #[arg(long, default_value = DEFAULT_KEY_ID)]
+        kid: String,
+
+        /// Write the generated `<kid>:<key>` to a mode 0600 file and omit raw key material from stdout.
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+
+        /// Overwrite an existing `--output-file`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Re-encrypt stored `sendAs` SMTP passwords and inbox rule webhook secrets under the active primary key.
+    RotateKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -1456,6 +1498,12 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "llm_triage_max_body_chars") {
             cfg.llm_triage_max_body_chars = self.llm_triage_max_body_chars;
+        }
+        if is_explicit(root_matches, "encryption_key") {
+            cfg.encryption_key = self.encryption_key;
+        }
+        if is_explicit(root_matches, "encryption_previous_keys") {
+            cfg.encryption_previous_keys = self.encryption_previous_keys;
         }
         if is_explicit(root_matches, "search_backend") {
             cfg.search_backend = self.search_backend;
@@ -2523,6 +2571,51 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 };
                 emit_output(serde_json::to_value(&report)?, None, false)?;
                 Ok(exit)
+            }
+        },
+
+        Command::Crypto { action } => match action {
+            CryptoCommand::GenerateKey {
+                kid,
+                output_file,
+                force,
+            } => {
+                let (validated_kid, formatted) = generate_formatted_key(&kid)?;
+                if let Some(path) = output_file {
+                    write_secret_file(&path, &formatted, force)?;
+                    let saved_to = fs::canonicalize(&path).unwrap_or(path);
+                    emit_output(
+                        json!({
+                            "ok": true,
+                            "kid": validated_kid,
+                            "saved_to": saved_to,
+                        }),
+                        None,
+                        false,
+                    )?;
+                } else {
+                    emit_output(
+                        json!({
+                            "ok": true,
+                            "kid": validated_kid,
+                            "key": formatted,
+                        }),
+                        None,
+                        false,
+                    )?;
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+
+            CryptoCommand::RotateKey => {
+                let loaded = cli
+                    .common
+                    .load_layered(None, &matches, None, cli.log_json)?;
+                let config = finalize_runtime_config(loaded, true)?;
+                let state = AppState::from_config_async(config).await?;
+                let report = rotate_secrets(&state).await?;
+                emit_output(serde_json::to_value(report)?, None, false)?;
+                Ok(ExitCode::SUCCESS)
             }
         },
 

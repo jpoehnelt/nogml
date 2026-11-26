@@ -11,7 +11,7 @@ Ready-to-use templates live in [`deploy/`](../deploy):
 
 ## Configuration and secret loading
 
-`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`, `auth`).
+`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`, `crypto`, `auth`).
 
 Precedence from highest to lowest:
 
@@ -81,9 +81,41 @@ All secret fields support three non-plaintext mechanisms so secrets never need t
 - `file:///path/to/secret`: reads a UTF-8 file and trims trailing `\r\n`. Relative `file://` paths resolve relative to the `nogml.toml` directory.
 - `file://$CREDENTIALS_DIRECTORY/secret`: resolves against `systemd`'s `CREDENTIALS_DIRECTORY` environment variable set by `LoadCredential=`.
 - `env://VAR_NAME`: reads the named environment variable and fails with exit code `2` if unset.
-- `*_FILE` environment variables: standard Docker secrets, Kubernetes projected volume, and `systemd` convention (`RESEND_API_KEY_FILE`, `RESEND_WEBHOOK_SECRET_FILE`, `NOGML_AUTH_TOKENS_FILE`, `NOGML_SCOPED_TOKENS_FILE`, `NOGML_IMAP_PASSWORD_FILE`, `NOGML_DATABASE_URL_FILE`, `NOGML_BLOB_S3_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_WEBHOOK_SECRET_FILE`, `NOGML_SMTP_PASSWORD_FILE`, `NOGML_RSPAMD_PASSWORD_FILE`, `NOGML_LLM_TRIAGE_API_KEY_FILE`, `NOGML_EMBEDDING_API_KEY_FILE`, `NOGML_OAUTH2_CLIENT_SECRET_FILE`, `NOGML_OAUTH2_SIGNING_SECRET_FILE`, `GMAIL_CLIENT_SECRET_FILE`, `GMAIL_REFRESH_TOKEN_FILE`, `GMAIL_ACCESS_TOKEN_FILE`, `GMAIL_IMAP_PASSWORD_FILE`).
+- `*_FILE` environment variables: standard Docker secrets, Kubernetes projected volume, and `systemd` convention (`RESEND_API_KEY_FILE`, `RESEND_WEBHOOK_SECRET_FILE`, `NOGML_AUTH_TOKENS_FILE`, `NOGML_SCOPED_TOKENS_FILE`, `NOGML_IMAP_PASSWORD_FILE`, `NOGML_DATABASE_URL_FILE`, `NOGML_BLOB_S3_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_SECRET_ACCESS_KEY_FILE`, `NOGML_SES_WEBHOOK_SECRET_FILE`, `NOGML_SMTP_PASSWORD_FILE`, `NOGML_RSPAMD_PASSWORD_FILE`, `NOGML_LLM_TRIAGE_API_KEY_FILE`, `NOGML_EMBEDDING_API_KEY_FILE`, `NOGML_ENCRYPTION_KEY_FILE`, `NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE`, `NOGML_OAUTH2_CLIENT_SECRET_FILE`, `NOGML_OAUTH2_SIGNING_SECRET_FILE`, `GMAIL_CLIENT_SECRET_FILE`, `GMAIL_REFRESH_TOKEN_FILE`, `GMAIL_ACCESS_TOKEN_FILE`, `GMAIL_IMAP_PASSWORD_FILE`).
 
 On Unix, `nogml config check` warns if any `file://` secret, `*_FILE` target, or IMAP TLS private key is readable by group or other (`mode & 0o077 != 0`). Restrict secret files with `chmod 0600`.
+
+### Encryption at rest and key rotation (`nogml crypto`)
+
+Enable AES-256-GCM encryption at rest so stored `sendAs.smtp_msa.password` and `inbox_rules.webhook_secret` fields are written as `enc:v1:<kid>:<nonce>:<ciphertext>` envelopes instead of plaintext. Legacy plaintext rows continue to decrypt transparently until rotated.
+
+Generate a 32-byte key stored in a mode `0600` file (raw key bytes are never printed to stdout or logs when `--output-file` is set):
+
+```bash
+nogml crypto generate-key --kid k1 --output-file /etc/nogml/secrets/encryption_key
+```
+
+Reference it in `nogml.toml` (or via `NOGML_ENCRYPTION_KEY` / `NOGML_ENCRYPTION_KEY_FILE`):
+
+```toml
+[security]
+encryption_key = "file:///etc/nogml/secrets/encryption_key"
+```
+
+To rotate from `k1` to `k2` without downtime:
+
+```bash
+# 1. Generate the new primary key
+nogml crypto generate-key --kid k2 --output-file /etc/nogml/secrets/encryption_key_k2
+
+# 2. Point [security] encryption_key at k2 and keep k1 in encryption_previous_keys, then validate
+nogml config check --config /etc/nogml/nogml.toml
+
+# 3. Re-encrypt all stored secrets across every mailbox under k2
+nogml crypto rotate-key --config /etc/nogml/nogml.toml
+
+# 4. Reload nogml, then remove k1 from encryption_previous_keys
+```
 
 ## Single-node Docker Compose with Caddy HTTPS
 

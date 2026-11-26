@@ -3670,6 +3670,7 @@ async fn get_capabilities(
         "sync_mode": cfg.sync_mode,
         "imap_enabled": cfg.imap_bind.is_some() || cfg.imap_tls_bind.is_some(),
         "oauth2_enabled": cfg.oauth2_enabled(),
+        "encryption_at_rest": state.cipher.is_enabled(),
         "active_filters": active_filters,
         "active_outbound_policies": state.outbound_policy.active_policies(),
         "backends": {

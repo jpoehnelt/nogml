@@ -14,6 +14,7 @@ use crate::{
     ai::{channel_for_source, sanitize_untrusted_text, to_compact_message, validate_resource_id},
     auth::{AuthScope, Principal},
     config::Config,
+    crypto::SecretCipher,
     error::{AppError, AppResult},
     events::{EventBus, EventSource, MailEvent},
     models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_UNREAD},
@@ -544,6 +545,28 @@ pub async fn evaluate_inbox_rules_with_policy(
     untrusted_content_guard: bool,
     webhook_policy: &RuleWebhookPolicy,
 ) -> StoredMessage {
+    evaluate_inbox_rules_with_cipher(
+        store,
+        events,
+        msg,
+        untrusted_content_guard,
+        webhook_policy,
+        &SecretCipher::disabled(),
+    )
+    .await
+}
+
+/// Evaluate all enabled per-mailbox inbox rules for a newly ingested inbound message
+/// using an explicit [`RuleWebhookPolicy`] and [`SecretCipher`] for decrypting stored
+/// `webhook_secret` envelopes prior to HMAC-SHA256 signing.
+pub async fn evaluate_inbox_rules_with_cipher(
+    store: &dyn MailStore,
+    events: &EventBus,
+    msg: &StoredMessage,
+    untrusted_content_guard: bool,
+    webhook_policy: &RuleWebhookPolicy,
+    cipher: &SecretCipher,
+) -> StoredMessage {
     // Never fire inbox rules on outbound SENT or DRAFT messages.
     if msg
         .label_ids
@@ -728,12 +751,30 @@ pub async fn evaluate_inbox_rules_with_policy(
             }
         };
 
-        let signature = rule
+        let signature = match rule
             .actions
             .webhook_secret
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|secret| compute_webhook_signature(secret, &body_bytes));
+        {
+            Some(raw_secret) => match cipher.decrypt(raw_secret) {
+                Ok(plain) if !plain.is_empty() => {
+                    Some(compute_webhook_signature(&plain, &body_bytes))
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(
+                        %err,
+                        rule_id = %rule.id,
+                        rule_name = %rule.name,
+                        mailbox_id = %event_mailbox,
+                        "Failed to decrypt inbox rule webhook_secret; skipping unsigned webhook delivery"
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
 
         spawn_rule_webhook(
             rule.id,
@@ -912,7 +953,12 @@ pub async fn execute_create_rule_with_context(
     }
 
     let policy = RuleWebhookPolicy::from_config(&state.config);
-    let validated = validate_new_inbox_rule_with_policy(&input, &policy)?;
+    let mut validated = validate_new_inbox_rule_with_policy(&input, &policy)?;
+    if let Some(ref secret) = validated.actions.webhook_secret
+        && !secret.is_empty()
+    {
+        validated.actions.webhook_secret = Some(state.cipher.encrypt(secret)?);
+    }
     let created = state.store.create_inbox_rule(&validated).await?;
     state
         .record_audit(
@@ -942,10 +988,15 @@ pub async fn execute_patch_rule_with_context(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Inbox rule '{id}' not found")))?;
 
+    let existing_plain_secret = existing
+        .actions
+        .webhook_secret
+        .as_deref()
+        .and_then(|s| state.cipher.decrypt(s).ok());
     let touches_webhook = patch.actions.as_ref().is_some_and(|actions| {
         let normalized = normalize_inbox_rule_actions(actions);
         normalized.webhook_url != existing.actions.webhook_url
-            || normalized.webhook_secret != existing.actions.webhook_secret
+            || normalized.webhook_secret != existing_plain_secret
     });
     let modifies_webhook_rule_trigger = existing.actions.webhook_url.is_some()
         && (patch.match_query.is_some() || patch.vip_only.is_some() || patch.enabled.is_some());
@@ -971,7 +1022,13 @@ pub async fn execute_patch_rule_with_context(
 
     let policy = RuleWebhookPolicy::from_config(&state.config);
     if let Some(ref actions) = patch.actions {
-        patch.actions = Some(validate_rule_actions_with_policy(actions, &policy)?);
+        let mut validated_actions = validate_rule_actions_with_policy(actions, &policy)?;
+        if let Some(ref secret) = validated_actions.webhook_secret
+            && !secret.is_empty()
+        {
+            validated_actions.webhook_secret = Some(state.cipher.encrypt(secret)?);
+        }
+        patch.actions = Some(validated_actions);
     }
 
     let updated = state.store.patch_inbox_rule(id, &patch).await?;

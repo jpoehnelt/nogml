@@ -6,6 +6,7 @@ pub mod auth;
 pub mod auth_wizard;
 pub mod blob;
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod filter;
@@ -47,6 +48,7 @@ use crate::{
         open_blob_store, raw_message_blob_key,
     },
     config::{Config, normalize_mailbox_id},
+    crypto::SecretCipher,
     error::AppResult,
     events::EventBus,
     filter::{InboundFilter, open_filter},
@@ -91,6 +93,8 @@ pub struct AppState {
     pub auth: Arc<dyn AuthProvider>,
     pub search: Arc<dyn SearchIndex>,
     pub outbound_policy: Arc<dyn OutboundPolicy>,
+    /// AES-256-GCM encryption-at-rest cipher for stored secrets and credentials.
+    pub cipher: Arc<SecretCipher>,
     /// Underlying Resend client used by `POST /webhooks/resend` Receiving API fetches.
     pub resend: Arc<dyn ResendClient>,
     pub events: EventBus,
@@ -194,6 +198,7 @@ impl AppState {
         >,
     ) -> AppResult<Self> {
         let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
+        let cipher = Arc::new(SecretCipher::from_config(&config)?);
         let base_blobs = open_blob_store(&config)?;
         let blobs = scope_blobs_for_mailbox(
             &base_blobs,
@@ -229,6 +234,7 @@ impl AppState {
             auth,
             search,
             outbound_policy,
+            cipher,
             resend,
             events,
             sync_lock,
@@ -279,6 +285,9 @@ impl AppState {
     ) -> Self {
         ensure_crypto_provider();
         let primary_mailbox_id = normalize_mailbox_id(&config.user_email);
+        let cipher = Arc::new(
+            SecretCipher::from_config(&config).unwrap_or_else(|_| SecretCipher::disabled()),
+        );
         let base_blobs: Arc<dyn BlobStore> = match open_blob_store(&config) {
             Ok(b) => b,
             Err(_) => Arc::new(InlineBlobStore),
@@ -317,6 +326,7 @@ impl AppState {
             auth,
             search,
             outbound_policy,
+            cipher,
             resend,
             events: EventBus::with_mailbox(&primary_mailbox_id),
             sync_lock,
@@ -439,6 +449,7 @@ impl AppState {
             auth: self.auth.clone(),
             search,
             outbound_policy,
+            cipher: self.cipher.clone(),
             resend: self.resend.clone(),
             events,
             sync_lock,
@@ -501,6 +512,43 @@ impl AppState {
     pub fn with_outbound_policy(mut self, outbound_policy: Arc<dyn OutboundPolicy>) -> Self {
         self.outbound_policy = outbound_policy;
         self
+    }
+
+    /// Replace the [`SecretCipher`] used for encryption at rest on this `AppState`.
+    pub fn with_cipher(mut self, cipher: Arc<SecretCipher>) -> Self {
+        self.cipher = cipher;
+        self
+    }
+
+    /// Encrypt `send_as.smtp_msa.password` in place using `self.cipher` when present and non-empty.
+    pub fn encrypt_send_as_password(&self, send_as: &mut crate::models::SendAs) -> AppResult<()> {
+        if let Some(ref mut msa) = send_as.smtp_msa
+            && let Some(ref password) = msa.password
+            && !password.is_empty()
+        {
+            msa.password = Some(self.cipher.encrypt(password)?);
+        }
+        Ok(())
+    }
+
+    /// Decrypt `send_as.smtp_msa.password` in place using `self.cipher` when present and non-empty.
+    pub fn decrypt_send_as_password(&self, send_as: &mut crate::models::SendAs) -> AppResult<()> {
+        if let Some(ref mut msa) = send_as.smtp_msa
+            && let Some(ref password) = msa.password
+            && !password.is_empty()
+        {
+            msa.password = Some(self.cipher.decrypt(password)?);
+        }
+        Ok(())
+    }
+
+    /// Load user settings from `self.store` and transparently decrypt stored `sendAs.smtp_msa.password` values.
+    pub async fn get_decrypted_settings(&self) -> AppResult<crate::storage::UserSettings> {
+        let mut settings = self.store.get_settings().await?;
+        for entry in &mut settings.send_as {
+            self.decrypt_send_as_password(entry)?;
+        }
+        Ok(settings)
     }
 
     /// Replace the [`ResumableUploadStore`] on this `AppState`.

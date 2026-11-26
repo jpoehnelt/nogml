@@ -368,6 +368,17 @@ pub struct Config {
     /// Maximum plain-text body characters included in the LLM triage prompt (default 2000).
     pub llm_triage_max_body_chars: usize,
 
+    // --- Security & encryption at rest ---
+    /// Master AES-256-GCM encryption key for stored secrets (`<kid>:<key>` or bare 32-byte
+    /// base64/hex key defaulting to `kid = "k1"`). Supports `file://`, `env://`, and
+    /// `NOGML_ENCRYPTION_KEY_FILE`.
+    #[serde(default)]
+    pub encryption_key: Option<String>,
+    /// Previous encryption keys (`<kid>:<key>`) retained for zero-downtime key rotation
+    /// (`NOGML_ENCRYPTION_PREVIOUS_KEYS` / `NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE`).
+    #[serde(default)]
+    pub encryption_previous_keys: Vec<String>,
+
     // --- Pluggable search & embeddings ---
     /// Search index backend (`store` [default] or `hybrid`).
     pub search_backend: SearchBackend,
@@ -496,6 +507,9 @@ impl Default for Config {
             llm_triage_timeout_ms: 10_000,
             llm_triage_max_body_chars: 2_000,
 
+            encryption_key: None,
+            encryption_previous_keys: Vec::new(),
+
             search_backend: SearchBackend::Store,
             embedding_base_url: None,
             embedding_api_key: None,
@@ -609,6 +623,13 @@ impl Config {
         self.imap_password
             .as_deref()
             .or_else(|| self.auth_tokens.first().map(String::as_str))
+    }
+
+    /// Returns `true` when AES-256-GCM encryption at rest is configured.
+    pub fn encryption_at_rest_enabled(&self) -> bool {
+        self.encryption_key
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
     }
 
     /// Returns `true` when `RspamdFilter` is configured with a non-empty URL.
@@ -731,6 +752,8 @@ impl Config {
             llm_triage_model,
             llm_triage_timeout_ms,
             llm_triage_max_body_chars,
+            encryption_key,
+            encryption_previous_keys,
             search_backend,
             embedding_base_url,
             embedding_api_key,
@@ -747,6 +770,8 @@ impl Config {
         };
 
         let redacted_auth_tokens: Vec<&str> = auth_tokens.iter().map(|_| REDACTED).collect();
+        let redacted_encryption_previous_keys: Vec<&str> =
+            encryption_previous_keys.iter().map(|_| REDACTED).collect();
         let redacted_scoped_tokens: Vec<Value> = scoped_tokens
             .iter()
             .map(|st| {
@@ -897,6 +922,13 @@ impl Config {
                     "timeout_ms": llm_triage_timeout_ms,
                     "max_body_chars": llm_triage_max_body_chars,
                 },
+            },
+            "security": {
+                "encryption_at_rest": encryption_key
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()),
+                "encryption_key": redact_opt(encryption_key),
+                "encryption_previous_keys": redacted_encryption_previous_keys,
             },
             "search": {
                 "backend": search_backend,
@@ -1082,6 +1114,41 @@ impl Config {
             "NOGML_EMBEDDING_API_KEY_FILE",
             self.embedding_api_key
         );
+        load_opt_env_file!(
+            "encryption_key",
+            "security.encryption_key",
+            "NOGML_ENCRYPTION_KEY",
+            "NOGML_ENCRYPTION_KEY_FILE",
+            self.encryption_key
+        );
+
+        // NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE
+        if let Some(path_str) = env_lookup("NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            match origin_of("encryption_previous_keys") {
+                ValueOrigin::Cli => {}
+                ValueOrigin::DirectEnv => {
+                    report.push_warning_unique(
+                        "Both NOGML_ENCRYPTION_PREVIOUS_KEYS and NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE are set; using NOGML_ENCRYPTION_PREVIOUS_KEYS"
+                            .to_string(),
+                    );
+                }
+                ValueOrigin::Unset => {
+                    if let Some(raw) = read_secret_file(
+                        "security.encryption_previous_keys",
+                        Path::new(&path_str),
+                        &mut report,
+                    ) {
+                        self.encryption_previous_keys = split_token_list(&raw);
+                    } else {
+                        self.encryption_previous_keys.clear();
+                    }
+                    loaded_from_env_file.insert("security.encryption_previous_keys");
+                }
+            }
+        }
 
         // NOGML_AUTH_TOKENS_FILE
         if let Some(path_str) = env_lookup("NOGML_AUTH_TOKENS_FILE")
@@ -1185,6 +1252,17 @@ impl Config {
         resolve_opt_uri!("filters.rspamd.password", self.rspamd_password);
         resolve_opt_uri!("filters.llm_triage.api_key", self.llm_triage_api_key);
         resolve_opt_uri!("search.embedding_api_key", self.embedding_api_key);
+        resolve_opt_uri!("security.encryption_key", self.encryption_key);
+
+        if !loaded_from_env_file.contains("security.encryption_previous_keys") {
+            self.encryption_previous_keys = resolve_secret_tokens(
+                "security.encryption_previous_keys",
+                &self.encryption_previous_keys,
+                base_dir,
+                env_lookup,
+                &mut report,
+            );
+        }
 
         if !loaded_from_env_file.contains("auth.tokens") {
             self.auth_tokens = resolve_secret_tokens(
@@ -1326,6 +1404,8 @@ impl fmt::Debug for Config {
             llm_triage_model,
             llm_triage_timeout_ms,
             llm_triage_max_body_chars,
+            encryption_key,
+            encryption_previous_keys,
             search_backend,
             embedding_base_url,
             embedding_api_key,
@@ -1335,6 +1415,8 @@ impl fmt::Debug for Config {
 
         let redacted_opt = |opt: &Option<String>| opt.as_ref().map(|_| REDACTED);
         let redacted_tokens: Vec<&str> = auth_tokens.iter().map(|_| REDACTED).collect();
+        let redacted_encryption_previous_keys: Vec<&str> =
+            encryption_previous_keys.iter().map(|_| REDACTED).collect();
 
         f.debug_struct("Config")
             .field("bind", bind)
@@ -1462,6 +1544,11 @@ impl fmt::Debug for Config {
             .field("llm_triage_model", llm_triage_model)
             .field("llm_triage_timeout_ms", llm_triage_timeout_ms)
             .field("llm_triage_max_body_chars", llm_triage_max_body_chars)
+            .field("encryption_key", &redacted_opt(encryption_key))
+            .field(
+                "encryption_previous_keys",
+                &redacted_encryption_previous_keys,
+            )
             .field("search_backend", search_backend)
             .field("embedding_base_url", embedding_base_url)
             .field("embedding_api_key", &redacted_opt(embedding_api_key))
@@ -1496,6 +1583,7 @@ pub struct TomlConfig {
     pub sync: SyncTomlConfig,
     pub watch: WatchTomlConfig,
     pub filters: FiltersTomlConfig,
+    pub security: SecurityTomlConfig,
     pub search: SearchTomlConfig,
 }
 
@@ -1905,6 +1993,26 @@ impl std::fmt::Debug for LlmTriageTomlConfig {
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct SecurityTomlConfig {
+    pub encryption_key: Option<String>,
+    pub encryption_previous_keys: Option<Vec<String>>,
+}
+
+impl std::fmt::Debug for SecurityTomlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_previous: Option<Vec<&'static str>> = self
+            .encryption_previous_keys
+            .as_ref()
+            .map(|list| list.iter().map(|_| crate::secrets::REDACTED).collect());
+        f.debug_struct("SecurityTomlConfig")
+            .field("encryption_key", &redacted_opt_debug(&self.encryption_key))
+            .field("encryption_previous_keys", &redacted_previous)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchTomlConfig {
     pub backend: Option<SearchBackend>,
     pub embedding_base_url: Option<String>,
@@ -2293,6 +2401,14 @@ impl TomlConfig {
             cfg.llm_triage_max_body_chars = v;
         }
 
+        // [security]
+        if let Some(ref v) = self.security.encryption_key {
+            cfg.encryption_key = Some(v.clone());
+        }
+        if let Some(ref v) = self.security.encryption_previous_keys {
+            cfg.encryption_previous_keys = v.clone();
+        }
+
         // [search]
         if let Some(v) = self.search.backend {
             cfg.search_backend = v;
@@ -2619,6 +2735,13 @@ pub fn validate_config(
         errors.push(err.to_string());
     }
 
+    // --- Encryption at rest ---
+    if !errors.iter().any(|e| e.contains("security.encryption_"))
+        && let Err(err) = crate::crypto::SecretCipher::from_config(config)
+    {
+        errors.push(err.to_string());
+    }
+
     if config.sync_interval_secs > 0 && !config.gmail_sync_configured() {
         warnings.push(
             "sync.interval_secs > 0, but no upstream Gmail sync credentials are configured"
@@ -2722,6 +2845,12 @@ untrusted_content_guard = true
 # tls_key = "/etc/nogml/tls/privkey.pem"
 # password = "file:///etc/nogml/secrets/imap_password"
 
+[security]
+# Optional AES-256-GCM encryption at rest for stored SMTP and webhook secrets.
+# Generate a key with: nogml crypto generate-key --kid k1 --output-file /etc/nogml/secrets/encryption_key
+# encryption_key = "file:///etc/nogml/secrets/encryption_key"
+# encryption_previous_keys = ["file:///etc/nogml/secrets/encryption_key_old"]
+
 [search]
 backend = "store"
 # backend = "hybrid"
@@ -2774,6 +2903,8 @@ mod tests {
         cfg.rspamd_password = Some("super-secret-rspamd".to_string());
         cfg.llm_triage_api_key = Some("super-secret-llm".to_string());
         cfg.embedding_api_key = Some("super-secret-embed".to_string());
+        cfg.encryption_key = Some("k2:super-secret-enc-primary".to_string());
+        cfg.encryption_previous_keys = vec!["k1:super-secret-enc-prev".to_string()];
         cfg.approval_webhook_url = Some(
             "https://user:approval-pass@hooks.slack.com/services/T0/B0/SUPER_SECRET_APPROVAL?token=qsec"
                 .to_string(),
@@ -2808,6 +2939,8 @@ mod tests {
             "super-secret-rspamd",
             "super-secret-llm",
             "super-secret-embed",
+            "super-secret-enc-primary",
+            "super-secret-enc-prev",
             "approval-pass",
             "SUPER_SECRET_APPROVAL",
             "qsec",
@@ -2871,6 +3004,9 @@ webhook_url = "https://discord.com/api/webhooks/1/toml-watch-secret"
 password = "toml-rspamd-pass"
 [filters.llm_triage]
 api_key = "toml-llm-key"
+[security]
+encryption_key = "k2:toml-enc-primary"
+encryption_previous_keys = ["k1:toml-enc-prev"]
 [search]
 embedding_api_key = "toml-embed-key"
 "#;
@@ -2898,6 +3034,8 @@ embedding_api_key = "toml-embed-key"
             "toml-watch-secret",
             "toml-rspamd-pass",
             "toml-llm-key",
+            "toml-enc-primary",
+            "toml-enc-prev",
             "toml-embed-key",
         ] {
             assert!(

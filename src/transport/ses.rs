@@ -38,7 +38,7 @@ use crate::{
     },
     transport::{
         InboundEnvelope, IngestOutcome, MailTransport, OutboundMessage, SendOutcome,
-        TransportCapabilities, ensure_raw_rfc2822, ingest_inbound_rfc2822_with_config,
+        TransportCapabilities, ensure_raw_rfc2822, ingest_inbound_rfc2822_with_cipher,
     },
 };
 
@@ -1727,12 +1727,13 @@ pub async fn ses_webhook_handler(
     if target_mailboxes.len() == 1 {
         let mb = &target_mailboxes[0];
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822_with_config(
+        let outcome = ingest_inbound_rfc2822_with_cipher(
             mb_state.store.as_ref(),
             &mb_state.events,
             mb_state.filter.as_ref(),
             base_envelope,
             &mb_state.config,
+            mb_state.cipher.as_ref(),
         )
         .await?;
 
@@ -1793,12 +1794,13 @@ pub async fn ses_webhook_handler(
 
     for mb in &target_mailboxes {
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822_with_config(
+        let outcome = ingest_inbound_rfc2822_with_cipher(
             mb_state.store.as_ref(),
             &mb_state.events,
             mb_state.filter.as_ref(),
             base_envelope.clone(),
             &mb_state.config,
+            mb_state.cipher.as_ref(),
         )
         .await?;
 

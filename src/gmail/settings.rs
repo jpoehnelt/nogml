@@ -102,6 +102,7 @@ pub async fn create_send_as(
         }
     }
 
+    state.encrypt_send_as_password(&mut payload)?;
     settings.send_as.push(payload.clone());
     state.store.save_settings(settings).await?;
     Ok(Json(redact_send_as(payload)))
@@ -111,11 +112,12 @@ pub async fn create_send_as(
 pub async fn update_send_as(
     MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
-    Json(payload): Json<SendAs>,
+    Json(mut payload): Json<SendAs>,
 ) -> AppResult<Json<SendAs>> {
     resolve_user_id(&user_id, &state.config)?;
     validate_resource_id(&send_as_email)?;
     validate_send_as_fields(&payload)?;
+    state.encrypt_send_as_password(&mut payload)?;
 
     let mut settings = state.store.get_settings().await?;
     let idx = settings
@@ -148,11 +150,12 @@ pub async fn update_send_as(
 pub async fn patch_send_as(
     MailboxState(state): MailboxState,
     Path((user_id, send_as_email)): Path<(String, String)>,
-    Json(payload): Json<SendAs>,
+    Json(mut payload): Json<SendAs>,
 ) -> AppResult<Json<SendAs>> {
     resolve_user_id(&user_id, &state.config)?;
     validate_resource_id(&send_as_email)?;
     validate_send_as_fields(&payload)?;
+    state.encrypt_send_as_password(&mut payload)?;
 
     let mut settings = state.store.get_settings().await?;
     let idx = settings

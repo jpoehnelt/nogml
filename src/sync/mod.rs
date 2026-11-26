@@ -231,12 +231,13 @@ pub async fn ingest_synced_message(
                 },
             );
             let webhook_policy = crate::ai::rules::RuleWebhookPolicy::from_config(&state.config);
-            outcome.message = crate::ai::rules::evaluate_inbox_rules_with_policy(
+            outcome.message = crate::ai::rules::evaluate_inbox_rules_with_cipher(
                 state.store.as_ref(),
                 &state.events,
                 &outcome.message,
                 state.config.untrusted_content_guard,
                 &webhook_policy,
+                state.cipher.as_ref(),
             )
             .await;
             let _ = state.post_store_message(&outcome.message).await;
