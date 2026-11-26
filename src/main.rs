@@ -1007,6 +1007,18 @@ enum MailAction {
     },
     /// List available labels.
     Labels,
+    /// Daily briefing: unread VIP threads, needs-reply threads, follow-ups due, pending approvals, and due snoozes.
+    Briefing {
+        /// Only include unread VIP threads active at or after this RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Days without a reply before a sent thread counts as a follow-up (default 3).
+        #[arg(long)]
+        followup_days: Option<u32>,
+        /// Maximum items per section (default 20, max 100).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Manage pending human-in-the-loop outbound approvals.
     Approvals {
         #[command(subcommand)]
@@ -1900,6 +1912,30 @@ async fn run_remote_mail(
             let resp = with_optional_bearer(client.get(format!("{base}/v1/labels")), bearer_token)
                 .send()
                 .await?;
+            let val = parse_remote_json(resp).await?;
+            emit_output(val, fields, json_flag)
+        }
+        MailAction::Briefing {
+            since,
+            followup_days,
+            limit,
+        } => {
+            let mut params: Vec<(String, String)> = Vec::new();
+            if let Some(since) = since {
+                params.push(("since".to_string(), since));
+            }
+            if let Some(days) = followup_days {
+                params.push(("followup_days".to_string(), days.to_string()));
+            }
+            if let Some(limit) = limit {
+                params.push(("limit".to_string(), limit.to_string()));
+            }
+            let resp = with_optional_bearer(
+                client.get(format!("{base}/v1/briefing")).query(&params),
+                bearer_token,
+            )
+            .send()
+            .await?;
             let val = parse_remote_json(resp).await?;
             emit_output(val, fields, json_flag)
         }
@@ -2854,6 +2890,23 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 MailAction::Labels => {
                     let labels = state.store.list_labels().await?;
                     emit_output(json!({ "labels": labels }), fields.as_deref(), json_flag)?;
+                }
+                MailAction::Briefing {
+                    since,
+                    followup_days,
+                    limit,
+                } => {
+                    let since = ai::parse_briefing_since(since.as_deref())?;
+                    let val = ai::execute_briefing(
+                        &state,
+                        ai::BriefingParams {
+                            since,
+                            followup_days,
+                            limit,
+                        },
+                    )
+                    .await?;
+                    emit_output(val, fields.as_deref(), json_flag)?;
                 }
                 MailAction::Approvals { action } => match action {
                     ApprovalsAction::List { status, limit } => {
