@@ -235,6 +235,7 @@ impl McpServer {
             | "read_email"
             | "read_attachment_text"
             | "get_thread_annotations"
+            | "get_reply_context"
             | "list_labels"
             | "lookup_contact"
             | "list_vips"
@@ -316,6 +317,7 @@ impl McpServer {
                     "cancel_scheduled_send" => self.tool_cancel_scheduled_send(arguments).await,
                     "annotate_thread" => self.tool_annotate_thread(arguments).await,
                     "get_thread_annotations" => self.tool_get_thread_annotations(arguments).await,
+                    "get_reply_context" => self.tool_get_reply_context(arguments).await,
                     "modify_labels" => self.tool_modify_labels(arguments).await,
                     "unsubscribe" => self.tool_unsubscribe(arguments).await,
                     "list_labels" => self.tool_list_labels().await,
@@ -1018,6 +1020,41 @@ impl McpServer {
 
         let parsed: Args = serde_json::from_value(args)?;
         ai::execute_get_thread_annotations(&self.state, &parsed.thread_id).await
+    }
+
+    async fn tool_get_reply_context(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            thread_id: String,
+            max_body_chars: Option<usize>,
+            max_style_samples: Option<usize>,
+            max_related_threads: Option<usize>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let ctx = ai::execute_get_reply_context(
+            &self.state,
+            &parsed.thread_id,
+            ai::ReplyContextOptions {
+                max_body_chars: parsed.max_body_chars,
+                max_style_samples: parsed.max_style_samples,
+                max_related_threads: parsed.max_related_threads,
+            },
+        )
+        .await?;
+
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                vec![parsed.thread_id],
+                "ok",
+                Some("reply_context".to_string()),
+            )
+            .await;
+
+        Ok(serde_json::to_value(ctx)?)
     }
 
     async fn tool_modify_labels(&self, args: Value) -> AppResult<Value> {
@@ -1967,6 +2004,26 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "get_reply_context",
+            "description": "Fetch everything needed to draft a reply in one call: the quote-stripped thread, annotation, participant contact profiles, recent sent messages to the primary recipient for tone matching, and related threads.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "max_body_chars": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "max_style_samples": { "type": "integer", "minimum": 0, "maximum": 10, "default": 3 },
+                    "max_related_threads": { "type": "integer", "minimum": 0, "maximum": 20, "default": 5 }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "modify_labels",
             "description": "Add or remove labels across multiple message_ids and/or thread_ids (supports archive, mark_read, trash shorthands and dry_run).",
             "inputSchema": {
@@ -2336,6 +2393,7 @@ mod tests {
             "cancel_scheduled_send",
             "annotate_thread",
             "get_thread_annotations",
+            "get_reply_context",
             "modify_labels",
             "unsubscribe",
             "list_labels",
@@ -2349,7 +2407,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 25);
+        assert_eq!(names.len(), 26);
     }
 
     #[tokio::test]
