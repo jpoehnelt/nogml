@@ -239,6 +239,7 @@ impl McpServer {
             | "list_labels"
             | "lookup_contact"
             | "list_vips"
+            | "get_briefing"
             | "list_scheduled_sends"
             | "list_rules"
             | "sync_status" => AuthScope::Read,
@@ -323,6 +324,7 @@ impl McpServer {
                     "list_labels" => self.tool_list_labels().await,
                     "lookup_contact" => self.tool_lookup_contact(arguments).await,
                     "list_vips" => self.tool_list_vips(arguments).await,
+                    "get_briefing" => self.tool_get_briefing(arguments).await,
                     "list_rules" => self.tool_list_rules().await,
                     "create_rule" => self.tool_create_rule(arguments).await,
                     "delete_rule" => self.tool_delete_rule(arguments).await,
@@ -413,6 +415,9 @@ impl McpServer {
                 }))
             }
             "nogml://labels" => self.tool_list_labels().await.map_err(RpcError::from_app),
+            "nogml://briefing" => ai::execute_briefing(&self.state, ai::BriefingParams::default())
+                .await
+                .map_err(RpcError::from_app),
             "nogml://sync/status" => self.tool_sync_status().await.map_err(RpcError::from_app),
             "nogml://status" => {
                 let profile = self
@@ -1172,6 +1177,38 @@ impl McpServer {
         }))
     }
 
+    async fn tool_get_briefing(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Default, Deserialize)]
+        struct Args {
+            since: Option<String>,
+            followup_days: Option<u32>,
+            limit: Option<usize>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let since = ai::parse_briefing_since(parsed.since.as_deref())?;
+        let body = ai::execute_briefing(
+            &self.state,
+            ai::BriefingParams {
+                since,
+                followup_days: parsed.followup_days,
+                limit: parsed.limit,
+            },
+        )
+        .await?;
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                Vec::new(),
+                "ok",
+                Some("briefing".to_string()),
+            )
+            .await;
+        Ok(body)
+    }
+
     async fn tool_list_rules(&self) -> AppResult<Value> {
         ai::rules::execute_list_rules(&self.state).await
     }
@@ -1589,6 +1626,12 @@ fn static_resources() -> Value {
             "uri": "nogml://unread",
             "name": "Unread Threads",
             "description": "Unread conversation thread summaries.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "nogml://briefing",
+            "name": "Daily Briefing",
+            "description": "Compact daily briefing: unread VIP threads, needs-reply threads, follow-ups due, pending approvals, and due snoozes.",
             "mimeType": "application/json"
         },
         {
@@ -2097,6 +2140,24 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "get_briefing",
+            "description": "Get one compact daily briefing: unread VIP threads, threads needing a reply, sent threads with no reply after followup_days, pending outbound approvals, due snoozes, and counts. Returns summaries only, never full bodies.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "string", "description": "RFC 3339 timestamp; only unread VIP threads active at or after this time are returned." },
+                    "followup_days": { "type": "integer", "minimum": 0, "default": 3 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_vips",
             "description": "List VIP contacts for the active mailbox (inferred from reply frequency or marked manually), ordered by activity.",
             "inputSchema": {
@@ -2365,7 +2426,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 25 tools
+        // tools/list advertises all 27 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -2399,6 +2460,7 @@ mod tests {
             "list_labels",
             "lookup_contact",
             "list_vips",
+            "get_briefing",
             "list_rules",
             "create_rule",
             "delete_rule",
@@ -2407,7 +2469,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 26);
+        assert_eq!(names.len(), 27);
     }
 
     #[tokio::test]
@@ -2634,6 +2696,7 @@ mod tests {
             .collect();
         assert!(uris.contains(&"nogml://inbox"));
         assert!(uris.contains(&"nogml://labels"));
+        assert!(uris.contains(&"nogml://briefing"));
         assert!(uris.contains(&"nogml://sync/status"));
 
         let tlist = server

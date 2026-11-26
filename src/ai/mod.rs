@@ -4,6 +4,7 @@
 //!
 //! Owned by the `ai-mcp` worker.
 
+pub mod briefing;
 pub mod reply_context;
 pub mod rules;
 pub mod safety;
@@ -72,6 +73,10 @@ use crate::{
     transport::{OutboundAttachment, OutboundMessage},
 };
 
+pub use briefing::{
+    ApprovalBriefingItem, BriefingCounts, BriefingParams, BriefingResponse, FollowUpCandidate,
+    build_briefing, execute_briefing, parse_briefing_since,
+};
 pub use reply_context::{
     ReplyContextOptions, ReplyContextResponse, clean_subject, execute_get_reply_context,
 };
@@ -195,6 +200,7 @@ pub fn router() -> Router<AppState> {
 
 /// Build the AI-first `/v1` router:
 /// - `GET /v1/capabilities`
+/// - `GET /v1/briefing`
 /// - `GET /v1/threads`, `POST /v1/threads/batch_triage`, `GET /v1/threads/{id}`, `POST /v1/threads/{id}/triage`
 /// - `GET /v1/threads/{id}/reply-context`
 /// - `GET /v1/messages`, `GET /v1/messages/{id}`, `GET /v1/messages/{id}/attachments/{attachment_id}`
@@ -208,6 +214,7 @@ pub fn router() -> Router<AppState> {
 pub fn ai_router() -> Router<AppState> {
     Router::new()
         .route("/v1/capabilities", get(get_capabilities))
+        .route("/v1/briefing", get(briefing_handler))
         .route("/v1/threads", get(list_threads))
         .route("/v1/threads/batch_triage", post(batch_triage_handler))
         .route("/v1/threads/{id}", get(get_thread))
@@ -3518,6 +3525,7 @@ async fn get_capabilities(
         "mcp_endpoint": "/mcp",
         "endpoints": [
             "GET /v1/capabilities",
+            "GET /v1/briefing",
             "GET /v1/threads",
             "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
@@ -4243,6 +4251,42 @@ async fn send_draft_handler(
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BriefingQueryParams {
+    since: Option<String>,
+    followup_days: Option<u32>,
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+async fn briefing_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(params): Query<BriefingQueryParams>,
+) -> Result<Json<Value>, AiError> {
+    let since = parse_briefing_since(params.since.as_deref())?;
+    let body = execute_briefing(
+        &state,
+        BriefingParams {
+            since,
+            followup_days: params.followup_days,
+            limit: params.limit,
+        },
+    )
+    .await?;
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            Vec::new(),
+            "ok",
+            Some("briefing".to_string()),
+        )
+        .await;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
 }
 
 async fn list_approvals_handler(

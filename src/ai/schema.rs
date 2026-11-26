@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 /// Build a self-describing runtime schema manifest for CLI subcommands and `/v1/` endpoints.
 pub fn runtime_schema(command: Option<&str>) -> Value {
-    let commands = json!({
+    let mut commands = json!({
         "mail.search": {
             "endpoint": "GET /v1/search",
             "mcp_tool": "search_emails",
@@ -414,6 +414,24 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         }
     });
+    if let Some(obj) = commands.as_object_mut() {
+        obj.insert(
+            "mail.briefing".to_string(),
+            json!({
+                "endpoint": "GET /v1/briefing",
+                "mcp_tool": "get_briefing",
+                "description": "One compact daily briefing: unread VIP threads, needs_reply or waiting_on=me threads, sent threads with no reply after followup_days, pending outbound approvals, due snoozes, and counts. Also available as the nogml://briefing MCP resource. Summaries only, never full bodies.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "since": { "type": "string", "description": "RFC 3339 timestamp filter for unread VIP threads." },
+                        "followup_days": { "type": "integer", "minimum": 0, "default": 3 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                }
+            }),
+        );
+    }
 
     if let Some(name) = command {
         let normalized = name.trim().to_ascii_lowercase();
@@ -434,6 +452,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
+            "briefing" | "get_briefing" => "mail.briefing",
             "contacts" | "lookup_contact" | "list_vips" | "vips" => "mail.contacts",
             "rules" | "list_rules" | "create_rule" | "delete_rule" => "mail.rules",
             "approvals" | "approve" | "reject" => "mail.approvals",
