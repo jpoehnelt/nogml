@@ -11,7 +11,7 @@ Ready-to-use templates live in [`deploy/`](../deploy):
 
 ## Configuration and secret loading
 
-`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`).
+`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`, `auth`).
 
 Precedence from highest to lowest:
 
@@ -40,6 +40,39 @@ nogml config check --config /etc/nogml/nogml.toml
 ```
 
 `nogml config check` prints a JSON report (`{ "ok", "config_file", "warnings", "errors", "effective_config" }`) with every secret, token, password, and database URL replaced by `"[REDACTED]"`. It exits `0` when valid and `2` on any configuration error.
+
+### Mint per-agent scoped tokens (`nogml auth mint-token`)
+
+Generate a high-entropy scoped token for each agent without hand-editing TOML or JSON. Pass `--output-file` to store the raw secret in a mode `0600` file and emit a `file://` reference so no plaintext token enters `nogml.toml`:
+
+```bash
+# Write the raw token to a mode 0600 file and append the [[auth.scoped_tokens]] block to nogml.toml
+nogml auth mint-token \
+  --mailbox agent@example.com \
+  --scopes read,write \
+  --draft-only \
+  --allowed-recipients @example.com,partner@acme.org \
+  --max-send-recipients 5 \
+  --output-file /etc/nogml/secrets/triage_agent_token >> /etc/nogml/nogml.toml
+
+# Or emit a JSON array compatible with NOGML_SCOPED_TOKENS
+nogml auth mint-token --mailbox agent@example.com --scopes read --json
+```
+
+Validate the updated config with `nogml config check --config /etc/nogml/nogml.toml`.
+
+### Obtain a Gmail OAuth2 refresh token (`nogml auth gmail`)
+
+For upstream Gmail API sync (`sync.mode = "api"`), run the loopback OAuth2 PKCE (`S256`) consent flow to obtain a refresh token and save it directly to a mode `0600` file:
+
+```bash
+GMAIL_CLIENT_ID="your-client-id.apps.googleusercontent.com" \
+GMAIL_CLIENT_SECRET="your-client-secret" \
+nogml auth gmail \
+  --output-file /etc/nogml/secrets/gmail_refresh_token
+```
+
+Pass `--no-browser` on headless or SSH hosts to print the authorization URL to stderr without launching a local browser. `nogml auth gmail` binds an ephemeral loopback callback (`http://127.0.0.1:<port>/callback`), verifies the CSRF `state`, exchanges the authorization code with the PKCE `code_verifier`, writes the refresh token with mode `0600`, and prints a redacted JSON summary with the `[sync]` `gmail_refresh_token = "file://..."` snippet. Raw tokens are never written to logs or stdout.
 
 ### Secret reference formats
 

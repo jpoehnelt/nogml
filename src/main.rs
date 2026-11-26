@@ -18,7 +18,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 use nogml::{
     AppState,
     ai::{self, ApprovalDecisionRequest},
-    auth::ScopedTokenConfig,
+    auth::{AuthScope, ScopedTokenConfig},
+    auth_wizard::{
+        DEFAULT_GMAIL_AUTH_URL, DEFAULT_GMAIL_SCOPE, DEFAULT_GMAIL_TOKEN_URL,
+        DEFAULT_OAUTH_TIMEOUT_SECS, GmailAuthOptions, MintTokenOptions, mint_scoped_token,
+        parse_auth_scope, render_scoped_token_json, render_scoped_token_toml, run_gmail_oauth_flow,
+    },
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
@@ -33,8 +38,8 @@ use nogml::{
     models::{AiCreateDraftRequest, AiSendEmailRequest, AiTriageRequest},
     search_index::reindex_mailbox,
     secrets::{
-        SecretResolutionReport, ValueOrigin, generate_bearer_token, system_env_lookup,
-        write_secret_file,
+        SecretResolutionReport, ValueOrigin, generate_bearer_token, read_secret_file,
+        resolve_secret_value, system_env_lookup, write_secret_file,
     },
     storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store_async},
     sync::{self, SyncRunOptions},
@@ -606,6 +611,12 @@ enum Command {
         action: ConfigCommand,
     },
 
+    /// Interactive Gmail OAuth2 consent and least-privilege scoped token setup (`gmail`, `mint-token`).
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
+    },
+
     /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints.
     Schema {
         /// Optional command or endpoint name to inspect.
@@ -744,6 +755,94 @@ enum ConfigCommand {
 
     /// Validate layered config, secret references, and IMAP TLS files, printing redacted JSON.
     Check(Box<ServeArgs>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum MintTokenFormat {
+    #[default]
+    Toml,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Generate a high-entropy least-privilege scoped token (`[[auth.scoped_tokens]]` TOML or `NOGML_SCOPED_TOKENS` JSON).
+    ///
+    /// Also honors global flags `--user-email`, `--draft-only`, `--allowed-recipients`,
+    /// and `--max-send-recipients` when passed on the command line.
+    MintToken {
+        /// Target mailbox email address (defaults to `--user-email` or `nogml.toml` `auth.user_email`).
+        #[arg(long)]
+        mailbox: Option<String>,
+
+        /// Comma-separated scopes (`read`, `write`, `send`, `admin`).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "read,write",
+            value_parser = parse_auth_scope
+        )]
+        scopes: Vec<AuthScope>,
+
+        /// Write the raw token to a mode 0600 secret file and emit a `file://` reference instead of plaintext.
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+
+        /// Overwrite an existing `--output-file`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Output format (`toml` or `json`).
+        #[arg(long, value_enum, default_value_t = MintTokenFormat::Toml)]
+        format: MintTokenFormat,
+
+        /// Emit JSON array output compatible with `NOGML_SCOPED_TOKENS` (shorthand for `--format json`).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Run a loopback OAuth2 PKCE consent flow against Google and save the refresh token with mode 0600.
+    Gmail {
+        /// Google OAuth2 client ID (defaults to `GMAIL_CLIENT_ID` or `nogml.toml` `sync.gmail_client_id`).
+        #[arg(long, env = "GMAIL_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// Optional Google OAuth2 client secret (defaults to `GMAIL_CLIENT_SECRET`, `GMAIL_CLIENT_SECRET_FILE`, or `nogml.toml`).
+        #[arg(long, env = "GMAIL_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
+        /// OAuth2 authorization endpoint URL.
+        #[arg(long, default_value = DEFAULT_GMAIL_AUTH_URL)]
+        auth_url: String,
+
+        /// OAuth2 token exchange endpoint URL (overridable for automated tests).
+        #[arg(long, default_value = DEFAULT_GMAIL_TOKEN_URL)]
+        token_url: String,
+
+        /// Comma- or space-separated Gmail OAuth2 scopes.
+        #[arg(long, default_value = DEFAULT_GMAIL_SCOPE)]
+        scopes: String,
+
+        /// Loopback listen address for the one-shot `/callback` HTTP server.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: SocketAddr,
+
+        /// Path to write the obtained `refresh_token` (mode 0600 on Unix).
+        #[arg(long)]
+        output_file: PathBuf,
+
+        /// Overwrite an existing `--output-file`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Print the authorization URL to stderr without launching a local browser.
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+
+        /// Maximum seconds to wait for the OAuth2 callback before timing out.
+        #[arg(long, default_value_t = DEFAULT_OAUTH_TIMEOUT_SECS)]
+        timeout_secs: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2068,6 +2167,210 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
             }
         },
 
+        Command::Auth { action } => match action {
+            AuthCommand::MintToken {
+                mailbox,
+                scopes,
+                output_file,
+                force,
+                format,
+                json: json_flag,
+            } => {
+                let resolved_mailbox =
+                    if let Some(mb) = mailbox.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(mb.to_string())
+                    } else if is_explicit(&matches, "user_email") {
+                        cli.common
+                            .user_email
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    } else if let Some(ref cfg_path) = cli.common.config {
+                        let toml_cfg = TomlConfig::from_file(cfg_path)?;
+                        toml_cfg
+                            .auth
+                            .user_email
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    } else {
+                        None
+                    };
+
+                let draft_only = (arg_origin(&matches, "draft_only") == ValueOrigin::Cli)
+                    .then_some(cli.common.draft_only);
+                let allowed_recipients = (arg_origin(&matches, "allowed_recipients")
+                    == ValueOrigin::Cli)
+                    .then(|| cli.common.allowed_recipients.clone());
+                let max_send_recipients = (arg_origin(&matches, "max_send_recipients")
+                    == ValueOrigin::Cli)
+                    .then_some(cli.common.max_send_recipients);
+
+                let minted = mint_scoped_token(&MintTokenOptions {
+                    mailbox: resolved_mailbox,
+                    scopes,
+                    draft_only,
+                    allowed_recipients,
+                    max_send_recipients,
+                    output_file,
+                    force,
+                })?;
+
+                if let Some(ref saved_to) = minted.saved_to {
+                    eprintln!(
+                        "Wrote scoped token (mode 0600) to '{}'.",
+                        saved_to.display()
+                    );
+                }
+
+                let effective_format = if json_flag {
+                    MintTokenFormat::Json
+                } else {
+                    format
+                };
+                match effective_format {
+                    MintTokenFormat::Toml => {
+                        println!("{}", render_scoped_token_toml(&minted.entry));
+                    }
+                    MintTokenFormat::Json => {
+                        let pretty = std::io::stdout().is_terminal();
+                        println!("{}", render_scoped_token_json(&minted.entry, pretty)?);
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+
+            AuthCommand::Gmail {
+                client_id,
+                client_secret,
+                auth_url,
+                token_url,
+                scopes,
+                listen,
+                output_file,
+                force,
+                no_browser,
+                timeout_secs,
+            } => {
+                let gmail_matches = matches
+                    .subcommand_matches("auth")
+                    .and_then(|m| m.subcommand_matches("gmail"));
+
+                let (cfg_client_id, cfg_client_secret, cfg_token_url) =
+                    if cli.common.config.is_some() {
+                        let loaded = cli
+                            .common
+                            .load_layered(None, &matches, None, cli.log_json)?;
+                        loaded.resolution.into_result()?;
+                        (
+                            loaded.config.gmail_client_id,
+                            loaded.config.gmail_client_secret,
+                            Some(loaded.config.gmail_oauth_token_url),
+                        )
+                    } else {
+                        (
+                            cli.common.gmail_client_id,
+                            cli.common.gmail_client_secret,
+                            is_explicit(&matches, "gmail_oauth_token_url")
+                                .then_some(cli.common.gmail_oauth_token_url),
+                        )
+                    };
+
+                let resolved_client_id = client_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        cfg_client_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    })
+                    .ok_or_else(|| {
+                        AppError::Config(
+                            "GMAIL_CLIENT_ID / --client-id is required for `nogml auth gmail`"
+                                .to_string(),
+                        )
+                    })?;
+
+                let raw_client_secret = client_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        cfg_client_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    });
+
+                let resolved_client_secret = match raw_client_secret {
+                    Some(raw) if raw.starts_with("file://") || raw.starts_with("env://") => {
+                        let mut report = SecretResolutionReport::default();
+                        let val = resolve_secret_value(
+                            "sync.gmail_client_secret",
+                            &raw,
+                            None,
+                            &system_env_lookup,
+                            &mut report,
+                        );
+                        report.into_result()?;
+                        val.filter(|s| !s.trim().is_empty())
+                    }
+                    Some(raw) => Some(raw),
+                    None => {
+                        if let Some(path_str) = system_env_lookup("GMAIL_CLIENT_SECRET_FILE")
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut report = SecretResolutionReport::default();
+                            let val = read_secret_file(
+                                "sync.gmail_client_secret",
+                                Path::new(&path_str),
+                                &mut report,
+                            );
+                            report.into_result()?;
+                            val.filter(|s| !s.trim().is_empty())
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                let resolved_token_url =
+                    if gmail_matches.is_some_and(|gm| is_explicit(gm, "token_url")) {
+                        token_url
+                    } else if let Some(url) = cfg_token_url {
+                        url
+                    } else {
+                        token_url
+                    };
+
+                let summary = run_gmail_oauth_flow(GmailAuthOptions {
+                    client_id: resolved_client_id,
+                    client_secret: resolved_client_secret,
+                    auth_url,
+                    token_url: resolved_token_url,
+                    scopes,
+                    listen,
+                    output_file,
+                    force,
+                    no_browser,
+                    timeout: Duration::from_secs(timeout_secs.max(1)),
+                })
+                .await?;
+
+                emit_output(serde_json::to_value(&summary)?, None, false)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+
         Command::Schema { command } => {
             let schema = ai::runtime_schema(command.as_deref());
             emit_output(schema, None, true)?;
@@ -2385,5 +2688,15 @@ async fn main() -> ExitCode {
             }
             ExitCode::from(code as u8)
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn clap_cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 }

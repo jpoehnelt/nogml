@@ -132,13 +132,21 @@ nogml mail --url http://127.0.0.1:8080 watch
 nogml schema --command send
 ```
 
-### 4. Sync a Gmail account (`nogml sync gmail`)
+### 4. Sync a Gmail account (`nogml auth gmail`, `nogml sync gmail`)
+
+Obtain an upstream Gmail OAuth2 refresh token using the loopback PKCE wizard (saved to a mode `0600` file, never logged), then run sync:
 
 ```bash
+# Run loopback OAuth2 PKCE consent flow and save refresh token with mode 0600
+# Pass --no-browser on headless or SSH machines to open the URL manually
+GMAIL_CLIENT_ID=... \
+GMAIL_CLIENT_SECRET=... \
+nogml auth gmail --output-file ./secrets/gmail_refresh_token
+
 # Gmail REST API v1 (OAuth2 refresh token or static access token)
 GMAIL_CLIENT_ID=... \
 GMAIL_CLIENT_SECRET=... \
-GMAIL_REFRESH_TOKEN=... \
+GMAIL_REFRESH_TOKEN_FILE=./secrets/gmail_refresh_token \
 nogml sync gmail --mode api --max-messages 500
 
 # Upstream Gmail IMAP (App Password)
@@ -337,10 +345,20 @@ Superhuman-style and custom HTTP clients: override the Gmail REST root from `htt
 
 ### Scoped API keys and local OAuth2
 
-Use `NOGML_SCOPED_TOKENS` to issue least-privilege keys with explicit scopes (`read`, `write`, `send`, `admin`) and optional per-agent outbound overrides (`draft_only`, `allowed_recipients`, `max_send_recipients`). Scopes are enforced across `/v1`, `/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`, `/mcp`, and IMAP (`STORE`, `COPY`, `MOVE`, `EXPUNGE`, `APPEND`, `CREATE`, `DELETE`, and `RENAME` require `write`). Legacy `NOGML_AUTH_TOKENS` entries keep full scopes.
+Use `nogml auth mint-token` or `NOGML_SCOPED_TOKENS` to issue least-privilege keys with explicit scopes (`read`, `write`, `send`, `admin`) and optional per-agent outbound overrides (`draft_only`, `allowed_recipients`, `max_send_recipients`). Scopes are enforced across `/v1`, `/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`, `/mcp`, and IMAP (`STORE`, `COPY`, `MOVE`, `EXPUNGE`, `APPEND`, `CREATE`, `DELETE`, and `RENAME` require `write`). Legacy `NOGML_AUTH_TOKENS` entries keep full scopes.
 
 ```bash
-NOGML_SCOPED_TOKENS='[{"token":"tok_ro","scopes":["read"]},{"token":"tok_draft","scopes":["read","write","send"],"draft_only":true,"allowed_recipients":["@example.com"],"max_send_recipients":5}]' \
+# Mint a per-agent token stored in a mode 0600 file and emit a [[auth.scoped_tokens]] snippet
+nogml auth mint-token \
+  --mailbox agent@example.com \
+  --scopes read,write \
+  --draft-only \
+  --allowed-recipients @example.com \
+  --max-send-recipients 5 \
+  --output-file ./secrets/agent_token >> nogml.toml
+
+# Or emit JSON directly for NOGML_SCOPED_TOKENS
+NOGML_SCOPED_TOKENS="$(nogml auth mint-token --mailbox agent@example.com --scopes read --draft-only --json)" \
 nogml serve --user-email agent@example.com
 ```
 
