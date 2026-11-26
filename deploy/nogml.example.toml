@@ -92,6 +92,9 @@ draft_only = false
 # Options: "block", "downgrade"
 draft_only_action = "block"
 require_approval = false
+first_contact_approval = false
+# Options: "off", "hold", "deny"
+dlp_action = "off"
 approval_ttl_secs = 86400
 approval_webhook_url = "https://hooks.example.com/nogml-approvals"
 allowed_recipients = ["@example.com", "partner@acme.org"]

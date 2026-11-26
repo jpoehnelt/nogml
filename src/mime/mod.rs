@@ -40,7 +40,10 @@ pub use attachments::{
 pub use fields::apply_fields_mask;
 pub use markdown::{decode_html_entities, html_to_markdown, select_body_or_html_markdown};
 pub use payload::build_gmail_payload;
-pub use text::{generate_snippet, sanitize_untrusted_text, strip_quoted_text};
+pub use text::{
+    extract_html_links, generate_snippet, sanitize_untrusted_text, strip_quoted_text,
+    strip_tracking_pixels,
+};
 pub use unsubscribe::{
     RFC8058_ONE_CLICK_BODY, parse_unsubscribe_from_raw, parse_unsubscribe_headers,
 };

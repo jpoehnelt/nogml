@@ -141,6 +141,19 @@ pub enum DraftOnlyAction {
     Downgrade,
 }
 
+/// Action taken by `DlpOutboundPolicy` when outbound mail matches a secret or PII pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DlpAction {
+    /// Disable outbound secret and PII DLP scanning.
+    #[default]
+    Off,
+    /// Hold matching sends in the persistent approval queue (HTTP `202`).
+    Hold,
+    /// Reject matching sends immediately (HTTP `403`).
+    Deny,
+}
+
 /// Upstream Gmail sync transport mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +266,10 @@ pub struct Config {
     pub draft_only_action: DraftOnlyAction,
     /// When `true`, `ConfigOutboundPolicy` holds all outbound sends for human approval (HTTP `202`).
     pub require_approval: bool,
+    /// When `true`, `FirstContactPolicy` holds outbound sends to recipients with no prior sent history.
+    pub first_contact_approval: bool,
+    /// Action taken by `DlpOutboundPolicy` when secrets or sensitive PII are detected (`off`, `hold`, `deny`).
+    pub dlp_action: DlpAction,
     /// Time-to-live in seconds for pending human approval requests (default 86400s / 24h).
     pub approval_ttl_secs: u64,
     /// Optional webhook URL notified via HTTP POST whenever a send enters `HoldForApproval`.
@@ -397,6 +414,8 @@ impl Default for Config {
             draft_only: false,
             draft_only_action: DraftOnlyAction::Block,
             require_approval: false,
+            first_contact_approval: false,
+            dlp_action: DlpAction::Off,
             approval_ttl_secs: 86_400,
             approval_webhook_url: None,
             allowed_recipients: Vec::new(),
@@ -631,6 +650,8 @@ impl Config {
             draft_only,
             draft_only_action,
             require_approval,
+            first_contact_approval,
+            dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
             allowed_recipients,
@@ -771,6 +792,8 @@ impl Config {
                 "draft_only": draft_only,
                 "draft_only_action": draft_only_action,
                 "require_approval": require_approval,
+                "first_contact_approval": first_contact_approval,
+                "dlp_action": dlp_action,
                 "approval_ttl_secs": approval_ttl_secs,
                 "approval_webhook_url": approval_webhook_url,
                 "allowed_recipients": allowed_recipients,
@@ -1204,6 +1227,8 @@ impl fmt::Debug for Config {
             draft_only,
             draft_only_action,
             require_approval,
+            first_contact_approval,
+            dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
             allowed_recipients,
@@ -1320,6 +1345,8 @@ impl fmt::Debug for Config {
             .field("draft_only", draft_only)
             .field("draft_only_action", draft_only_action)
             .field("require_approval", require_approval)
+            .field("first_contact_approval", first_contact_approval)
+            .field("dlp_action", dlp_action)
             .field("approval_ttl_secs", approval_ttl_secs)
             .field("approval_webhook_url", approval_webhook_url)
             .field("allowed_recipients", allowed_recipients)
@@ -1498,6 +1525,8 @@ pub struct SafetyTomlConfig {
     pub draft_only: Option<bool>,
     pub draft_only_action: Option<DraftOnlyAction>,
     pub require_approval: Option<bool>,
+    pub first_contact_approval: Option<bool>,
+    pub dlp_action: Option<DlpAction>,
     pub approval_ttl_secs: Option<u64>,
     pub approval_webhook_url: Option<String>,
     pub allowed_recipients: Option<Vec<String>>,
@@ -1777,6 +1806,12 @@ impl TomlConfig {
         }
         if let Some(v) = self.safety.require_approval {
             cfg.require_approval = v;
+        }
+        if let Some(v) = self.safety.first_contact_approval {
+            cfg.first_contact_approval = v;
+        }
+        if let Some(v) = self.safety.dlp_action {
+            cfg.dlp_action = v;
         }
         if let Some(v) = self.safety.approval_ttl_secs {
             cfg.approval_ttl_secs = v;
@@ -2314,6 +2349,8 @@ base_url = "https://api.resend.com"
 draft_only = true
 draft_only_action = "block"
 require_approval = false
+first_contact_approval = false
+dlp_action = "off"
 approval_ttl_secs = 86400
 # allowed_recipients = ["@{default_domain}"]
 max_send_recipients = 50

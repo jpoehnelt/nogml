@@ -573,7 +573,13 @@ async fn execute_gmail_send(
         subject: outbound.subject.clone(),
         text: outbound.text.clone(),
         html: outbound.html.clone(),
+        attachment_filenames: outbound
+            .attachments
+            .iter()
+            .filter_map(|a| a.filename.clone())
+            .collect(),
         thread_id: thread_id.clone(),
+        mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send,
         agent_policy,
     };

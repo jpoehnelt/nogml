@@ -27,7 +27,7 @@ use nogml::{
     blob::{migrate_blobs, open_blob_store},
     build_router,
     config::{
-        AuthFailAction, BlobBackend, Config, ConfigCheckReport, DraftOnlyAction,
+        AuthFailAction, BlobBackend, Config, ConfigCheckReport, DlpAction, DraftOnlyAction,
         RspamdRejectAction, SearchBackend, SmtpTlsMode, StorageBackend, SyncMode, TomlConfig,
         TransportBackend, render_starter_toml, validate_config,
     },
@@ -303,6 +303,19 @@ struct CommonConfigArgs {
         global = true
     )]
     require_approval: bool,
+
+    /// Hold outbound sends to recipients with no prior sent history for human approval.
+    #[arg(
+        long,
+        env = "NOGML_FIRST_CONTACT_APPROVAL",
+        default_value_t = false,
+        global = true
+    )]
+    first_contact_approval: bool,
+
+    /// Outbound secret/PII DLP scanner action (`off`, `hold`, or `deny`).
+    #[arg(long, env = "NOGML_DLP_ACTION", default_value = "off", global = true)]
+    dlp_action: DlpAction,
 
     /// Time-to-live in seconds for pending outbound approval requests (default 86400s).
     #[arg(
@@ -1230,6 +1243,12 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "require_approval") {
             cfg.require_approval = self.require_approval;
+        }
+        if is_explicit(root_matches, "first_contact_approval") {
+            cfg.first_contact_approval = self.first_contact_approval;
+        }
+        if is_explicit(root_matches, "dlp_action") {
+            cfg.dlp_action = self.dlp_action;
         }
         if is_explicit(root_matches, "approval_ttl_secs") {
             cfg.approval_ttl_secs = self.approval_ttl_secs;
