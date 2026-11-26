@@ -887,7 +887,9 @@ async fn execute_mailto_unsubscribe(
         .await?;
 
     state.post_store_message(&stored).await?;
-    state.metrics.inc_messages_sent();
+    state
+        .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+        .await;
 
     state.events.publish(
         source,

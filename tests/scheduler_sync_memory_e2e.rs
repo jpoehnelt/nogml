@@ -860,6 +860,71 @@ impl MailStore for FailingInsertStore {
     async fn delete_domain(&self, domain: &str) -> AppResult<bool> {
         self.inner.delete_domain(domain).await
     }
+    async fn upsert_suppression(
+        &self,
+        input: nogml::storage::NewSuppressionInput,
+    ) -> AppResult<nogml::storage::SuppressionEntry> {
+        self.inner.upsert_suppression(input).await
+    }
+    async fn get_suppression(
+        &self,
+        email: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<nogml::storage::SuppressionEntry>> {
+        self.inner.get_suppression(email, now_ms).await
+    }
+    async fn find_suppressed_emails(
+        &self,
+        emails: &[String],
+        now_ms: i64,
+    ) -> AppResult<Vec<nogml::storage::SuppressionEntry>> {
+        self.inner.find_suppressed_emails(emails, now_ms).await
+    }
+    async fn list_suppressions(
+        &self,
+        query: &nogml::storage::SuppressionQuery,
+        now_ms: i64,
+    ) -> AppResult<Vec<nogml::storage::SuppressionEntry>> {
+        self.inner.list_suppressions(query, now_ms).await
+    }
+    async fn delete_suppression(&self, email: &str) -> AppResult<bool> {
+        self.inner.delete_suppression(email).await
+    }
+    async fn record_deliverability_event(
+        &self,
+        input: nogml::storage::NewDeliverabilityEvent,
+    ) -> AppResult<nogml::storage::DeliverabilityEvent> {
+        self.inner.record_deliverability_event(input).await
+    }
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        since_ms: i64,
+    ) -> AppResult<nogml::storage::DeliverabilityCounts> {
+        self.inner
+            .count_deliverability_events(domain, since_ms)
+            .await
+    }
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+        self.inner.list_deliverability_domains().await
+    }
+    async fn get_domain_deliverability_state(
+        &self,
+        domain: &str,
+    ) -> AppResult<Option<nogml::storage::DomainDeliverabilityState>> {
+        self.inner.get_domain_deliverability_state(domain).await
+    }
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<nogml::storage::DomainDeliverabilityState> {
+        self.inner
+            .set_domain_deliverability_paused(domain, paused, reason, now_ms)
+            .await
+    }
 }
 
 #[tokio::test]

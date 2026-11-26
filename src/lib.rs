@@ -7,6 +7,7 @@ pub mod auth_wizard;
 pub mod blob;
 pub mod config;
 pub mod crypto;
+pub mod deliverability;
 pub mod doctor;
 pub mod domains;
 pub mod error;
@@ -95,6 +96,8 @@ pub struct AppState {
     pub auth: Arc<dyn AuthProvider>,
     pub search: Arc<dyn SearchIndex>,
     pub outbound_policy: Arc<dyn OutboundPolicy>,
+    /// Persistent deliverability guard (suppression list, domain daily quota, and circuit breaker).
+    pub deliverability_policy: Arc<crate::deliverability::DeliverabilityPolicy>,
     /// AES-256-GCM encryption-at-rest cipher for stored secrets and credentials.
     pub cipher: Arc<SecretCipher>,
     /// Underlying Resend client used by `POST /webhooks/resend` Receiving API fetches.
@@ -216,6 +219,9 @@ impl AppState {
         let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
+        let deliverability_policy = Arc::new(
+            crate::deliverability::DeliverabilityPolicy::from_config(&config, store.clone()),
+        );
         let domain_providers =
             Arc::new(crate::domains::DomainProviderRegistry::from_config(&config));
         let sync_lock = Arc::new(Mutex::new(()));
@@ -240,6 +246,7 @@ impl AppState {
             auth,
             search,
             outbound_policy,
+            deliverability_policy,
             cipher,
             resend,
             domain_providers,
@@ -319,6 +326,9 @@ impl AppState {
             Err(_) => Arc::new(StoreSearchIndex::new(store.clone())),
         };
         let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
+        let deliverability_policy = Arc::new(
+            crate::deliverability::DeliverabilityPolicy::from_config(&config, store.clone()),
+        );
         let domain_providers =
             Arc::new(crate::domains::DomainProviderRegistry::from_config(&config));
         let sync_lock = Arc::new(Mutex::new(()));
@@ -335,6 +345,7 @@ impl AppState {
             auth,
             search,
             outbound_policy,
+            deliverability_policy,
             cipher,
             resend,
             domain_providers,
@@ -358,14 +369,29 @@ impl AppState {
         }
     }
 
-    /// Evaluate `self.outbound_policy` and record the resulting decision in `self.metrics`.
+    /// Evaluate `self.outbound_policy` and `self.deliverability_policy`, recording the resulting
+    /// decision in `self.metrics`.
     pub async fn evaluate_outbound_policy(
         &self,
         check: &crate::ai::safety::OutboundCheck,
     ) -> AppResult<crate::ai::safety::OutboundDecision> {
-        let res = self.outbound_policy.evaluate(check).await;
+        let primary = self.outbound_policy.evaluate(check).await;
+        let res = match primary {
+            Err(err) => Err(err),
+            Ok(deny @ crate::ai::safety::OutboundDecision::Deny { .. }) => Ok(deny),
+            Ok(other_decision) => match self.deliverability_policy.evaluate(check).await {
+                Ok(deny @ crate::ai::safety::OutboundDecision::Deny { .. }) => Ok(deny),
+                Ok(_) => Ok(other_decision),
+                Err(err) => Err(err),
+            },
+        };
         match &res {
-            Ok(decision) => self.metrics.record_policy_decision(decision),
+            Ok(decision) => {
+                self.metrics.record_policy_decision(decision);
+                if let crate::ai::safety::OutboundDecision::Deny { code, .. } = decision {
+                    self.metrics.inc_deliverability_blocked(code);
+                }
+            }
             Err(
                 crate::error::AppError::RecipientNotAllowed { .. }
                 | crate::error::AppError::PolicyDenied { .. }
@@ -375,6 +401,35 @@ impl AppState {
             Err(_) => {}
         }
         res
+    }
+
+    /// Record a successfully dispatched outbound send in Prometheus metrics and persistent
+    /// deliverability telemetry (`deliverability_events` with `kind = "sent"`).
+    pub async fn record_outbound_sent(&self, from: &str, to: &[String], provider: &str) {
+        self.metrics.inc_messages_sent();
+        self.metrics.inc_deliverability_sent();
+
+        let domain =
+            crate::deliverability::resolve_sender_domain(from, &self.config.default_domain);
+        if domain.is_empty() {
+            return;
+        }
+        let recipient = to
+            .first()
+            .map(|r| crate::ai::safety::extract_email_address(r))
+            .filter(|s| !s.is_empty());
+        let event = crate::storage::NewDeliverabilityEvent {
+            domain,
+            mailbox_id: Some(self.mailbox_id().to_string()),
+            kind: crate::storage::DeliverabilityEventKind::Sent,
+            recipient,
+            provider: Some(provider.to_string()),
+            detail: None,
+            created_at_ms: None,
+        };
+        if let Err(err) = self.store.record_deliverability_event(event).await {
+            tracing::warn!(error = %err, "Failed to record outbound sent deliverability event");
+        }
     }
 
     /// Signal graceful shutdown to all active long-lived handlers (such as `/v1/events` SSE streams).
@@ -459,6 +514,7 @@ impl AppState {
             auth: self.auth.clone(),
             search,
             outbound_policy,
+            deliverability_policy: self.deliverability_policy.clone(),
             cipher: self.cipher.clone(),
             resend: self.resend.clone(),
             domain_providers: self.domain_providers.clone(),

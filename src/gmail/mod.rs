@@ -633,11 +633,17 @@ async fn execute_gmail_send(
                     hint: hint.unwrap_or(reason),
                 });
             }
+            let details = if code == "recipient_suppressed" {
+                let suppressed = crate::deliverability::extract_suppressed_from_reason(&reason);
+                (!suppressed.is_empty()).then(|| serde_json::json!({ "suppressed": suppressed }))
+            } else {
+                None
+            };
             return Err(AppError::PolicyDenied {
                 code,
                 message: reason,
                 hint,
-                details: None,
+                details,
             });
         }
         OutboundDecision::DowngradeToDraft { .. } => {
@@ -708,7 +714,9 @@ async fn execute_gmail_send(
     input.upstream_thread_id = upstream_thread_id;
     let stored = state.store.insert_message(input).await?;
     state.post_store_message(&stored).await?;
-    state.metrics.inc_messages_sent();
+    state
+        .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+        .await;
 
     state.events.publish(
         EventSource::Api,

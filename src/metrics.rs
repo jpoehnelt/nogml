@@ -43,6 +43,14 @@ pub struct Metrics {
     policy_downgrade_total: AtomicU64,
     policy_hold_total: AtomicU64,
     policy_deny_total: AtomicU64,
+    deliverability_events_sent_total: AtomicU64,
+    deliverability_events_hard_bounce_total: AtomicU64,
+    deliverability_events_soft_bounce_total: AtomicU64,
+    deliverability_events_complaint_total: AtomicU64,
+    deliverability_suppression_added_total: AtomicU64,
+    deliverability_blocked_suppressed_total: AtomicU64,
+    deliverability_blocked_daily_limit_total: AtomicU64,
+    deliverability_blocked_circuit_breaker_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -70,6 +78,14 @@ impl Metrics {
             policy_downgrade_total: AtomicU64::new(0),
             policy_hold_total: AtomicU64::new(0),
             policy_deny_total: AtomicU64::new(0),
+            deliverability_events_sent_total: AtomicU64::new(0),
+            deliverability_events_hard_bounce_total: AtomicU64::new(0),
+            deliverability_events_soft_bounce_total: AtomicU64::new(0),
+            deliverability_events_complaint_total: AtomicU64::new(0),
+            deliverability_suppression_added_total: AtomicU64::new(0),
+            deliverability_blocked_suppressed_total: AtomicU64::new(0),
+            deliverability_blocked_daily_limit_total: AtomicU64::new(0),
+            deliverability_blocked_circuit_breaker_total: AtomicU64::new(0),
         }
     }
 
@@ -159,6 +175,55 @@ impl Metrics {
     /// Record a denied outbound policy outcome (including policy errors such as disallowed recipients).
     pub fn inc_policy_deny(&self) {
         self.policy_deny_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_events_total{kind="sent"}`.
+    pub fn inc_deliverability_sent(&self) {
+        self.deliverability_events_sent_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_events_total{kind="hard_bounce"}`.
+    pub fn inc_deliverability_hard_bounce(&self) {
+        self.deliverability_events_hard_bounce_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_events_total{kind="soft_bounce"}`.
+    pub fn inc_deliverability_soft_bounce(&self) {
+        self.deliverability_events_soft_bounce_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_events_total{kind="complaint"}`.
+    pub fn inc_deliverability_complaint(&self) {
+        self.deliverability_events_complaint_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_suppression_added_total`.
+    pub fn inc_suppression_added(&self) {
+        self.deliverability_suppression_added_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `nogml_deliverability_blocked_total{reason=...}` for a deliverability policy block.
+    pub fn inc_deliverability_blocked(&self, code: &str) {
+        match code {
+            "recipient_suppressed" => {
+                self.deliverability_blocked_suppressed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "daily_send_limit_exceeded" => {
+                self.deliverability_blocked_daily_limit_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "deliverability_circuit_open" => {
+                self.deliverability_blocked_circuit_breaker_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
     }
 
     /// Current value of `nogml_http_requests_total`.
@@ -313,6 +378,75 @@ impl Metrics {
             self.policy_deny_total.load(Ordering::Relaxed)
         );
 
+        let _ = writeln!(
+            out,
+            "# HELP nogml_deliverability_events_total Total number of deliverability events by kind."
+        );
+        let _ = writeln!(out, "# TYPE nogml_deliverability_events_total counter");
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_events_total{{kind=\"sent\"}} {}",
+            self.deliverability_events_sent_total
+                .load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_events_total{{kind=\"hard_bounce\"}} {}",
+            self.deliverability_events_hard_bounce_total
+                .load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_events_total{{kind=\"soft_bounce\"}} {}",
+            self.deliverability_events_soft_bounce_total
+                .load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_events_total{{kind=\"complaint\"}} {}",
+            self.deliverability_events_complaint_total
+                .load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP nogml_deliverability_suppression_added_total Total number of email addresses added to the suppression list."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE nogml_deliverability_suppression_added_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_suppression_added_total {}",
+            self.deliverability_suppression_added_total
+                .load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP nogml_deliverability_blocked_total Total number of outbound sends blocked by deliverability guards."
+        );
+        let _ = writeln!(out, "# TYPE nogml_deliverability_blocked_total counter");
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_blocked_total{{reason=\"suppressed\"}} {}",
+            self.deliverability_blocked_suppressed_total
+                .load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_blocked_total{{reason=\"daily_limit\"}} {}",
+            self.deliverability_blocked_daily_limit_total
+                .load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "nogml_deliverability_blocked_total{{reason=\"circuit_breaker\"}} {}",
+            self.deliverability_blocked_circuit_breaker_total
+                .load(Ordering::Relaxed)
+        );
+
         out
     }
 }
@@ -355,6 +489,14 @@ mod tests {
             reason: "blocked".into(),
             hint: None,
         });
+        metrics.inc_deliverability_sent();
+        metrics.inc_deliverability_hard_bounce();
+        metrics.inc_deliverability_soft_bounce();
+        metrics.inc_deliverability_complaint();
+        metrics.inc_suppression_added();
+        metrics.inc_deliverability_blocked("recipient_suppressed");
+        metrics.inc_deliverability_blocked("daily_send_limit_exceeded");
+        metrics.inc_deliverability_blocked("deliverability_circuit_open");
 
         let imap_guard = metrics.track_imap_connection();
         let sse_guard = metrics.track_sse_connection();
@@ -377,6 +519,16 @@ mod tests {
         assert!(text.contains("nogml_policy_decisions_total{decision=\"downgrade\"} 1\n"));
         assert!(text.contains("nogml_policy_decisions_total{decision=\"hold\"} 1\n"));
         assert!(text.contains("nogml_policy_decisions_total{decision=\"deny\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_events_total{kind=\"sent\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_events_total{kind=\"hard_bounce\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_events_total{kind=\"soft_bounce\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_events_total{kind=\"complaint\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_suppression_added_total 1\n"));
+        assert!(text.contains("nogml_deliverability_blocked_total{reason=\"suppressed\"} 1\n"));
+        assert!(text.contains("nogml_deliverability_blocked_total{reason=\"daily_limit\"} 1\n"));
+        assert!(
+            text.contains("nogml_deliverability_blocked_total{reason=\"circuit_breaker\"} 1\n")
+        );
 
         drop(imap_guard);
         drop(sse_guard);

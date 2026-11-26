@@ -19,6 +19,11 @@ use crate::{
     storage::{MailStore, parse_simple_email_address},
 };
 
+pub use crate::deliverability::{
+    DeliverabilityCircuitBreakerPolicy, DeliverabilityPolicy, DomainQuotaPolicy,
+    SuppressionListPolicy,
+};
+
 /// Alias for [`PolicyCheckResult`] exposed alongside [`OutboundPolicy`].
 pub type PolicyCheck = PolicyCheckResult;
 
@@ -1622,6 +1627,11 @@ pub async fn evaluate_resolved_dry_run(
         agent_policy: agent_policy.cloned(),
     };
     checks.extend(state.outbound_policy.policy_checks(&outbound_check));
+    let deliverability_checks = state
+        .deliverability_policy
+        .evaluate_dry_run_checks(&outbound_check, chrono::Utc::now().timestamp_millis())
+        .await?;
+    checks.extend(deliverability_checks);
 
     if state.config.require_verified_from_domain {
         let verified = VerifiedFromDomainPolicy::is_from_domain_verified(

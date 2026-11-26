@@ -22,19 +22,23 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DomainRecord, DomainStatus, DomainUpdate, DraftListPage,
+        ContactRecord, DeliverabilityCounts, DeliverabilityEvent, DeliverabilityEventKind,
+        DomainDeliverabilityState, DomainRecord, DomainStatus, DomainUpdate, DraftListPage,
         HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind, HistoryListPage,
         HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet,
         ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRulePatch,
-        MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry, NewDomainInput,
-        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
-        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
-        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
-        apply_inbox_rule_patch, compute_contact_is_vip, normalize_and_validate_domain,
-        normalize_contact_email, normalize_domain_lookup_key, normalize_inbox_rule_actions,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        MAX_SQL_LIMIT, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewDeliverabilityEvent, NewDomainInput, NewInboxRule, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, NewScheduledSend, NewSuppressionInput, PendingApproval,
+        ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft,
+        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SuppressionEntry,
+        SuppressionQuery, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
+        UpsertOutcome, UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
+        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
+        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
+        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
+        parse_simple_email_address, validate_and_normalize_contact_email,
+        validate_and_normalize_suppression_email, validate_deliverability_domain,
     },
 };
 
@@ -836,6 +840,9 @@ pub struct MemoryStore {
     mailboxes: Arc<RwLock<HashMap<String, Arc<RwLock<MemoryState>>>>>,
     state: Arc<RwLock<MemoryState>>,
     domains: Arc<RwLock<HashMap<String, DomainRecord>>>,
+    suppressions: Arc<RwLock<HashMap<String, SuppressionEntry>>>,
+    deliverability_events: Arc<RwLock<Vec<DeliverabilityEvent>>>,
+    deliverability_domain_states: Arc<RwLock<HashMap<String, DomainDeliverabilityState>>>,
 }
 
 impl Default for MemoryStore {
@@ -855,6 +862,9 @@ impl MemoryStore {
             mailboxes: Arc::new(RwLock::new(map)),
             state,
             domains: Arc::new(RwLock::new(HashMap::new())),
+            suppressions: Arc::new(RwLock::new(HashMap::new())),
+            deliverability_events: Arc::new(RwLock::new(Vec::new())),
+            deliverability_domain_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1168,6 +1178,9 @@ impl MailStore for MemoryStore {
             mailboxes: self.mailboxes.clone(),
             state,
             domains: self.domains.clone(),
+            suppressions: self.suppressions.clone(),
+            deliverability_events: self.deliverability_events.clone(),
+            deliverability_domain_states: self.deliverability_domain_states.clone(),
         })
     }
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
@@ -4018,6 +4031,275 @@ impl MailStore for MemoryStore {
             .write()
             .map_err(|_| AppError::Storage("MemoryStore domains write lock poisoned".into()))?;
         Ok(domains.remove(&key).is_some())
+    }
+
+    async fn upsert_suppression(&self, input: NewSuppressionInput) -> AppResult<SuppressionEntry> {
+        let email = validate_and_normalize_suppression_email(&input.email)?;
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let entry = SuppressionEntry {
+            email: email.clone(),
+            reason: input.reason,
+            source: input.source,
+            detail: normalize_optional_text(input.detail.as_deref()),
+            created_at_ms,
+            expires_at_ms: input.expires_at_ms,
+        };
+        let mut map = self.suppressions.write().map_err(|_| {
+            AppError::Storage("MemoryStore suppressions write lock poisoned".into())
+        })?;
+        map.insert(email, entry.clone());
+        Ok(entry)
+    }
+
+    async fn get_suppression(
+        &self,
+        email: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<SuppressionEntry>> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let map = self
+            .suppressions
+            .read()
+            .map_err(|_| AppError::Storage("MemoryStore suppressions read lock poisoned".into()))?;
+        Ok(map.get(&key).filter(|e| e.is_active(now_ms)).cloned())
+    }
+
+    async fn find_suppressed_emails(
+        &self,
+        emails: &[String],
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        if emails.is_empty() {
+            return Ok(Vec::new());
+        }
+        let map = self
+            .suppressions
+            .read()
+            .map_err(|_| AppError::Storage("MemoryStore suppressions read lock poisoned".into()))?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for raw in emails {
+            let key = normalize_contact_email(raw);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            if let Some(entry) = map.get(&key)
+                && entry.is_active(now_ms)
+            {
+                out.push(entry.clone());
+            }
+        }
+        out.sort_by(|a, b| a.email.cmp(&b.email));
+        Ok(out)
+    }
+
+    async fn list_suppressions(
+        &self,
+        query: &SuppressionQuery,
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        let limit = clamp_sql_limit(query.limit, 100, MAX_SQL_LIMIT) as usize;
+        let q_lower = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase);
+        let map = self
+            .suppressions
+            .read()
+            .map_err(|_| AppError::Storage("MemoryStore suppressions read lock poisoned".into()))?;
+        let mut out: Vec<SuppressionEntry> = map
+            .values()
+            .filter(|entry| {
+                if !query.include_expired && !entry.is_active(now_ms) {
+                    return false;
+                }
+                if let Some(reason) = query.reason
+                    && entry.reason != reason
+                {
+                    return false;
+                }
+                if let Some(source) = query.source
+                    && entry.source != source
+                {
+                    return false;
+                }
+                if let Some(ref q) = q_lower {
+                    let in_email = entry.email.contains(q);
+                    let in_detail = entry
+                        .detail
+                        .as_deref()
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(q));
+                    if !in_email && !in_detail {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.email.cmp(&b.email))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn delete_suppression(&self, email: &str) -> AppResult<bool> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let mut map = self.suppressions.write().map_err(|_| {
+            AppError::Storage("MemoryStore suppressions write lock poisoned".into())
+        })?;
+        Ok(map.remove(&key).is_some())
+    }
+
+    async fn record_deliverability_event(
+        &self,
+        input: NewDeliverabilityEvent,
+    ) -> AppResult<DeliverabilityEvent> {
+        let domain = validate_deliverability_domain(&input.domain)?;
+        let mailbox_id = input
+            .mailbox_id
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let recipient = input
+            .recipient
+            .as_deref()
+            .map(normalize_contact_email)
+            .filter(|s| !s.is_empty());
+        let provider = normalize_optional_text(input.provider.as_deref());
+        let detail = normalize_optional_text(input.detail.as_deref());
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let event = DeliverabilityEvent {
+            id: format!("dlv_{}", new_hex_id()),
+            domain,
+            mailbox_id,
+            kind: input.kind,
+            recipient,
+            provider,
+            detail,
+            created_at_ms,
+        };
+        let mut events = self.deliverability_events.write().map_err(|_| {
+            AppError::Storage("MemoryStore deliverability_events write lock poisoned".into())
+        })?;
+        events.push(event.clone());
+        Ok(event)
+    }
+
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        since_ms: i64,
+    ) -> AppResult<DeliverabilityCounts> {
+        let key = normalize_deliverability_domain(domain);
+        let mut counts = DeliverabilityCounts {
+            domain: key.clone(),
+            ..Default::default()
+        };
+        if key.is_empty() {
+            return Ok(counts);
+        }
+        let events = self.deliverability_events.read().map_err(|_| {
+            AppError::Storage("MemoryStore deliverability_events read lock poisoned".into())
+        })?;
+        for ev in events.iter() {
+            if ev.domain == key && ev.created_at_ms >= since_ms {
+                match ev.kind {
+                    DeliverabilityEventKind::Sent => counts.sent += 1,
+                    DeliverabilityEventKind::HardBounce => counts.hard_bounce += 1,
+                    DeliverabilityEventKind::SoftBounce => counts.soft_bounce += 1,
+                    DeliverabilityEventKind::Complaint => counts.complaint += 1,
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+        let mut set = std::collections::BTreeSet::new();
+        {
+            let events = self.deliverability_events.read().map_err(|_| {
+                AppError::Storage("MemoryStore deliverability_events read lock poisoned".into())
+            })?;
+            for ev in events.iter() {
+                if !ev.domain.is_empty() {
+                    set.insert(ev.domain.clone());
+                }
+            }
+        }
+        {
+            let states = self.deliverability_domain_states.read().map_err(|_| {
+                AppError::Storage(
+                    "MemoryStore deliverability_domain_states read lock poisoned".into(),
+                )
+            })?;
+            for domain in states.keys() {
+                if !domain.is_empty() {
+                    set.insert(domain.clone());
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    async fn get_domain_deliverability_state(
+        &self,
+        domain: &str,
+    ) -> AppResult<Option<DomainDeliverabilityState>> {
+        let key = normalize_deliverability_domain(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let states = self.deliverability_domain_states.read().map_err(|_| {
+            AppError::Storage("MemoryStore deliverability_domain_states read lock poisoned".into())
+        })?;
+        Ok(states.get(&key).cloned())
+    }
+
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<DomainDeliverabilityState> {
+        let key = validate_deliverability_domain(domain)?;
+        let mut states = self.deliverability_domain_states.write().map_err(|_| {
+            AppError::Storage("MemoryStore deliverability_domain_states write lock poisoned".into())
+        })?;
+        let existing_resumed = states.get(&key).and_then(|s| s.resumed_at_ms);
+        let next = DomainDeliverabilityState {
+            domain: key.clone(),
+            manually_paused: paused,
+            pause_reason: if paused {
+                normalize_optional_text(reason.as_deref())
+            } else {
+                None
+            },
+            resumed_at_ms: if paused {
+                existing_resumed
+            } else {
+                Some(now_ms)
+            },
+            updated_at_ms: now_ms,
+        };
+        states.insert(key, next.clone());
+        Ok(next)
     }
 }
 

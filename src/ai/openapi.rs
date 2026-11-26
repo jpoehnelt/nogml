@@ -51,6 +51,12 @@ pub const V1_OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("patch", "/v1/domains/{domain}"),
     ("delete", "/v1/domains/{domain}"),
     ("post", "/v1/domains/{domain}/verify"),
+    ("get", "/v1/suppression"),
+    ("post", "/v1/suppression"),
+    ("delete", "/v1/suppression/{email}"),
+    ("get", "/v1/deliverability/stats"),
+    ("post", "/v1/deliverability/domains/{domain}/resume"),
+    ("post", "/v1/deliverability/domains/{domain}/pause"),
     ("get", "/v1/audit"),
     ("get", "/v1/labels"),
     ("get", "/v1/search"),
@@ -1273,6 +1279,172 @@ fn build_paths() -> Value {
         }),
     );
 
+    // /v1/suppression
+    paths.insert(
+        "/v1/suppression".to_string(),
+        json!({
+            "get": {
+                "operationId": "listSuppressions",
+                "summary": "List email addresses on the outbound suppression list",
+                "tags": ["Deliverability"],
+                "x-required-scope": "read",
+                "parameters": [
+                    query_param("q", "Substring filter matched against email or detail.", json!({ "type": "string" })),
+                    query_param("reason", "Filter by suppression reason.", json!({ "type": "string", "enum": ["hard_bounce", "complaint", "unsubscribe", "manual"] })),
+                    query_param("source", "Filter by suppression source.", json!({ "type": "string", "enum": ["ses_sns", "resend", "manual"] })),
+                    query_param("include_expired", "Include expired suppression entries (default false).", json!({ "type": "boolean", "default": false })),
+                    query_param("limit", "Maximum entries to return (default 100, max 1000).", json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 })),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Suppression list entries.", ref_schema("SuppressionListResponse")))],
+                    false,
+                    false
+                )
+            },
+            "post": {
+                "operationId": "addSuppression",
+                "summary": "Add or update an email address on the outbound suppression list",
+                "tags": ["Deliverability"],
+                "x-required-scope": "admin",
+                "parameters": [ref_param("Fields")],
+                "requestBody": json_request_body(
+                    true,
+                    ref_schema("AddSuppressionRequest"),
+                    "Suppression entry to persist."
+                ),
+                "responses": build_responses(
+                    vec![("201", json_ok("Created or updated suppression entry.", json!({
+                        "type": "object",
+                        "required": ["suppression"],
+                        "properties": {
+                            "suppression": ref_schema("SuppressionEntry")
+                        }
+                    })))],
+                    false,
+                    false
+                )
+            }
+        }),
+    );
+
+    // /v1/suppression/{email}
+    paths.insert(
+        "/v1/suppression/{email}".to_string(),
+        json!({
+            "delete": {
+                "operationId": "deleteSuppression",
+                "summary": "Remove an email address from the outbound suppression list",
+                "tags": ["Deliverability"],
+                "x-required-scope": "admin",
+                "parameters": [
+                    path_param("email", "Email address to remove from the suppression list."),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Suppression entry deleted.", json!({
+                        "type": "object",
+                        "required": ["deleted", "email"],
+                        "properties": {
+                            "deleted": { "type": "boolean" },
+                            "email": { "type": "string" }
+                        }
+                    })))],
+                    true,
+                    false
+                )
+            }
+        }),
+    );
+
+    // /v1/deliverability/stats
+    paths.insert(
+        "/v1/deliverability/stats".to_string(),
+        json!({
+            "get": {
+                "operationId": "getDeliverabilityStats",
+                "summary": "Inspect per-domain send volume, bounce/complaint rates, daily quotas, and circuit-breaker status",
+                "tags": ["Deliverability"],
+                "x-required-scope": "read",
+                "parameters": [
+                    query_param("domain", "Optional sender domain to inspect.", json!({ "type": "string" })),
+                    query_param("window_secs", "Optional rolling window override in seconds.", json!({ "type": "integer", "minimum": 1 })),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Per-domain deliverability metrics and circuit-breaker status.", ref_schema("DeliverabilityStatsResponse")))],
+                    false,
+                    false
+                )
+            }
+        }),
+    );
+
+    // /v1/deliverability/domains/{domain}/resume
+    paths.insert(
+        "/v1/deliverability/domains/{domain}/resume".to_string(),
+        json!({
+            "post": {
+                "operationId": "resumeDeliverabilityDomain",
+                "summary": "Reset and resume a tripped or paused sender domain circuit breaker",
+                "tags": ["Deliverability"],
+                "x-required-scope": "admin",
+                "parameters": [
+                    path_param("domain", "Sender domain to resume (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Updated domain deliverability state after resuming.", json!({
+                        "type": "object",
+                        "required": ["domain", "resumed", "stats"],
+                        "properties": {
+                            "domain": { "type": "string" },
+                            "resumed": { "type": "boolean" },
+                            "stats": ref_schema("DomainDeliverabilityStats")
+                        }
+                    })))],
+                    false,
+                    false
+                )
+            }
+        }),
+    );
+
+    // /v1/deliverability/domains/{domain}/pause
+    paths.insert(
+        "/v1/deliverability/domains/{domain}/pause".to_string(),
+        json!({
+            "post": {
+                "operationId": "pauseDeliverabilityDomain",
+                "summary": "Manually pause outbound sending for a sender domain",
+                "tags": ["Deliverability"],
+                "x-required-scope": "admin",
+                "parameters": [
+                    path_param("domain", "Sender domain to pause (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "requestBody": json_request_body(
+                    false,
+                    ref_schema("PauseDeliverabilityDomainRequest"),
+                    "Optional human-readable pause reason."
+                ),
+                "responses": build_responses(
+                    vec![("200", json_ok("Updated domain deliverability state after pausing.", json!({
+                        "type": "object",
+                        "required": ["domain", "paused", "stats"],
+                        "properties": {
+                            "domain": { "type": "string" },
+                            "paused": { "type": "boolean" },
+                            "stats": ref_schema("DomainDeliverabilityStats")
+                        }
+                    })))],
+                    false,
+                    false
+                )
+            }
+        }),
+    );
+
     // /v1/audit
     paths.insert(
         "/v1/audit".to_string(),
@@ -2253,6 +2425,136 @@ fn build_schemas() -> Value {
         }),
     );
 
+    schemas.insert(
+        "SuppressionEntry".to_string(),
+        json!({
+            "type": "object",
+            "required": ["email", "reason", "source", "created_at_ms"],
+            "properties": {
+                "email": { "type": "string" },
+                "reason": { "type": "string", "enum": ["hard_bounce", "complaint", "unsubscribe", "manual"] },
+                "source": { "type": "string", "enum": ["ses_sns", "resend", "manual"] },
+                "detail": { "type": ["string", "null"] },
+                "created_at_ms": { "type": "integer" },
+                "expires_at_ms": { "type": ["integer", "null"] }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "SuppressionListResponse".to_string(),
+        json!({
+            "type": "object",
+            "required": ["suppressions", "count"],
+            "properties": {
+                "suppressions": { "type": "array", "items": ref_schema("SuppressionEntry") },
+                "count": { "type": "integer" }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "AddSuppressionRequest".to_string(),
+        json!({
+            "type": "object",
+            "required": ["email"],
+            "properties": {
+                "email": { "type": "string" },
+                "reason": { "type": "string", "enum": ["hard_bounce", "complaint", "unsubscribe", "manual"], "default": "manual" },
+                "source": { "type": "string", "enum": ["ses_sns", "resend", "manual"], "default": "manual" },
+                "detail": { "type": "string" },
+                "expires_at": { "type": "string", "description": "Optional RFC 3339 timestamp or Unix epoch ms." },
+                "expires_at_ms": { "type": "integer", "description": "Optional Unix epoch ms expiration timestamp." }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "CircuitBreakerStatus".to_string(),
+        json!({
+            "type": "object",
+            "required": ["state", "tripped", "manually_paused"],
+            "properties": {
+                "state": { "type": "string", "enum": ["closed", "open_bounce_rate", "open_complaint_rate", "paused"] },
+                "tripped": { "type": "boolean" },
+                "manually_paused": { "type": "boolean" },
+                "reason": { "type": ["string", "null"] },
+                "resumed_at_ms": { "type": ["integer", "null"] }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "DomainDeliverabilityStats".to_string(),
+        json!({
+            "type": "object",
+            "required": [
+                "domain",
+                "sent",
+                "hard_bounce",
+                "soft_bounce",
+                "complaint",
+                "bounce_rate",
+                "complaint_rate",
+                "daily_sent",
+                "daily_limit",
+                "circuit_breaker"
+            ],
+            "properties": {
+                "domain": { "type": "string" },
+                "sent": { "type": "integer" },
+                "hard_bounce": { "type": "integer" },
+                "soft_bounce": { "type": "integer" },
+                "complaint": { "type": "integer" },
+                "bounce_rate": { "type": "number" },
+                "complaint_rate": { "type": "number" },
+                "daily_sent": { "type": "integer" },
+                "daily_limit": { "type": "integer" },
+                "daily_remaining": { "type": ["integer", "null"] },
+                "circuit_breaker": ref_schema("CircuitBreakerStatus")
+            }
+        }),
+    );
+
+    schemas.insert(
+        "DeliverabilityStatsResponse".to_string(),
+        json!({
+            "type": "object",
+            "required": ["config", "suppression_count", "domains"],
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "required": [
+                        "daily_send_limit_per_domain",
+                        "max_bounce_rate",
+                        "max_complaint_rate",
+                        "min_samples",
+                        "window_secs"
+                    ],
+                    "properties": {
+                        "daily_send_limit_per_domain": { "type": "integer" },
+                        "max_bounce_rate": { "type": "number" },
+                        "max_complaint_rate": { "type": "number" },
+                        "min_samples": { "type": "integer" },
+                        "window_secs": { "type": "integer" }
+                    }
+                },
+                "suppression_count": { "type": "integer" },
+                "domains": { "type": "array", "items": ref_schema("DomainDeliverabilityStats") }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "PauseDeliverabilityDomainRequest".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": { "type": "string", "description": "Optional reason explaining why the domain was paused." }
+            }
+        }),
+    );
+
     Value::Object(schemas)
 }
 
@@ -2292,6 +2594,7 @@ pub fn openapi_spec() -> Value {
             { "name": "Contacts", "description": "Per-mailbox contact graph and VIP overrides." },
             { "name": "Rules", "description": "Event-driven inbox rules and dry-run testing." },
             { "name": "Domains", "description": "BYOD custom domain registration, DNS verification, and catch-all routing." },
+            { "name": "Deliverability", "description": "Persistent suppression lists, per-domain daily send limits, and bounce/complaint circuit breakers." },
             { "name": "Audit", "description": "Immutable append-only agent and API audit log." },
             { "name": "Labels", "description": "Mailbox system and user label metadata." },
             { "name": "Search", "description": "Full-text and hybrid semantic search." },

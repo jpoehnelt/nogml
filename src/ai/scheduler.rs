@@ -744,7 +744,9 @@ pub async fn process_due_scheduler_items(
                 "Scheduled send post_store_message (blob/search/contacts) failed after send"
             );
         }
-        mb_state.metrics.inc_messages_sent();
+        mb_state
+            .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+            .await;
 
         if let Err(err) = mb_state
             .store

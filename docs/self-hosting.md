@@ -180,6 +180,35 @@ nogml domains list
 - **Dynamic catch-all inbound routing**: When a Resend or SES inbound webhook delivers to an address with no explicit `mailbox_aliases` or local mailbox match, `nogml` checks whether the recipient domain is a `verified` BYOD domain with `catch_all_mailbox` configured and routes the message to that mailbox. Explicit aliases always take precedence, and unverified domains never trigger catch-all routing.
 - **Tenant isolation**: Non-admin tokens can only list, inspect, verify, update, and delete domains owned by mailboxes they can access. Attempting to register a domain already owned by another mailbox returns `409 Conflict`, and manually overriding verification status on a `manual` domain requires `admin` scope.
 
+### Deliverability protection, suppression lists, and circuit breakers
+
+`nogml` protects shared Resend and AWS SES sender reputation with persistent suppression lists, optional per-domain daily send limits, and automatic bounce/complaint circuit breakers stored across SQLite, Memory, and PostgreSQL (`suppression_list`, `deliverability_events`, and `deliverability_domain_state`).
+
+- **Automatic bounce and complaint ingestion**:
+  - AWS SES SNS `Bounce` (`Permanent`) and `Complaint` notifications on `POST /webhooks/ses` automatically add bounced or complaining recipients to `suppression_list` and record `hard_bounce` or `complaint` events. `Transient` bounces record `soft_bounce` events without suppressing the recipient.
+  - Svix-verified Resend `email.bounced` (hard bounce) and `email.complained` webhooks on `POST /webhooks/resend` automatically add recipients to `suppression_list` and record deliverability events.
+- **Outbound enforcement**: Every send path (`/v1/messages/send`, `/v1/drafts/{id}/send`, `/gmail/v1`, approvals, scheduled sends, and mailto unsubscribe) checks `SuppressionListPolicy`, `DeliverabilityCircuitBreakerPolicy`, and `DomainQuotaPolicy` before calling `MailTransport`. Blocked sends return HTTP `403` with structured error codes (`recipient_suppressed`, `daily_send_limit_exceeded`, or `deliverability_circuit_open`).
+- **Configuration** (`[safety]` in `nogml.toml`, CLI flags, or environment variables):
+  - `daily_send_limit_per_domain` (`NOGML_DAILY_SEND_LIMIT_PER_DOMAIN` or `NOGML_DAILY_SEND_LIMIT`, default `0` / disabled)
+  - `deliverability_max_bounce_rate` (`NOGML_MAX_BOUNCE_RATE`, default `0.05` = 5%)
+  - `deliverability_max_complaint_rate` (`NOGML_MAX_COMPLAINT_RATE`, default `0.001` = 0.1%)
+  - `deliverability_min_samples` (`NOGML_DELIVERABILITY_MIN_SAMPLES`, default `20`)
+  - `deliverability_window_secs` (`NOGML_DELIVERABILITY_WINDOW_SECS`, default `86400` = 24 hours)
+- **REST management API**:
+  - `GET /v1/suppression` (`read` scope) and `POST /v1/suppression`, `DELETE /v1/suppression/{email}` (`admin` scope)
+  - `GET /v1/deliverability/stats` (`read` scope) for per-domain sent, bounce, complaint counts, computed rates, daily quota usage, and circuit-breaker state
+  - `POST /v1/deliverability/domains/{domain}/pause` and `POST /v1/deliverability/domains/{domain}/resume` (`admin` scope) to manually pause or reset a tripped domain circuit breaker
+
+```bash
+# Inspect per-domain deliverability health and circuit-breaker state
+curl -fsS -H "Authorization: Bearer ${NOGML_TOKEN}" \
+  "http://127.0.0.1:8080/v1/deliverability/stats"
+
+# Resume a tripped domain after fixing DNS or list hygiene (admin scope)
+curl -fsS -X POST -H "Authorization: Bearer ${NOGML_ADMIN_TOKEN}" \
+  "http://127.0.0.1:8080/v1/deliverability/domains/example.com/resume"
+```
+
 ### Secret reference formats
 
 All secret fields support three non-plaintext mechanisms so secrets never need to be checked into `nogml.toml` or exposed in process command lines:

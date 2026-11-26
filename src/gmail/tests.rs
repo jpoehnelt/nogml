@@ -1004,6 +1004,92 @@ impl MailStore for MockStore {
     async fn delete_domain(&self, _domain: &str) -> AppResult<bool> {
         Ok(false)
     }
+    async fn upsert_suppression(
+        &self,
+        input: crate::storage::NewSuppressionInput,
+    ) -> AppResult<crate::storage::SuppressionEntry> {
+        Ok(crate::storage::SuppressionEntry {
+            email: input.email.to_ascii_lowercase(),
+            reason: input.reason,
+            source: input.source,
+            detail: input.detail,
+            created_at_ms: input.created_at_ms.unwrap_or(0),
+            expires_at_ms: input.expires_at_ms,
+        })
+    }
+    async fn get_suppression(
+        &self,
+        _email: &str,
+        _now_ms: i64,
+    ) -> AppResult<Option<crate::storage::SuppressionEntry>> {
+        Ok(None)
+    }
+    async fn find_suppressed_emails(
+        &self,
+        _emails: &[String],
+        _now_ms: i64,
+    ) -> AppResult<Vec<crate::storage::SuppressionEntry>> {
+        Ok(Vec::new())
+    }
+    async fn list_suppressions(
+        &self,
+        _query: &crate::storage::SuppressionQuery,
+        _now_ms: i64,
+    ) -> AppResult<Vec<crate::storage::SuppressionEntry>> {
+        Ok(Vec::new())
+    }
+    async fn delete_suppression(&self, _email: &str) -> AppResult<bool> {
+        Ok(false)
+    }
+    async fn record_deliverability_event(
+        &self,
+        input: crate::storage::NewDeliverabilityEvent,
+    ) -> AppResult<crate::storage::DeliverabilityEvent> {
+        Ok(crate::storage::DeliverabilityEvent {
+            id: "dlv_mock".to_string(),
+            domain: input.domain,
+            mailbox_id: input.mailbox_id,
+            kind: input.kind,
+            recipient: input.recipient,
+            provider: input.provider,
+            detail: input.detail,
+            created_at_ms: input.created_at_ms.unwrap_or(0),
+        })
+    }
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        _since_ms: i64,
+    ) -> AppResult<crate::storage::DeliverabilityCounts> {
+        Ok(crate::storage::DeliverabilityCounts {
+            domain: domain.to_string(),
+            ..Default::default()
+        })
+    }
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn get_domain_deliverability_state(
+        &self,
+        _domain: &str,
+    ) -> AppResult<Option<crate::storage::DomainDeliverabilityState>> {
+        Ok(None)
+    }
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<crate::storage::DomainDeliverabilityState> {
+        Ok(crate::storage::DomainDeliverabilityState {
+            domain: domain.to_string(),
+            manually_paused: paused,
+            pause_reason: reason,
+            resumed_at_ms: (!paused).then_some(now_ms),
+            updated_at_ms: now_ms,
+        })
+    }
 }
 
 fn test_app_with_config(cfg: Config) -> (AppState, Arc<MockResend>, Router) {

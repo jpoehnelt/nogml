@@ -34,20 +34,24 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DnsRecord, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
-        DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        ContactRecord, DeliverabilityCounts, DeliverabilityEvent, DeliverabilityEventKind,
+        DnsRecord, DomainDeliverabilityState, DomainProviderKind, DomainRecord, DomainStatus,
+        DomainUpdate, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
         HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
         ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
         InboxRuleActions, InboxRulePatch, MAX_SQL_LIMIT, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewDomainInput, NewInboxRule, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
-        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        VIP_REPLY_THRESHOLD, WatchSubscription, apply_domain_update, apply_inbox_rule_patch,
-        clamp_sql_limit, compute_contact_is_vip, normalize_and_validate_domain,
-        normalize_contact_email, normalize_domain_lookup_key, normalize_inbox_rule_actions,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        MessageListQuery, NewAuditLogEntry, NewDeliverabilityEvent, NewDomainInput, NewInboxRule,
+        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        NewSuppressionInput, PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread,
+        StoredAttachment, StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage,
+        StoredThreadDetail, SuppressionEntry, SuppressionQuery, SuppressionReason,
+        SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
+        UpsertOutcome, UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
+        apply_domain_update, apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
+        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
+        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
+        parse_simple_email_address, validate_and_normalize_contact_email,
+        validate_and_normalize_suppression_email, validate_deliverability_domain,
     },
 };
 
@@ -69,7 +73,7 @@ pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 10;
+const CURRENT_SCHEMA_VERSION: i32 = 11;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -456,6 +460,42 @@ CREATE INDEX IF NOT EXISTS idx_domains_mailbox_created
     ON domains (mailbox_id, created_at_ms ASC, domain ASC);
 CREATE INDEX IF NOT EXISTS idx_domains_status
     ON domains (status, domain);
+
+CREATE TABLE IF NOT EXISTS suppression_list (
+    email TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL,
+    detail TEXT,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_suppression_list_reason_created
+    ON suppression_list (reason, created_at_ms DESC, email ASC);
+CREATE INDEX IF NOT EXISTS idx_suppression_list_expires
+    ON suppression_list (expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS deliverability_events (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    mailbox_id TEXT,
+    kind TEXT NOT NULL,
+    recipient TEXT,
+    provider TEXT,
+    detail TEXT,
+    created_at_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deliverability_events_domain_ts
+    ON deliverability_events (domain, created_at_ms DESC, kind);
+CREATE INDEX IF NOT EXISTS idx_deliverability_events_ts
+    ON deliverability_events (created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS deliverability_domain_state (
+    domain TEXT PRIMARY KEY,
+    manually_paused BOOLEAN NOT NULL DEFAULT FALSE,
+    pause_reason TEXT,
+    resumed_at_ms BIGINT,
+    updated_at_ms BIGINT NOT NULL
+);
 "#;
 
 const MIGRATION_V7_PRE_SQL: &str = r#"
@@ -7907,6 +7947,397 @@ impl MailStore for PostgresStore {
             .map_err(pg_err)?;
         Ok(affected > 0)
     }
+
+    async fn upsert_suppression(&self, input: NewSuppressionInput) -> AppResult<SuppressionEntry> {
+        let email = validate_and_normalize_suppression_email(&input.email)?;
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let detail = normalize_optional_text(input.detail.as_deref());
+        let reason_str = input.reason.as_str();
+        let source_str = input.source.as_str();
+
+        let conn = self.ready_conn().await?;
+        conn.execute(
+            "INSERT INTO suppression_list (
+                 email, reason, source, detail, created_at_ms, expires_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (email) DO UPDATE SET
+                 reason = EXCLUDED.reason,
+                 source = EXCLUDED.source,
+                 detail = EXCLUDED.detail,
+                 created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms",
+            &[
+                &email,
+                &reason_str,
+                &source_str,
+                &detail,
+                &created_at_ms,
+                &input.expires_at_ms,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+
+        Ok(SuppressionEntry {
+            email,
+            reason: input.reason,
+            source: input.source,
+            detail,
+            created_at_ms,
+            expires_at_ms: input.expires_at_ms,
+        })
+    }
+
+    async fn get_suppression(
+        &self,
+        email: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<SuppressionEntry>> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.ready_conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+                 FROM suppression_list
+                 WHERE email = $1
+                   AND (expires_at_ms IS NULL OR expires_at_ms > $2)",
+                &[&key, &now_ms],
+            )
+            .await
+            .map_err(pg_err)?;
+        row.as_ref().map(suppression_from_row).transpose()
+    }
+
+    async fn find_suppressed_emails(
+        &self,
+        emails: &[String],
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in emails {
+            let key = normalize_contact_email(raw);
+            if !key.is_empty() && seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+                 FROM suppression_list
+                 WHERE (expires_at_ms IS NULL OR expires_at_ms > $1)
+                   AND email = ANY($2)
+                 ORDER BY email ASC",
+                &[&now_ms, &keys],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(suppression_from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn list_suppressions(
+        &self,
+        query: &SuppressionQuery,
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        let limit = clamp_sql_limit(query.limit, 100, MAX_SQL_LIMIT);
+        let q = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s.to_ascii_lowercase()));
+        let reason = query.reason.map(|r| r.as_str().to_string());
+        let source = query.source.map(|s| s.as_str().to_string());
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        if !query.include_expired {
+            params.push(Box::new(now_ms));
+            clauses.push(format!(
+                "(expires_at_ms IS NULL OR expires_at_ms > ${})",
+                params.len()
+            ));
+        }
+        if let Some(r) = reason {
+            params.push(Box::new(r));
+            clauses.push(format!("reason = ${}", params.len()));
+        }
+        if let Some(s) = source {
+            params.push(Box::new(s));
+            clauses.push(format!("source = ${}", params.len()));
+        }
+        if let Some(pattern) = q {
+            params.push(Box::new(pattern));
+            let p = params.len();
+            clauses.push(format!(
+                "(LOWER(email) LIKE ${p} OR LOWER(COALESCE(detail, '')) LIKE ${p})"
+            ));
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        params.push(Box::new(limit));
+        let limit_idx = params.len();
+        let sql = format!(
+            "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+             FROM suppression_list
+             {where_sql}
+             ORDER BY created_at_ms DESC, email ASC
+             LIMIT ${limit_idx}"
+        );
+        let param_refs: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        let conn = self.ready_conn().await?;
+        let rows = conn.query(&sql, &param_refs).await.map_err(pg_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(suppression_from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn delete_suppression(&self, email: &str) -> AppResult<bool> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.ready_conn().await?;
+        let affected = conn
+            .execute("DELETE FROM suppression_list WHERE email = $1", &[&key])
+            .await
+            .map_err(pg_err)?;
+        Ok(affected > 0)
+    }
+
+    async fn record_deliverability_event(
+        &self,
+        input: NewDeliverabilityEvent,
+    ) -> AppResult<DeliverabilityEvent> {
+        let domain = validate_deliverability_domain(&input.domain)?;
+        let mailbox_id = input
+            .mailbox_id
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let recipient = input
+            .recipient
+            .as_deref()
+            .map(normalize_contact_email)
+            .filter(|s| !s.is_empty());
+        let provider = normalize_optional_text(input.provider.as_deref());
+        let detail = normalize_optional_text(input.detail.as_deref());
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let id = format!("dlv_{}", new_hex_id());
+        let kind_str = input.kind.as_str();
+
+        let conn = self.ready_conn().await?;
+        conn.execute(
+            "INSERT INTO deliverability_events (
+                 id, domain, mailbox_id, kind, recipient, provider, detail, created_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &id,
+                &domain,
+                &mailbox_id,
+                &kind_str,
+                &recipient,
+                &provider,
+                &detail,
+                &created_at_ms,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+
+        Ok(DeliverabilityEvent {
+            id,
+            domain,
+            mailbox_id,
+            kind: input.kind,
+            recipient,
+            provider,
+            detail,
+            created_at_ms,
+        })
+    }
+
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        since_ms: i64,
+    ) -> AppResult<DeliverabilityCounts> {
+        let key = normalize_deliverability_domain(domain);
+        let mut counts = DeliverabilityCounts {
+            domain: key.clone(),
+            ..Default::default()
+        };
+        if key.is_empty() {
+            return Ok(counts);
+        }
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT kind, COUNT(*)::BIGINT
+                 FROM deliverability_events
+                 WHERE domain = $1 AND created_at_ms >= $2
+                 GROUP BY kind",
+                &[&key, &since_ms],
+            )
+            .await
+            .map_err(pg_err)?;
+        for row in &rows {
+            let kind_raw: String = row.get(0);
+            let count_raw: i64 = row.get(1);
+            let n = count_raw.max(0) as u64;
+            if let Some(kind) = DeliverabilityEventKind::parse_str(&kind_raw) {
+                match kind {
+                    DeliverabilityEventKind::Sent => counts.sent = n,
+                    DeliverabilityEventKind::HardBounce => counts.hard_bounce = n,
+                    DeliverabilityEventKind::SoftBounce => counts.soft_bounce = n,
+                    DeliverabilityEventKind::Complaint => counts.complaint = n,
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+        let conn = self.ready_conn().await?;
+        let rows = conn
+            .query(
+                "SELECT domain FROM deliverability_events
+                 UNION
+                 SELECT domain FROM deliverability_domain_state
+                 ORDER BY domain ASC",
+                &[],
+            )
+            .await
+            .map_err(pg_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let d: String = row.get(0);
+            if !d.is_empty() {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_domain_deliverability_state(
+        &self,
+        domain: &str,
+    ) -> AppResult<Option<DomainDeliverabilityState>> {
+        let key = normalize_deliverability_domain(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.ready_conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT domain, manually_paused, pause_reason, resumed_at_ms, updated_at_ms
+                 FROM deliverability_domain_state
+                 WHERE domain = $1",
+                &[&key],
+            )
+            .await
+            .map_err(pg_err)?;
+        Ok(row.map(|r| DomainDeliverabilityState {
+            domain: r.get(0),
+            manually_paused: r.get(1),
+            pause_reason: r.get(2),
+            resumed_at_ms: r.get(3),
+            updated_at_ms: r.get(4),
+        }))
+    }
+
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<DomainDeliverabilityState> {
+        let key = validate_deliverability_domain(domain)?;
+        let pause_reason = if paused {
+            normalize_optional_text(reason.as_deref())
+        } else {
+            None
+        };
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let existing_resumed: Option<i64> = tx
+            .query_opt(
+                "SELECT resumed_at_ms FROM deliverability_domain_state WHERE domain = $1 FOR UPDATE",
+                &[&key],
+            )
+            .await
+            .map_err(pg_err)?
+            .and_then(|r| r.get(0));
+        let resumed_at_ms = if paused {
+            existing_resumed
+        } else {
+            Some(now_ms)
+        };
+        tx.execute(
+            "INSERT INTO deliverability_domain_state (
+                 domain, manually_paused, pause_reason, resumed_at_ms, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (domain) DO UPDATE SET
+                 manually_paused = EXCLUDED.manually_paused,
+                 pause_reason = EXCLUDED.pause_reason,
+                 resumed_at_ms = EXCLUDED.resumed_at_ms,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+            &[&key, &paused, &pause_reason, &resumed_at_ms, &now_ms],
+        )
+        .await
+        .map_err(pg_err)?;
+        tx.commit().await.map_err(pg_err)?;
+
+        Ok(DomainDeliverabilityState {
+            domain: key,
+            manually_paused: paused,
+            pause_reason,
+            resumed_at_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+}
+
+fn suppression_from_row(row: &Row) -> AppResult<SuppressionEntry> {
+    let reason_raw: String = row.get(1);
+    let reason = SuppressionReason::parse_str(&reason_raw)
+        .ok_or_else(|| AppError::Storage(format!("Unknown suppression reason '{reason_raw}'")))?;
+    let source_raw: String = row.get(2);
+    let source = SuppressionSource::parse_str(&source_raw)
+        .ok_or_else(|| AppError::Storage(format!("Unknown suppression source '{source_raw}'")))?;
+    Ok(SuppressionEntry {
+        email: row.get(0),
+        reason,
+        source,
+        detail: row.get(3),
+        created_at_ms: row.get(4),
+        expires_at_ms: row.get(5),
+    })
 }
 
 fn domain_from_row(row: &Row) -> AppResult<DomainRecord> {
@@ -8086,7 +8517,9 @@ mod tests {
 
     #[test]
     fn postgres_schema_version_10_includes_sync_state_imap_columns() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+        const {
+            assert!(CURRENT_SCHEMA_VERSION >= 10);
+        }
         for ddl in [
             "imap_highest_modseq BIGINT",
             "imap_folder_states_json TEXT NOT NULL DEFAULT '{}'",
@@ -8096,6 +8529,36 @@ mod tests {
             assert!(
                 SCHEMA_SQL.contains(ddl),
                 "Postgres SCHEMA_SQL missing expected sync_state DDL fragment: {ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_schema_version_11_includes_deliverability_tables_and_indexes() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS suppression_list"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS deliverability_events"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS deliverability_domain_state"));
+        for col in [
+            "email TEXT PRIMARY KEY",
+            "reason TEXT NOT NULL",
+            "source TEXT NOT NULL",
+            "detail TEXT",
+            "expires_at_ms BIGINT",
+            "idx_suppression_list_reason_created",
+            "idx_suppression_list_expires",
+            "kind TEXT NOT NULL",
+            "recipient TEXT",
+            "idx_deliverability_events_domain_ts",
+            "idx_deliverability_events_ts",
+            "manually_paused BOOLEAN NOT NULL DEFAULT FALSE",
+            "pause_reason TEXT",
+            "resumed_at_ms BIGINT",
+            "updated_at_ms BIGINT NOT NULL",
+        ] {
+            assert!(
+                SCHEMA_SQL.contains(col),
+                "Postgres SCHEMA_SQL missing expected deliverability DDL fragment: {col}"
             );
         }
     }

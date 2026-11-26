@@ -512,6 +512,18 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
         return Some(AuthScope::Admin);
     }
 
+    // Suppression mutations and deliverability circuit-breaker overrides require `Admin`
+    // because they protect shared sender reputation across all mailboxes.
+    if method != Method::GET
+        && method != Method::HEAD
+        && (normalized == "/v1/suppression"
+            || normalized.starts_with("/v1/suppression/")
+            || normalized == "/v1/deliverability"
+            || normalized.starts_with("/v1/deliverability/"))
+    {
+        return Some(AuthScope::Admin);
+    }
+
     // `POST /v1/messages/{id}/unsubscribe` enforces `Write` (for `dry_run: true`) or `Send`
     // (for execution) inside the handler after parsing the JSON body.
     if method == Method::POST
