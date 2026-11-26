@@ -26,7 +26,9 @@ use crate::{
     models::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LABEL_DRAFT, LABEL_INBOX,
         LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, PopSettings,
-        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadSummary, VacationSettings, is_system_label,
+        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
+        VacationSettings, WaitingOn, apply_thread_annotation_patch, default_extracted_object,
+        is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
@@ -60,7 +62,7 @@ const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -309,6 +311,22 @@ CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_vip_activity
     ON contacts (mailbox_id, is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC);
 CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_domain
     ON contacts (mailbox_id, domain);
+
+CREATE TABLE IF NOT EXISTS thread_annotations (
+    mailbox_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    summary TEXT,
+    needs_reply BOOLEAN,
+    waiting_on TEXT,
+    priority TEXT,
+    due_at_ms BIGINT,
+    extracted_json TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (mailbox_id, thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_annotations_mailbox_triage
+    ON thread_annotations (mailbox_id, needs_reply, waiting_on);
 "#;
 
 /// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
@@ -1880,7 +1898,11 @@ fn decode_keyset_cursor(cursor: &str) -> AppResult<(i64, String)> {
     Ok((ts_ms, id_part.to_string()))
 }
 
-fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSummary {
+fn build_thread_summary(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    annotation: Option<ThreadAnnotation>,
+) -> ThreadSummary {
     let subject = messages
         .first()
         .map(|m| m.subject.clone())
@@ -1941,7 +1963,155 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         has_attachments,
         message_count: messages.len(),
         last_message_at,
+        annotation,
     }
+}
+
+fn thread_annotation_from_row(row: &Row) -> ThreadAnnotation {
+    let waiting_on: Option<String> = row.get(3);
+    let due_at_ms: Option<i64> = row.get(5);
+    let extracted_json: String = row.get(6);
+    let updated_at_ms: i64 = row.get(8);
+
+    ThreadAnnotation {
+        thread_id: row.get(0),
+        summary: row.get(1),
+        needs_reply: row.get(2),
+        waiting_on: waiting_on.as_deref().and_then(WaitingOn::parse_str),
+        priority: row.get(4),
+        due_at: due_at_ms.and_then(DateTime::from_timestamp_millis),
+        extracted: serde_json::from_str(&extracted_json)
+            .unwrap_or_else(|_| default_extracted_object()),
+        updated_by: row.get(7),
+        updated_at: DateTime::from_timestamp_millis(updated_at_ms).unwrap_or_else(Utc::now),
+    }
+}
+
+async fn load_thread_annotation_client<C: GenericClient>(
+    client: &C,
+    mb: &str,
+    thread_id: &str,
+    for_update: bool,
+) -> AppResult<Option<ThreadAnnotation>> {
+    let sql = if for_update {
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = $1 AND thread_id = $2
+         FOR UPDATE"
+    } else {
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = $1 AND thread_id = $2"
+    };
+    let row = client
+        .query_opt(sql, &[&mb, &thread_id])
+        .await
+        .map_err(pg_err)?;
+    Ok(row.as_ref().map(thread_annotation_from_row))
+}
+
+async fn upsert_thread_annotation_client<C: GenericClient>(
+    client: &C,
+    mb: &str,
+    annotation: &ThreadAnnotation,
+) -> AppResult<()> {
+    let extracted_json = serde_json::to_string(&annotation.extracted)
+        .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
+    let waiting_on_str = annotation.waiting_on.map(|w| w.as_str().to_string());
+    let due_at_ms = annotation.due_at.map(|dt| dt.timestamp_millis());
+    let updated_at_ms = annotation.updated_at.timestamp_millis();
+
+    client
+        .execute(
+            "INSERT INTO thread_annotations (
+                mailbox_id, thread_id, summary, needs_reply, waiting_on, priority,
+                due_at_ms, extracted_json, updated_by, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (mailbox_id, thread_id) DO UPDATE SET
+                summary = EXCLUDED.summary,
+                needs_reply = EXCLUDED.needs_reply,
+                waiting_on = EXCLUDED.waiting_on,
+                priority = EXCLUDED.priority,
+                due_at_ms = EXCLUDED.due_at_ms,
+                extracted_json = EXCLUDED.extracted_json,
+                updated_by = EXCLUDED.updated_by,
+                updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &mb,
+                &annotation.thread_id,
+                &annotation.summary,
+                &annotation.needs_reply,
+                &waiting_on_str,
+                &annotation.priority,
+                &due_at_ms,
+                &extracted_json,
+                &annotation.updated_by,
+                &updated_at_ms,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+    Ok(())
+}
+
+async fn load_thread_annotations_filtered<C: GenericClient>(
+    client: &C,
+    mb: &str,
+    needs_reply: Option<bool>,
+    waiting_on: Option<WaitingOn>,
+) -> AppResult<HashMap<String, ThreadAnnotation>> {
+    let waiting_on_str = waiting_on.map(|w| w.as_str().to_string());
+    let mut sql = String::from(
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = $1",
+    );
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&mb];
+    if let Some(ref nr) = needs_reply {
+        params.push(nr);
+        sql.push_str(&format!(" AND needs_reply = ${}", params.len()));
+    }
+    if let Some(ref wo) = waiting_on_str {
+        params.push(wo);
+        sql.push_str(&format!(" AND waiting_on = ${}", params.len()));
+    }
+
+    let rows = client.query(&sql, &params).await.map_err(pg_err)?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let ann = thread_annotation_from_row(row);
+        map.insert(ann.thread_id.clone(), ann);
+    }
+    Ok(map)
+}
+
+async fn load_thread_annotations_for_ids<C: GenericClient>(
+    client: &C,
+    mb: &str,
+    thread_ids: &[String],
+) -> AppResult<HashMap<String, ThreadAnnotation>> {
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = client
+        .query(
+            "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                    extracted_json, updated_by, updated_at_ms
+             FROM thread_annotations
+             WHERE mailbox_id = $1 AND thread_id = ANY($2)",
+            &[&mb, &thread_ids],
+        )
+        .await
+        .map_err(pg_err)?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let ann = thread_annotation_from_row(row);
+        map.insert(ann.thread_id.clone(), ann);
+    }
+    Ok(map)
 }
 
 enum ResolvedMailbox {
@@ -3028,6 +3198,12 @@ impl MailStore for PostgresStore {
         for mid in &msg_ids {
             delete_message_tx(&tx, mb, mid).await?;
         }
+        tx.execute(
+            "DELETE FROM thread_annotations WHERE mailbox_id = $1 AND thread_id = $2",
+            &[&mb, &thread_id],
+        )
+        .await
+        .map_err(pg_err)?;
         tx.commit().await.map_err(pg_err)?;
         Ok(true)
     }
@@ -3828,6 +4004,26 @@ impl MailStore for PostgresStore {
             _ => None,
         };
 
+        let filtered_annotations: Option<HashMap<String, ThreadAnnotation>> = if query
+            .needs_reply
+            .is_some()
+            || query.waiting_on.is_some()
+        {
+            let map =
+                load_thread_annotations_filtered(&conn, mb, query.needs_reply, query.waiting_on)
+                    .await?;
+            if map.is_empty() {
+                return Ok(AiThreadPage {
+                    threads: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                });
+            }
+            Some(map)
+        } else {
+            None
+        };
+
         let visible_msgs =
             load_all_messages_filtered(&conn, mb, &[], effective_include_spam_trash, None).await?;
 
@@ -3846,12 +4042,20 @@ impl MailStore for PostgresStore {
             {
                 continue;
             }
+            let annotation = if let Some(ref ann_map) = filtered_annotations {
+                let Some(ann) = ann_map.get(&tid) else {
+                    continue;
+                };
+                Some(ann.clone())
+            } else {
+                None
+            };
             msgs.sort_by(|a, b| {
                 a.internal_date_ms
                     .cmp(&b.internal_date_ms)
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let summary = build_thread_summary(&tid, &msgs);
+            let summary = build_thread_summary(&tid, &msgs, annotation);
             if let Some(ref req_label) = resolved_label
                 && !summary.labels.contains(req_label)
             {
@@ -3882,7 +4086,14 @@ impl MailStore for PostgresStore {
         } else {
             None
         };
-        let threads = summaries.into_iter().map(|(_, s)| s).collect();
+        let mut threads: Vec<ThreadSummary> = summaries.into_iter().map(|(_, s)| s).collect();
+        if filtered_annotations.is_none() && !threads.is_empty() {
+            let ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+            let mut ann_map = load_thread_annotations_for_ids(&conn, mb, &ids).await?;
+            for thread in &mut threads {
+                thread.annotation = ann_map.remove(&thread.id);
+            }
+        }
 
         Ok(AiThreadPage {
             threads,
@@ -3910,6 +4121,54 @@ impl MailStore for PostgresStore {
             affected_message_ids,
             labels,
         })
+    }
+
+    async fn get_thread_annotation(&self, thread_id: &str) -> AppResult<Option<ThreadAnnotation>> {
+        let conn = self.ready_conn().await?;
+        load_thread_annotation_client(&conn, &self.mailbox_id, thread_id, false).await
+    }
+
+    async fn upsert_thread_annotation(
+        &self,
+        thread_id: &str,
+        annotation: &ThreadAnnotation,
+    ) -> AppResult<ThreadAnnotation> {
+        let conn = self.ready_conn().await?;
+        let mut stored = annotation.clone();
+        stored.thread_id = thread_id.to_string();
+        stored.due_at = stored.due_at.map(truncate_to_millis);
+        stored.updated_at = truncate_to_millis(stored.updated_at);
+        upsert_thread_annotation_client(&conn, &self.mailbox_id, &stored).await?;
+        Ok(stored)
+    }
+
+    async fn patch_thread_annotation(
+        &self,
+        thread_id: &str,
+        patch: &ThreadAnnotationPatch,
+        updated_by: Option<&str>,
+    ) -> AppResult<ThreadAnnotation> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let existing =
+            load_thread_annotation_client(&tx, &self.mailbox_id, thread_id, true).await?;
+        let merged =
+            apply_thread_annotation_patch(existing, thread_id, patch, updated_by, Utc::now());
+        upsert_thread_annotation_client(&tx, &self.mailbox_id, &merged).await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(merged)
+    }
+
+    async fn delete_thread_annotation(&self, thread_id: &str) -> AppResult<()> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        conn.execute(
+            "DELETE FROM thread_annotations WHERE mailbox_id = $1 AND thread_id = $2",
+            &[&mb, &thread_id],
+        )
+        .await
+        .map_err(pg_err)?;
+        Ok(())
     }
 
     async fn find_message_by_resend_id(&self, resend_id: &str) -> AppResult<Option<StoredMessage>> {

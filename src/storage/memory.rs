@@ -16,7 +16,8 @@ use crate::{
     models::{
         AttachmentMeta, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM,
         LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, Profile, SYSTEM_LABEL_IDS,
-        ThreadSummary, is_system_label,
+        ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary, apply_thread_annotation_patch,
+        is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
@@ -88,6 +89,7 @@ struct MemoryState {
     settings: UserSettings,
     pending_approvals: HashMap<String, PendingApproval>,
     contacts: HashMap<String, ContactRecord>,
+    thread_annotations: HashMap<String, ThreadAnnotation>,
 }
 
 impl MemoryState {
@@ -140,6 +142,7 @@ impl MemoryState {
             settings: UserSettings::default_for_email(default_email),
             pending_approvals: HashMap::new(),
             contacts: HashMap::new(),
+            thread_annotations: HashMap::new(),
         }
     }
 
@@ -996,7 +999,11 @@ fn matches_ai_text_query(msg: &StoredMessage, raw_q: &str) -> bool {
     })
 }
 
-fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSummary {
+fn build_thread_summary(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    annotation: Option<ThreadAnnotation>,
+) -> ThreadSummary {
     let subject = messages
         .first()
         .map(|m| m.subject.clone())
@@ -1057,6 +1064,7 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         has_attachments,
         message_count: messages.len(),
         last_message_at,
+        annotation,
     }
 }
 
@@ -1567,6 +1575,7 @@ impl MailStore for MemoryStore {
         for mid in msg_ids {
             state.delete_message_inner(&mid);
         }
+        state.thread_annotations.remove(thread_id);
         Ok(true)
     }
 
@@ -2176,7 +2185,18 @@ impl MailStore for MemoryStore {
                     .cmp(&b.internal_date_ms)
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let summary = build_thread_summary(&tid, &msgs);
+            let annotation = state.thread_annotations.get(&tid).cloned();
+            if let Some(expected_needs_reply) = query.needs_reply
+                && annotation.as_ref().and_then(|a| a.needs_reply) != Some(expected_needs_reply)
+            {
+                continue;
+            }
+            if let Some(expected_waiting_on) = query.waiting_on
+                && annotation.as_ref().and_then(|a| a.waiting_on) != Some(expected_waiting_on)
+            {
+                continue;
+            }
+            let summary = build_thread_summary(&tid, &msgs, annotation);
             if let Some(ref req_label) = resolved_label
                 && !summary.labels.contains(req_label)
             {
@@ -2235,6 +2255,49 @@ impl MailStore for MemoryStore {
             affected_message_ids,
             labels,
         })
+    }
+
+    async fn get_thread_annotation(&self, thread_id: &str) -> AppResult<Option<ThreadAnnotation>> {
+        let state = self.read_state()?;
+        Ok(state.thread_annotations.get(thread_id).cloned())
+    }
+
+    async fn upsert_thread_annotation(
+        &self,
+        thread_id: &str,
+        annotation: &ThreadAnnotation,
+    ) -> AppResult<ThreadAnnotation> {
+        let mut state = self.write_state()?;
+        let mut stored = annotation.clone();
+        stored.thread_id = thread_id.to_string();
+        stored.due_at = stored.due_at.map(truncate_to_millis);
+        stored.updated_at = truncate_to_millis(stored.updated_at);
+        state
+            .thread_annotations
+            .insert(thread_id.to_string(), stored.clone());
+        Ok(stored)
+    }
+
+    async fn patch_thread_annotation(
+        &self,
+        thread_id: &str,
+        patch: &ThreadAnnotationPatch,
+        updated_by: Option<&str>,
+    ) -> AppResult<ThreadAnnotation> {
+        let mut state = self.write_state()?;
+        let existing = state.thread_annotations.get(thread_id).cloned();
+        let merged =
+            apply_thread_annotation_patch(existing, thread_id, patch, updated_by, Utc::now());
+        state
+            .thread_annotations
+            .insert(thread_id.to_string(), merged.clone());
+        Ok(merged)
+    }
+
+    async fn delete_thread_annotation(&self, thread_id: &str) -> AppResult<()> {
+        let mut state = self.write_state()?;
+        state.thread_annotations.remove(thread_id);
+        Ok(())
     }
 
     async fn find_message_by_resend_id(&self, resend_id: &str) -> AppResult<Option<StoredMessage>> {

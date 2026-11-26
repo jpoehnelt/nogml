@@ -25,6 +25,7 @@ use crate::{
     transport::OutboundMessage,
 };
 
+pub use crate::models::{ThreadAnnotation, ThreadAnnotationPatch, WaitingOn};
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]
 pub use postgres::{PG_EVENTS_CHANNEL, PostgresEventBridge, PostgresStore};
@@ -278,6 +279,8 @@ pub struct AiThreadQuery {
     pub q: Option<String>,
     pub label: Option<String>,
     pub unread_only: bool,
+    pub needs_reply: Option<bool>,
+    pub waiting_on: Option<WaitingOn>,
     pub include_spam_trash: bool,
     pub limit: usize,
     pub cursor: Option<String>,
@@ -793,6 +796,21 @@ pub trait MailStore: Send + Sync {
     async fn search_messages_ai(&self, query: &AiSearchQuery) -> AppResult<AiMessagePage>;
     async fn list_thread_summaries(&self, query: &AiThreadQuery) -> AppResult<AiThreadPage>;
     async fn triage_thread(&self, thread_id: &str, patch: &TriagePatch) -> AppResult<TriageResult>;
+
+    // --- Thread Annotations ---
+    async fn get_thread_annotation(&self, thread_id: &str) -> AppResult<Option<ThreadAnnotation>>;
+    async fn upsert_thread_annotation(
+        &self,
+        thread_id: &str,
+        annotation: &ThreadAnnotation,
+    ) -> AppResult<ThreadAnnotation>;
+    async fn patch_thread_annotation(
+        &self,
+        thread_id: &str,
+        patch: &ThreadAnnotationPatch,
+        updated_by: Option<&str>,
+    ) -> AppResult<ThreadAnnotation>;
+    async fn delete_thread_annotation(&self, thread_id: &str) -> AppResult<()>;
 
     // --- Resend Webhook & Lookup Helpers ---
     async fn find_message_by_resend_id(&self, resend_id: &str) -> AppResult<Option<StoredMessage>>;

@@ -1239,6 +1239,30 @@ mod tests {
                 notes: patch.notes.clone(),
             })
         }
+        async fn get_thread_annotation(
+            &self,
+            _thread_id: &str,
+        ) -> AppResult<Option<crate::models::ThreadAnnotation>> {
+            unreachable!()
+        }
+        async fn upsert_thread_annotation(
+            &self,
+            _thread_id: &str,
+            _annotation: &crate::models::ThreadAnnotation,
+        ) -> AppResult<crate::models::ThreadAnnotation> {
+            unreachable!()
+        }
+        async fn patch_thread_annotation(
+            &self,
+            _thread_id: &str,
+            _patch: &crate::models::ThreadAnnotationPatch,
+            _updated_by: Option<&str>,
+        ) -> AppResult<crate::models::ThreadAnnotation> {
+            unreachable!()
+        }
+        async fn delete_thread_annotation(&self, _thread_id: &str) -> AppResult<()> {
+            unreachable!()
+        }
     }
 
     fn test_state(

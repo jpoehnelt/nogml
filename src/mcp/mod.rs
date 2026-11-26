@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -24,7 +25,8 @@ use crate::{
     events::EventSource,
     models::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
-        AiTriageRequest, LABEL_INBOX, SyncTriggerRequest,
+        AiTriageRequest, LABEL_INBOX, PatchThreadAnnotationRequest, SyncTriggerRequest,
+        ThreadAnnotationPatch, UpsertThreadAnnotationRequest, default_extracted_object,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord,
@@ -226,11 +228,13 @@ impl McpServer {
             | "read_thread"
             | "read_email"
             | "read_attachment_text"
+            | "get_thread_annotations"
             | "list_labels"
             | "lookup_contact"
             | "list_vips"
             | "sync_status" => AuthScope::Read,
-            "create_draft" | "triage_thread" | "modify_labels" | "sync_gmail" => AuthScope::Write,
+            "create_draft" | "triage_thread" | "annotate_thread" | "modify_labels"
+            | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
             "unsubscribe" => {
                 let is_dry_run = arguments
@@ -266,6 +270,8 @@ impl McpServer {
                     "create_draft" => self.tool_create_draft(arguments).await,
                     "send_draft" => self.tool_send_draft(arguments).await,
                     "triage_thread" => self.tool_triage_thread(arguments).await,
+                    "annotate_thread" => self.tool_annotate_thread(arguments).await,
+                    "get_thread_annotations" => self.tool_get_thread_annotations(arguments).await,
                     "modify_labels" => self.tool_modify_labels(arguments).await,
                     "unsubscribe" => self.tool_unsubscribe(arguments).await,
                     "list_labels" => self.tool_list_labels().await,
@@ -549,6 +555,10 @@ impl McpServer {
             #[serde(default)]
             unread_only: bool,
             #[serde(default)]
+            needs_reply: Option<bool>,
+            #[serde(default)]
+            waiting_on: Option<String>,
+            #[serde(default)]
             include_spam_trash: bool,
             limit: Option<usize>,
             cursor: Option<String>,
@@ -558,6 +568,7 @@ impl McpServer {
         if let Some(lbl) = parsed.label.as_deref() {
             ai::validate_resource_id(lbl)?;
         }
+        let waiting_on = ai::parse_waiting_on_filter(parsed.waiting_on.as_deref())?;
 
         let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let mut page = self
@@ -567,6 +578,8 @@ impl McpServer {
                 q: parsed.query,
                 label: parsed.label,
                 unread_only: parsed.unread_only,
+                needs_reply: parsed.needs_reply,
+                waiting_on,
                 include_spam_trash: parsed.include_spam_trash,
                 limit,
                 cursor: parsed.cursor,
@@ -748,6 +761,80 @@ impl McpServer {
             EventSource::Mcp,
         )
         .await
+    }
+
+    async fn tool_annotate_thread(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            thread_id: String,
+            #[serde(default)]
+            summary: Option<String>,
+            #[serde(default)]
+            needs_reply: Option<bool>,
+            #[serde(default)]
+            waiting_on: Option<String>,
+            #[serde(default)]
+            priority: Option<String>,
+            #[serde(default)]
+            due_at: Option<DateTime<Utc>>,
+            #[serde(default)]
+            extracted: Option<Value>,
+            #[serde(default)]
+            updated_by: Option<String>,
+            #[serde(default)]
+            replace: bool,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let waiting_on = ai::parse_waiting_on_filter(parsed.waiting_on.as_deref())?;
+
+        if parsed.replace {
+            let req = UpsertThreadAnnotationRequest {
+                summary: parsed.summary,
+                needs_reply: parsed.needs_reply,
+                waiting_on,
+                priority: parsed.priority,
+                due_at: parsed.due_at,
+                extracted: parsed.extracted.unwrap_or_else(default_extracted_object),
+                updated_by: parsed.updated_by,
+            };
+            ai::execute_upsert_thread_annotation(
+                &self.state,
+                &parsed.thread_id,
+                req,
+                Some(&self.principal),
+            )
+            .await
+        } else {
+            let req = PatchThreadAnnotationRequest {
+                patch: ThreadAnnotationPatch {
+                    summary: parsed.summary,
+                    needs_reply: parsed.needs_reply,
+                    waiting_on,
+                    priority: parsed.priority,
+                    due_at: parsed.due_at,
+                    extracted: parsed.extracted,
+                },
+                updated_by: parsed.updated_by,
+            };
+            ai::execute_patch_thread_annotation(
+                &self.state,
+                &parsed.thread_id,
+                req,
+                Some(&self.principal),
+            )
+            .await
+        }
+    }
+
+    async fn tool_get_thread_annotations(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            thread_id: String,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        ai::execute_get_thread_annotations(&self.state, &parsed.thread_id).await
     }
 
     async fn tool_modify_labels(&self, args: Value) -> AppResult<Value> {
@@ -1264,13 +1351,15 @@ fn tool_catalog() -> Value {
         },
         {
             "name": "list_threads",
-            "description": "List conversation thread summaries filtered by label, unread status, or query.",
+            "description": "List conversation thread summaries filtered by label, unread status, query, or annotation state (needs_reply, waiting_on).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
                     "label": { "type": "string" },
                     "unread_only": { "type": "boolean", "default": false },
+                    "needs_reply": { "type": "boolean" },
+                    "waiting_on": { "type": "string", "enum": ["me", "them", "none"] },
                     "include_spam_trash": { "type": "boolean", "default": false },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "cursor": { "type": "string" }
@@ -1429,6 +1518,48 @@ fn tool_catalog() -> Value {
             },
             "annotations": {
                 "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "annotate_thread",
+            "description": "Persist structured agent annotations and extracted JSON state on a thread. Merges provided fields and shallow-merges extracted JSON object keys by default (pass replace: true to overwrite).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "needs_reply": { "type": "boolean" },
+                    "waiting_on": { "type": "string", "enum": ["me", "them", "none"] },
+                    "priority": { "type": "string" },
+                    "due_at": { "type": "string", "format": "date-time" },
+                    "extracted": { "type": "object", "description": "Arbitrary structured state (invoices, tracking numbers, dates, action items)" },
+                    "updated_by": { "type": "string" },
+                    "replace": { "type": "boolean", "default": false }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_thread_annotations",
+            "description": "Read persisted structured annotations and extracted state for a thread.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": {
+                    "thread_id": { "type": "string" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
                 "destructiveHint": false,
                 "idempotentHint": true,
                 "openWorldHint": false
@@ -1637,7 +1768,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 16 tools
+        // tools/list advertises all 18 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1659,6 +1790,8 @@ mod tests {
             "create_draft",
             "send_draft",
             "triage_thread",
+            "annotate_thread",
+            "get_thread_annotations",
             "modify_labels",
             "unsubscribe",
             "list_labels",
@@ -1669,7 +1802,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 18);
     }
 
     #[tokio::test]

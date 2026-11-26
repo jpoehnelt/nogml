@@ -11,7 +11,7 @@ use nogml::{
     events::{EventBridge, EventBus, EventEnvelope, EventSource, MailEvent},
     models::{
         LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD,
-        LabelColor, SYSTEM_LABEL_IDS,
+        LabelColor, SYSTEM_LABEL_IDS, ThreadAnnotation, ThreadAnnotationPatch, WaitingOn,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactDirection, ContactInteraction,
@@ -957,6 +957,244 @@ async fn contract_pending_approvals_atomic_transitions(store: Arc<dyn MailStore>
     assert!(matches!(third, AppError::Conflict(_)));
 }
 
+async fn contract_thread_annotations(store: Arc<dyn MailStore>) {
+    let mut m1 = sample_message(
+        "Invoice #4021",
+        "billing@vendor.test",
+        "Please pay $1,250 by Friday.",
+        1_700_000_001_000,
+    );
+    m1.thread_id = Some("thr_ann_1".to_string());
+    let _s1 = store.insert_message(m1).await.unwrap();
+
+    let mut m2 = sample_message(
+        "Design review",
+        "bob@acme.test",
+        "Waiting for their updated mockups.",
+        1_700_000_002_000,
+    );
+    m2.thread_id = Some("thr_ann_2".to_string());
+    let _s2 = store.insert_message(m2).await.unwrap();
+
+    let mut m3 = sample_message(
+        "Weekly digest",
+        "news@digest.test",
+        "No reply needed.",
+        1_700_000_003_000,
+    );
+    m3.thread_id = Some("thr_ann_3".to_string());
+    let _s3 = store.insert_message(m3).await.unwrap();
+
+    // 1. Initially absent
+    assert!(
+        store
+            .get_thread_annotation("thr_ann_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let empty_filtered = store
+        .list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(empty_filtered.threads.is_empty());
+
+    // 2. Full upsert round-trip
+    let due_at = DateTime::from_timestamp_millis(1_760_000_000_000).unwrap();
+    let updated_at = DateTime::from_timestamp_millis(1_750_000_000_000).unwrap();
+    let initial = ThreadAnnotation {
+        thread_id: "thr_ann_1".to_string(),
+        summary: Some("Vendor invoice #4021 due Friday".to_string()),
+        needs_reply: Some(true),
+        waiting_on: Some(WaitingOn::Me),
+        priority: Some("high".to_string()),
+        due_at: Some(due_at),
+        extracted: serde_json::json!({
+            "invoice_id": "INV-4021",
+            "amount_usd": 1250
+        }),
+        updated_by: Some("triage-cron".to_string()),
+        updated_at,
+    };
+    let saved = store
+        .upsert_thread_annotation("thr_ann_1", &initial)
+        .await
+        .unwrap();
+    assert_eq!(saved, initial);
+    let fetched = store
+        .get_thread_annotation("thr_ann_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched, saved);
+
+    // 3. Patch merges provided fields cleanly and shallow-merges JSON object keys in `extracted`
+    let patched = store
+        .patch_thread_annotation(
+            "thr_ann_1",
+            &ThreadAnnotationPatch {
+                priority: Some("urgent".to_string()),
+                extracted: Some(serde_json::json!({
+                    "amount_usd": 1300,
+                    "approved_by": "finance"
+                })),
+                ..Default::default()
+            },
+            Some("briefing-agent"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        patched.summary.as_deref(),
+        Some("Vendor invoice #4021 due Friday")
+    );
+    assert_eq!(patched.needs_reply, Some(true));
+    assert_eq!(patched.waiting_on, Some(WaitingOn::Me));
+    assert_eq!(patched.priority.as_deref(), Some("urgent"));
+    assert_eq!(patched.due_at, Some(due_at));
+    assert_eq!(patched.updated_by.as_deref(), Some("briefing-agent"));
+    assert_eq!(
+        patched.extracted,
+        serde_json::json!({
+            "invoice_id": "INV-4021",
+            "amount_usd": 1300,
+            "approved_by": "finance"
+        })
+    );
+
+    // Patch on a thread without an existing annotation creates one
+    let patched_2 = store
+        .patch_thread_annotation(
+            "thr_ann_2",
+            &ThreadAnnotationPatch {
+                summary: Some("Awaiting mockups from Bob".to_string()),
+                needs_reply: Some(false),
+                waiting_on: Some(WaitingOn::Them),
+                ..Default::default()
+            },
+            Some("chat-agent"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched_2.needs_reply, Some(false));
+    assert_eq!(patched_2.waiting_on, Some(WaitingOn::Them));
+
+    // 4. Filter by needs_reply and waiting_on in list_thread_summaries
+    let need_reply = store
+        .list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(need_reply.threads.len(), 1);
+    assert_eq!(need_reply.threads[0].id, "thr_ann_1");
+    assert_eq!(
+        need_reply.threads[0]
+            .annotation
+            .as_ref()
+            .and_then(|a| a.waiting_on),
+        Some(WaitingOn::Me)
+    );
+
+    let no_reply = store
+        .list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(no_reply.threads.len(), 1);
+    assert_eq!(no_reply.threads[0].id, "thr_ann_2");
+
+    let waiting_me = store
+        .list_thread_summaries(&AiThreadQuery {
+            waiting_on: Some(WaitingOn::Me),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting_me.threads.len(), 1);
+    assert_eq!(waiting_me.threads[0].id, "thr_ann_1");
+
+    let combined = store
+        .list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(false),
+            waiting_on: Some(WaitingOn::Them),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(combined.threads.len(), 1);
+    assert_eq!(combined.threads[0].id, "thr_ann_2");
+
+    let mismatch = store
+        .list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(true),
+            waiting_on: Some(WaitingOn::Them),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(mismatch.threads.is_empty());
+
+    // Unfiltered listing includes annotations on annotated threads and None on unannotated threads
+    let all = store
+        .list_thread_summaries(&AiThreadQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(all.threads.len(), 3);
+    let t1 = all.threads.iter().find(|t| t.id == "thr_ann_1").unwrap();
+    let t3 = all.threads.iter().find(|t| t.id == "thr_ann_3").unwrap();
+    assert!(t1.annotation.is_some());
+    assert!(t3.annotation.is_none());
+
+    // 5. Full upsert replaces existing fields (clearing priority/due_at)
+    let replaced = store
+        .upsert_thread_annotation(
+            "thr_ann_1",
+            &ThreadAnnotation {
+                thread_id: "thr_ann_1".to_string(),
+                summary: Some("Replaced summary".to_string()),
+                needs_reply: Some(false),
+                waiting_on: Some(WaitingOn::None),
+                priority: None,
+                due_at: None,
+                extracted: serde_json::json!({ "status": "paid" }),
+                updated_by: Some("closer".to_string()),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(replaced.priority.is_none());
+    assert!(replaced.due_at.is_none());
+    assert_eq!(replaced.extracted, serde_json::json!({ "status": "paid" }));
+
+    // 6. delete_thread_annotation removes annotation
+    store.delete_thread_annotation("thr_ann_1").await.unwrap();
+    assert!(
+        store
+            .get_thread_annotation("thr_ann_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 7. delete_thread cleans up its persisted annotation
+    assert!(store.delete_thread("thr_ann_2").await.unwrap());
+    assert!(
+        store
+            .get_thread_annotation("thr_ann_2")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 async fn contract_multi_mailbox_isolation(
     base_store: Arc<dyn MailStore>,
     alice_mb: &str,
@@ -1133,6 +1371,74 @@ async fn contract_multi_mailbox_isolation(
     assert_eq!(alice_contact.notes.as_deref(), Some("Alice secret note"));
     assert_eq!(alice_contact.sent_count, 1);
     assert_eq!(alice_contact.received_count, 0);
+
+    // Multi-mailbox thread annotation isolation on identical thread_id
+    let mut a_ann_msg = sample_message("Shared ID Alice", "x@a.test", "Alice body", 3000);
+    a_ann_msg.thread_id = Some("thr_shared_ann".to_string());
+    alice.insert_message(a_ann_msg).await.unwrap();
+    alice
+        .patch_thread_annotation(
+            "thr_shared_ann",
+            &ThreadAnnotationPatch {
+                summary: Some("Alice private summary".to_string()),
+                needs_reply: Some(true),
+                waiting_on: Some(WaitingOn::Me),
+                extracted: Some(serde_json::json!({ "owner": "alice" })),
+                ..Default::default()
+            },
+            Some("alice-agent"),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        bob.get_thread_annotation("thr_shared_ann")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        bob.list_thread_summaries(&AiThreadQuery {
+            needs_reply: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .threads
+        .is_empty()
+    );
+
+    let mut b_ann_msg = sample_message("Shared ID Bob", "x@b.test", "Bob body", 4000);
+    b_ann_msg.thread_id = Some("thr_shared_ann".to_string());
+    bob.insert_message(b_ann_msg).await.unwrap();
+    bob.patch_thread_annotation(
+        "thr_shared_ann",
+        &ThreadAnnotationPatch {
+            summary: Some("Bob private summary".to_string()),
+            needs_reply: Some(false),
+            waiting_on: Some(WaitingOn::Them),
+            extracted: Some(serde_json::json!({ "owner": "bob" })),
+            ..Default::default()
+        },
+        Some("bob-agent"),
+    )
+    .await
+    .unwrap();
+
+    let alice_ann = alice
+        .get_thread_annotation("thr_shared_ann")
+        .await
+        .unwrap()
+        .unwrap();
+    let bob_ann = bob
+        .get_thread_annotation("thr_shared_ann")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice_ann.summary.as_deref(), Some("Alice private summary"));
+    assert_eq!(alice_ann.waiting_on, Some(WaitingOn::Me));
+    assert_eq!(bob_ann.summary.as_deref(), Some("Bob private summary"));
+    assert_eq!(bob_ann.waiting_on, Some(WaitingOn::Them));
 }
 
 async fn contract_contacts_stats_vip_filtering_and_patch(store: Arc<dyn MailStore>) {
@@ -1331,6 +1637,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     let mb_sync = format!("{prefix}-sync-{suffix}@contract.test");
     let mb_apr = format!("{prefix}-apr-{suffix}@contract.test");
     let mb_contacts = format!("{prefix}-contacts-{suffix}@contract.test");
+    let mb_ann = format!("{prefix}-ann-{suffix}@contract.test");
     let mb_alice = format!("{prefix}-alice-{suffix}@contract.test");
     let mb_bob = format!("{prefix}-bob-{suffix}@contract.test");
 
@@ -1340,6 +1647,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_upsert_dedup_settings_watch_sync_state(base_store.for_mailbox(&mb_sync)).await;
     contract_pending_approvals_atomic_transitions(base_store.for_mailbox(&mb_apr)).await;
     contract_contacts_stats_vip_filtering_and_patch(base_store.for_mailbox(&mb_contacts)).await;
+    contract_thread_annotations(base_store.for_mailbox(&mb_ann)).await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
 }
 
