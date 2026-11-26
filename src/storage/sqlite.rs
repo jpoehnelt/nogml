@@ -5664,6 +5664,20 @@ impl MailStore for SqliteStore {
                     }
                 }
 
+                if existing
+                    .upstream_thread_id
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+                    && let Some(ref utid) = input.upstream_thread_id
+                    && !utid.trim().is_empty()
+                {
+                    tx.execute(
+                        "UPDATE messages SET upstream_thread_id = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                        params![utid.trim(), mb, &existing_id],
+                    )
+                    .map_err(sql_err)?;
+                }
+
                 let updated = if labels_changed {
                     modify_message_labels_resolved_tx_with_source(
                         &tx,

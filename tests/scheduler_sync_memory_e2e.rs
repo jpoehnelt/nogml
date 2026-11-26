@@ -125,6 +125,7 @@ impl MailTransport for DelayedRecordingTransport {
         Ok(SendOutcome {
             provider: "delayed-recording".to_string(),
             provider_message_id: format!("prov_{}", guard.len()),
+            provider_thread_id: None,
         })
     }
 }

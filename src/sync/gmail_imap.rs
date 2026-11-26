@@ -19,17 +19,18 @@ use async_imap::{
     Authenticator, Session,
     extensions::idle::IdleResponse,
     imap_proto::{
-        AttributeValue, MailboxDatum, Response as ImapResponse, ResponseCode, Status as ImapStatus,
-        rfc4315::UidSetMember,
+        AttributeValue, Capability as ImapCapability, MailboxDatum, Response as ImapResponse,
+        ResponseCode, Status as ImapStatus, rfc4315::UidSetMember,
     },
 };
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     sync::watch,
 };
@@ -211,6 +212,121 @@ impl Authenticator for XOAuth2Authenticator {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct EnabledImapExtensions {
+    qresync: bool,
+    utf8_accept: bool,
+}
+
+/// Encode a UTF-8 IMAP mailbox or `X-GM-LABELS` string into RFC 3501 section 5.1.3 Modified UTF-7.
+///
+/// Printable US-ASCII (`0x20..=0x7E`) except `&` is preserved verbatim, `&` is encoded as `&-`,
+/// and runs of non-printable/non-ASCII Unicode characters are encoded as big-endian UTF-16 in
+/// unpadded Modified Base64 (`,` instead of `/`) wrapped in `&...-`.
+pub fn encode_imap_mutf7(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut non_ascii_utf16: Vec<u16> = Vec::new();
+
+    let flush_non_ascii = |buf: &mut Vec<u16>, out: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(buf.len() * 2);
+        for unit in buf.drain(..) {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(&bytes)
+            .replace('/', ",");
+        out.push('&');
+        out.push_str(&encoded);
+        out.push('-');
+    };
+
+    for ch in input.chars() {
+        let code = ch as u32;
+        if (0x20..=0x7e).contains(&code) {
+            flush_non_ascii(&mut non_ascii_utf16, &mut out);
+            if ch == '&' {
+                out.push_str("&-");
+            } else {
+                out.push(ch);
+            }
+        } else {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                non_ascii_utf16.push(*unit);
+            }
+        }
+    }
+    flush_non_ascii(&mut non_ascii_utf16, &mut out);
+    out
+}
+
+/// Decode an RFC 3501 section 5.1.3 Modified UTF-7 IMAP mailbox or `X-GM-LABELS` string back to UTF-8.
+///
+/// Falls back to returning `input` verbatim if any shift sequence is malformed so already-UTF-8
+/// strings containing `&` are preserved safely.
+pub fn decode_imap_mutf7(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            let rest = &input[i..];
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        // Shift sequence starts at `&`.
+        let start = i + 1;
+        let Some(rel_end) = bytes[start..].iter().position(|&b| b == b'-') else {
+            return input.to_string();
+        };
+        let end = start + rel_end;
+        if end == start {
+            // `&-` represents a literal `&`.
+            out.push('&');
+            i = end + 1;
+            continue;
+        }
+
+        let b64_slice = &input[start..end];
+        if !b64_slice
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b',')
+        {
+            return input.to_string();
+        }
+        let std_b64 = b64_slice.replace(',', "/");
+        let Ok(decoded_bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(&std_b64)
+        else {
+            return input.to_string();
+        };
+        let (pairs, remainder) = decoded_bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return input.to_string();
+        }
+        let units: Vec<u16> = pairs.iter().map(|&pair| u16::from_be_bytes(pair)).collect();
+        for res in char::decode_utf16(units) {
+            match res {
+                Ok(ch) => out.push(ch),
+                Err(_) => return input.to_string(),
+            }
+        }
+        i = end + 1;
+    }
+
+    out
+}
+
 /// Safely quote an IMAP string (mailbox name or custom Gmail `X-GM-LABELS` label).
 ///
 /// Rejects empty strings and any string containing CR, LF, NUL, or ASCII control bytes to prevent
@@ -241,23 +357,34 @@ pub fn quote_imap_string(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// Map a local `nogml` label ID to a Gmail IMAP `X-GM-LABELS` wire token.
+/// Map a local `nogml` label ID to a Gmail IMAP `X-GM-LABELS` wire token using RFC 3501
+/// Modified UTF-7 encoding for non-ASCII custom labels (safe when `UTF8=ACCEPT` is not enabled).
 ///
 /// - System labels map to unquoted Gmail special-use tokens (`\Inbox`, `\Starred`, `\Important`,
-///   `\Spam`, `\Trash`, `\Sent`, `\Draft`).
+///   `\Junk`, `\Trash`, `\Sent`, `\Draft`).
 /// - `UNREAD` returns `None` because read/unread state is governed by the `\Seen` IMAP flag.
-/// - Custom user labels are resolved via `user_label_names` and quoted safely via
-///   [`quote_imap_string`].
+/// - Custom user labels are resolved via `user_label_names`, encoded as Modified UTF-7, and quoted
+///   safely via [`quote_imap_string`].
 pub fn map_local_label_to_xgm_token(
     label_id: &str,
     user_label_names: &HashMap<String, String>,
+) -> Option<String> {
+    map_local_label_to_xgm_token_with_utf8(label_id, user_label_names, false)
+}
+
+/// Map a local `nogml` label ID to a Gmail IMAP `X-GM-LABELS` wire token, emitting raw UTF-8 when
+/// `utf8_accept` is `true` (RFC 6855 `ENABLE UTF8=ACCEPT`) or RFC 3501 Modified UTF-7 when `false`.
+pub fn map_local_label_to_xgm_token_with_utf8(
+    label_id: &str,
+    user_label_names: &HashMap<String, String>,
+    utf8_accept: bool,
 ) -> Option<String> {
     match label_id {
         LABEL_UNREAD => None,
         LABEL_INBOX => Some("\\Inbox".to_string()),
         LABEL_STARRED => Some("\\Starred".to_string()),
         LABEL_IMPORTANT => Some("\\Important".to_string()),
-        LABEL_SPAM => Some("\\Spam".to_string()),
+        LABEL_SPAM => Some("\\Junk".to_string()),
         LABEL_TRASH => Some("\\Trash".to_string()),
         LABEL_SENT => Some("\\Sent".to_string()),
         LABEL_DRAFT => Some("\\Draft".to_string()),
@@ -268,8 +395,21 @@ pub fn map_local_label_to_xgm_token(
             let name = user_label_names
                 .get(other)
                 .map(String::as_str)
-                .unwrap_or(other);
-            quote_imap_string(name)
+                .unwrap_or(other)
+                .trim();
+            if name.is_empty()
+                || name
+                    .bytes()
+                    .any(|b| b == b'\r' || b == b'\n' || b == 0 || b < 0x20 || b == 0x7f)
+            {
+                return None;
+            }
+            if utf8_accept {
+                quote_imap_string(name)
+            } else {
+                let wire = encode_imap_mutf7(name);
+                quote_imap_string(&wire)
+            }
         }
     }
 }
@@ -430,6 +570,7 @@ async fn collect_labels_from_fetch(
     fetch: &FetchedImapMessage,
     selected_mailbox: &str,
     archive_mailbox: &str,
+    utf8_accept: bool,
     user_label_cache: &mut HashMap<String, String>,
     report: &mut PullReport,
 ) -> AppResult<HashSet<String>> {
@@ -474,7 +615,16 @@ async fn collect_labels_from_fetch(
                 }
                 "\\All" | "\\AllMail" => {}
                 other if other.starts_with('\\') => {}
-                user_name => {
+                raw_user_name => {
+                    let decoded_name = if utf8_accept {
+                        raw_user_name.to_string()
+                    } else {
+                        decode_imap_mutf7(raw_user_name)
+                    };
+                    let user_name = decoded_name.trim();
+                    if user_name.is_empty() {
+                        continue;
+                    }
                     let local_id = if let Some(existing) = user_label_cache.get(user_name) {
                         existing.clone()
                     } else {
@@ -517,6 +667,7 @@ async fn apply_fetched_metadata_delta(
     selected_mailbox: &str,
     archive_mailbox: &str,
     has_xgm: bool,
+    utf8_accept: bool,
     skip_labels: Option<&HashSet<String>>,
     user_label_cache: &mut HashMap<String, String>,
     report: &mut PullReport,
@@ -532,6 +683,7 @@ async fn apply_fetched_metadata_delta(
             fetch,
             selected_mailbox,
             archive_mailbox,
+            utf8_accept,
             user_label_cache,
             report,
         )
@@ -796,7 +948,9 @@ impl SyncSource for GmailImapSyncSource {
             connect_imap_session(&state.config, connect_timeout, command_timeout).await?;
 
         let caps = query_imap_capabilities(&mut session, command_timeout).await?;
-        let qresync_enabled = enable_imap_extensions(&mut session, &caps, command_timeout).await;
+        let enabled_ext = enable_imap_extensions(&mut session, &caps, command_timeout).await;
+        let qresync_enabled = enabled_ext.qresync;
+        let utf8_accept = enabled_ext.utf8_accept;
 
         let mut user_label_cache: HashMap<String, String> = HashMap::new();
         for lbl in state.store.list_labels().await? {
@@ -945,10 +1099,30 @@ impl SyncSource for GmailImapSyncSource {
                                 used_snapshot_reconcile = true;
                             }
                         }
+                    }
 
-                        // Servers supporting CONDSTORE without QRESYNC (such as Gmail IMAP) do not
-                        // emit `VANISHED`, so check tracked UIDs against `UID SEARCH 1:<last_uid>`.
-                        if !qresync_enabled && !folder_state.uid_to_message_id.is_empty() {
+                    // Servers supporting CONDSTORE without QRESYNC (such as Gmail IMAP) do not
+                    // emit `VANISHED` and per RFC 7162 section 3.1.2 are not required to bump
+                    // HIGHESTMODSEQ on expunge. Run deletion reconciliation outside
+                    // `if !server_unchanged` whenever HIGHESTMODSEQ changed, EXISTS differs from
+                    // our tracked count, or UIDNEXT indicates new arrivals that could mask an
+                    // expunge.
+                    if !qresync_enabled
+                        && !used_snapshot_reconcile
+                        && !folder_state.uid_to_message_id.is_empty()
+                    {
+                        let tracked_count = folder_state
+                            .uid_to_message_id
+                            .keys()
+                            .filter(|&&u| u <= prev_last_uid)
+                            .count();
+                        let maybe_new_arrivals = mailbox
+                            .uid_next
+                            .is_none_or(|uid_next| uid_next > prev_last_uid.saturating_add(1));
+                        let should_sweep_deletions = !server_unchanged
+                            || (mailbox.exists as usize) != tracked_count
+                            || maybe_new_arrivals;
+                        if should_sweep_deletions {
                             let surviving =
                                 search_existing_uids(&mut session, prev_last_uid, command_timeout)
                                     .await?;
@@ -1020,6 +1194,7 @@ impl SyncSource for GmailImapSyncSource {
                         &selected_mailbox,
                         &archive_mailbox,
                         caps.has_xgm,
+                        utf8_accept,
                         skip_labels,
                         &mut user_label_cache,
                         &mut report,
@@ -1074,14 +1249,14 @@ impl SyncSource for GmailImapSyncSource {
                             report.messages_updated += 1;
                         }
                         multi_folder_vanished_candidates.insert(existing.id);
-                    } else if let Some(ref up_id) = existing.upstream_gmail_id
-                        && state
-                            .store
-                            .delete_message_by_upstream_id(up_id)
-                            .await?
-                            .is_some()
-                    {
-                        report.messages_deleted += 1;
+                    } else if let Some(ref up_id) = existing.upstream_gmail_id {
+                        let att_ids = state.collect_external_attachment_ids(&existing.id).await;
+                        if let Some(removed) =
+                            state.store.delete_message_by_upstream_id(up_id).await?
+                        {
+                            let _ = state.post_delete_message(&removed.id, &att_ids).await;
+                            report.messages_deleted += 1;
+                        }
                     }
                 }
             }
@@ -1168,6 +1343,7 @@ impl SyncSource for GmailImapSyncSource {
                             &fetch,
                             &selected_mailbox,
                             &archive_mailbox,
+                            utf8_accept,
                             &mut user_label_cache,
                             &mut report,
                         )
@@ -1246,13 +1422,12 @@ impl SyncSource for GmailImapSyncSource {
                 }
                 if let Some(msg) = state.store.get_message(&candidate_id).await?
                     && let Some(ref up_id) = msg.upstream_gmail_id
-                    && state
-                        .store
-                        .delete_message_by_upstream_id(up_id)
-                        .await?
-                        .is_some()
                 {
-                    report.messages_deleted += 1;
+                    let att_ids = state.collect_external_attachment_ids(&msg.id).await;
+                    if let Some(removed) = state.store.delete_message_by_upstream_id(up_id).await? {
+                        let _ = state.post_delete_message(&removed.id, &att_ids).await;
+                        report.messages_deleted += 1;
+                    }
                 }
             }
         }
@@ -1287,7 +1462,8 @@ impl SyncSource for GmailImapSyncSource {
         let mut session =
             connect_imap_session(&state.config, connect_timeout, command_timeout).await?;
         let caps = query_imap_capabilities(&mut session, command_timeout).await?;
-        let _ = enable_imap_extensions(&mut session, &caps, command_timeout).await;
+        let enabled_ext = enable_imap_extensions(&mut session, &caps, command_timeout).await;
+        let utf8_accept = enabled_ext.utf8_accept;
 
         let mut user_label_names: HashMap<String, String> = HashMap::new();
         for lbl in state.store.list_labels().await? {
@@ -1455,6 +1631,7 @@ impl SyncSource for GmailImapSyncSource {
                             add_labels,
                             remove_labels,
                             &user_label_names,
+                            utf8_accept,
                             command_timeout,
                         )
                         .await?;
@@ -1505,6 +1682,7 @@ impl SyncSource for GmailImapSyncSource {
                             add_labels,
                             remove_labels,
                             &user_label_names,
+                            utf8_accept,
                             command_timeout,
                         )
                         .await?;
@@ -1528,6 +1706,7 @@ impl SyncSource for GmailImapSyncSource {
                                     &[LABEL_TRASH.to_string()],
                                     &[LABEL_INBOX.to_string()],
                                     &user_label_names,
+                                    utf8_accept,
                                     command_timeout,
                                 )
                                 .await?;
@@ -1930,14 +2109,13 @@ async fn query_imap_capabilities(
 }
 
 /// Enable `QRESYNC` / `CONDSTORE` / `UTF8=ACCEPT` when advertised by the server.
-/// Returns `true` when `QRESYNC` was successfully enabled.
 async fn enable_imap_extensions(
     session: &mut Session<UpstreamImapStream>,
     caps: &ImapServerCaps,
     command_timeout: Duration,
-) -> bool {
+) -> EnabledImapExtensions {
     if !caps.has_enable {
-        return false;
+        return EnabledImapExtensions::default();
     }
     let mut to_enable: Vec<&'static str> = Vec::new();
     if caps.has_qresync {
@@ -1950,19 +2128,22 @@ async fn enable_imap_extensions(
         to_enable.push("UTF8=ACCEPT");
     }
     if to_enable.is_empty() {
-        return false;
+        return EnabledImapExtensions::default();
     }
 
     let cmd = format!("ENABLE {}", to_enable.join(" "));
     match tokio::time::timeout(command_timeout, session.run_command_and_check_ok(&cmd)).await {
-        Ok(Ok(())) => caps.has_qresync,
+        Ok(Ok(())) => EnabledImapExtensions {
+            qresync: caps.has_qresync,
+            utf8_accept: caps.has_utf8_accept,
+        },
         Ok(Err(err)) => {
-            debug!(%err, cmd = %cmd, "IMAP ENABLE rejected; continuing without QRESYNC");
-            false
+            debug!(%err, cmd = %cmd, "IMAP ENABLE rejected; continuing without optional extensions");
+            EnabledImapExtensions::default()
         }
         Err(_) => {
-            warn!(cmd = %cmd, "IMAP ENABLE timed out; continuing without QRESYNC");
-            false
+            warn!(cmd = %cmd, "IMAP ENABLE timed out; continuing without optional extensions");
+            EnabledImapExtensions::default()
         }
     }
 }
@@ -2056,11 +2237,147 @@ async fn find_local_message_for_imap_uid(
     state.store.find_message_by_upstream_id(&fallback_id).await
 }
 
+pub(crate) fn is_loopback_imap_host(host: &str) -> bool {
+    let trimmed = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+pub(crate) fn is_gmail_imap_host(host: &str) -> bool {
+    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    lower == "imap.gmail.com"
+        || lower == "imap.googlemail.com"
+        || lower.ends_with(".gmail.com")
+        || lower.ends_with(".googlemail.com")
+}
+
+/// Validate that sending a Google OAuth2 bearer token to the configured IMAP server is safe:
+/// requires TLS (except loopback for local tests) and a Gmail IMAP host (or loopback).
+pub(crate) fn validate_imap_xoauth2_target(config: &Config) -> AppResult<()> {
+    let host = config.gmail_imap_host.trim();
+    if is_loopback_imap_host(host) {
+        return Ok(());
+    }
+    if !config.gmail_imap_tls {
+        return Err(AppError::Config(format!(
+            "Refusing to send Gmail OAuth2 bearer token over non-TLS IMAP connection to '{host}'; enable gmail_imap_tls or configure gmail_imap_password"
+        )));
+    }
+    if !is_gmail_imap_host(host) {
+        return Err(AppError::Config(format!(
+            "Refusing to send Gmail OAuth2 bearer token to non-Gmail IMAP host '{host}'; configure gmail_imap_password for third-party IMAP servers"
+        )));
+    }
+    Ok(())
+}
+
+fn caps_list_has_xoauth2(caps: &[ImapCapability<'_>]) -> bool {
+    caps.iter().any(|cap| match cap {
+        ImapCapability::Auth(mech) => mech.eq_ignore_ascii_case("XOAUTH2"),
+        ImapCapability::Atom(atom) => atom.eq_ignore_ascii_case("AUTH=XOAUTH2"),
+        ImapCapability::Imap4rev1 => false,
+    })
+}
+
+fn greeting_advertises_xoauth2(parsed: Option<&ImapResponse<'_>>) -> Option<bool> {
+    match parsed? {
+        ImapResponse::Data { outcome, .. } => match outcome.code.as_ref() {
+            Some(ResponseCode::Capabilities(caps)) => Some(caps_list_has_xoauth2(caps)),
+            _ => None,
+        },
+        ImapResponse::Capabilities(caps) => Some(caps_list_has_xoauth2(caps)),
+        _ => None,
+    }
+}
+
+async fn read_crlf_line_bounded(
+    stream: &mut UpstreamImapStream,
+    max_bytes: usize,
+) -> std::io::Result<String> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let b = stream.read_u8().await?;
+        buf.push(b);
+        if b == b'\n' {
+            break;
+        }
+        if buf.len() >= max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IMAP pre-auth capability line exceeded maximum length",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn query_preauth_xoauth2_capability(
+    client: async_imap::Client<UpstreamImapStream>,
+    greeting_xoauth2: Option<bool>,
+    command_timeout: Duration,
+) -> AppResult<(async_imap::Client<UpstreamImapStream>, bool)> {
+    if let Some(supported) = greeting_xoauth2 {
+        return Ok((client, supported));
+    }
+
+    let mut stream = client.into_inner();
+    let supported = with_imap_timeout(
+        command_timeout,
+        "IMAP pre-auth CAPABILITY",
+        async {
+            stream.write_all(b"C0 CAPABILITY\r\n").await?;
+            stream.flush().await?;
+            let mut found = false;
+            for _ in 0..32 {
+                let line = read_crlf_line_bounded(&mut stream, 16 * 1024).await?;
+                let trimmed = line.trim();
+                let upper = trimmed.to_ascii_uppercase();
+                if upper.starts_with("* CAPABILITY ") {
+                    if trimmed
+                        .split_whitespace()
+                        .skip(2)
+                        .any(|tok| tok.eq_ignore_ascii_case("AUTH=XOAUTH2"))
+                    {
+                        found = true;
+                    }
+                } else if upper.starts_with("C0 ") {
+                    if let Some(bracket_start) = trimmed.find('[')
+                        && let Some(bracket_end) = trimmed[bracket_start + 1..].find(']')
+                    {
+                        let inner = &trimmed[bracket_start + 1..bracket_start + 1 + bracket_end];
+                        if inner
+                            .split_whitespace()
+                            .any(|tok| tok.eq_ignore_ascii_case("AUTH=XOAUTH2"))
+                        {
+                            found = true;
+                        }
+                    }
+                    break;
+                }
+            }
+            Ok::<bool, std::io::Error>(found)
+        },
+        |e| AppError::Upstream {
+            status: 502,
+            message: format!("IMAP pre-auth CAPABILITY failed: {e}"),
+        },
+    )
+    .await?;
+
+    Ok((async_imap::Client::new(stream), supported))
+}
+
 async fn connect_imap_client(
     config: &Config,
     connect_timeout: Duration,
     command_timeout: Duration,
-) -> AppResult<async_imap::Client<UpstreamImapStream>> {
+) -> AppResult<(async_imap::Client<UpstreamImapStream>, Option<bool>)> {
     ensure_crypto_provider();
 
     let host = &config.gmail_imap_host;
@@ -2101,7 +2418,7 @@ async fn connect_imap_client(
     };
 
     let mut client = async_imap::Client::new(stream);
-    with_imap_timeout(
+    let greeting = with_imap_timeout(
         command_timeout,
         "IMAP greeting",
         client.read_response(),
@@ -2111,8 +2428,9 @@ async fn connect_imap_client(
         },
     )
     .await?;
+    let greeting_xoauth2 = greeting_advertises_xoauth2(greeting.as_ref().map(|r| r.parsed()));
 
-    Ok(client)
+    Ok((client, greeting_xoauth2))
 }
 
 async fn connect_imap_session(
@@ -2131,84 +2449,98 @@ async fn connect_imap_session(
         .as_deref()
         .filter(|s| !s.is_empty());
 
-    let use_oauth2 = config.has_gmail_oauth2();
-    if !use_oauth2 && password.is_none() {
+    // Prefer explicit `gmail_imap_password` over Gmail OAuth2 (matching `SmtpConfig::from_config`)
+    // so deployments configuring Gmail OAuth2 for outbound transport never leak Google bearer
+    // tokens to third-party IMAP servers and password auth is never blocked by OAuth refresh failures.
+    if let Some(pass) = password {
+        let (client, _) = connect_imap_client(config, connect_timeout, command_timeout).await?;
+        return with_imap_timeout(
+            command_timeout,
+            "IMAP LOGIN",
+            client.login(user, pass),
+            |(err, _)| AppError::Unauthorized(format!("IMAP login failed: {err}")),
+        )
+        .await;
+    }
+
+    if !config.has_gmail_oauth2() {
         return Err(AppError::Config(
             "Gmail IMAP sync requires gmail_imap_password or Gmail OAuth2 credentials".to_string(),
         ));
     }
 
-    if use_oauth2 {
-        let http_client = reqwest::Client::builder()
-            .timeout(connect_timeout)
-            .build()
-            .map_err(|e| AppError::Internal(format!("Failed to build OAuth2 HTTP client: {e}")))?;
-        let can_refresh = config
-            .gmail_access_token
+    validate_imap_xoauth2_target(config)?;
+
+    let http_client = reqwest::Client::builder()
+        .timeout(connect_timeout)
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build OAuth2 HTTP client: {e}")))?;
+    let can_refresh = config
+        .gmail_access_token
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+        && config
+            .gmail_refresh_token
             .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-            && config
-                .gmail_refresh_token
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+            .is_some_and(|s| !s.trim().is_empty());
 
-        let mut token = acquire_access_token(&http_client, config).await?;
-        let mut refreshed = false;
+    let (client, greeting_xoauth2) =
+        connect_imap_client(config, connect_timeout, command_timeout).await?;
+    let (mut client, supports_xoauth2) =
+        query_preauth_xoauth2_capability(client, greeting_xoauth2, command_timeout).await?;
+    if !supports_xoauth2 {
+        return Err(AppError::Unauthorized(format!(
+            "IMAP server {}:{} did not advertise AUTH=XOAUTH2; refusing to send OAuth2 bearer token",
+            config.gmail_imap_host, config.gmail_imap_port
+        )));
+    }
 
-        loop {
-            let client = connect_imap_client(config, connect_timeout, command_timeout).await?;
-            let auth = XOAuth2Authenticator::new(user, &token);
-            match tokio::time::timeout(command_timeout, client.authenticate("XOAUTH2", auth)).await
-            {
-                Ok(Ok(session)) => return Ok(session),
-                Ok(Err((err, _client))) => {
-                    if can_refresh && !refreshed {
-                        refreshed = true;
-                        warn!(%err, "IMAP XOAUTH2 authentication failed; refreshing OAuth2 token and retrying once");
-                        invalidate_access_token(config);
-                        token = acquire_access_token(&http_client, config).await?;
-                        continue;
-                    }
-                    if let Some(pass) = password {
-                        warn!(%err, "IMAP XOAUTH2 authentication failed; falling back to LOGIN");
-                        let fallback_client =
-                            connect_imap_client(config, connect_timeout, command_timeout).await?;
-                        return with_imap_timeout(
+    let mut token = acquire_access_token(&http_client, config).await?;
+    let mut refreshed = false;
+
+    loop {
+        let auth = XOAuth2Authenticator::new(user, &token);
+        match tokio::time::timeout(command_timeout, client.authenticate("XOAUTH2", auth)).await {
+            Ok(Ok(session)) => return Ok(session),
+            Ok(Err((err, _client))) => {
+                if can_refresh && !refreshed {
+                    refreshed = true;
+                    warn!(%err, "IMAP XOAUTH2 authentication failed; refreshing OAuth2 token and retrying once");
+                    invalidate_access_token(config);
+                    token = acquire_access_token(&http_client, config).await?;
+                    let (retry_client, retry_greeting) =
+                        connect_imap_client(config, connect_timeout, command_timeout).await?;
+                    let (verified_client, retry_supports_xoauth2) =
+                        query_preauth_xoauth2_capability(
+                            retry_client,
+                            retry_greeting,
                             command_timeout,
-                            "IMAP LOGIN",
-                            fallback_client.login(user, pass),
-                            |(login_err, _)| {
-                                AppError::Unauthorized(format!("IMAP login failed: {login_err}"))
-                            },
                         )
-                        .await;
+                        .await?;
+                    if !retry_supports_xoauth2 {
+                        return Err(AppError::Unauthorized(format!(
+                            "IMAP server {}:{} did not advertise AUTH=XOAUTH2 on retry",
+                            config.gmail_imap_host, config.gmail_imap_port
+                        )));
                     }
-                    return Err(AppError::Unauthorized(format!(
-                        "IMAP XOAUTH2 authentication failed: {err}"
-                    )));
+                    client = verified_client;
+                    continue;
                 }
-                Err(_) => {
-                    return Err(AppError::Upstream {
-                        status: 504,
-                        message: format!(
-                            "IMAP AUTHENTICATE XOAUTH2 timed out after {}ms",
-                            command_timeout.as_millis()
-                        ),
-                    });
-                }
+                return Err(AppError::Unauthorized(format!(
+                    "IMAP XOAUTH2 authentication failed: {err}"
+                )));
+            }
+            Err(_) => {
+                return Err(AppError::Upstream {
+                    status: 504,
+                    message: format!(
+                        "IMAP AUTHENTICATE XOAUTH2 timed out after {}ms",
+                        command_timeout.as_millis()
+                    ),
+                });
             }
         }
     }
-
-    let pass = password.expect("checked above");
-    let client = connect_imap_client(config, connect_timeout, command_timeout).await?;
-    with_imap_timeout(
-        command_timeout,
-        "IMAP LOGIN",
-        client.login(user, pass),
-        |(err, _)| AppError::Unauthorized(format!("IMAP login failed: {err}")),
-    )
-    .await
 }
 
 async fn select_imap_mailbox(
@@ -2478,18 +2810,21 @@ async fn apply_imap_flag_deltas(
     Ok(did_store)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_xgm_label_deltas(
     session: &mut Session<UpstreamImapStream>,
     uid_str: &str,
     add_labels: &[String],
     remove_labels: &[String],
     user_label_names: &HashMap<String, String>,
+    utf8_accept: bool,
     command_timeout: Duration,
 ) -> AppResult<bool> {
     let mut add_tokens: Vec<String> = Vec::new();
     let mut add_seen: HashSet<String> = HashSet::new();
     for lid in add_labels {
-        if let Some(tok) = map_local_label_to_xgm_token(lid, user_label_names)
+        if let Some(tok) =
+            map_local_label_to_xgm_token_with_utf8(lid, user_label_names, utf8_accept)
             && add_seen.insert(tok.clone())
         {
             add_tokens.push(tok);
@@ -2499,7 +2834,8 @@ async fn apply_xgm_label_deltas(
     let mut remove_tokens: Vec<String> = Vec::new();
     let mut remove_seen: HashSet<String> = HashSet::new();
     for lid in remove_labels {
-        if let Some(tok) = map_local_label_to_xgm_token(lid, user_label_names)
+        if let Some(tok) =
+            map_local_label_to_xgm_token_with_utf8(lid, user_label_names, utf8_accept)
             && remove_seen.insert(tok.clone())
         {
             remove_tokens.push(tok);
@@ -2908,7 +3244,12 @@ async fn push_local_message_via_append(
 
     let flags = build_append_flags(msg, is_draft);
     let internaldate = format_imap_internaldate(msg.internal_date_ms);
-    let raw_bytes = build_append_raw_bytes(msg);
+    let hydrated_raw = state.load_raw_rfc2822(msg).await?;
+    let raw_bytes = if !hydrated_raw.is_empty() {
+        hydrated_raw
+    } else {
+        build_append_raw_bytes(msg)
+    };
 
     let mut appended: Option<(String, AppendOutcome)> = None;
     let mut last_err: Option<AppError> = None;

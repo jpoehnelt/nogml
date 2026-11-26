@@ -970,6 +970,31 @@ async fn contract_upsert_dedup_settings_watch_sync_state(store: Arc<dyn MailStor
             .contains(&LABEL_STARRED.to_string())
     );
 
+    // 3b. Step 1 match by upstream_gmail_id backfills upstream_thread_id when previously None
+    let mut no_tid_msg = sample_message("No thread ID yet", &mb, "Sent locally", 1500);
+    no_tid_msg.label_ids = vec![LABEL_SENT.to_string()];
+    no_tid_msg.upstream_gmail_id = Some("gm_backfill_tid_1".to_string());
+    no_tid_msg.upstream_thread_id = None;
+    let stored_no_tid = store.insert_message(no_tid_msg).await.unwrap();
+    assert_eq!(stored_no_tid.upstream_thread_id, None);
+
+    let mut synced_with_tid = sample_message("No thread ID yet", &mb, "Sent locally", 1500);
+    synced_with_tid.label_ids = vec![LABEL_SENT.to_string()];
+    synced_with_tid.upstream_gmail_id = Some("gm_backfill_tid_1".to_string());
+    synced_with_tid.upstream_thread_id = Some("gm_thr_backfilled_99".to_string());
+    synced_with_tid.source = "gmail_api".to_string();
+    let out_backfill = store.upsert_synced_message(synced_with_tid).await.unwrap();
+    assert_eq!(out_backfill.message.id, stored_no_tid.id);
+    assert_eq!(
+        out_backfill.message.upstream_thread_id.as_deref(),
+        Some("gm_thr_backfilled_99")
+    );
+    let reloaded_backfill = store.get_message(&stored_no_tid.id).await.unwrap().unwrap();
+    assert_eq!(
+        reloaded_backfill.upstream_thread_id.as_deref(),
+        Some("gm_thr_backfilled_99")
+    );
+
     // 4. Step 3 insert brand-new upstream message + find & delete by upstream_gmail_id
     let mut brand_new = sample_message("Brand new", "ext@ex.com", "Hello", 2000);
     brand_new.upstream_gmail_id = Some("gm_2002".to_string());

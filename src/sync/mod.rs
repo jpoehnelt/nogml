@@ -823,7 +823,7 @@ pub(crate) async fn pending_local_label_touches(
     Ok(touched)
 }
 
-async fn load_mutation_history_range(
+pub(crate) async fn load_mutation_history_range(
     state: &AppState,
     after_hid: u64,
     through_hid: u64,

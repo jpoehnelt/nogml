@@ -109,6 +109,7 @@ impl MailTransport for CountingTransport {
         Ok(SendOutcome {
             provider: "counting_test".to_string(),
             provider_message_id: format!("prov_sched_{n}"),
+            provider_thread_id: None,
         })
     }
 }

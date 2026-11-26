@@ -34,11 +34,12 @@ use crate::{
         is_system_label,
     },
     storage::{
-        MessageListQuery, NewLabelInput, StoredDraft, StoredLabel, StoredMessage, SyncState,
+        HISTORY_SOURCE_SYNC, HistoryEventKind, MessageListQuery, NewLabelInput, StoredDraft,
+        StoredLabel, StoredMessage, SyncState,
     },
     sync::{
         LocalMutation, LocalMutationKind, PullReport, PushReport, SyncRunOptions, SyncSource,
-        ingest_synced_message,
+        ingest_synced_message, load_mutation_history_range,
     },
 };
 
@@ -176,7 +177,11 @@ struct SyncedLabelRecord {
 struct SyncedDraftRecord {
     pub upstream_draft_id: String,
     pub upstream_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_message_id: Option<String>,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -185,6 +190,10 @@ struct GmailSyncMeta {
     pub labels: HashMap<String, SyncedLabelRecord>,
     #[serde(default)]
     pub drafts: HashMap<String, SyncedDraftRecord>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pending_deleted_drafts: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_draft_history_id: Option<u64>,
 }
 
 async fn load_sync_meta(state: &AppState, account_key: &str) -> AppResult<GmailSyncMeta> {
@@ -372,9 +381,100 @@ fn plan_label_push_actions(
     actions
 }
 
+/// Reconcile `meta.drafts` entries whose local draft row no longer exists, distinguishing
+/// intentional local deletions (`HISTORY_SOURCE_LOCAL`) from sync-driven cascade deletions
+/// (`HISTORY_SOURCE_SYNC`) so upstream drafts edited in Gmail are never erroneously deleted.
+async fn reconcile_local_draft_deletions(
+    state: &AppState,
+    present_local_draft_ids: &HashSet<String>,
+    meta: &mut GmailSyncMeta,
+) -> AppResult<()> {
+    let cur_hid = state.store.current_history_id().await?;
+    let missing_entries: Vec<(String, SyncedDraftRecord)> = meta
+        .drafts
+        .iter()
+        .filter(|(local_id, _)| !present_local_draft_ids.contains(*local_id))
+        .map(|(local_id, rec)| (local_id.clone(), rec.clone()))
+        .collect();
+
+    if missing_entries.is_empty() {
+        if cur_hid > meta.last_draft_history_id.unwrap_or(0) {
+            meta.last_draft_history_id = Some(cur_hid);
+        }
+        return Ok(());
+    }
+
+    let after_hid = meta.last_draft_history_id.unwrap_or(0);
+    let history_entries = if cur_hid > after_hid {
+        load_mutation_history_range(state, after_hid, cur_hid).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut sync_deleted_msg_ids: HashSet<String> = HashSet::new();
+    let mut sync_deleted_upstream_ids: HashSet<String> = HashSet::new();
+    let mut local_deleted_msg_ids: HashSet<String> = HashSet::new();
+    let mut local_deleted_upstream_ids: HashSet<String> = HashSet::new();
+    let mut any_local_draft_deleted = false;
+
+    for ev in history_entries {
+        if ev.kind != HistoryEventKind::MessageDeleted {
+            continue;
+        }
+        if ev.source == HISTORY_SOURCE_SYNC {
+            sync_deleted_msg_ids.insert(ev.message_id);
+            if let Some(ugid) = ev.upstream_gmail_id {
+                sync_deleted_upstream_ids.insert(ugid);
+            }
+        } else {
+            local_deleted_msg_ids.insert(ev.message_id);
+            if let Some(ugid) = ev.upstream_gmail_id {
+                local_deleted_upstream_ids.insert(ugid);
+            }
+            if ev.label_ids.iter().any(|l| l == LABEL_DRAFT) {
+                any_local_draft_deleted = true;
+            }
+        }
+    }
+
+    for (local_id, rec) in missing_entries {
+        let cascade_deleted_by_sync = rec
+            .local_message_id
+            .as_deref()
+            .is_some_and(|mid| sync_deleted_msg_ids.contains(mid))
+            || (!rec.upstream_message_id.is_empty()
+                && sync_deleted_upstream_ids.contains(&rec.upstream_message_id));
+
+        let intentionally_deleted_locally = !cascade_deleted_by_sync
+            && (rec
+                .local_message_id
+                .as_deref()
+                .is_some_and(|mid| local_deleted_msg_ids.contains(mid))
+                || (!rec.upstream_message_id.is_empty()
+                    && local_deleted_upstream_ids.contains(&rec.upstream_message_id))
+                || any_local_draft_deleted);
+
+        meta.drafts.remove(&local_id);
+        if intentionally_deleted_locally {
+            meta.pending_deleted_drafts
+                .insert(local_id, rec.upstream_draft_id);
+        } else {
+            debug!(
+                local_draft_id = %local_id,
+                upstream_draft_id = %rec.upstream_draft_id,
+                cascade_deleted_by_sync,
+                "Dropped stale synced draft metadata without scheduling upstream delete"
+            );
+        }
+    }
+
+    meta.last_draft_history_id = Some(cur_hid);
+    Ok(())
+}
+
 async fn plan_draft_push_actions(
     state: &AppState,
-    meta: &GmailSyncMeta,
+    meta: &mut GmailSyncMeta,
 ) -> AppResult<Vec<DraftPushAction>> {
     let local_drafts = list_all_local_drafts(state).await?;
     let mut actions = Vec::new();
@@ -408,11 +508,13 @@ async fn plan_draft_push_actions(
         }
     }
 
-    for (local_draft_id, rec) in &meta.drafts {
+    reconcile_local_draft_deletions(state, &present_ids, meta).await?;
+
+    for (local_draft_id, upstream_draft_id) in &meta.pending_deleted_drafts {
         if !present_ids.contains(local_draft_id) {
             actions.push(DraftPushAction::Delete {
                 local_draft_id: local_draft_id.clone(),
-                upstream_draft_id: rec.upstream_draft_id.clone(),
+                upstream_draft_id: upstream_draft_id.clone(),
             });
         }
     }
@@ -477,7 +579,23 @@ impl SyncSource for GmailApiSyncSource {
         )
         .await?;
 
-        // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
+        // 2. Sync upstream drafts BEFORE incremental/full message sync so editing a draft
+        // in Gmail (which emits messagesDeleted(old_msg_id) + messagesAdded(new_msg_id) while
+        // preserving draft.id) updates the local draft in place instead of cascade-deleting it.
+        let active_draft_msg_ids = sync_drafts_pull(
+            &client,
+            base,
+            &user_id,
+            &auth,
+            &label_map,
+            state,
+            bidirectional,
+            &mut meta,
+            &mut report,
+        )
+        .await?;
+
+        // 3. Attempt incremental sync if we have a checkpoint and `full` was not requested.
         let mut need_full = opts.full || sync_state.last_history_id.is_none();
         if !need_full && let Some(start_history_id) = sync_state.last_history_id.clone() {
             match run_incremental(
@@ -487,6 +605,7 @@ impl SyncSource for GmailApiSyncSource {
                 &auth,
                 &start_history_id,
                 &label_map,
+                &active_draft_msg_ids,
                 state,
                 &mut report,
             )
@@ -507,7 +626,7 @@ impl SyncSource for GmailApiSyncSource {
             }
         }
 
-        // 3. Full backfill (initial run, `--full`, or automatic 404 fallback).
+        // 4. Full backfill (initial run, `--full`, or automatic 404 fallback).
         if need_full {
             report.full_resync = true;
             let baseline_history = run_full_backfill(
@@ -517,6 +636,7 @@ impl SyncSource for GmailApiSyncSource {
                 &auth,
                 opts,
                 &label_map,
+                &active_draft_msg_ids,
                 state,
                 &mut report,
             )
@@ -525,20 +645,6 @@ impl SyncSource for GmailApiSyncSource {
             sync_state.last_full_sync_at = Some(Utc::now());
             report.history_id = Some(baseline_history);
         }
-
-        // 4. Sync upstream drafts (`users.drafts.list` + `users.drafts.get?format=raw`).
-        sync_drafts_pull(
-            &client,
-            base,
-            &user_id,
-            &auth,
-            &label_map,
-            state,
-            bidirectional,
-            &mut meta,
-            &mut report,
-        )
-        .await?;
 
         save_sync_meta(state, &account_key, &meta).await?;
 
@@ -559,7 +665,7 @@ impl SyncSource for GmailApiSyncSource {
         let local_labels = state.store.list_labels().await?;
         let label_actions = plan_label_push_actions(&local_labels, &meta);
         let import_candidates = list_unsynced_import_messages(state).await?;
-        let draft_actions = plan_draft_push_actions(state, &meta).await?;
+        let draft_actions = plan_draft_push_actions(state, &mut meta).await?;
 
         if changes.is_empty()
             && label_actions.is_empty()
@@ -988,11 +1094,13 @@ impl SyncSource for GmailApiSyncSource {
                         });
                     }
                     meta.drafts.remove(&local_draft_id);
+                    meta.pending_deleted_drafts.remove(&local_draft_id);
                     pushed += 1;
                 }
             }
         }
 
+        meta.last_draft_history_id = Some(state.store.current_history_id().await?);
         save_sync_meta(state, &account_key, &meta).await?;
 
         Ok(PushReport {
@@ -1120,12 +1228,14 @@ async fn sync_labels(
     let local_labels = state.store.list_labels().await?;
 
     let mut local_by_upstream: HashMap<String, StoredLabel> = HashMap::new();
+    let mut local_by_id: HashMap<String, StoredLabel> = HashMap::new();
     let mut local_ids: HashSet<String> = HashSet::new();
     for l in local_labels {
         local_ids.insert(l.id.clone());
         if let Some(ref up) = l.upstream_label_id {
-            local_by_upstream.insert(up.clone(), l);
+            local_by_upstream.insert(up.clone(), l.clone());
         }
+        local_by_id.insert(l.id.clone(), l);
     }
 
     let pending_local_deletes: HashSet<String> = if bidirectional {
@@ -1142,11 +1252,13 @@ async fn sync_labels(
     };
 
     let mut map = HashMap::new();
+    let mut seen_upstream_label_ids = HashSet::new();
     for lbl in resp.labels {
         if is_system_label(&lbl.id) || lbl.label_type.as_deref() == Some("system") {
             map.insert(lbl.id.clone(), lbl.id);
             continue;
         }
+        seen_upstream_label_ids.insert(lbl.id.clone());
         if bidirectional && pending_local_deletes.contains(&lbl.id) {
             debug!(
                 upstream_label_id = %lbl.id,
@@ -1208,6 +1320,36 @@ async fn sync_labels(
         map.insert(lbl.id, stored.id);
         report.labels_synced += 1;
     }
+
+    // Reconcile custom labels deleted upstream against `meta.labels` (preserving locally modified labels).
+    let stale_label_ids: Vec<(String, SyncedLabelRecord)> = meta
+        .labels
+        .iter()
+        .filter(|(_, rec)| !seen_upstream_label_ids.contains(&rec.upstream_label_id))
+        .map(|(lid, rec)| (lid.clone(), rec.clone()))
+        .collect();
+
+    for (local_id, prev) in stale_label_ids {
+        match local_by_id.get(&local_id) {
+            Some(existing) => {
+                let local_changed = existing.name != prev.name
+                    || existing.message_list_visibility != prev.message_list_visibility
+                    || existing.label_list_visibility != prev.label_list_visibility
+                    || existing.color != prev.color;
+                if !bidirectional || !local_changed {
+                    match state.store.delete_label(&local_id).await {
+                        Ok(()) | Err(AppError::NotFound(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                    meta.labels.remove(&local_id);
+                }
+            }
+            None => {
+                meta.labels.remove(&local_id);
+            }
+        }
+    }
+
     Ok(map)
 }
 
@@ -1258,6 +1400,13 @@ async fn record_pushed_draft(
         .as_ref()
         .map(|m| m.thread_id.as_str())
         .filter(|s| !s.is_empty());
+    let upstream_content_hash = upstream
+        .message
+        .as_ref()
+        .and_then(|m| m.raw.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|raw| decode_base64_tolerant(raw).ok())
+        .map(|bytes| sha256_hex(&bytes));
     if !up_msg_id.is_empty() {
         let _ = state
             .store
@@ -1265,16 +1414,39 @@ async fn record_pushed_draft(
             .await?;
     }
     if !upstream.id.is_empty() {
+        meta.pending_deleted_drafts.remove(&local.id);
         meta.drafts.insert(
             local.id.clone(),
             SyncedDraftRecord {
                 upstream_draft_id: upstream.id.clone(),
                 upstream_message_id: up_msg_id,
+                local_message_id: Some(local.message.id.clone()),
                 content_hash,
+                upstream_content_hash,
             },
         );
     }
     Ok(())
+}
+
+fn collect_active_draft_upstream_msg_ids(
+    meta: &GmailSyncMeta,
+    local_drafts: &[StoredDraft],
+) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for rec in meta.drafts.values() {
+        if !rec.upstream_message_id.is_empty() {
+            ids.insert(rec.upstream_message_id.clone());
+        }
+    }
+    for d in local_drafts {
+        if let Some(ref up_mid) = d.message.upstream_gmail_id
+            && !up_mid.is_empty()
+        {
+            ids.insert(up_mid.clone());
+        }
+    }
+    ids
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1288,7 +1460,7 @@ async fn sync_drafts_pull(
     bidirectional: bool,
     meta: &mut GmailSyncMeta,
     report: &mut PullReport,
-) -> AppResult<()> {
+) -> AppResult<HashSet<String>> {
     let mut page_token: Option<String> = None;
     let mut listed = Vec::new();
     let mut first_page = true;
@@ -1303,7 +1475,7 @@ async fn sync_drafts_pull(
         let (status, body) = get_with_retry(client, &url, auth).await?;
         if first_page && status == StatusCode::NOT_FOUND {
             debug!("Upstream Gmail drafts.list returned 404; skipping drafts pull");
-            return Ok(());
+            return Ok(collect_active_draft_upstream_msg_ids(meta, &[]));
         }
         first_page = false;
         if !status.is_success() {
@@ -1329,26 +1501,32 @@ async fn sync_drafts_pull(
 
     let local_drafts = list_all_local_drafts(state).await?;
     let local_draft_ids: HashSet<String> = local_drafts.iter().map(|d| d.id.clone()).collect();
-    let mut local_draft_by_up_msg: HashMap<String, String> = HashMap::new();
+    let mut local_draft_msg_id_by_id: HashMap<String, String> = HashMap::new();
+    let mut local_draft_by_up_msg: HashMap<String, (String, String)> = HashMap::new();
     for d in &local_drafts {
+        local_draft_msg_id_by_id.insert(d.id.clone(), d.message.id.clone());
         if let Some(ref up_mid) = d.message.upstream_gmail_id {
-            local_draft_by_up_msg.insert(up_mid.clone(), d.id.clone());
+            local_draft_by_up_msg.insert(up_mid.clone(), (d.id.clone(), d.message.id.clone()));
         }
     }
 
+    if bidirectional {
+        reconcile_local_draft_deletions(state, &local_draft_ids, meta).await?;
+    }
+
     let pending_local_deleted_drafts: HashSet<String> = if bidirectional {
-        meta.drafts
-            .iter()
-            .filter(|(local_id, _)| !local_draft_ids.contains(*local_id))
-            .map(|(_, rec)| rec.upstream_draft_id.clone())
-            .collect()
+        meta.pending_deleted_drafts.values().cloned().collect()
     } else {
         HashSet::new()
     };
 
     let mut seen_upstream_draft_ids = HashSet::new();
+    let mut active_draft_msg_ids = collect_active_draft_upstream_msg_ids(meta, &local_drafts);
     for dref in listed {
         seen_upstream_draft_ids.insert(dref.id.clone());
+        if !dref.message.id.is_empty() {
+            active_draft_msg_ids.insert(dref.message.id.clone());
+        }
         if bidirectional && pending_local_deleted_drafts.contains(&dref.id) {
             debug!(
                 upstream_draft_id = %dref.id,
@@ -1388,6 +1566,9 @@ async fn sync_drafts_pull(
         } else {
             msg.id
         };
+        if !up_msg_id.is_empty() {
+            active_draft_msg_ids.insert(up_msg_id.clone());
+        }
         let up_tid = (!msg.thread_id.is_empty()).then_some(msg.thread_id);
         let internal_date_ms = msg
             .internal_date
@@ -1408,12 +1589,55 @@ async fn sync_drafts_pull(
         if let Some(local_id) = existing_local_id
             && local_draft_ids.contains(&local_id)
         {
-            if let Some(rec) = meta.drafts.get(&local_id)
-                && rec.content_hash == upstream_hash
-            {
-                report.messages_deduplicated += 1;
-                continue;
+            if let Some(rec) = meta.drafts.get(&local_id).cloned() {
+                let same_upstream_msg = !up_msg_id.is_empty()
+                    && !rec.upstream_message_id.is_empty()
+                    && up_msg_id == rec.upstream_message_id;
+
+                if same_upstream_msg {
+                    // When Gmail canonicalizes a pushed draft's RFC 2822 headers, `upstream_hash`
+                    // differs from our local `rec.content_hash` even though `upstream_message_id`
+                    // has not advanced. Record the canonical hash and preserve any pending local edits.
+                    if rec.upstream_content_hash.is_none()
+                        || rec.upstream_content_hash.as_deref() == Some(upstream_hash.as_str())
+                        || rec.content_hash == upstream_hash
+                    {
+                        if let Some(entry) = meta.drafts.get_mut(&local_id) {
+                            entry.upstream_content_hash = Some(upstream_hash);
+                        }
+                        report.messages_deduplicated += 1;
+                        continue;
+                    }
+                    // Upstream message ID did not advance, yet raw bytes differed from the last
+                    // observed upstream hash: never clobber pending local edits.
+                    let local_changed =
+                        if let Some(local_d) = state.store.get_draft(&local_id).await? {
+                            let local_raw = state.load_raw_rfc2822(&local_d.message).await?;
+                            sha256_hex(&local_raw) != rec.content_hash
+                        } else {
+                            false
+                        };
+                    if local_changed {
+                        report.messages_deduplicated += 1;
+                        continue;
+                    }
+                } else if rec.upstream_content_hash.as_deref() == Some(upstream_hash.as_str())
+                    || rec.content_hash == upstream_hash
+                {
+                    if let Some(entry) = meta.drafts.get_mut(&local_id) {
+                        entry.upstream_message_id = up_msg_id;
+                        entry.upstream_content_hash = Some(upstream_hash);
+                    }
+                    report.messages_deduplicated += 1;
+                    continue;
+                }
             }
+
+            let old_local_msg_id = local_draft_msg_id_by_id.get(&local_id).cloned();
+            let old_att_ids = match old_local_msg_id.as_deref() {
+                Some(old_mid) => state.collect_external_attachment_ids(old_mid).await,
+                None => Vec::new(),
+            };
             let input = parse_raw_to_new_message_input(
                 raw_bytes,
                 mapped_labels,
@@ -1425,13 +1649,19 @@ async fn sync_drafts_pull(
                 false,
             );
             let updated = state.store.update_draft(&local_id, input).await?;
+            if let Some(old_mid) = old_local_msg_id {
+                let _ = state.post_delete_message(&old_mid, &old_att_ids).await;
+            }
             state.post_store_message(&updated.message).await?;
+            local_draft_msg_id_by_id.insert(local_id.clone(), updated.message.id.clone());
             meta.drafts.insert(
                 local_id,
                 SyncedDraftRecord {
                     upstream_draft_id: dref.id,
                     upstream_message_id: up_msg_id,
-                    content_hash: upstream_hash,
+                    local_message_id: Some(updated.message.id),
+                    content_hash: upstream_hash.clone(),
+                    upstream_content_hash: Some(upstream_hash),
                 },
             );
             report.messages_updated += 1;
@@ -1440,33 +1670,38 @@ async fn sync_drafts_pull(
 
         // Dedup against an existing local draft already linked to this upstream message ID.
         if !up_msg_id.is_empty()
-            && let Some(local_id) = local_draft_by_up_msg.get(&up_msg_id).cloned()
+            && let Some((local_id, local_msg_id)) = local_draft_by_up_msg.get(&up_msg_id).cloned()
         {
             meta.drafts.insert(
                 local_id,
                 SyncedDraftRecord {
                     upstream_draft_id: dref.id,
                     upstream_message_id: up_msg_id,
-                    content_hash: upstream_hash,
+                    local_message_id: Some(local_msg_id),
+                    content_hash: upstream_hash.clone(),
+                    upstream_content_hash: Some(upstream_hash),
                 },
             );
             report.messages_deduplicated += 1;
             continue;
         }
 
-        // If `messages.list` already ingested the bare draft message (without a drafts row),
-        // remove that bare message so `create_draft` stores it cleanly as a draft without duplicating upstream_gmail_id.
+        // If a previous pass already ingested the bare draft message (without a drafts row),
+        // remove that bare message (and clean up its external blobs/search entry) so `create_draft`
+        // stores it cleanly as a draft without duplicating `upstream_gmail_id` or `messages_added`.
+        let mut replaced_bare_message = false;
         if !up_msg_id.is_empty()
-            && state
-                .store
-                .find_message_by_upstream_id(&up_msg_id)
-                .await?
-                .is_some()
+            && let Some(bare) = state.store.find_message_by_upstream_id(&up_msg_id).await?
         {
-            let _ = state
+            let att_ids = state.collect_external_attachment_ids(&bare.id).await;
+            if let Some(removed) = state
                 .store
                 .delete_message_by_upstream_id(&up_msg_id)
-                .await?;
+                .await?
+            {
+                let _ = state.post_delete_message(&removed.id, &att_ids).await;
+                replaced_bare_message = true;
+            }
         }
 
         let input = parse_raw_to_new_message_input(
@@ -1486,10 +1721,16 @@ async fn sync_drafts_pull(
             SyncedDraftRecord {
                 upstream_draft_id: dref.id,
                 upstream_message_id: up_msg_id,
-                content_hash: upstream_hash,
+                local_message_id: Some(created.message.id),
+                content_hash: upstream_hash.clone(),
+                upstream_content_hash: Some(upstream_hash),
             },
         );
-        report.messages_added += 1;
+        if replaced_bare_message {
+            report.messages_updated += 1;
+        } else {
+            report.messages_added += 1;
+        }
     }
 
     // Reconcile drafts deleted upstream (only when unmodified locally).
@@ -1523,7 +1764,18 @@ async fn sync_drafts_pull(
         }
     }
 
-    Ok(())
+    // Drop any pending local deletion whose upstream draft is already gone.
+    meta.pending_deleted_drafts
+        .retain(|_, up_draft_id| seen_upstream_draft_ids.contains(up_draft_id));
+    meta.last_draft_history_id = Some(state.store.current_history_id().await?);
+
+    for rec in meta.drafts.values() {
+        if !rec.upstream_message_id.is_empty() {
+            active_draft_msg_ids.insert(rec.upstream_message_id.clone());
+        }
+    }
+
+    Ok(active_draft_msg_ids)
 }
 
 enum IncrementalOutcome {
@@ -1539,6 +1791,7 @@ async fn run_incremental(
     auth: &GmailAuth,
     start_history_id: &str,
     label_map: &HashMap<String, String>,
+    active_draft_msg_ids: &HashSet<String>,
     state: &AppState,
     report: &mut PullReport,
 ) -> AppResult<IncrementalOutcome> {
@@ -1577,7 +1830,8 @@ async fn run_incremental(
 
         for record in page.history.unwrap_or_default() {
             for added in record.messages_added.unwrap_or_default() {
-                if !added.message.id.is_empty() {
+                if !added.message.id.is_empty() && !active_draft_msg_ids.contains(&added.message.id)
+                {
                     to_fetch.insert(added.message.id);
                 }
             }
@@ -1587,6 +1841,13 @@ async fn run_incremental(
                     continue;
                 }
                 to_fetch.remove(&uid);
+                if active_draft_msg_ids.contains(&uid) {
+                    debug!(
+                        upstream_message_id = %uid,
+                        "Skipping incremental message deletion for active synced draft"
+                    );
+                    continue;
+                }
                 let att_ids = match state.store.find_message_by_upstream_id(&uid).await? {
                     Some(existing) => state.collect_external_attachment_ids(&existing.id).await,
                     None => Vec::new(),
@@ -1627,7 +1888,7 @@ async fn run_incremental(
                             },
                         );
                     }
-                } else {
+                } else if !active_draft_msg_ids.contains(&uid) {
                     to_fetch.insert(uid);
                 }
             }
@@ -1654,7 +1915,7 @@ async fn run_incremental(
                             },
                         );
                     }
-                } else {
+                } else if !active_draft_msg_ids.contains(&uid) {
                     to_fetch.insert(uid);
                 }
             }
@@ -1685,6 +1946,7 @@ async fn run_full_backfill(
     auth: &GmailAuth,
     opts: &SyncRunOptions,
     label_map: &HashMap<String, String>,
+    active_draft_msg_ids: &HashSet<String>,
     state: &AppState,
     report: &mut PullReport,
 ) -> AppResult<String> {
@@ -1756,9 +2018,12 @@ async fn run_full_backfill(
         }
     }
 
-    // Skip messages already present locally by upstream_gmail_id.
+    // Skip active drafts (already synced by `sync_drafts_pull`) and messages already present locally.
     let mut missing_ids = Vec::new();
     for id in listed_ids {
+        if active_draft_msg_ids.contains(&id) {
+            continue;
+        }
         if state
             .store
             .find_message_by_upstream_id(&id)

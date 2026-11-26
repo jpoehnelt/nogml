@@ -1049,3 +1049,757 @@ async fn gmail_api_transport_end_to_end_reply_threading_and_sync_dedup() {
     assert_eq!(report.messages_added, 0);
     assert_eq!(report.messages_deduplicated, 2);
 }
+
+// ============================================================================
+// 4. Issue #86 Regression: Upstream draft edit in Gmail MUST NOT delete draft
+//    + no double-counting of messages_added + cascade-delete resilience
+// ============================================================================
+
+#[tokio::test]
+async fn gmail_api_bidirectional_sync_upstream_draft_edit_never_deletes_draft() {
+    let mock = MockServer::start().await;
+
+    // Pass 1: Initial full sync where `messages.list` ALSO lists the draft's message ID (as real Gmail does).
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "emailAddress": "agent@example.com",
+            "messagesTotal": 1,
+            "threadsTotal": 1,
+            "historyId": "100"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [
+                { "id": "gm_draft_v1", "threadId": "gm_thr_d1" }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_edit_1",
+                    "message": { "id": "gm_draft_v1", "threadId": "gm_thr_d1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    let draft_v1_raw =
+        "From: agent@example.com\r\nTo: bob@example.com\r\nSubject: Draft V1\r\n\r\nInitial draft";
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_edit_1",
+            "message": {
+                "id": "gm_draft_v1",
+                "threadId": "gm_thr_d1",
+                "labelIds": ["DRAFT"],
+                "raw": b64url(draft_v1_raw)
+            }
+        })))
+        .mount(&mock)
+        .await;
+
+    let mut cfg = Config::for_test();
+    cfg.sync_mode = SyncMode::Api;
+    cfg.sync_bidirectional = true;
+    cfg.gmail_api_base_url = mock.uri();
+    cfg.gmail_access_token = Some("tok-draft-edit".to_string());
+    let (_dir, state) = make_sqlite_state(cfg);
+
+    let r1 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    // Draft must be counted ONCE (not double-counted by messages.list + drafts.list).
+    assert_eq!(r1.messages_added, 1);
+    assert_eq!(r1.messages_pushed, 0);
+
+    let drafts_p1 = state
+        .store
+        .list_drafts(&Default::default())
+        .await
+        .unwrap()
+        .drafts;
+    assert_eq!(drafts_p1.len(), 1);
+    assert_eq!(drafts_p1[0].message.subject, "Draft V1");
+    let local_draft_id = drafts_p1[0].id.clone();
+
+    // Pass 2: Simulate editing the draft in Gmail web UI.
+    // Gmail keeps `draft.id = r_edit_1`, deletes old message `gm_draft_v1`, and creates `gm_draft_v2`.
+    mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "historyId": "105",
+            "history": [
+                {
+                    "id": "101",
+                    "messagesDeleted": [
+                        { "message": { "id": "gm_draft_v1", "threadId": "gm_thr_d1" } }
+                    ],
+                    "messagesAdded": [
+                        { "message": { "id": "gm_draft_v2", "threadId": "gm_thr_d1" } }
+                    ]
+                }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_edit_1",
+                    "message": { "id": "gm_draft_v2", "threadId": "gm_thr_d1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    let draft_v2_raw = "From: agent@example.com\r\nTo: bob@example.com\r\nSubject: Draft V2 Edited\r\n\r\nEdited upstream in Gmail";
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_edit_1",
+            "message": {
+                "id": "gm_draft_v2",
+                "threadId": "gm_thr_d1",
+                "labelIds": ["DRAFT"],
+                "raw": b64url(draft_v2_raw)
+            }
+        })))
+        .mount(&mock)
+        .await;
+    // CRITICAL ASSERTION: upstream DELETE must NEVER be called!
+    Mock::given(method("DELETE"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let r2 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r2.messages_pushed, 0);
+    assert_eq!(r2.messages_deleted, 0);
+
+    let updated = state
+        .store
+        .get_draft(&local_draft_id)
+        .await
+        .unwrap()
+        .expect("local draft must survive upstream Gmail edit");
+    assert_eq!(updated.message.subject, "Draft V2 Edited");
+    assert_eq!(
+        updated.message.upstream_gmail_id.as_deref(),
+        Some("gm_draft_v2")
+    );
+
+    // Pass 3: Even if a sync-driven cascade delete removed the backing message (HISTORY_SOURCE_SYNC),
+    // bidirectional sync must NOT issue DELETE /drafts/r_edit_1 and should safely re-pull it.
+    state
+        .store
+        .delete_message_by_upstream_id("gm_draft_v2")
+        .await
+        .unwrap();
+    assert!(
+        state
+            .store
+            .get_draft(&local_draft_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/history"))
+        .and(query_param("startHistoryId", "105"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "historyId": "106"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_edit_1",
+                    "message": { "id": "gm_draft_v2", "threadId": "gm_thr_d1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_edit_1",
+            "message": {
+                "id": "gm_draft_v2",
+                "threadId": "gm_thr_d1",
+                "labelIds": ["DRAFT"],
+                "raw": b64url(draft_v2_raw)
+            }
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let r3 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r3.messages_pushed, 0);
+    let repulled_drafts = state
+        .store
+        .list_drafts(&Default::default())
+        .await
+        .unwrap()
+        .drafts;
+    assert_eq!(repulled_drafts.len(), 1);
+    assert_eq!(repulled_drafts[0].message.subject, "Draft V2 Edited");
+    let repulled_id = repulled_drafts[0].id.clone();
+
+    // Pass 4: Intentional local deletion (`store.delete_draft` -> HISTORY_SOURCE_LOCAL) DOES push DELETE.
+    state.store.delete_draft(&repulled_id).await.unwrap();
+    mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/history"))
+        .and(query_param("startHistoryId", "106"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "historyId": "107"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_edit_1",
+                    "message": { "id": "gm_draft_v2", "threadId": "gm_thr_d1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/gmail/v1/users/me/drafts/r_edit_1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let r4 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r4.messages_pushed, 1);
+}
+
+// ============================================================================
+// 5. Issue #86 Regression: Local draft edits preserved after Gmail RFC 2822
+//    canonicalization
+// ============================================================================
+
+#[tokio::test]
+async fn gmail_api_bidirectional_sync_preserves_local_draft_edit_after_canonicalization() {
+    let mock = MockServer::start().await;
+
+    // Pass 1: Push a new local draft to Gmail.
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "emailAddress": "agent@example.com",
+            "messagesTotal": 0,
+            "threadsTotal": 0,
+            "historyId": "200"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [],
+            "resultSizeEstimate": 0
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [],
+            "resultSizeEstimate": 0
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_canon_1",
+            "message": { "id": "gm_canon_msg_1", "threadId": "gm_canon_thr_1" }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = Config::for_test();
+    cfg.sync_mode = SyncMode::Api;
+    cfg.sync_bidirectional = true;
+    cfg.gmail_api_base_url = mock.uri();
+    cfg.gmail_access_token = Some("tok-canon".to_string());
+    let (_dir, state) = make_sqlite_state(cfg);
+
+    let local_v1 = "From: agent@example.com\r\nTo: alice@example.com\r\nSubject: Draft Local V1\r\n\r\nBody V1";
+    let local_draft = state
+        .store
+        .create_draft(parse_raw_to_new_message_input(
+            local_v1.as_bytes().to_vec(),
+            vec![LABEL_DRAFT.to_string()],
+            None,
+            "local",
+            None,
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let r1 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r1.messages_pushed, 1);
+
+    // User edits the draft locally BEFORE Pass 2.
+    let local_v2 = "From: agent@example.com\r\nTo: alice@example.com\r\nSubject: Draft Local V2 Edited\r\n\r\nPending local edit";
+    state
+        .store
+        .update_draft(
+            &local_draft.id,
+            parse_raw_to_new_message_input(
+                local_v2.as_bytes().to_vec(),
+                vec![LABEL_DRAFT.to_string()],
+                None,
+                "local",
+                None,
+                Some("gm_canon_thr_1".to_string()),
+                false,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Pass 2: Upstream Gmail serves canonicalized V1 (different bytes/SHA-256 due to added
+    // MIME-Version & Date headers) while keeping the SAME `message.id = gm_canon_msg_1`.
+    mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/history"))
+        .and(query_param("startHistoryId", "200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "historyId": "201"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_canon_1",
+                    "message": { "id": "gm_canon_msg_1", "threadId": "gm_canon_thr_1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    let gmail_canonicalized_v1 = "MIME-Version: 1.0\r\nDate: Fri, 02 Jan 2026 12:00:00 +0000\r\nFrom: agent@example.com\r\nTo: alice@example.com\r\nSubject: Draft Local V1\r\n\r\nBody V1";
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r_canon_1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_canon_1",
+            "message": {
+                "id": "gm_canon_msg_1",
+                "threadId": "gm_canon_thr_1",
+                "labelIds": ["DRAFT"],
+                "raw": b64url(gmail_canonicalized_v1)
+            }
+        })))
+        .mount(&mock)
+        .await;
+    // Expect our pending local V2 edit to be pushed upstream via PUT (not clobbered!).
+    Mock::given(method("PUT"))
+        .and(path("/gmail/v1/users/me/drafts/r_canon_1"))
+        .and(body_partial_json(json!({
+            "id": "r_canon_1",
+            "message": { "raw": b64url(local_v2) }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_canon_1",
+            "message": { "id": "gm_canon_msg_2", "threadId": "gm_canon_thr_1" }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let r2 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r2.messages_pushed, 1);
+
+    let after = state
+        .store
+        .get_draft(&local_draft.id)
+        .await
+        .unwrap()
+        .expect("draft should still exist");
+    assert_eq!(after.message.subject, "Draft Local V2 Edited");
+    assert_eq!(
+        after.message.upstream_gmail_id.as_deref(),
+        Some("gm_canon_msg_2")
+    );
+}
+
+// ============================================================================
+// 6. Issue #86 Regression: New thread sent via GmailApiTransport persists
+//    upstream_thread_id so subsequent replies thread cleanly upstream
+// ============================================================================
+
+#[tokio::test]
+async fn gmail_api_transport_new_thread_persists_upstream_thread_id_for_replies() {
+    let mock = MockServer::start().await;
+
+    // 1. Brand new thread send -> Gmail returns new `id` + `threadId`
+    Mock::given(method("POST"))
+        .and(path("/gmail/v1/users/me/messages/send"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "gm_new_sent_1",
+            "threadId": "gm_new_thr_777",
+            "labelIds": ["SENT"]
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = Config::for_test();
+    cfg.transport = TransportBackend::Gmail;
+    cfg.gmail_api_base_url = mock.uri();
+    cfg.gmail_access_token = Some("tok-new-thread".to_string());
+    let (_dir, state) = make_sqlite_state(cfg);
+    let app = build_router(state.clone());
+
+    let (code, first_resp) = http_json(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages/send")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "to": ["bob@example.com"],
+                    "subject": "Fresh Topic",
+                    "text": "Starting a new thread"
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "response: {first_resp}");
+    let first_local_id = first_resp["message_id"].as_str().unwrap().to_string();
+
+    let stored_first = state
+        .store
+        .get_message(&first_local_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_first.upstream_gmail_id.as_deref(),
+        Some("gm_new_sent_1")
+    );
+    assert_eq!(
+        stored_first.upstream_thread_id.as_deref(),
+        Some("gm_new_thr_777")
+    );
+
+    // 2. Reply on the same thread MUST include `threadId: "gm_new_thr_777"` in Gmail API request!
+    Mock::given(method("POST"))
+        .and(path("/gmail/v1/users/me/messages/send"))
+        .and(body_partial_json(json!({
+            "threadId": "gm_new_thr_777"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "gm_new_sent_2",
+            "threadId": "gm_new_thr_777",
+            "labelIds": ["SENT"]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (code2, reply_resp) = http_json(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages/send")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "to": ["bob@example.com"],
+                    "subject": "Re: Fresh Topic",
+                    "text": "Follow-up on same thread",
+                    "reply_to_message_id": first_local_id
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code2, StatusCode::OK, "reply response: {reply_resp}");
+}
+
+// ============================================================================
+// 7. Issue #86 Regression: Upstream custom label deletions reconcile locally
+//    and bare-draft replacement cleans up external blobs
+// ============================================================================
+
+#[tokio::test]
+async fn gmail_api_sync_reconciles_deleted_upstream_labels_and_bare_draft_blobs() {
+    let mock = MockServer::start().await;
+
+    // Pass 1: Two custom labels ("Keep" and "RemoveMe")
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "labels": [
+                { "id": "INBOX", "name": "INBOX", "type": "system" },
+                { "id": "Label_keep", "name": "Keep", "type": "user" },
+                { "id": "Label_remove", "name": "RemoveMe", "type": "user" },
+                { "id": "Label_local_edit", "name": "LocalEdited", "type": "user" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "emailAddress": "agent@example.com",
+            "messagesTotal": 0,
+            "threadsTotal": 0,
+            "historyId": "300"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [],
+            "resultSizeEstimate": 0
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [],
+            "resultSizeEstimate": 0
+        })))
+        .mount(&mock)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let blob_dir = dir.path().join("blobs");
+    let mut cfg = Config::for_test();
+    cfg.storage = StorageBackend::Sqlite;
+    cfg.db_path = dir.path().join("nogml.db");
+    cfg.blob_backend = nogml::config::BlobBackend::Fs;
+    cfg.blob_dir = blob_dir.clone();
+    cfg.sync_mode = SyncMode::Api;
+    cfg.sync_bidirectional = true;
+    cfg.gmail_api_base_url = mock.uri();
+    cfg.gmail_access_token = Some("tok-lbl-blob".to_string());
+    let state = AppState::from_config(cfg).unwrap();
+
+    run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+
+    let labels_p1 = state.store.list_labels().await.unwrap();
+    assert!(labels_p1.iter().any(|l| l.name == "Keep"));
+    assert!(labels_p1.iter().any(|l| l.name == "RemoveMe"));
+    let local_edit_lbl = labels_p1
+        .iter()
+        .find(|l| l.name == "LocalEdited")
+        .unwrap()
+        .clone();
+
+    // Rename "LocalEdited" locally so bidirectional mode preserves it even if deleted upstream.
+    state
+        .store
+        .update_label(
+            &local_edit_lbl.id,
+            nogml::storage::UpdateLabelInput {
+                name: Some("LocalEdited-Renamed".to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Seed a pre-existing bare draft message whose raw bytes are stored in the external FsBlobStore.
+    let bare_raw =
+        b"From: agent@example.com\r\nTo: bob@example.com\r\nSubject: Bare Draft\r\n\r\nBare body"
+            .to_vec();
+    let bare_msg = state
+        .store
+        .insert_message(parse_raw_to_new_message_input(
+            bare_raw.clone(),
+            vec![LABEL_DRAFT.to_string()],
+            None,
+            "gmail_api",
+            Some("gm_bare_draft_1".to_string()),
+            Some("gm_bare_thr_1".to_string()),
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+    state.post_store_message(&bare_msg).await.unwrap();
+    let bare_blob_key = nogml::blob::raw_message_blob_key(&bare_msg.id);
+    assert!(
+        state.blobs.get(&bare_blob_key).await.unwrap().is_some(),
+        "pre-existing bare draft blob should exist before replacement"
+    );
+
+    // Pass 2: Upstream omits Label_remove (unmodified locally -> deleted) and Label_local_edit
+    // (modified locally -> preserved; PATCH returns 404 and is skipped), and lists draft for gm_bare_draft_1.
+    mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "labels": [
+                { "id": "INBOX", "name": "INBOX", "type": "system" },
+                { "id": "Label_keep", "name": "Keep", "type": "user" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/gmail/v1/users/me/labels/Label_local_edit"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/history"))
+        .and(query_param("startHistoryId", "300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "historyId": "301"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "drafts": [
+                {
+                    "id": "r_bare_1",
+                    "message": { "id": "gm_bare_draft_1", "threadId": "gm_bare_thr_1" }
+                }
+            ],
+            "resultSizeEstimate": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r_bare_1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "r_bare_1",
+            "message": {
+                "id": "gm_bare_draft_1",
+                "threadId": "gm_bare_thr_1",
+                "labelIds": ["DRAFT"],
+                "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bare_raw)
+            }
+        })))
+        .mount(&mock)
+        .await;
+
+    let r2 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    // Replacing an existing bare message should count as updated, not double-added.
+    assert_eq!(r2.messages_added, 0);
+    assert_eq!(r2.messages_updated, 1);
+
+    // Unmodified upstream-deleted label "RemoveMe" is deleted locally; "Keep" and locally-renamed label remain.
+    let labels_p2 = state.store.list_labels().await.unwrap();
+    assert!(labels_p2.iter().any(|l| l.name == "Keep"));
+    assert!(!labels_p2.iter().any(|l| l.name == "RemoveMe"));
+    assert!(labels_p2.iter().any(|l| l.name == "LocalEdited-Renamed"));
+
+    // Replaced bare message's external blob must be cleaned up (no leak).
+    assert!(
+        state.blobs.get(&bare_blob_key).await.unwrap().is_none(),
+        "old bare draft blob must be deleted when replaced by synced draft"
+    );
+}

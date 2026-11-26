@@ -1067,6 +1067,7 @@ mod pluggable_seam_tests {
             Ok(SendOutcome {
                 provider: "custom_smtp".to_string(),
                 provider_message_id: format!("smtp_{n}"),
+                provider_thread_id: None,
             })
         }
     }

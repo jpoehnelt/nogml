@@ -81,6 +81,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording_conformance".to_string(),
             provider_message_id: format!("rec_msg_{}", guard.len()),
+            provider_thread_id: None,
         })
     }
 }

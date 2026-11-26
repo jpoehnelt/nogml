@@ -92,6 +92,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording_test".to_string(),
             provider_message_id: format!("rec_{n}"),
+            provider_thread_id: None,
         })
     }
 }
@@ -1323,4 +1324,150 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn gmail_settings_filter_rewrites_custom_label_names_in_query_and_negated_query() {
+    let state = AppState::from_config(Config::for_test()).unwrap();
+
+    // Create two custom user labels (stored with opaque IDs like Label_...).
+    let vip_lbl = state
+        .store
+        .create_label(nogml::storage::NewLabelInput {
+            name: "Clients/VIP".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let muted_lbl = state
+        .store
+        .create_label(nogml::storage::NewLabelInput {
+            name: "MutedQueue".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Persist a Gmail settings filter matching `label:Clients/VIP` and excluding `label:MutedQueue`.
+    let mut settings = state.store.get_settings().await.unwrap();
+    settings.filters.push(nogml::models::GmailFilter {
+        id: "flt_custom_lbl_1".to_string(),
+        criteria: Some(nogml::models::FilterCriteria {
+            query: Some("label:Clients/VIP".to_string()),
+            negated_query: Some("label:MutedQueue".to_string()),
+            ..Default::default()
+        }),
+        action: Some(nogml::models::FilterAction {
+            add_label_ids: Some(vec![nogml::models::LABEL_STARRED.to_string()]),
+            remove_label_ids: None,
+            forward: None,
+        }),
+    });
+    state.store.save_settings(settings).await.unwrap();
+
+    // 1. Message carrying opaque `vip_lbl.id` matches `label:Clients/VIP` -> STARRED added.
+    let msg_match = state
+        .store
+        .insert_message(NewMessageInput {
+            id: None,
+            thread_id: None,
+            label_ids: vec![LABEL_INBOX.to_string(), vip_lbl.id.clone()],
+            raw_rfc2822:
+                b"From: vip@client.test\r\nTo: agent@example.com\r\nSubject: Urgent VIP\r\n\r\nHi"
+                    .to_vec(),
+            snippet: "Hi".to_string(),
+            internal_date_ms: 1_700_000_010_000,
+            subject: "Urgent VIP".to_string(),
+            from_addr: "vip@client.test".to_string(),
+            to_addrs: vec!["agent@example.com".to_string()],
+            cc_addrs: vec![],
+            bcc_addrs: vec![],
+            text_body: "Hi".to_string(),
+            html_body: None,
+            rfc822_message_id: Some("<vip-custom-1@client.test>".to_string()),
+            in_reply_to: None,
+            references_header: None,
+            resend_id: None,
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "gmail_api".to_string(),
+            is_answered: false,
+            is_deleted: false,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let updated_match = nogml::ai::rules::evaluate_inbox_rules_with_cipher(
+        state.store.as_ref(),
+        &state.events,
+        &msg_match,
+        true,
+        &nogml::ai::rules::RuleWebhookPolicy::default(),
+        state.cipher.as_ref(),
+    )
+    .await;
+    assert!(
+        updated_match
+            .label_ids
+            .iter()
+            .any(|l| l == nogml::models::LABEL_STARRED),
+        "expected Gmail filter with custom label name query to add STARRED, got {:?}",
+        updated_match.label_ids
+    );
+
+    // 2. Message carrying BOTH `vip_lbl.id` and `muted_lbl.id` is excluded by `negated_query: label:MutedQueue`.
+    let msg_excluded = state
+        .store
+        .insert_message(NewMessageInput {
+            id: None,
+            thread_id: None,
+            label_ids: vec![
+                LABEL_INBOX.to_string(),
+                vip_lbl.id.clone(),
+                muted_lbl.id.clone(),
+            ],
+            raw_rfc2822:
+                b"From: vip@client.test\r\nTo: agent@example.com\r\nSubject: Muted VIP\r\n\r\nMuted"
+                    .to_vec(),
+            snippet: "Muted".to_string(),
+            internal_date_ms: 1_700_000_020_000,
+            subject: "Muted VIP".to_string(),
+            from_addr: "vip@client.test".to_string(),
+            to_addrs: vec!["agent@example.com".to_string()],
+            cc_addrs: vec![],
+            bcc_addrs: vec![],
+            text_body: "Muted".to_string(),
+            html_body: None,
+            rfc822_message_id: Some("<vip-custom-2@client.test>".to_string()),
+            in_reply_to: None,
+            references_header: None,
+            resend_id: None,
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "gmail_api".to_string(),
+            is_answered: false,
+            is_deleted: false,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let updated_excluded = nogml::ai::rules::evaluate_inbox_rules_with_cipher(
+        state.store.as_ref(),
+        &state.events,
+        &msg_excluded,
+        true,
+        &nogml::ai::rules::RuleWebhookPolicy::default(),
+        state.cipher.as_ref(),
+    )
+    .await;
+    assert!(
+        !updated_excluded
+            .label_ids
+            .iter()
+            .any(|l| l == nogml::models::LABEL_STARRED),
+        "expected negated_query with custom label name to suppress filter match, got {:?}",
+        updated_excluded.label_ids
+    );
 }
