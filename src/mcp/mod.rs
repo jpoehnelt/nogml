@@ -218,7 +218,12 @@ impl McpServer {
         }
 
         let required_scope = match name {
-            "search_emails" | "list_threads" | "read_thread" | "read_email" | "list_labels"
+            "search_emails"
+            | "list_threads"
+            | "read_thread"
+            | "read_email"
+            | "read_attachment_text"
+            | "list_labels"
             | "sync_status" => AuthScope::Read,
             "create_draft" | "triage_thread" | "modify_labels" | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
@@ -251,6 +256,7 @@ impl McpServer {
                     "list_threads" => self.tool_list_threads(arguments).await,
                     "read_thread" => self.tool_read_thread(arguments).await,
                     "read_email" => self.tool_read_email(arguments).await,
+                    "read_attachment_text" => self.tool_read_attachment_text(arguments).await,
                     "send_email" => self.tool_send_email(arguments).await,
                     "create_draft" => self.tool_create_draft(arguments).await,
                     "send_draft" => self.tool_send_draft(arguments).await,
@@ -617,6 +623,9 @@ impl McpServer {
             #[serde(default)]
             include_html: bool,
             include_attachments_meta: Option<bool>,
+            #[serde(default)]
+            extract_attachment_text: bool,
+            attachment_max_chars: Option<usize>,
         }
 
         let parsed: Args = serde_json::from_value(args)?;
@@ -634,7 +643,7 @@ impl McpServer {
         let max_body_chars = ai::clamp_max_body_chars(parsed.max_body_chars, &self.state.config);
         let include_attachments_meta = parsed.include_attachments_meta.unwrap_or(true);
 
-        let compact = ai::build_compact_message_with_meta(
+        let mut compact = ai::build_compact_message_with_meta(
             &self.state,
             &msg,
             true,
@@ -645,7 +654,36 @@ impl McpServer {
         )
         .await?;
 
+        if parsed.extract_attachment_text {
+            ai::attach_extracted_attachment_texts(
+                &self.state,
+                &mut compact,
+                parsed.attachment_max_chars,
+            )
+            .await?;
+        }
+
         Ok(serde_json::to_value(compact)?)
+    }
+
+    async fn tool_read_attachment_text(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            message_id: String,
+            attachment_id: String,
+            max_chars: Option<usize>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let extracted = ai::execute_read_attachment_text(
+            &self.state,
+            &parsed.message_id,
+            &parsed.attachment_id,
+            parsed.max_chars,
+        )
+        .await?;
+
+        Ok(serde_json::to_value(extracted)?)
     }
 
     async fn tool_send_email(&self, args: Value) -> AppResult<Value> {
@@ -1196,7 +1234,7 @@ fn tool_catalog() -> Value {
         },
         {
             "name": "read_email",
-            "description": "Read a single email message by ID with bounded text body and attachment metadata.",
+            "description": "Read a single email message by ID with bounded text/Markdown body, attachment metadata, and optional attachment text extraction.",
             "inputSchema": {
                 "type": "object",
                 "required": ["message_id"],
@@ -1205,7 +1243,28 @@ fn tool_catalog() -> Value {
                     "max_body_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 4000 },
                     "strip_quotes": { "type": "boolean", "default": false },
                     "include_html": { "type": "boolean", "default": false },
-                    "include_attachments_meta": { "type": "boolean", "default": true }
+                    "include_attachments_meta": { "type": "boolean", "default": true },
+                    "extract_attachment_text": { "type": "boolean", "default": false },
+                    "attachment_max_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 20000 }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "read_attachment_text",
+            "description": "Extract readable text or structured calendar data (.txt, .csv, .md, .json, .html, .ics, .pdf) from a message attachment with strict byte and character ceilings.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id", "attachment_id"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "attachment_id": { "type": "string" },
+                    "max_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 20000 }
                 }
             },
             "annotations": {
@@ -1473,7 +1532,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 13 tools
+        // tools/list advertises all 14 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1490,6 +1549,7 @@ mod tests {
             "list_threads",
             "read_thread",
             "read_email",
+            "read_attachment_text",
             "send_email",
             "create_draft",
             "send_draft",
@@ -1502,7 +1562,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
     }
 
     #[tokio::test]

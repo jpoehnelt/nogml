@@ -43,14 +43,15 @@ use crate::{
     error::{AiError, AppError, AppResult},
     events::{EventEnvelope, EventSource, MailEvent},
     mime::{
-        ComposeEmailInput, apply_fields_mask, build_rfc2822, generate_snippet,
-        parse_unsubscribe_from_raw, strip_quoted_text,
+        ComposeEmailInput, DEFAULT_ATTACHMENT_MAX_BYTES, apply_fields_mask, build_rfc2822,
+        extract_attachment_text, generate_snippet, oversize_attachment_extraction,
+        parse_unsubscribe_from_raw, select_body_or_html_markdown, strip_quoted_text,
     },
     models::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
-        AiTriageRequest, AiUnsubscribeRequest, CompactMessage, EmailAddress, LABEL_DRAFT,
-        LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest,
-        ThreadDetail, UnsubscribeInfo,
+        AiTriageRequest, AiUnsubscribeRequest, AttachmentTextExtraction, CompactMessage,
+        EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH,
+        LABEL_UNREAD, SyncTriggerRequest, ThreadDetail, UnsubscribeInfo,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, MessageListQuery, NewAttachmentInput,
@@ -111,6 +112,10 @@ pub fn ai_router() -> Router<AppState> {
         .route(
             "/v1/messages/{id}/attachments/{attachment_id}",
             get(get_attachment_handler),
+        )
+        .route(
+            "/v1/messages/{id}/attachments/{attachment_id}/text",
+            get(get_attachment_text_handler),
         )
         .route("/v1/drafts", get(list_drafts).post(create_draft_handler))
         .route("/v1/drafts/{id}", delete(delete_draft_handler))
@@ -1240,11 +1245,17 @@ pub fn to_compact_message(
     let date = DateTime::from_timestamp_millis(msg.internal_date_ms).unwrap_or_else(Utc::now);
     let effective_cap = max_body_chars.min(safety::HARD_MAX_BODY_CHARS);
 
+    let (source_text, text_from_html) = if include_body {
+        select_body_or_html_markdown(&msg.text_body, msg.html_body.as_deref())
+    } else {
+        (msg.text_body.clone(), false)
+    };
+
     let processed_text = if strip_quotes {
-        let stripped = strip_quoted_text(&msg.text_body);
+        let stripped = strip_quoted_text(&source_text);
         clean(&stripped)
     } else {
-        clean(&msg.text_body)
+        clean(&source_text)
     };
     let text_total_chars = processed_text.chars().count();
 
@@ -1258,6 +1269,8 @@ pub fn to_compact_message(
     } else {
         (None, false)
     };
+
+    let text_format = (include_body && text_from_html).then(|| "markdown".to_string());
 
     let html = if include_body && include_html {
         msg.html_body.as_deref().map(|raw_html| {
@@ -1287,7 +1300,9 @@ pub fn to_compact_message(
         unread: msg.label_ids.iter().any(|l| l == LABEL_UNREAD),
         has_attachments: msg.has_attachments,
         attachments_meta: None,
+        attachments_text: None,
         text,
+        text_format,
         text_truncated,
         text_total_chars,
         html,
@@ -1437,6 +1452,88 @@ pub async fn build_compact_message_with_meta(
         );
     }
     Ok(compact)
+}
+
+/// Extract readable text / structured metadata for a single message attachment with strict
+/// byte (`5 MiB`) and character (`default 20_000`, `hard cap 100_000`) ceilings and
+/// `untrusted_content_guard` sanitization.
+pub async fn execute_read_attachment_text(
+    state: &AppState,
+    message_id: &str,
+    attachment_id: &str,
+    max_chars: Option<usize>,
+) -> AppResult<AttachmentTextExtraction> {
+    validate_resource_id(message_id)?;
+    validate_resource_id(attachment_id)?;
+
+    let att = state
+        .store
+        .get_attachment(message_id, attachment_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Attachment '{attachment_id}' on message '{message_id}' not found"
+            ))
+        })?;
+
+    let guard = state.config.untrusted_content_guard;
+    let safe_filename = att.filename.as_deref().map(|name| {
+        if guard {
+            sanitize_untrusted_text(name)
+        } else {
+            name.to_string()
+        }
+    });
+
+    let mut extracted = if att.size_bytes > DEFAULT_ATTACHMENT_MAX_BYTES as u64 {
+        oversize_attachment_extraction(
+            safe_filename,
+            att.content_type.clone(),
+            att.size_bytes,
+            DEFAULT_ATTACHMENT_MAX_BYTES,
+        )
+    } else {
+        let data = state.load_attachment_bytes(&att).await?;
+        extract_attachment_text(
+            &data,
+            &att.content_type,
+            safe_filename.as_deref(),
+            max_chars,
+            DEFAULT_ATTACHMENT_MAX_BYTES,
+            guard,
+        )
+    };
+
+    extracted.attachment_id = Some(att.id);
+    extracted.message_id = Some(att.message_id);
+    if extracted.size_bytes == 0 {
+        extracted.size_bytes = att.size_bytes;
+    }
+    extracted.meta = untrusted_meta(&state.config);
+    Ok(extracted)
+}
+
+/// Populate `compact.attachments_text` for every attachment on `compact.id`.
+pub async fn attach_extracted_attachment_texts(
+    state: &AppState,
+    compact: &mut CompactMessage,
+    max_chars: Option<usize>,
+) -> AppResult<()> {
+    if !compact.has_attachments {
+        return Ok(());
+    }
+    let metas = state.store.list_attachment_meta(&compact.id).await?;
+    if metas.is_empty() {
+        return Ok(());
+    }
+    let mut results = Vec::with_capacity(metas.len());
+    for meta in metas {
+        let extracted =
+            execute_read_attachment_text(state, &compact.id, &meta.id, max_chars).await?;
+        results.push(extracted);
+    }
+    compact.attachments_text = Some(results);
+    Ok(())
 }
 
 /// Build the `GET /v1/sync/gmail` / MCP `sync_gmail` [`SyncRunOptions`] from a [`SyncTriggerRequest`].
@@ -1932,6 +2029,15 @@ struct ReadMessageParams {
     #[serde(default)]
     include_html: bool,
     include_attachments_meta: Option<bool>,
+    #[serde(default)]
+    extract_attachment_text: bool,
+    attachment_max_chars: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AttachmentTextParams {
+    max_chars: Option<usize>,
     fields: Option<String>,
 }
 
@@ -2008,6 +2114,7 @@ async fn get_capabilities(
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",
             "GET /v1/messages/{id}/attachments/{attachment_id}",
+            "GET /v1/messages/{id}/attachments/{attachment_id}/text",
             "POST /v1/messages/send",
             "POST /v1/messages/modify",
             "GET /v1/drafts",
@@ -2211,7 +2318,7 @@ async fn get_message(
     let max_body_chars = clamp_max_body_chars(params.max_body_chars, &state.config);
     let include_attachments_meta = params.include_attachments_meta.unwrap_or(true);
 
-    let compact = build_compact_message_with_meta(
+    let mut compact = build_compact_message_with_meta(
         &state,
         &msg,
         true,
@@ -2221,6 +2328,11 @@ async fn get_message(
         include_attachments_meta,
     )
     .await?;
+
+    if params.extract_attachment_text {
+        attach_extracted_attachment_texts(&state, &mut compact, params.attachment_max_chars)
+            .await?;
+    }
 
     let value = serde_json::to_value(compact).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
@@ -2250,6 +2362,17 @@ async fn unsubscribe_message_handler(
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())
+}
+
+async fn get_attachment_text_handler(
+    MailboxState(state): MailboxState,
+    Path((id, attachment_id)): Path<(String, String)>,
+    Query(params): Query<AttachmentTextParams>,
+) -> Result<Json<Value>, AiError> {
+    let extracted =
+        execute_read_attachment_text(&state, &id, &attachment_id, params.max_chars).await?;
+    let value = serde_json::to_value(extracted).map_err(AppError::from)?;
+    Ok(Json(project_fields(value, params.fields.as_deref())?))
 }
 
 async fn get_attachment_handler(

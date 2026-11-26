@@ -603,7 +603,7 @@ pub fn parse_raw_to_new_message_input(
     let text_body = if !text_parts.is_empty() {
         text_parts.join("\n")
     } else if let Some(ref html) = html_body {
-        mail_parser::html_to_text(html)
+        crate::mime::html_to_markdown(html)
     } else {
         String::new()
     };

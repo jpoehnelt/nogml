@@ -44,6 +44,7 @@ tokio-postgres = { version = "0.7", optional = true }
 
 # MIME parsing/building, encoding & webhook verification
 base64 = "0.22"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hmac = "0.12"
 mail-builder = "2"
 mail-parser = "1"
