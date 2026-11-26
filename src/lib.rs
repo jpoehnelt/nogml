@@ -27,7 +27,7 @@ pub mod transport;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, Mutex as StdMutex, Once},
+    sync::{Arc, Mutex as StdMutex, Once, Weak},
 };
 
 use axum::{
@@ -97,6 +97,8 @@ pub struct AppState {
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
     pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
+    /// Per-`(mailbox_id, scope, idempotency_key)` single-flight locks preventing concurrent double-sends.
+    idempotency_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
     primary_mailbox_id: String,
     base_blobs: Arc<dyn BlobStore>,
     sync_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -217,6 +219,7 @@ impl AppState {
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
             sync_locks: Arc::new(StdMutex::new(locks)),
@@ -298,6 +301,7 @@ impl AppState {
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
             sync_locks: Arc::new(StdMutex::new(locks)),
@@ -380,6 +384,7 @@ impl AppState {
             resumable_uploads: self.resumable_uploads.clone(),
             approval_in_flight: self.approval_in_flight.clone(),
             used_oauth_codes: self.used_oauth_codes.clone(),
+            idempotency_locks: self.idempotency_locks.clone(),
             primary_mailbox_id: self.primary_mailbox_id.clone(),
             base_blobs: self.base_blobs.clone(),
             sync_locks: self.sync_locks.clone(),
@@ -560,6 +565,62 @@ impl AppState {
         }
         let _ = self.search.remove(message_id).await;
         Ok(())
+    }
+
+    /// Return a per-`(mailbox_id, scope, key)` async mutex so concurrent retries with the same
+    /// idempotency key serialize cleanly and the second caller observes the first caller's cached result.
+    pub fn idempotency_key_lock(&self, scope: &str, key: &str) -> Arc<Mutex<()>> {
+        let composite = format!("{}\x1f{}\x1f{}", self.mailbox_id(), scope, key);
+        let mut map = self
+            .idempotency_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.len() > 256 {
+            map.retain(|_, v| v.strong_count() > 0);
+        }
+        if let Some(existing) = map.get(&composite).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        map.insert(composite, Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Append an immutable audit log entry for an operation executed on this mailbox.
+    pub async fn record_audit(
+        &self,
+        principal: Option<&Principal>,
+        channel: &str,
+        action: &str,
+        target_ids: Vec<String>,
+        outcome: &str,
+        detail: Option<String>,
+    ) {
+        let actor = principal
+            .map(|p| p.mailbox_id.clone())
+            .unwrap_or_else(|| self.mailbox_id().to_string());
+        let scopes: Vec<String> = match principal {
+            Some(p) => p.scopes.iter().map(|s| s.as_str().to_string()).collect(),
+            None => vec![
+                "read".to_string(),
+                "write".to_string(),
+                "send".to_string(),
+                "admin".to_string(),
+            ],
+        };
+        let entry = crate::storage::NewAuditLogEntry {
+            timestamp_ms: None,
+            actor,
+            scopes,
+            channel: channel.to_string(),
+            action: action.to_string(),
+            target_ids,
+            outcome: outcome.to_string(),
+            detail,
+        };
+        if let Err(err) = self.store.append_audit_log(&entry).await {
+            tracing::warn!(%err, action, channel, "Failed to append audit log entry");
+        }
     }
 }
 

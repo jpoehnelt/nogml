@@ -29,10 +29,7 @@ use chrono::{Duration, Utc};
 use crate::{
     AppState, MailboxState,
     ai::safety::{OutboundCheck, OutboundDecision},
-    auth::{
-        AgentPolicyOverride, Principal, resolve_user_id, validate_email_header,
-        validate_resource_id,
-    },
+    auth::{Principal, resolve_user_id, validate_email_header, validate_resource_id},
     blob::is_external_blob_store,
     error::{AppError, AppResult},
     events::{EventSource, MailEvent},
@@ -541,13 +538,14 @@ fn parsed_to_outbound_message(
 }
 
 /// Shared outbound send helper used by `messages.send` and `drafts.send`.
+#[allow(clippy::too_many_arguments)]
 async fn execute_gmail_send(
     state: &AppState,
     raw_bytes: Vec<u8>,
     thread_id: Option<String>,
     extra_labels: Vec<String>,
     idempotency_key: Option<&str>,
-    agent_policy: Option<AgentPolicyOverride>,
+    principal: Option<&Principal>,
     is_draft_send: bool,
 ) -> AppResult<StoredMessage> {
     if raw_bytes.is_empty() {
@@ -566,6 +564,7 @@ async fn execute_gmail_send(
         idempotency_key,
     )?;
 
+    let agent_policy = principal.and_then(|p| p.agent_policy.clone());
     let policy_check = OutboundCheck {
         from: outbound.from.clone(),
         to: outbound.to.clone(),
@@ -581,6 +580,16 @@ async fn execute_gmail_send(
     match state.outbound_policy.evaluate(&policy_check).await? {
         OutboundDecision::Allow => {}
         OutboundDecision::Deny { code, reason, hint } => {
+            state
+                .record_audit(
+                    principal,
+                    "/gmail/v1",
+                    "send",
+                    Vec::new(),
+                    "denied",
+                    Some(format!("{code}: {reason}")),
+                )
+                .await;
             if code == "draft_only_mode" {
                 return Err(AppError::DraftOnlyBlocked {
                     hint: hint.unwrap_or(reason),
@@ -594,9 +603,29 @@ async fn execute_gmail_send(
             });
         }
         OutboundDecision::DowngradeToDraft { .. } => {
+            state
+                .record_audit(
+                    principal,
+                    "/gmail/v1",
+                    "send",
+                    Vec::new(),
+                    "denied",
+                    Some("draft_only_mode".to_string()),
+                )
+                .await;
             return Err(AppError::draft_only_blocked());
         }
         OutboundDecision::HoldForApproval { reason } => {
+            state
+                .record_audit(
+                    principal,
+                    "/gmail/v1",
+                    "send",
+                    Vec::new(),
+                    "denied",
+                    Some(format!("approval_required: {reason}")),
+                )
+                .await;
             return Err(AppError::Forbidden(format!(
                 "Outbound send held for approval: {reason}"
             )));
@@ -639,6 +668,17 @@ async fn execute_gmail_send(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            "/gmail/v1",
+            "send",
+            vec![stored.id.clone(), stored.thread_id.clone()],
+            "ok",
+            Some(format!("to={}", stored.to_addrs.join(","))),
+        )
+        .await;
+
     Ok(stored)
 }
 
@@ -663,6 +703,7 @@ async fn get_profile(
 /// `GET /gmail/v1/users/{userId}/messages`
 async fn list_messages(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListMessagesResponse>> {
@@ -670,6 +711,23 @@ async fn list_messages(
     let params = QueryParams::from_raw(raw_query.as_deref());
     let query = params.parse_message_list_query()?;
     let page = state.store.list_messages(&query).await?;
+
+    let target_ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+    let action = if query.q.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        "search"
+    } else {
+        "read"
+    };
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            action,
+            target_ids,
+            "ok",
+            query.q.clone(),
+        )
+        .await;
 
     let messages = if page.messages.is_empty() {
         None
@@ -695,6 +753,7 @@ async fn list_messages(
 /// `GET /gmail/v1/users/{userId}/messages/{id}`
 async fn get_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Message>> {
@@ -711,6 +770,16 @@ async fn get_message(
         .ok_or_else(|| AppError::NotFound(format!("Message '{id}' not found")))?;
 
     let msg = format_gmail_message_from_store(&state, &stored, format, &metadata_headers).await?;
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("message".to_string()),
+        )
+        .await;
     Ok(Json(msg))
 }
 
@@ -742,7 +811,7 @@ async fn complete_send_message(
     metadata: Message,
     raw_bytes: Option<Vec<u8>>,
     idempotency_key: Option<&str>,
-    agent_policy: Option<AgentPolicyOverride>,
+    principal: Option<&Principal>,
 ) -> AppResult<Message> {
     let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
@@ -761,7 +830,7 @@ async fn complete_send_message(
         thread_id,
         metadata.label_ids.unwrap_or_default(),
         idempotency_key,
-        agent_policy,
+        principal,
         false,
     )
     .await?;
@@ -776,6 +845,7 @@ async fn complete_insert_message(
     raw_bytes: Option<Vec<u8>>,
     date_source: &str,
     deleted: bool,
+    principal: Option<&Principal>,
 ) -> AppResult<Message> {
     let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
@@ -823,10 +893,22 @@ async fn complete_insert_message(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            "/gmail/v1",
+            "modify",
+            vec![stored.id.clone()],
+            "ok",
+            Some("insert".to_string()),
+        )
+        .await;
+
     format_gmail_message(&stored, MessageFormat::Minimal, &[])
 }
 
 /// Shared `messages.import` completion logic used by JSON, `media`, `multipart`, and `resumable`.
+#[allow(clippy::too_many_arguments)]
 async fn complete_import_message(
     state: &AppState,
     metadata: Message,
@@ -835,6 +917,7 @@ async fn complete_import_message(
     never_mark_spam: bool,
     _process_for_calendar: bool,
     deleted: bool,
+    principal: Option<&Principal>,
 ) -> AppResult<Message> {
     let raw_bytes = raw_bytes.ok_or_else(|| {
         AppError::BadRequest(
@@ -924,6 +1007,17 @@ async fn complete_import_message(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            "/gmail/v1",
+            "modify",
+            vec![stored.id.clone()],
+            "ok",
+            Some("import".to_string()),
+        )
+        .await;
+
     format_gmail_message(&stored, MessageFormat::Minimal, &[])
 }
 
@@ -977,7 +1071,7 @@ async fn execute_completed_resumable(
     state: &AppState,
     session: ResumableUploadSession,
     headers: &HeaderMap,
-    agent_policy: Option<AgentPolicyOverride>,
+    principal: Option<&Principal>,
 ) -> AppResult<Response> {
     let idempotency_key = session
         .idempotency_key
@@ -987,9 +1081,8 @@ async fn execute_completed_resumable(
     match (session.target, session.metadata) {
         (ResumableUploadTarget::MessagesSend, ResumableUploadMetadata::Message(metadata)) => {
             let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
-            let msg =
-                complete_send_message(state, metadata, raw_bytes, idempotency_key, agent_policy)
-                    .await?;
+            let msg = complete_send_message(state, metadata, raw_bytes, idempotency_key, principal)
+                .await?;
             Ok(Json(msg).into_response())
         }
         (
@@ -1000,8 +1093,15 @@ async fn execute_completed_resumable(
             ResumableUploadMetadata::Message(metadata),
         ) => {
             let raw_bytes = resolve_resumable_message_bytes(session.buffer, &metadata)?;
-            let msg =
-                complete_insert_message(state, metadata, raw_bytes, &date_source, deleted).await?;
+            let msg = complete_insert_message(
+                state,
+                metadata,
+                raw_bytes,
+                &date_source,
+                deleted,
+                principal,
+            )
+            .await?;
             Ok(Json(msg).into_response())
         }
         (
@@ -1022,13 +1122,14 @@ async fn execute_completed_resumable(
                 never_mark_spam,
                 process_for_calendar,
                 deleted,
+                principal,
             )
             .await?;
             Ok(Json(msg).into_response())
         }
         (ResumableUploadTarget::DraftsCreate, ResumableUploadMetadata::Draft(metadata)) => {
             let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
-            let draft = complete_create_draft(state, metadata, raw_bytes).await?;
+            let draft = complete_create_draft(state, metadata, raw_bytes, principal).await?;
             Ok(Json(draft).into_response())
         }
         (
@@ -1036,14 +1137,14 @@ async fn execute_completed_resumable(
             ResumableUploadMetadata::Draft(metadata),
         ) => {
             let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
-            let draft = complete_update_draft(state, &draft_id, metadata, raw_bytes).await?;
+            let draft =
+                complete_update_draft(state, &draft_id, metadata, raw_bytes, principal).await?;
             Ok(Json(draft).into_response())
         }
         (ResumableUploadTarget::DraftsSend, ResumableUploadMetadata::Draft(metadata)) => {
             let raw_bytes = resolve_resumable_draft_bytes(session.buffer, &metadata)?;
             let msg =
-                complete_send_draft(state, metadata, raw_bytes, idempotency_key, agent_policy)
-                    .await?;
+                complete_send_draft(state, metadata, raw_bytes, idempotency_key, principal).await?;
             Ok(Json(msg).into_response())
         }
         _ => Err(AppError::Internal(
@@ -1083,7 +1184,7 @@ async fn handle_resumable_chunk(
     raw_query: Option<&str>,
     headers: &HeaderMap,
     body: Bytes,
-    agent_policy: Option<AgentPolicyOverride>,
+    principal: Option<&Principal>,
 ) -> AppResult<Response> {
     let user_email = resolve_user_id(user_id, &state.config)?;
     let params = QueryParams::from_raw(raw_query);
@@ -1127,7 +1228,7 @@ async fn handle_resumable_chunk(
             build_resumable_incomplete_response(received)
         }
         ResumableChunkOutcome::Complete(session) => {
-            execute_completed_resumable(state, *session, headers, agent_policy).await
+            execute_completed_resumable(state, *session, headers, principal).await
         }
     }
 }
@@ -1173,7 +1274,6 @@ async fn send_message_resumable_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
-    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     handle_resumable_chunk(
         &state,
         &user_id,
@@ -1181,7 +1281,7 @@ async fn send_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
-        agent_policy,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await
 }
@@ -1202,6 +1302,7 @@ async fn send_message_resumable_delete(
 
 async fn insert_message_resumable_put(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1214,7 +1315,7 @@ async fn insert_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
-        None,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await
 }
@@ -1235,6 +1336,7 @@ async fn insert_message_resumable_delete(
 
 async fn import_message_resumable_put(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1247,7 +1349,7 @@ async fn import_message_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
-        None,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await
 }
@@ -1268,6 +1370,7 @@ async fn import_message_resumable_delete(
 
 async fn create_draft_resumable_put(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -1280,7 +1383,7 @@ async fn create_draft_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
-        None,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await
 }
@@ -1307,7 +1410,6 @@ async fn send_draft_resumable_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
-    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     handle_resumable_chunk(
         &state,
         &user_id,
@@ -1315,7 +1417,7 @@ async fn send_draft_resumable_put(
         raw_query.as_deref(),
         &headers,
         body,
-        agent_policy,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await
 }
@@ -1375,14 +1477,13 @@ async fn send_message(
         );
     }
 
-    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     let extracted = extract_message_upload(&headers, &params, &body)?;
     let msg = complete_send_message(
         &state,
         extracted.metadata,
         extracted.raw_bytes,
         idempotency_key_header(&headers),
-        agent_policy,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await?;
     Ok(Json(msg).into_response())
@@ -1391,6 +1492,7 @@ async fn send_message(
 /// `POST /gmail/v1/users/{userId}/messages` & `/upload/gmail/v1/users/{userId}/messages` (`insert`)
 async fn insert_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -1434,6 +1536,7 @@ async fn insert_message(
         extracted.raw_bytes,
         &date_source,
         deleted,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await?;
     Ok(Json(msg).into_response())
@@ -1442,6 +1545,7 @@ async fn insert_message(
 /// `POST /gmail/v1/users/{userId}/messages/import` & `/upload/gmail/v1/users/{userId}/messages/import`
 async fn import_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -1491,6 +1595,7 @@ async fn import_message(
         never_mark_spam,
         process_for_calendar,
         deleted,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await?;
     Ok(Json(msg).into_response())
@@ -1499,6 +1604,7 @@ async fn import_message(
 /// `POST /gmail/v1/users/{userId}/messages/{id}/modify`
 async fn modify_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     Json(req): Json<ModifyMessageRequest>,
 ) -> AppResult<Json<Message>> {
@@ -1517,10 +1623,25 @@ async fn modify_message(
         MailEvent::MessageUpdated {
             message_id: stored.id.clone(),
             thread_id: stored.thread_id.clone(),
-            added_labels: req.add_label_ids,
-            removed_labels: req.remove_label_ids,
+            added_labels: req.add_label_ids.clone(),
+            removed_labels: req.remove_label_ids.clone(),
         },
     );
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![stored.id.clone()],
+            "ok",
+            Some(format!(
+                "add=[{}] remove=[{}]",
+                req.add_label_ids.join(","),
+                req.remove_label_ids.join(",")
+            )),
+        )
+        .await;
 
     let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
     Ok(Json(msg))
@@ -1529,6 +1650,7 @@ async fn modify_message(
 /// `POST /gmail/v1/users/{userId}/messages/{id}/trash`
 async fn trash_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Message>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1545,6 +1667,17 @@ async fn trash_message(
         },
     );
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![stored.id.clone()],
+            "ok",
+            Some("trash".to_string()),
+        )
+        .await;
+
     let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
     Ok(Json(msg))
 }
@@ -1552,6 +1685,7 @@ async fn trash_message(
 /// `POST /gmail/v1/users/{userId}/messages/{id}/untrash`
 async fn untrash_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Message>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1568,6 +1702,17 @@ async fn untrash_message(
         },
     );
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![stored.id.clone()],
+            "ok",
+            Some("untrash".to_string()),
+        )
+        .await;
+
     let msg = format_gmail_message(&stored, MessageFormat::Minimal, &[])?;
     Ok(Json(msg))
 }
@@ -1575,6 +1720,7 @@ async fn untrash_message(
 /// `DELETE /gmail/v1/users/{userId}/messages/{id}`
 async fn delete_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1610,12 +1756,24 @@ async fn delete_message(
         );
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "delete",
+            vec![id],
+            "ok",
+            Some("message".to_string()),
+        )
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /gmail/v1/users/{userId}/messages/batchModify`
 async fn batch_modify_messages(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     Json(req): Json<BatchModifyMessagesRequest>,
 ) -> AppResult<StatusCode> {
@@ -1655,12 +1813,24 @@ async fn batch_modify_messages(
         }
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            req.ids,
+            "ok",
+            Some("batchModify".to_string()),
+        )
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /gmail/v1/users/{userId}/messages/batchDelete`
 async fn batch_delete_messages(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     Json(req): Json<BatchDeleteMessagesRequest>,
 ) -> AppResult<StatusCode> {
@@ -1700,12 +1870,24 @@ async fn batch_delete_messages(
         );
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "delete",
+            req.ids,
+            "ok",
+            Some("batchDelete".to_string()),
+        )
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /gmail/v1/users/{userId}/messages/{messageId}/attachments/{id}`
 async fn get_attachment(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, message_id, id)): Path<(String, String, String)>,
 ) -> AppResult<Json<MessagePartBody>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1724,6 +1906,17 @@ async fn get_attachment(
 
     let data = state.load_attachment_bytes(&att).await?;
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "read",
+            vec![message_id, id],
+            "ok",
+            Some("attachment".to_string()),
+        )
+        .await;
+
     Ok(Json(MessagePartBody {
         attachment_id: None,
         size: data.len().min(i32::MAX as usize) as i32,
@@ -1738,6 +1931,7 @@ async fn get_attachment(
 /// `GET /gmail/v1/users/{userId}/threads`
 async fn list_threads(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListThreadsResponse>> {
@@ -1745,6 +1939,23 @@ async fn list_threads(
     let params = QueryParams::from_raw(raw_query.as_deref());
     let query = params.parse_message_list_query()?;
     let page = state.store.list_threads(&query).await?;
+
+    let target_ids: Vec<String> = page.threads.iter().map(|t| t.id.clone()).collect();
+    let action = if query.q.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        "search"
+    } else {
+        "read"
+    };
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            action,
+            target_ids,
+            "ok",
+            query.q.clone(),
+        )
+        .await;
 
     let threads = if page.threads.is_empty() {
         None
@@ -1771,6 +1982,7 @@ async fn list_threads(
 /// `GET /gmail/v1/users/{userId}/threads/{id}`
 async fn get_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Thread>> {
@@ -1787,12 +1999,23 @@ async fn get_thread(
         .ok_or_else(|| AppError::NotFound(format!("Thread '{id}' not found")))?;
 
     let thread = format_thread_detail(&state, detail, format, &metadata_headers).await?;
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("thread".to_string()),
+        )
+        .await;
     Ok(Json(thread))
 }
 
 /// `POST /gmail/v1/users/{userId}/threads/{id}/modify`
 async fn modify_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     Json(req): Json<ModifyThreadRequest>,
 ) -> AppResult<Json<Thread>> {
@@ -1818,6 +2041,21 @@ async fn modify_thread(
         );
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![id],
+            "ok",
+            Some(format!(
+                "thread add=[{}] remove=[{}]",
+                req.add_label_ids.join(","),
+                req.remove_label_ids.join(",")
+            )),
+        )
+        .await;
+
     let thread = format_thread_detail(&state, detail, MessageFormat::Minimal, &[]).await?;
     Ok(Json(thread))
 }
@@ -1825,6 +2063,7 @@ async fn modify_thread(
 /// `POST /gmail/v1/users/{userId}/threads/{id}/trash`
 async fn trash_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Thread>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1843,6 +2082,17 @@ async fn trash_thread(
         );
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![id],
+            "ok",
+            Some("trash_thread".to_string()),
+        )
+        .await;
+
     let thread = format_thread_detail(&state, detail, MessageFormat::Minimal, &[]).await?;
     Ok(Json(thread))
 }
@@ -1850,6 +2100,7 @@ async fn trash_thread(
 /// `POST /gmail/v1/users/{userId}/threads/{id}/untrash`
 async fn untrash_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<Json<Thread>> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1868,6 +2119,17 @@ async fn untrash_thread(
         );
     }
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "modify",
+            vec![id],
+            "ok",
+            Some("untrash_thread".to_string()),
+        )
+        .await;
+
     let thread = format_thread_detail(&state, detail, MessageFormat::Minimal, &[]).await?;
     Ok(Json(thread))
 }
@@ -1875,6 +2137,7 @@ async fn untrash_thread(
 /// `DELETE /gmail/v1/users/{userId}/threads/{id}`
 async fn delete_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -1899,6 +2162,17 @@ async fn delete_thread(
             );
         }
     }
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "delete",
+            vec![id],
+            "ok",
+            Some("thread".to_string()),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2090,6 +2364,7 @@ async fn format_stored_draft(
 /// `GET /gmail/v1/users/{userId}/drafts`
 async fn list_drafts(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<ListDraftsResponse>> {
@@ -2097,6 +2372,18 @@ async fn list_drafts(
     let params = QueryParams::from_raw(raw_query.as_deref());
     let query = params.parse_message_list_query()?;
     let page = state.store.list_drafts(&query).await?;
+
+    let target_ids: Vec<String> = page.drafts.iter().map(|d| d.id.clone()).collect();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "read",
+            target_ids,
+            "ok",
+            Some("drafts".to_string()),
+        )
+        .await;
 
     let drafts = if page.drafts.is_empty() {
         None
@@ -2125,6 +2412,7 @@ async fn list_drafts(
 /// `GET /gmail/v1/users/{userId}/drafts/{id}`
 async fn get_draft(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> AppResult<Json<Draft>> {
@@ -2140,6 +2428,17 @@ async fn get_draft(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Draft '{id}' not found")))?;
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("draft".to_string()),
+        )
+        .await;
+
     Ok(Json(
         format_stored_draft(&state, &draft, format, &metadata_headers).await?,
     ))
@@ -2150,6 +2449,7 @@ async fn complete_create_draft(
     state: &AppState,
     metadata: Draft,
     raw_bytes: Option<Vec<u8>>,
+    principal: Option<&Principal>,
 ) -> AppResult<Draft> {
     let input = build_draft_message_input(state, &metadata, raw_bytes)?;
     let draft = state.store.create_draft(input).await?;
@@ -2163,6 +2463,17 @@ async fn complete_create_draft(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            "/gmail/v1",
+            "draft",
+            vec![draft.id.clone(), draft.message.id.clone()],
+            "ok",
+            None,
+        )
+        .await;
+
     format_stored_draft(state, &draft, MessageFormat::Minimal, &[]).await
 }
 
@@ -2172,6 +2483,7 @@ async fn complete_update_draft(
     draft_id: &str,
     metadata: Draft,
     raw_bytes: Option<Vec<u8>>,
+    principal: Option<&Principal>,
 ) -> AppResult<Draft> {
     let input = build_draft_message_input(state, &metadata, raw_bytes)?;
     let draft = state.store.update_draft(draft_id, input).await?;
@@ -2185,6 +2497,17 @@ async fn complete_update_draft(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            "/gmail/v1",
+            "draft",
+            vec![draft.id.clone(), draft.message.id.clone()],
+            "ok",
+            Some("update".to_string()),
+        )
+        .await;
+
     format_stored_draft(state, &draft, MessageFormat::Minimal, &[]).await
 }
 
@@ -2194,7 +2517,7 @@ async fn complete_send_draft(
     metadata: Draft,
     raw_bytes: Option<Vec<u8>>,
     idempotency_key: Option<&str>,
-    agent_policy: Option<AgentPolicyOverride>,
+    principal: Option<&Principal>,
 ) -> AppResult<Message> {
     let draft_id = (!metadata.id.trim().is_empty()).then(|| metadata.id.trim().to_string());
     if let Some(ref did) = draft_id {
@@ -2245,7 +2568,7 @@ async fn complete_send_draft(
         thread_id,
         extra_labels,
         idempotency_key,
-        agent_policy,
+        principal,
         true,
     )
     .await?;
@@ -2260,6 +2583,7 @@ async fn complete_send_draft(
 /// `POST /gmail/v1/users/{userId}/drafts` & `/upload/gmail/v1/users/{userId}/drafts`
 async fn create_draft(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(user_id): Path<String>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -2283,13 +2607,20 @@ async fn create_draft(
     }
 
     let extracted = extract_draft_upload(&headers, &params, &body)?;
-    let draft = complete_create_draft(&state, extracted.metadata, extracted.raw_bytes).await?;
+    let draft = complete_create_draft(
+        &state,
+        extracted.metadata,
+        extracted.raw_bytes,
+        principal.as_ref().map(|Extension(p)| p),
+    )
+    .await?;
     Ok(Json(draft).into_response())
 }
 
 /// `PUT /gmail/v1/users/{userId}/drafts/{id}` & `/upload/gmail/v1/users/{userId}/drafts/{id}`
 async fn update_draft(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
     uri: Uri,
     RawQuery(raw_query): RawQuery,
@@ -2311,7 +2642,7 @@ async fn update_draft(
             raw_query.as_deref(),
             &headers,
             body,
-            None,
+            principal.as_ref().map(|Extension(p)| p),
         )
         .await;
     }
@@ -2331,13 +2662,21 @@ async fn update_draft(
     }
 
     let extracted = extract_draft_upload(&headers, &params, &body)?;
-    let draft = complete_update_draft(&state, &id, extracted.metadata, extracted.raw_bytes).await?;
+    let draft = complete_update_draft(
+        &state,
+        &id,
+        extracted.metadata,
+        extracted.raw_bytes,
+        principal.as_ref().map(|Extension(p)| p),
+    )
+    .await?;
     Ok(Json(draft).into_response())
 }
 
 /// `DELETE /gmail/v1/users/{userId}/drafts/{id}`
 async fn delete_draft(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((user_id, id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     resolve_user_id(&user_id, &state.config)?;
@@ -2360,6 +2699,17 @@ async fn delete_draft(
             },
         );
     }
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/gmail/v1",
+            "delete",
+            vec![id],
+            "ok",
+            Some("draft".to_string()),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2390,14 +2740,13 @@ async fn send_draft(
         );
     }
 
-    let agent_policy = principal.and_then(|Extension(p)| p.agent_policy);
     let extracted = extract_draft_upload(&headers, &params, &body)?;
     let msg = complete_send_draft(
         &state,
         extracted.metadata,
         extracted.raw_bytes,
         idempotency_key_header(&headers),
-        agent_policy,
+        principal.as_ref().map(|Extension(p)| p),
     )
     .await?;
     Ok(Json(msg).into_response())

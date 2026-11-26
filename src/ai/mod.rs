@@ -56,9 +56,9 @@ use crate::{
         UpsertThreadAnnotationRequest, WaitingOn, truncate_to_millis,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactPatch, ContactQuery, ContactRecord,
-        MessageListQuery, NewAttachmentInput, NewMessageInput, NewPendingApprovalInput,
-        PendingApproval, StoredMessage, StoredThreadDetail, TriagePatch,
+        AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactPatch, ContactQuery,
+        ContactRecord, MessageListQuery, NewAttachmentInput, NewMessageInput,
+        NewPendingApprovalInput, PendingApproval, StoredMessage, StoredThreadDetail, TriagePatch,
         parse_simple_email_address, validate_and_normalize_contact_email,
     },
     sync::{self, SyncRunOptions},
@@ -81,8 +81,84 @@ const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
 const DEFAULT_CONTACTS_LIMIT: usize = 50;
 const MAX_CONTACTS_LIMIT: usize = 200;
+const DEFAULT_AUDIT_LIMIT: usize = 50;
+const MAX_AUDIT_LIMIT: usize = 500;
 const DEFAULT_LIST_BODY_CHARS: usize = 1000;
 const SSE_REPLAY_LIMIT: usize = 1024;
+/// Default TTL (24 hours) for persisted send/draft idempotency keys.
+pub const DEFAULT_IDEMPOTENCY_TTL_SECS: i64 = 86_400;
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+const IDEMPOTENCY_SCOPE_SEND: &str = "send_email";
+const IDEMPOTENCY_SCOPE_DRAFT: &str = "create_draft";
+
+pub(crate) fn channel_for_source(source: EventSource) -> &'static str {
+    match source {
+        EventSource::Mcp => "/mcp",
+        EventSource::Api => "/v1",
+        EventSource::Imap => "imap",
+        EventSource::GmailSync => "sync",
+        EventSource::ResendInbound | EventSource::ResendWebhook => "resend",
+        EventSource::SesInbound => "ses",
+        EventSource::System => "system",
+    }
+}
+
+fn idempotency_key_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_idempotency_key(raw: Option<&str>) -> AppResult<Option<String>> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.len() > MAX_IDEMPOTENCY_KEY_LEN {
+        return Err(AppError::validation(
+            format!("idempotency_key exceeds maximum length of {MAX_IDEMPOTENCY_KEY_LEN} bytes"),
+            Some("Provide a shorter idempotency key (<= 256 bytes).".to_string()),
+        ));
+    }
+    if trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f) || trimmed.chars().any(char::is_control) {
+        return Err(AppError::validation(
+            "idempotency_key contains disallowed control characters",
+            None,
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn extract_cached_target_ids(val: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    for field in ["approval_id", "draft_id", "message_id", "thread_id"] {
+        if let Some(s) = val.get(field).and_then(Value::as_str)
+            && !s.is_empty()
+            && !ids.iter().any(|existing| existing == s)
+        {
+            ids.push(s.to_string());
+        }
+    }
+    ids
+}
+
+/// Parse an audit `since` filter accepting either epoch milliseconds (`i64`) or RFC 3339 timestamp.
+pub fn parse_since_ms(raw: Option<&str>) -> AppResult<Option<i64>> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(ms) = trimmed.parse::<i64>() {
+        return Ok(Some(ms));
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(Some(dt.timestamp_millis()));
+    }
+    Err(AppError::validation(
+        format!("Invalid 'since' timestamp '{trimmed}'"),
+        Some("Provide Unix epoch milliseconds (e.g. 1700000000000) or an RFC 3339 timestamp (e.g. 2026-01-01T00:00:00Z).".to_string()),
+    ))
+}
 
 /// Build the AI-first `/v1` router (alias for [`ai_router`]).
 pub fn router() -> Router<AppState> {
@@ -141,6 +217,7 @@ pub fn ai_router() -> Router<AppState> {
             "/v1/contacts/{email}",
             get(get_contact_handler).patch(patch_contact_handler),
         )
+        .route("/v1/audit", get(list_audit_handler))
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
         .route("/v1/events", get(events_sse_handler))
@@ -183,11 +260,53 @@ pub async fn execute_send_email_with_context(
     principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
+    let channel = channel_for_source(source);
     let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());
     if req.dry_run {
         let preview =
             safety::evaluate_send_dry_run_with_policy(state, &req, agent_policy.as_ref()).await?;
+        state
+            .record_audit(
+                principal.as_ref(),
+                channel,
+                "send",
+                Vec::new(),
+                "dry_run",
+                Some(format!("would_succeed={}", preview.would_succeed)),
+            )
+            .await;
         return Ok(serde_json::to_value(preview)?);
+    }
+
+    let idempotency_key = normalize_idempotency_key(req.idempotency_key.as_deref())?;
+    let _idem_guard = match idempotency_key.as_deref() {
+        Some(key) => {
+            let lock = state.idempotency_key_lock(IDEMPOTENCY_SCOPE_SEND, key);
+            Some(lock.lock_owned().await)
+        }
+        None => None,
+    };
+
+    if let Some(ref key) = idempotency_key {
+        let now_ms = Utc::now().timestamp_millis();
+        if let Some(rec) = state
+            .store
+            .get_idempotency_key(IDEMPOTENCY_SCOPE_SEND, key, now_ms)
+            .await?
+        {
+            let cached: Value = serde_json::from_str(&rec.response_json)?;
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    extract_cached_target_ids(&cached),
+                    "idempotent_replay",
+                    Some(format!("idempotency_key={key}")),
+                )
+                .await;
+            return Ok(cached);
+        }
     }
 
     if let Some(subj) = req.subject.as_deref() {
@@ -242,6 +361,16 @@ pub async fn execute_send_email_with_context(
 
     match decision {
         OutboundDecision::Deny { code, reason, hint } => {
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    Vec::new(),
+                    "denied",
+                    Some(format!("{code}: {reason}")),
+                )
+                .await;
             return Err(policy_deny_to_error(code, reason, hint));
         }
         OutboundDecision::DowngradeToDraft { .. } => {
@@ -280,7 +409,7 @@ pub async fn execute_send_email_with_context(
                     thread_id: draft.message.thread_id.clone(),
                 },
             );
-            return Ok(json!({
+            let resp = json!({
                 "status": "draft_created",
                 "downgraded_from_send": true,
                 "draft_id": draft.id,
@@ -288,10 +417,34 @@ pub async fn execute_send_email_with_context(
                 "thread_id": draft.message.thread_id,
                 "to": draft.message.to_addrs,
                 "subject": draft.message.subject,
-            }));
+            });
+            if let Some(ref key) = idempotency_key {
+                let encoded = serde_json::to_string(&resp)?;
+                state
+                    .store
+                    .put_idempotency_key(
+                        IDEMPOTENCY_SCOPE_SEND,
+                        key,
+                        &encoded,
+                        DEFAULT_IDEMPOTENCY_TTL_SECS,
+                    )
+                    .await?;
+            }
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    vec![draft.id.clone(), draft.message.id.clone()],
+                    "downgraded_to_draft",
+                    None,
+                )
+                .await;
+            return Ok(resp);
         }
         OutboundDecision::HoldForApproval { reason } => {
-            let outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+            let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+            outbound_msg.idempotency_key = idempotency_key.clone();
             let draft_input = NewMessageInput {
                 id: None,
                 thread_id: resolved.thread_id.clone(),
@@ -331,7 +484,7 @@ pub async fn execute_send_email_with_context(
             let approval = enqueue_pending_approval(
                 state,
                 reason,
-                principal,
+                principal.clone(),
                 outbound_msg,
                 req.reply_to_message_id.clone(),
                 Some(draft.message.thread_id.clone()),
@@ -342,19 +495,46 @@ pub async fn execute_send_email_with_context(
             )
             .await?;
 
-            return Ok(build_hold_response(
+            let resp = build_hold_response(
                 &approval,
                 Some(&draft.id),
                 Some(&draft.message.id),
                 Some(&draft.message.thread_id),
                 &snippet,
-            ));
+            );
+            if let Some(ref key) = idempotency_key {
+                let encoded = serde_json::to_string(&resp)?;
+                state
+                    .store
+                    .put_idempotency_key(
+                        IDEMPOTENCY_SCOPE_SEND,
+                        key,
+                        &encoded,
+                        DEFAULT_IDEMPOTENCY_TTL_SECS,
+                    )
+                    .await?;
+            }
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    vec![approval.id.clone(), draft.id.clone()],
+                    "pending_approval",
+                    Some(approval.reason.clone()),
+                )
+                .await;
+            return Ok(resp);
         }
         OutboundDecision::Allow => {}
     }
 
-    let outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
-    let send_outcome = state.transport.send(&outbound_msg, None).await?;
+    let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+    outbound_msg.idempotency_key = idempotency_key.clone();
+    let send_outcome = state
+        .transport
+        .send(&outbound_msg, idempotency_key.as_deref())
+        .await?;
 
     let stored = state
         .store
@@ -399,7 +579,7 @@ pub async fn execute_send_email_with_context(
         },
     );
 
-    Ok(json!({
+    let resp = json!({
         "status": "sent",
         "provider": send_outcome.provider,
         "message_id": stored.id,
@@ -413,12 +593,38 @@ pub async fn execute_send_email_with_context(
         "in_reply_to": stored.in_reply_to,
         "references": stored.references_header,
         "rfc_message_id": stored.rfc822_message_id,
-    }))
+    });
+
+    if let Some(ref key) = idempotency_key {
+        let encoded = serde_json::to_string(&resp)?;
+        state
+            .store
+            .put_idempotency_key(
+                IDEMPOTENCY_SCOPE_SEND,
+                key,
+                &encoded,
+                DEFAULT_IDEMPOTENCY_TTL_SECS,
+            )
+            .await?;
+    }
+
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "send",
+            vec![stored.id.clone(), stored.thread_id.clone()],
+            "ok",
+            Some(format!("to={}", stored.to_addrs.join(","))),
+        )
+        .await;
+
+    Ok(resp)
 }
 
 /// Execute an AI-first draft creation (shared across `/v1/drafts`, MCP `create_draft`, and CLI).
 pub async fn execute_create_draft(state: &AppState, req: AiCreateDraftRequest) -> AppResult<Value> {
-    execute_create_draft_with_source(state, req, EventSource::Api).await
+    execute_create_draft_with_context(state, req, None, EventSource::Api).await
 }
 
 /// Internal variant allowing callers to tag the published [`EventSource`].
@@ -427,6 +633,48 @@ pub async fn execute_create_draft_with_source(
     req: AiCreateDraftRequest,
     source: EventSource,
 ) -> AppResult<Value> {
+    execute_create_draft_with_context(state, req, None, source).await
+}
+
+/// Variant accepting the authenticated [`Principal`] for audit attribution and idempotency handling.
+pub async fn execute_create_draft_with_context(
+    state: &AppState,
+    req: AiCreateDraftRequest,
+    principal: Option<Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    let channel = channel_for_source(source);
+    let idempotency_key = normalize_idempotency_key(req.idempotency_key.as_deref())?;
+    let _idem_guard = match idempotency_key.as_deref() {
+        Some(key) => {
+            let lock = state.idempotency_key_lock(IDEMPOTENCY_SCOPE_DRAFT, key);
+            Some(lock.lock_owned().await)
+        }
+        None => None,
+    };
+
+    if let Some(ref key) = idempotency_key {
+        let now_ms = Utc::now().timestamp_millis();
+        if let Some(rec) = state
+            .store
+            .get_idempotency_key(IDEMPOTENCY_SCOPE_DRAFT, key, now_ms)
+            .await?
+        {
+            let cached: Value = serde_json::from_str(&rec.response_json)?;
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "draft",
+                    extract_cached_target_ids(&cached),
+                    "idempotent_replay",
+                    Some(format!("idempotency_key={key}")),
+                )
+                .await;
+            return Ok(cached);
+        }
+    }
+
     if let Some(subj) = req.subject.as_deref() {
         validate_email_header("subject", subj)?;
     }
@@ -496,7 +744,7 @@ pub async fn execute_create_draft_with_source(
         },
     );
 
-    Ok(json!({
+    let resp = json!({
         "status": "draft_created",
         "draft_id": draft.id,
         "message_id": draft.message.id,
@@ -507,7 +755,33 @@ pub async fn execute_create_draft_with_source(
         "subject": draft.message.subject,
         "in_reply_to": draft.message.in_reply_to,
         "references": draft.message.references_header,
-    }))
+    });
+
+    if let Some(ref key) = idempotency_key {
+        let encoded = serde_json::to_string(&resp)?;
+        state
+            .store
+            .put_idempotency_key(
+                IDEMPOTENCY_SCOPE_DRAFT,
+                key,
+                &encoded,
+                DEFAULT_IDEMPOTENCY_TTL_SECS,
+            )
+            .await?;
+    }
+
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "draft",
+            vec![draft.id.clone(), draft.message.id.clone()],
+            "ok",
+            None,
+        )
+        .await;
+
+    Ok(resp)
 }
 
 /// Execute sending an existing draft (shared across `/v1/drafts/{id}/send` and MCP `send_draft`).
@@ -538,6 +812,7 @@ pub async fn execute_send_draft_with_context(
     principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
+    let channel = channel_for_source(source);
     let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());
     validate_resource_id(draft_id)?;
 
@@ -566,6 +841,16 @@ pub async fn execute_send_draft_with_context(
             agent_policy.as_ref(),
         )
         .await?;
+        state
+            .record_audit(
+                principal.as_ref(),
+                channel,
+                "send",
+                vec![draft_id.to_string()],
+                "dry_run",
+                Some(format!("would_succeed={}", preview.would_succeed)),
+            )
+            .await;
         return Ok(serde_json::to_value(preview)?);
     }
 
@@ -610,9 +895,29 @@ pub async fn execute_send_draft_with_context(
     };
     match state.outbound_policy.evaluate(&policy_check).await? {
         OutboundDecision::Deny { code, reason, hint } => {
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    vec![draft_id.to_string()],
+                    "denied",
+                    Some(format!("{code}: {reason}")),
+                )
+                .await;
             return Err(policy_deny_to_error(code, reason, hint));
         }
         OutboundDecision::DowngradeToDraft { .. } => {
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    vec![draft.id.clone(), msg.id.clone()],
+                    "downgraded_to_draft",
+                    None,
+                )
+                .await;
             return Ok(json!({
                 "status": "draft_created",
                 "downgraded_from_send": true,
@@ -656,7 +961,7 @@ pub async fn execute_send_draft_with_context(
             let approval = enqueue_pending_approval(
                 state,
                 reason,
-                principal,
+                principal.clone(),
                 outbound_msg,
                 None,
                 Some(msg.thread_id.clone()),
@@ -666,6 +971,17 @@ pub async fn execute_send_draft_with_context(
                 source,
             )
             .await?;
+
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "send",
+                    vec![approval.id.clone(), draft.id.clone()],
+                    "pending_approval",
+                    Some(approval.reason.clone()),
+                )
+                .await;
 
             return Ok(build_hold_response(
                 &approval,
@@ -739,6 +1055,17 @@ pub async fn execute_send_draft_with_context(
         },
     );
 
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "send",
+            vec![stored.id.clone(), draft_id.to_string()],
+            "ok",
+            Some(format!("to={}", stored.to_addrs.join(","))),
+        )
+        .await;
+
     Ok(json!({
         "status": "sent",
         "provider": send_outcome.provider,
@@ -757,7 +1084,7 @@ pub async fn execute_triage_thread(
     thread_id: &str,
     req: AiTriageRequest,
 ) -> AppResult<Value> {
-    execute_triage_thread_with_source(state, thread_id, req, EventSource::Api).await
+    execute_triage_thread_with_context(state, thread_id, req, None, EventSource::Api).await
 }
 
 /// Internal variant allowing callers to tag the published [`EventSource`].
@@ -767,6 +1094,18 @@ pub async fn execute_triage_thread_with_source(
     req: AiTriageRequest,
     source: EventSource,
 ) -> AppResult<Value> {
+    execute_triage_thread_with_context(state, thread_id, req, None, source).await
+}
+
+/// Variant accepting the authenticated [`Principal`] for audit attribution.
+pub async fn execute_triage_thread_with_context(
+    state: &AppState,
+    thread_id: &str,
+    req: AiTriageRequest,
+    principal: Option<Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    let channel = channel_for_source(source);
     validate_resource_id(thread_id)?;
 
     if req.mark_read == Some(true) && req.mark_unread == Some(true) {
@@ -799,6 +1138,16 @@ pub async fn execute_triage_thread_with_source(
     let affected_ids: Vec<String> = thread.messages.iter().map(|m| m.id.clone()).collect();
 
     if req.dry_run {
+        state
+            .record_audit(
+                principal.as_ref(),
+                channel,
+                "triage",
+                vec![thread.id.clone()],
+                "dry_run",
+                None,
+            )
+            .await;
         return Ok(json!({
             "dry_run": true,
             "would_succeed": true,
@@ -841,6 +1190,23 @@ pub async fn execute_triage_thread_with_source(
         }
     }
 
+    let mut target_ids = vec![result.thread_id.clone()];
+    target_ids.extend(result.affected_message_ids.iter().cloned());
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "triage",
+            target_ids,
+            "ok",
+            Some(format!(
+                "add=[{}] remove=[{}]",
+                add_labels.join(","),
+                remove_labels.join(",")
+            )),
+        )
+        .await;
+
     Ok(json!({
         "thread_id": result.thread_id,
         "affected_message_ids": result.affected_message_ids,
@@ -855,7 +1221,7 @@ pub async fn execute_modify_labels(
     state: &AppState,
     req: AiModifyLabelsRequest,
 ) -> AppResult<Value> {
-    execute_modify_labels_with_source(state, req, EventSource::Api).await
+    execute_modify_labels_with_context(state, req, None, EventSource::Api).await
 }
 
 /// Internal variant allowing callers to tag the published [`EventSource`].
@@ -864,6 +1230,17 @@ pub async fn execute_modify_labels_with_source(
     req: AiModifyLabelsRequest,
     source: EventSource,
 ) -> AppResult<Value> {
+    execute_modify_labels_with_context(state, req, None, source).await
+}
+
+/// Variant accepting the authenticated [`Principal`] for audit attribution.
+pub async fn execute_modify_labels_with_context(
+    state: &AppState,
+    req: AiModifyLabelsRequest,
+    principal: Option<Principal>,
+    source: EventSource,
+) -> AppResult<Value> {
+    let channel = channel_for_source(source);
     if req.message_ids.is_empty() && req.thread_ids.is_empty() {
         return Err(AppError::validation(
             "At least one of message_ids or thread_ids must be non-empty",
@@ -921,6 +1298,16 @@ pub async fn execute_modify_labels_with_source(
     let target_ids: Vec<String> = targets.iter().map(|(mid, _)| mid.clone()).collect();
 
     if req.dry_run {
+        state
+            .record_audit(
+                principal.as_ref(),
+                channel,
+                "modify",
+                target_ids.clone(),
+                "dry_run",
+                None,
+            )
+            .await;
         return Ok(json!({
             "dry_run": true,
             "would_succeed": true,
@@ -956,6 +1343,21 @@ pub async fn execute_modify_labels_with_source(
             );
         }
     }
+
+    state
+        .record_audit(
+            principal.as_ref(),
+            channel,
+            "modify",
+            target_ids.clone(),
+            "ok",
+            Some(format!(
+                "add=[{}] remove=[{}]",
+                add_labels.join(","),
+                remove_labels.join(",")
+            )),
+        )
+        .await;
 
     Ok(json!({
         "modified_count": target_ids.len(),
@@ -1283,6 +1685,17 @@ pub async fn execute_approve_approval(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            channel_for_source(source),
+            "approve",
+            vec![resolved.id.clone(), stored.id.clone()],
+            "ok",
+            req.note.clone(),
+        )
+        .await;
+
     let compact = to_compact_message(
         &stored,
         &state.config,
@@ -1343,9 +1756,55 @@ pub async fn execute_reject_approval(
         },
     );
 
+    state
+        .record_audit(
+            principal,
+            channel_for_source(source),
+            "reject",
+            vec![resolved.id.clone()],
+            "ok",
+            req.note.clone(),
+        )
+        .await;
+
     Ok(json!({
         "status": "rejected",
         "approval": resolved,
+    }))
+}
+
+/// List immutable audit log entries for the active mailbox (shared across `GET /v1/audit` and CLI).
+pub async fn execute_list_audit_log(
+    state: &AppState,
+    action: Option<&str>,
+    actor: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+) -> AppResult<Value> {
+    let since_ms = parse_since_ms(since)?;
+    let clamped = if limit == 0 {
+        DEFAULT_AUDIT_LIMIT
+    } else {
+        limit.clamp(1, MAX_AUDIT_LIMIT)
+    };
+    let entries = state
+        .store
+        .list_audit_log(&AuditLogQuery {
+            action: action
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            actor: actor
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            since_ms,
+            limit: clamped,
+        })
+        .await?;
+    Ok(json!({
+        "entries": entries,
+        "count": entries.len(),
     }))
 }
 
@@ -2304,6 +2763,15 @@ struct ListContactsParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ListAuditParams {
+    action: Option<String>,
+    actor: Option<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct EventsParams {
     types: Option<String>,
     label: Option<String>,
@@ -2354,6 +2822,7 @@ async fn get_capabilities(
             "GET /v1/contacts",
             "GET /v1/contacts/{email}",
             "PATCH /v1/contacts/{email}",
+            "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",
@@ -2398,6 +2867,7 @@ async fn get_capabilities(
 
 async fn list_threads(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(params): Query<ListThreadsParams>,
 ) -> Result<Json<Value>, AiError> {
     if let Some(lbl) = params.label.as_deref() {
@@ -2412,8 +2882,8 @@ async fn list_threads(
     let mut page = state
         .store
         .list_thread_summaries(&AiThreadQuery {
-            q: params.q,
-            label: params.label,
+            q: params.q.clone(),
+            label: params.label.clone(),
             unread_only: params.unread_only,
             needs_reply: params.needs_reply,
             waiting_on,
@@ -2424,6 +2894,17 @@ async fn list_threads(
         .await?;
 
     enrich_thread_summaries_with_contacts(&state, &mut page.threads).await?;
+    let target_ids: Vec<String> = page.threads.iter().map(|t| t.id.clone()).collect();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            target_ids,
+            "ok",
+            params.q.as_ref().map(|q| format!("threads q={q}")),
+        )
+        .await;
 
     let body = json!({
         "threads": page.threads,
@@ -2435,6 +2916,7 @@ async fn list_threads(
 
 async fn get_thread(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(params): Query<ReadThreadParams>,
 ) -> Result<Json<Value>, AiError> {
@@ -2460,17 +2942,36 @@ async fn get_thread(
     )
     .await?;
 
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("thread".to_string()),
+        )
+        .await;
+
     let value = serde_json::to_value(projected).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
 }
 
 async fn triage_thread_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiTriageRequest>,
 ) -> Result<Json<Value>, AiError> {
-    let res = execute_triage_thread_with_source(&state, &id, req, EventSource::Api).await?;
+    let res = execute_triage_thread_with_context(
+        &state,
+        &id,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
     Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 
@@ -2524,6 +3025,7 @@ async fn delete_thread_annotations_handler(
 
 async fn list_messages(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(params): Query<ListMessagesParams>,
 ) -> Result<Json<Value>, AiError> {
     let mut labels = parse_csv(params.labels.as_deref());
@@ -2551,7 +3053,7 @@ async fn list_messages(
     let page = state
         .store
         .search_messages_ai(&AiSearchQuery {
-            q: params.q,
+            q: params.q.clone(),
             labels,
             thread_id: params.thread_id,
             include_spam_trash: params.include_spam_trash,
@@ -2560,6 +3062,18 @@ async fn list_messages(
             ..Default::default()
         })
         .await?;
+
+    let target_ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            target_ids,
+            "ok",
+            params.q.as_ref().map(|q| format!("messages q={q}")),
+        )
+        .await;
 
     let messages: Vec<CompactMessage> = page
         .messages
@@ -2586,6 +3100,7 @@ async fn list_messages(
 
 async fn get_message(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(params): Query<ReadMessageParams>,
 ) -> Result<Json<Value>, AiError> {
@@ -2615,6 +3130,17 @@ async fn get_message(
         attach_extracted_attachment_texts(&state, &mut compact, params.attachment_max_chars)
             .await?;
     }
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("message".to_string()),
+        )
+        .await;
 
     let value = serde_json::to_value(compact).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
@@ -2648,17 +3174,29 @@ async fn unsubscribe_message_handler(
 
 async fn get_attachment_text_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((id, attachment_id)): Path<(String, String)>,
     Query(params): Query<AttachmentTextParams>,
 ) -> Result<Json<Value>, AiError> {
     let extracted =
         execute_read_attachment_text(&state, &id, &attachment_id, params.max_chars).await?;
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            vec![id, attachment_id],
+            "ok",
+            Some("attachment_text".to_string()),
+        )
+        .await;
     let value = serde_json::to_value(extracted).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
 }
 
 async fn get_attachment_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> Result<Response, AiError> {
     validate_resource_id(&id)?;
@@ -2692,15 +3230,36 @@ async fn get_attachment_handler(
     }
 
     let data = state.load_attachment_bytes(&att).await?;
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            vec![id, attachment_id],
+            "ok",
+            Some("attachment".to_string()),
+        )
+        .await;
     Ok((StatusCode::OK, headers, data).into_response())
 }
 
 async fn send_message_handler(
     MailboxState(state): MailboxState,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Query(query): Query<FieldsQuery>,
-    Json(req): Json<AiSendEmailRequest>,
+    Json(mut req): Json<AiSendEmailRequest>,
 ) -> Result<Response, AiError> {
+    if req
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+        && let Some(hdr_key) = idempotency_key_header(&headers)
+    {
+        req.idempotency_key = Some(hdr_key.to_string());
+    }
     let res = execute_send_email_with_context(
         &state,
         req,
@@ -2719,15 +3278,23 @@ async fn send_message_handler(
 
 async fn modify_messages_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AiModifyLabelsRequest>,
 ) -> Result<Json<Value>, AiError> {
-    let res = execute_modify_labels_with_source(&state, req, EventSource::Api).await?;
+    let res = execute_modify_labels_with_context(
+        &state,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
     Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 
 async fn list_drafts(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(params): Query<ListDraftsParams>,
 ) -> Result<Json<Value>, AiError> {
     let limit = params
@@ -2743,6 +3310,18 @@ async fn list_drafts(
             ..Default::default()
         })
         .await?;
+
+    let target_ids: Vec<String> = page.drafts.iter().map(|d| d.id.clone()).collect();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            target_ids,
+            "ok",
+            Some("drafts".to_string()),
+        )
+        .await;
 
     let drafts: Vec<Value> = page
         .drafts
@@ -2774,10 +3353,28 @@ async fn list_drafts(
 
 async fn create_draft_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Query(query): Query<FieldsQuery>,
-    Json(req): Json<AiCreateDraftRequest>,
+    Json(mut req): Json<AiCreateDraftRequest>,
 ) -> Result<Json<Value>, AiError> {
-    let res = execute_create_draft_with_source(&state, req, EventSource::Api).await?;
+    if req
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+        && let Some(hdr_key) = idempotency_key_header(&headers)
+    {
+        req.idempotency_key = Some(hdr_key.to_string());
+    }
+    let res = execute_create_draft_with_context(
+        &state,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
     Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 
@@ -2867,6 +3464,7 @@ async fn reject_approval_handler(
 
 async fn delete_draft_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AiError> {
     validate_resource_id(&id)?;
@@ -2874,7 +3472,33 @@ async fn delete_draft_handler(
     if !deleted {
         return Err(AppError::NotFound(format!("Draft '{id}' not found")).into());
     }
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "delete",
+            vec![id.clone()],
+            "ok",
+            Some("draft".to_string()),
+        )
+        .await;
     Ok(Json(json!({ "deleted": true, "draft_id": id })))
+}
+
+async fn list_audit_handler(
+    MailboxState(state): MailboxState,
+    Query(params): Query<ListAuditParams>,
+) -> Result<Json<Value>, AiError> {
+    let limit = params.limit.unwrap_or(DEFAULT_AUDIT_LIMIT);
+    let body = execute_list_audit_log(
+        &state,
+        params.action.as_deref(),
+        params.actor.as_deref(),
+        params.since.as_deref(),
+        limit,
+    )
+    .await?;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
 }
 
 async fn list_labels(
@@ -2902,6 +3526,7 @@ async fn list_labels(
 
 async fn search_messages(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Value>, AiError> {
     let mut labels = parse_csv(params.labels.as_deref());
@@ -2929,7 +3554,7 @@ async fn search_messages(
     let page = state
         .search
         .search(&AiSearchQuery {
-            q: params.q,
+            q: params.q.clone(),
             labels,
             unread: params.unread,
             thread_id: params.thread_id,
@@ -2943,6 +3568,18 @@ async fn search_messages(
             cursor: params.cursor,
         })
         .await?;
+
+    let target_ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "search",
+            target_ids,
+            "ok",
+            params.q.clone(),
+        )
+        .await;
 
     let messages: Vec<CompactMessage> = page
         .messages
