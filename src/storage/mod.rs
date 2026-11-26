@@ -367,6 +367,9 @@ pub struct ImapMailboxInfo {
     pub uid_next: u32,
     pub messages: u32,
     pub unseen: u32,
+    /// Total RFC 822 size in bytes across all messages in this mailbox (for RFC 8438 `STATUS=SIZE`).
+    #[serde(default)]
+    pub total_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1585,6 +1588,21 @@ pub trait MailStore: Send + Sync {
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>>;
     async fn imap_mailbox_info(&self, mailbox_name: &str) -> AppResult<Option<ImapMailboxInfo>>;
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>>;
+    /// Total storage usage in bytes across all unique messages in this user mailbox (for RFC 2087 `QUOTA`).
+    async fn imap_total_storage_bytes(&self) -> AppResult<u64> {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for mbx in ["[Gmail]/All Mail", "[Gmail]/Trash", "[Gmail]/Spam"] {
+            if let Ok(entries) = self.imap_list_messages(mbx).await {
+                for entry in entries {
+                    if seen.insert(entry.message_id) {
+                        total = total.saturating_add(entry.size_estimate.max(0) as u64);
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
     async fn imap_set_flags(
         &self,
         message_id: &str,

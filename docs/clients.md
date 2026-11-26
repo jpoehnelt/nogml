@@ -97,23 +97,24 @@ nogml serve \
 | Host | `127.0.0.1` | `mail.example.com` | `mail.example.com` |
 | Port | `1143` (from `--imap-bind`) | `143` or `1143` (from `--imap-bind`) | `993` or `1993` (from `--imap-tls-bind`) |
 | Security | None (loopback only) | `STARTTLS` | `SSL/TLS` (implicit TLS) |
-| Auth mechanisms | `LOGIN`, `PLAIN`, `XOAUTH2` | `LOGIN`, `PLAIN`, `XOAUTH2` | `LOGIN`, `PLAIN`, `XOAUTH2` |
+| Auth mechanisms | `LOGIN`, `PLAIN`, `XOAUTH2`, `OAUTHBEARER` | `LOGIN`, `PLAIN`, `XOAUTH2`, `OAUTHBEARER` | `LOGIN`, `PLAIN`, `XOAUTH2`, `OAUTHBEARER` |
 | Username | `NOGML_USER_EMAIL` or `NOGML_IMAP_USERNAME` | `NOGML_USER_EMAIL` or `NOGML_IMAP_USERNAME` | `NOGML_USER_EMAIL` or `NOGML_IMAP_USERNAME` |
 | Password / token | `NOGML_IMAP_PASSWORD`, first `NOGML_AUTH_TOKENS`, scoped token, or OAuth2 JWT | Same | Same |
 
 ### Folder and flag mapping
 
-`nogml` advertises `IMAP4rev1`, `LITERAL+`, `IDLE`, `MOVE`, `UIDPLUS`, `SPECIAL-USE`, `NAMESPACE`, `ID`, `X-GM-EXT-1`, `ENABLE`, `CONDSTORE`, and `QRESYNC` (after authentication). Gmail labels map to IMAP folders as follows:
+`nogml` advertises `IMAP4rev1`, `LITERAL-`, `IDLE`, `MOVE`, `UIDPLUS`, `UNSELECT`, `SPECIAL-USE`, `CHILDREN`, `XLIST`, `LIST-EXTENDED`, `LIST-STATUS`, `NAMESPACE`, `ID`, `SORT`, `THREAD=REFERENCES`, `THREAD=ORDEREDSUBJECT`, `ESEARCH`, `X-GM-EXT-1`, plus post-auth `ENABLE`, `CONDSTORE`, `QRESYNC`, `COMPRESS=DEFLATE`, `UTF8=ACCEPT`, `QUOTA`, `STATUS=SIZE`, `WITHIN`, and `APPENDLIMIT=<max_body_bytes>`. Configure the reported storage quota with `NOGML_IMAP_QUOTA_BYTES` (`[imap].quota_bytes`, default 15 GiB). Gmail labels map to IMAP folders as follows:
 
 | IMAP folder | Special-use attribute | Backing Gmail label |
 | --- | --- | --- |
-| `INBOX` | *(primary)* | `INBOX` |
-| `[Gmail]/All Mail` | `\All` | All non-trash, non-spam messages |
+| `INBOX` | *(primary; `\Inbox` in `XLIST`)* | `INBOX` |
+| `[Gmail]/All Mail` | `\All` (`\AllMail` in `XLIST`) | All non-trash, non-spam messages |
 | `[Gmail]/Sent Mail` | `\Sent` | `SENT` |
 | `[Gmail]/Drafts` | `\Drafts` | `DRAFT` |
 | `[Gmail]/Trash` | `\Trash` | `TRASH` |
-| `[Gmail]/Spam` | `\Junk` | `SPAM` |
-| `[Gmail]/Starred` | `\Flagged` | `STARRED` |
+| `[Gmail]/Spam` | `\Junk` (`\Spam` in `XLIST`) | `SPAM` |
+| `[Gmail]/Starred` | `\Flagged` (`\Starred` in `XLIST`) | `STARRED` |
+| `[Gmail]/Important` | `\Important` | `IMPORTANT` |
 | `<Custom Label>` | *(none)* | User-defined Gmail label |
 
 IMAP system flags sync directly with mailbox state: `\Seen` toggles `UNREAD`, `\Flagged` toggles `STARRED`, and `\Draft` toggles `DRAFT`. Real-time changes from webhooks, REST API calls, or sync push over `IDLE`.
@@ -137,7 +138,7 @@ IMAP system flags sync directly with mailbox state: `\Seen` toggles `UNREAD`, `\
    - **Protocol**: IMAP
    - **Hostname**: `mail.example.com` (or `127.0.0.1` for local testing)
    - **Port**: `993` (or `1993`) with **SSL/TLS**, or `143` (or `1143`) with **STARTTLS**
-   - **Authentication method**: Normal password (`LOGIN`/`PLAIN`) or OAuth2 (`XOAUTH2` when using local OAuth2 tokens)
+   - **Authentication method**: Normal password (`LOGIN`/`PLAIN`) or OAuth2 (`XOAUTH2` / `OAUTHBEARER` when using local OAuth2 tokens)
 4. Click **Re-test** and **Done**.
 5. Thunderbird negotiates `CONDSTORE` and `IDLE` automatically and reads `SPECIAL-USE` folder roles on first `LIST`.
 

@@ -5,6 +5,7 @@
 //!
 //! Owned by the `imap-sync` worker.
 
+pub mod deflate;
 pub mod mime_fmt;
 pub mod parser;
 pub mod session;

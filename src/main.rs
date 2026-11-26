@@ -934,6 +934,10 @@ struct ServeArgs {
     #[arg(long, env = "NOGML_IMAP_PASSWORD")]
     imap_password: Option<String>,
 
+    /// Reported IMAP RFC 2087 QUOTA storage limit in bytes (default 15 GiB).
+    #[arg(long, env = "NOGML_IMAP_QUOTA_BYTES", default_value_t = nogml::config::DEFAULT_IMAP_QUOTA_BYTES)]
+    imap_quota_bytes: u64,
+
     /// Background upstream Gmail sync interval in seconds (`0` disables background sync).
     #[arg(long, env = "NOGML_SYNC_INTERVAL_SECS", default_value_t = 0)]
     sync_interval_secs: u64,
@@ -1758,6 +1762,9 @@ impl CommonConfigArgs {
             }
             if is_explicit(sm, "imap_password") {
                 cfg.imap_password = s.imap_password;
+            }
+            if is_explicit(sm, "imap_quota_bytes") {
+                cfg.imap_quota_bytes = s.imap_quota_bytes;
             }
             if is_explicit(sm, "sync_interval_secs") {
                 cfg.sync_interval_secs = s.sync_interval_secs;

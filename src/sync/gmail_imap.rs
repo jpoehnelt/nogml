@@ -1923,6 +1923,7 @@ pub async fn run_imap_idle_listener_with_options(
             }
             continue;
         }
+        let _ = enable_imap_extensions(&mut session, &caps, command_timeout).await;
 
         let primary_folder = configured_sync_folders(&state.config)[0].clone();
         if let Err(err) = examine_imap_mailbox(&mut session, &primary_folder, command_timeout).await
@@ -2108,7 +2109,9 @@ async fn query_imap_capabilities(
     }
 }
 
-/// Enable `QRESYNC` / `CONDSTORE` / `UTF8=ACCEPT` when advertised by the server.
+/// Enable `QRESYNC` / `CONDSTORE` / `UTF8=ACCEPT` when advertised by the server, parsing the
+/// untagged `* ENABLED ...` response per RFC 5161 §3.2 so only server-confirmed extensions are
+/// treated as active.
 async fn enable_imap_extensions(
     session: &mut Session<UpstreamImapStream>,
     caps: &ImapServerCaps,
@@ -2132,11 +2135,36 @@ async fn enable_imap_extensions(
     }
 
     let cmd = format!("ENABLE {}", to_enable.join(" "));
-    match tokio::time::timeout(command_timeout, session.run_command_and_check_ok(&cmd)).await {
-        Ok(Ok(())) => EnabledImapExtensions {
-            qresync: caps.has_qresync,
-            utf8_accept: caps.has_utf8_accept,
-        },
+    let fut = async {
+        let cmd_tag = session.run_command(&cmd).await?;
+        let mut enabled = EnabledImapExtensions::default();
+        while let Some(resp) = session.read_response().await? {
+            match resp.parsed() {
+                ImapResponse::Capabilities(enabled_caps) => {
+                    for cap in enabled_caps {
+                        if let ImapCapability::Atom(atom) = cap {
+                            if atom.eq_ignore_ascii_case("QRESYNC") {
+                                enabled.qresync = true;
+                            } else if atom.eq_ignore_ascii_case("UTF8=ACCEPT") {
+                                enabled.utf8_accept = true;
+                            }
+                        }
+                    }
+                }
+                ImapResponse::Done { tag, status, .. } if tag == &cmd_tag => {
+                    if matches!(status, ImapStatus::Ok) {
+                        return Ok(enabled);
+                    }
+                    return Ok(EnabledImapExtensions::default());
+                }
+                _ => {}
+            }
+        }
+        Ok::<EnabledImapExtensions, async_imap::error::Error>(EnabledImapExtensions::default())
+    };
+
+    match tokio::time::timeout(command_timeout, fut).await {
+        Ok(Ok(enabled)) => enabled,
         Ok(Err(err)) => {
             debug!(%err, cmd = %cmd, "IMAP ENABLE rejected; continuing without optional extensions");
             EnabledImapExtensions::default()

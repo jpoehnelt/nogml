@@ -26,13 +26,14 @@ use crate::{
     events::{EventSource, MailEvent},
     filter::{FilterDecision, InboundMessage, apply_filter_labels},
     imap::{
+        deflate::{DeflateImapStream, DeflateLimits},
         mime_fmt::{
             extract_body_section, format_bodystructure, format_envelope, parse_body_section,
             parse_raw_to_new_message_input, split_raw_header_and_body,
         },
         parser::{
             ImapArg, ImapCommand, ReadCommandLimits, ReadCommandOutcome, append_literal,
-            format_internal_date, format_sequence_set, imap_quote, imap_string,
+            format_internal_date, format_sequence_set, imap_quote, imap_string_with_utf8,
             imap_wildcard_match, normalize_mailbox_name, parse_imap_date_time,
             parse_imap_search_date, parse_sequence_set, read_command_with_limits, read_crlf_line,
             read_crlf_line_into, sanitize_imap_text, seq_set_contains,
@@ -74,19 +75,19 @@ const IMAP_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Maximum duration allowed for `STARTTLS` handshake negotiation.
 const IMAP_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Underlying transport stream for an IMAP client connection (plain TCP or TLS).
-pub enum ImapStream {
+/// Raw TCP or TLS transport wrapped by [`DeflateImapStream`] after RFC 4978 `COMPRESS DEFLATE`.
+pub enum ImapTransport {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
-impl ImapStream {
-    pub fn is_tls(&self) -> bool {
+impl ImapTransport {
+    fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
 }
 
-impl AsyncRead for ImapStream {
+impl AsyncRead for ImapTransport {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -99,7 +100,7 @@ impl AsyncRead for ImapStream {
     }
 }
 
-impl AsyncWrite for ImapStream {
+impl AsyncWrite for ImapTransport {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -122,6 +123,71 @@ impl AsyncWrite for ImapStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Underlying transport stream for an IMAP client connection (plain TCP, TLS, or DEFLATE-compressed).
+pub enum ImapStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    Deflate(Box<DeflateImapStream<ImapTransport>>),
+}
+
+impl ImapStream {
+    pub fn is_tls(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Tls(_) => true,
+            Self::Deflate(d) => d.inner().is_tls(),
+        }
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, Self::Deflate(_))
+    }
+}
+
+impl AsyncRead for ImapStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Self::Deflate(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ImapStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Self::Deflate(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Self::Deflate(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Self::Deflate(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -151,6 +217,8 @@ struct ImapSession {
     condstore_enabled: bool,
     /// RFC 7162 `QRESYNC` enabled for this connection (via `ENABLE QRESYNC`).
     qresync_enabled: bool,
+    /// RFC 6855 `UTF8=ACCEPT` enabled for this connection (via `ENABLE UTF8=ACCEPT`).
+    utf8_accept: bool,
     /// Consecutive failed authentication attempts on this connection.
     failed_auth_attempts: u32,
 }
@@ -173,6 +241,7 @@ pub async fn handle_connection(
         tls_acceptor,
         condstore_enabled: false,
         qresync_enabled: false,
+        utf8_accept: false,
         failed_auth_attempts: 0,
     };
 
@@ -307,7 +376,7 @@ pub async fn handle_connection(
             let inner = reader.into_inner();
             let tcp = match inner {
                 ImapStream::Plain(tcp) => tcp,
-                ImapStream::Tls(_) => break,
+                ImapStream::Tls(_) | ImapStream::Deflate(_) => break,
             };
             match tokio::time::timeout(IMAP_TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
                 Ok(Ok(tls_stream)) => {
@@ -317,6 +386,7 @@ pub async fn handle_connection(
                     session.principal = None;
                     session.condstore_enabled = false;
                     session.qresync_enabled = false;
+                    session.utf8_accept = false;
                 }
                 Ok(Err(err)) => {
                     warn!(%err, "IMAP STARTTLS handshake failed");
@@ -327,6 +397,82 @@ pub async fn handle_connection(
                     break;
                 }
             }
+            continue;
+        }
+
+        // Special-case COMPRESS (RFC 4978) because it consumes and wraps the transport stream.
+        if cmd.name == "COMPRESS" {
+            if !session.is_authenticated() {
+                let _ = write_flush(
+                    &mut reader,
+                    format!(
+                        "{} BAD COMPRESS is only valid after authentication\r\n",
+                        cmd.tag
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                continue;
+            }
+            if reader.get_ref().is_compressed() {
+                let _ = write_flush(
+                    &mut reader,
+                    format!(
+                        "{} NO [COMPRESSIONACTIVE] Compression is already active\r\n",
+                        cmd.tag
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                continue;
+            }
+            if cmd.args.len() != 1 {
+                let _ = write_flush(
+                    &mut reader,
+                    format!("{} BAD COMPRESS requires DEFLATE mechanism\r\n", cmd.tag).as_bytes(),
+                )
+                .await;
+                continue;
+            }
+            let Some(mech) = cmd.args[0].as_str_lossy() else {
+                let _ = write_flush(
+                    &mut reader,
+                    format!("{} BAD Invalid COMPRESS mechanism\r\n", cmd.tag).as_bytes(),
+                )
+                .await;
+                continue;
+            };
+            if !mech.eq_ignore_ascii_case("DEFLATE") {
+                let safe_mech = sanitize_imap_text(&mech);
+                let _ = write_flush(
+                    &mut reader,
+                    format!(
+                        "{} NO Unsupported compression mechanism {safe_mech}\r\n",
+                        cmd.tag
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                continue;
+            }
+            if write_flush(
+                &mut reader,
+                format!("{} OK COMPRESS completed\r\n", cmd.tag).as_bytes(),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            let leftover = reader.buffer().to_vec();
+            let transport = match reader.into_inner() {
+                ImapStream::Plain(tcp) => ImapTransport::Plain(tcp),
+                ImapStream::Tls(tls) => ImapTransport::Tls(tls),
+                ImapStream::Deflate(_) => break,
+            };
+            let limits = DeflateLimits::for_max_body_bytes(session.state.config.max_body_bytes);
+            let deflate_stream = DeflateImapStream::new(transport, leftover, limits);
+            reader = BufReader::new(ImapStream::Deflate(Box::new(deflate_stream)));
             continue;
         }
 
@@ -377,39 +523,61 @@ pub async fn handle_connection(
 
 impl ImapSession {
     fn capability_string(&self, is_tls: bool) -> String {
-        let mut caps = vec!["IMAP4rev1"];
+        let mut caps: Vec<String> = vec!["IMAP4rev1".to_string()];
         match self.auth {
             AuthState::NotAuthenticated => {
                 if !is_tls && self.tls_acceptor.is_some() {
-                    caps.push("STARTTLS");
-                    caps.push("LOGINDISABLED");
+                    caps.push("STARTTLS".to_string());
+                    caps.push("LOGINDISABLED".to_string());
                 } else {
-                    caps.push("AUTH=PLAIN");
-                    caps.push("AUTH=XOAUTH2");
-                    caps.push("SASL-IR");
+                    caps.push("AUTH=PLAIN".to_string());
+                    caps.push("AUTH=XOAUTH2".to_string());
+                    caps.push("AUTH=OAUTHBEARER".to_string());
+                    caps.push("SASL-IR".to_string());
                 }
             }
             AuthState::Authenticated | AuthState::Selected(_) => {
-                caps.extend_from_slice(&["SASL-IR", "ENABLE", "CONDSTORE", "QRESYNC"]);
+                caps.extend(
+                    [
+                        "SASL-IR",
+                        "ENABLE",
+                        "CONDSTORE",
+                        "QRESYNC",
+                        "COMPRESS=DEFLATE",
+                        "UTF8=ACCEPT",
+                        "QUOTA",
+                        "STATUS=SIZE",
+                        "WITHIN",
+                    ]
+                    .into_iter()
+                    .map(str::to_string),
+                );
+                caps.push(format!("APPENDLIMIT={}", self.state.config.max_body_bytes));
             }
         }
-        caps.extend_from_slice(&[
-            "LITERAL-",
-            "IDLE",
-            "MOVE",
-            "UIDPLUS",
-            "UNSELECT",
-            "SPECIAL-USE",
-            "LIST-EXTENDED",
-            "LIST-STATUS",
-            "NAMESPACE",
-            "ID",
-            "SORT",
-            "THREAD=REFERENCES",
-            "THREAD=ORDEREDSUBJECT",
-            "ESEARCH",
-            "X-GM-EXT-1",
-        ]);
+        caps.extend(
+            [
+                "LITERAL-",
+                "IDLE",
+                "MOVE",
+                "UIDPLUS",
+                "UNSELECT",
+                "SPECIAL-USE",
+                "CHILDREN",
+                "XLIST",
+                "LIST-EXTENDED",
+                "LIST-STATUS",
+                "NAMESPACE",
+                "ID",
+                "SORT",
+                "THREAD=REFERENCES",
+                "THREAD=ORDEREDSUBJECT",
+                "ESEARCH",
+                "X-GM-EXT-1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
         caps.join(" ")
     }
 
@@ -479,8 +647,20 @@ impl ImapSession {
                 self.handle_list(&tag, &cmd.args, false, stream).await?;
                 Ok(true)
             }
+            "XLIST" => {
+                self.handle_xlist(&tag, &cmd.args, stream).await?;
+                Ok(true)
+            }
             "LSUB" => {
                 self.handle_list(&tag, &cmd.args, true, stream).await?;
+                Ok(true)
+            }
+            "GETQUOTAROOT" => {
+                self.handle_getquotaroot(&tag, &cmd.args, stream).await?;
+                Ok(true)
+            }
+            "GETQUOTA" => {
+                self.handle_getquota(&tag, &cmd.args, stream).await?;
                 Ok(true)
             }
             "STATUS" => {
@@ -737,7 +917,8 @@ impl ImapSession {
         };
         let is_plain = mech.eq_ignore_ascii_case("PLAIN");
         let is_xoauth2 = mech.eq_ignore_ascii_case("XOAUTH2");
-        if !is_plain && !is_xoauth2 {
+        let is_oauthbearer = mech.eq_ignore_ascii_case("OAUTHBEARER");
+        if !is_plain && !is_xoauth2 && !is_oauthbearer {
             let safe_mech = sanitize_imap_text(&mech);
             write_flush(
                 stream,
@@ -811,7 +992,13 @@ impl ImapSession {
         {
             Ok(bytes) => bytes,
             Err(_) => {
-                let mech_label = if is_xoauth2 { "XOAUTH2" } else { "PLAIN" };
+                let mech_label = if is_xoauth2 {
+                    "XOAUTH2"
+                } else if is_oauthbearer {
+                    "OAUTHBEARER"
+                } else {
+                    "PLAIN"
+                };
                 write_flush(
                     stream,
                     format!("{tag} BAD Invalid base64 in AUTHENTICATE {mech_label}\r\n").as_bytes(),
@@ -820,6 +1007,10 @@ impl ImapSession {
                 return Ok(true);
             }
         };
+
+        if is_oauthbearer {
+            return self.complete_oauthbearer_auth(tag, &decoded, stream).await;
+        }
 
         let (auth_result, plain_authzid_check) = if is_xoauth2 {
             let Some((user, token)) = parse_xoauth2_payload(&decoded) else {
@@ -897,6 +1088,102 @@ impl ImapSession {
         }
     }
 
+    async fn complete_oauthbearer_auth(
+        &mut self,
+        tag: &str,
+        decoded: &[u8],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<bool> {
+        let Some(payload) = parse_oauthbearer_payload(decoded) else {
+            return self
+                .fail_oauthbearer_with_challenge(
+                    tag,
+                    "AUTHENTICATIONFAILED",
+                    "Invalid OAUTHBEARER payload",
+                    stream,
+                )
+                .await;
+        };
+
+        let bearer_principal = match self
+            .base_state
+            .auth
+            .authenticate_bearer(Some(&payload.token))
+            .await
+        {
+            Ok(p) => p,
+            Err(_) => {
+                return self
+                    .fail_oauthbearer_with_challenge(
+                        tag,
+                        "AUTHENTICATIONFAILED",
+                        "Invalid credentials",
+                        stream,
+                    )
+                    .await;
+            }
+        };
+
+        let principal = if let Some(ref authzid) = payload.authzid {
+            match self
+                .base_state
+                .auth
+                .authenticate_xoauth2(authzid, &payload.token)
+                .await
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    return self
+                        .fail_oauthbearer_with_challenge(
+                            tag,
+                            "AUTHORIZATIONFAILED",
+                            "Authorization identity is not permitted",
+                            stream,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            bearer_principal
+        };
+
+        self.failed_auth_attempts = 0;
+        self.state = self.base_state.for_mailbox(&principal.mailbox_id);
+        self.principal = Some(principal);
+        self.auth = AuthState::Authenticated;
+        let cap = self.capability_string(stream.get_ref().is_tls());
+        write_flush(
+            stream,
+            format!("{tag} OK [CAPABILITY {cap}] AUTHENTICATE completed\r\n").as_bytes(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Emit RFC 7628 §3.2.2 JSON error challenge, wait for client's dummy ack response,
+    /// then record the tagged auth failure.
+    async fn fail_oauthbearer_with_challenge(
+        &mut self,
+        tag: &str,
+        code: &str,
+        message: &str,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<bool> {
+        let challenge_b64 = base64::engine::general_purpose::STANDARD
+            .encode(br#"{"status":"invalid_token","schemes":"bearer"}"#);
+        write_flush(stream, format!("+ {challenge_b64}\r\n").as_bytes()).await?;
+        match tokio::time::timeout(IMAP_PRE_AUTH_READ_TIMEOUT, read_crlf_line(stream, 4096)).await {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => return Ok(false),
+            Ok(Err(_)) => return Ok(false),
+            Err(_) => {
+                let _ = write_flush(stream, b"* BYE Autologout; idle for too long\r\n").await;
+                return Ok(false);
+            }
+        }
+        self.record_auth_failure(tag, code, message, stream).await
+    }
+
     async fn handle_enable(
         &mut self,
         tag: &str,
@@ -949,6 +1236,12 @@ impl ImapSession {
                     self.condstore_enabled = true;
                     if !enabled.contains(&"QRESYNC") {
                         enabled.push("QRESYNC");
+                    }
+                }
+                "UTF8=ACCEPT" => {
+                    self.utf8_accept = true;
+                    if !enabled.contains(&"UTF8=ACCEPT") {
+                        enabled.push("UTF8=ACCEPT");
                     }
                 }
                 _ => {
@@ -1004,14 +1297,18 @@ impl ImapSession {
             let pattern = args[1].as_str_lossy().unwrap_or_default();
             let full_pattern = combine_list_pattern(&reference, &pattern);
             let mailboxes = self.state.store.imap_list_mailboxes().await?;
+            let virtual_parents = collect_virtual_parents(&mailboxes);
             let mut out = String::new();
 
-            let has_gmail_children = mailboxes.iter().any(|m| m.name.starts_with("[Gmail]/"));
-            if has_gmail_children
-                && imap_wildcard_match(&full_pattern, "[Gmail]", '/')
-                && (self.subscribed.is_empty() || self.subscribed.contains("[Gmail]"))
-            {
-                out.push_str("* LSUB (\\Noselect \\HasChildren) \"/\" \"[Gmail]\"\r\n");
+            for parent in &virtual_parents {
+                if imap_wildcard_match(&full_pattern, parent, '/')
+                    && (self.subscribed.is_empty() || self.subscribed.contains(parent))
+                {
+                    out.push_str(&format!(
+                        "* LSUB (\\Noselect \\HasChildren) \"/\" {}\r\n",
+                        imap_string_with_utf8(parent, self.utf8_accept)
+                    ));
+                }
             }
 
             for mbx in &mailboxes {
@@ -1021,9 +1318,7 @@ impl ImapSession {
                 if !imap_wildcard_match(&full_pattern, &mbx.name, '/') {
                     continue;
                 }
-                let has_children = mailboxes
-                    .iter()
-                    .any(|other| other.name.starts_with(&format!("{}/", mbx.name)));
+                let has_children = mailbox_has_children(&mbx.name, &mailboxes);
                 let mut attrs = Vec::new();
                 attrs.push(if has_children {
                     "\\HasChildren".to_string()
@@ -1036,7 +1331,7 @@ impl ImapSession {
                 out.push_str(&format!(
                     "* LSUB ({}) \"/\" {}\r\n",
                     attrs.join(" "),
-                    imap_string(&mbx.name)
+                    imap_string_with_utf8(&mbx.name, self.utf8_accept)
                 ));
             }
             out.push_str(&format!("{tag} OK LSUB completed\r\n"));
@@ -1073,6 +1368,7 @@ impl ImapSession {
             .collect();
 
         let mailboxes = self.state.store.imap_list_mailboxes().await?;
+        let virtual_parents = collect_virtual_parents(&mailboxes);
         let highest_modseq = if parsed
             .return_status_items
             .as_ref()
@@ -1086,24 +1382,27 @@ impl ImapSession {
         let mut out = String::new();
         let emit_subscribed_attr = parsed.select_subscribed || parsed.return_subscribed;
 
-        // Synthesize virtual "[Gmail]" container if it matches and is not filtered out by SPECIAL-USE.
-        let has_gmail_children = mailboxes.iter().any(|m| m.name.starts_with("[Gmail]/"));
-        if has_gmail_children
-            && !parsed.select_special_use
-            && full_patterns
-                .iter()
-                .any(|p| imap_wildcard_match(p, "[Gmail]", '/'))
-            && (!parsed.select_subscribed || self.subscribed.contains("[Gmail]"))
-        {
-            let mut attrs = vec!["\\Noselect", "\\HasChildren"];
-            if emit_subscribed_attr && self.subscribed.contains("[Gmail]") {
-                attrs.push("\\Subscribed");
+        // Synthesize virtual parent containers (`[Gmail]` and any missing intermediate label parents)
+        // when matching and not filtered out by SPECIAL-USE.
+        if !parsed.select_special_use {
+            for parent in &virtual_parents {
+                if full_patterns
+                    .iter()
+                    .any(|p| imap_wildcard_match(p, parent, '/'))
+                    && (!parsed.select_subscribed || self.subscribed.contains(parent))
+                {
+                    let mut attrs = vec!["\\Noselect", "\\HasChildren"];
+                    if emit_subscribed_attr && self.subscribed.contains(parent) {
+                        attrs.push("\\Subscribed");
+                    }
+                    out.push_str(&format!(
+                        "* {cmd_word} ({}) \"/\" {}\r\n",
+                        attrs.join(" "),
+                        imap_string_with_utf8(parent, self.utf8_accept)
+                    ));
+                    // RFC 5819 Section 2: never emit STATUS for \Noselect mailboxes.
+                }
             }
-            out.push_str(&format!(
-                "* {cmd_word} ({}) \"/\" \"[Gmail]\"\r\n",
-                attrs.join(" ")
-            ));
-            // RFC 5819 Section 2: never emit STATUS for \Noselect mailboxes.
         }
 
         for mbx in &mailboxes {
@@ -1119,9 +1418,7 @@ impl ImapSession {
             {
                 continue;
             }
-            let has_children = mailboxes
-                .iter()
-                .any(|other| other.name.starts_with(&format!("{}/", mbx.name)));
+            let has_children = mailbox_has_children(&mbx.name, &mailboxes);
             let mut attrs = Vec::new();
             attrs.push(if has_children {
                 "\\HasChildren".to_string()
@@ -1137,20 +1434,194 @@ impl ImapSession {
             out.push_str(&format!(
                 "* {cmd_word} ({}) \"/\" {}\r\n",
                 attrs.join(" "),
-                imap_string(&mbx.name)
+                imap_string_with_utf8(&mbx.name, self.utf8_accept)
             ));
 
             if let Some(ref status_items) = parsed.return_status_items {
                 let pairs = format_status_pairs(mbx, status_items, highest_modseq);
                 out.push_str(&format!(
                     "* STATUS {} ({})\r\n",
-                    imap_string(&mbx.name),
+                    imap_string_with_utf8(&mbx.name, self.utf8_accept),
                     pairs.join(" ")
                 ));
             }
         }
         out.push_str(&format!("{tag} OK {cmd_word} completed\r\n"));
         write_flush(stream, out.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn handle_xlist(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        if !self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
+        if args.len() < 2 {
+            write_flush(
+                stream,
+                format!("{tag} BAD XLIST requires reference and pattern\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let reference = args[0].as_str_lossy().unwrap_or_default();
+        let pattern = args[1].as_str_lossy().unwrap_or_default();
+        if pattern.is_empty() {
+            let resp = format!("* XLIST (\\Noselect) \"/\" \"\"\r\n{tag} OK XLIST completed\r\n");
+            write_flush(stream, resp.as_bytes()).await?;
+            return Ok(());
+        }
+
+        let full_pattern = combine_list_pattern(&reference, &pattern);
+        let mailboxes = self.state.store.imap_list_mailboxes().await?;
+        let virtual_parents = collect_virtual_parents(&mailboxes);
+        let mut out = String::new();
+
+        for parent in &virtual_parents {
+            if imap_wildcard_match(&full_pattern, parent, '/') {
+                out.push_str(&format!(
+                    "* XLIST (\\Noselect \\HasChildren) \"/\" {}\r\n",
+                    imap_string_with_utf8(parent, self.utf8_accept)
+                ));
+            }
+        }
+
+        for mbx in &mailboxes {
+            if !imap_wildcard_match(&full_pattern, &mbx.name, '/') {
+                continue;
+            }
+            let has_children = mailbox_has_children(&mbx.name, &mailboxes);
+            let mut attrs = Vec::new();
+            attrs.push(if has_children {
+                "\\HasChildren"
+            } else {
+                "\\HasNoChildren"
+            });
+            if let Some(xlist_attr) = xlist_special_use_attr(mbx) {
+                attrs.push(xlist_attr);
+            }
+            out.push_str(&format!(
+                "* XLIST ({}) \"/\" {}\r\n",
+                attrs.join(" "),
+                imap_string_with_utf8(&mbx.name, self.utf8_accept)
+            ));
+        }
+
+        out.push_str(&format!("{tag} OK XLIST completed\r\n"));
+        write_flush(stream, out.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn handle_getquotaroot(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        if !self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
+        let Some(raw_mailbox) = args.first().and_then(ImapArg::as_str_lossy) else {
+            write_flush(
+                stream,
+                format!("{tag} BAD GETQUOTAROOT requires a mailbox name\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let mailbox = normalize_mailbox_name(&raw_mailbox);
+        let Some(info) = self.state.store.imap_mailbox_info(&mailbox).await? else {
+            write_flush(
+                stream,
+                format!(
+                    "{tag} NO Mailbox does not exist: {}\r\n",
+                    imap_quote(&mailbox)
+                )
+                .as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let used_bytes = self.state.store.imap_total_storage_bytes().await?;
+        let used_kb = used_bytes.div_ceil(1024);
+        let limit_kb = self.state.config.imap_quota_bytes / 1024;
+        let resp = format!(
+            "* QUOTAROOT {} \"\"\r\n* QUOTA \"\" (STORAGE {used_kb} {limit_kb})\r\n{tag} OK GETQUOTAROOT completed\r\n",
+            imap_string_with_utf8(&info.name, self.utf8_accept)
+        );
+        write_flush(stream, resp.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn handle_getquota(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        if !self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} NO Authenticate first\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self
+            .require_scope_or_no(tag, AuthScope::Read, stream)
+            .await?
+        {
+            return Ok(());
+        }
+        let Some(root) = args.first().and_then(ImapArg::as_str_lossy) else {
+            write_flush(
+                stream,
+                format!("{tag} BAD GETQUOTA requires a quota root\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        if !root.is_empty() {
+            write_flush(
+                stream,
+                format!("{tag} NO Quota root does not exist\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let used_bytes = self.state.store.imap_total_storage_bytes().await?;
+        let used_kb = used_bytes.div_ceil(1024);
+        let limit_kb = self.state.config.imap_quota_bytes / 1024;
+        let resp = format!(
+            "* QUOTA \"\" (STORAGE {used_kb} {limit_kb})\r\n{tag} OK GETQUOTA completed\r\n"
+        );
+        write_flush(stream, resp.as_bytes()).await?;
         Ok(())
     }
 
@@ -1217,6 +1688,7 @@ impl ImapSession {
                 "UIDNEXT" => pairs.push(format!("UIDNEXT {}", info.uid_next)),
                 "UIDVALIDITY" => pairs.push(format!("UIDVALIDITY {}", info.uid_validity)),
                 "UNSEEN" => pairs.push(format!("UNSEEN {}", info.unseen)),
+                "SIZE" => pairs.push(format!("SIZE {}", info.total_size_bytes)),
                 "HIGHESTMODSEQ" => {
                     let hms = match highest_modseq_cache {
                         Some(v) => v,
@@ -1233,7 +1705,7 @@ impl ImapSession {
         }
         let resp = format!(
             "* STATUS {} ({})\r\n{tag} OK STATUS completed\r\n",
-            imap_string(&info.name),
+            imap_string_with_utf8(&info.name, self.utf8_accept),
             pairs.join(" ")
         );
         write_flush(stream, resp.as_bytes()).await?;
@@ -1775,20 +2247,71 @@ impl ImapSession {
             }
             idx += 1;
         }
+        let is_utf8_arg = |arg_idx: usize| -> bool {
+            args.get(arg_idx)
+                .and_then(ImapArg::as_str_lossy)
+                .is_some_and(|s| s.eq_ignore_ascii_case("UTF8"))
+                && args.get(arg_idx + 1).and_then(ImapArg::as_list).is_some()
+        };
         if idx + 1 < args.len()
+            && !is_utf8_arg(idx)
             && let Some(date_str) = args.get(idx).and_then(ImapArg::as_str_lossy)
         {
             internal_date_ms = parse_imap_date_time(&date_str);
             idx += 1;
         }
-        let Some(raw_bytes) = args.get(idx).and_then(ImapArg::as_bytes) else {
+        let raw_bytes = if is_utf8_arg(idx) {
+            if !self.utf8_accept {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD APPEND UTF8 requires ENABLE UTF8=ACCEPT first\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            let Some(inner) = args.get(idx + 1).and_then(ImapArg::as_list) else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD APPEND UTF8 requires (~{{N}}) literal list\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            let Some(bytes) = (inner.len() == 1).then(|| inner[0].as_bytes()).flatten() else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD APPEND UTF8 missing message literal\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            bytes
+        } else {
+            let Some(bytes) = args.get(idx).and_then(ImapArg::as_bytes) else {
+                write_flush(
+                    stream,
+                    format!("{tag} BAD APPEND missing message literal\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            };
+            bytes
+        };
+
+        if raw_bytes.len() > self.state.config.max_body_bytes {
             write_flush(
                 stream,
-                format!("{tag} BAD APPEND missing message literal\r\n").as_bytes(),
+                format!(
+                    "{tag} NO [TOOBIG] Message size {} exceeds APPENDLIMIT of {} bytes\r\n",
+                    raw_bytes.len(),
+                    self.state.config.max_body_bytes
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
-        };
+        }
 
         let is_seen = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
         let is_flagged = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Flagged"));
@@ -2313,6 +2836,7 @@ impl ImapSession {
 
         let mut matched_ids = Vec::new();
         let mut max_matched_modseq: u64 = 0;
+        let now_ms = Utc::now().timestamp_millis();
 
         for snap_entry in &sel.snapshot {
             let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
@@ -2334,7 +2858,14 @@ impl ImapSession {
             } else {
                 None
             };
-            if eval_search_criteria(&criteria, &effective, full_msg.as_ref(), &label_id_to_name) {
+            if eval_search_criteria(
+                &criteria,
+                &effective,
+                full_msg.as_ref(),
+                &label_id_to_name,
+                now_ms,
+                self.utf8_accept,
+            ) {
                 matched_ids.push(if is_uid { effective.uid } else { effective.seq });
                 max_matched_modseq = max_matched_modseq.max(effective.modseq());
             }
@@ -2474,6 +3005,7 @@ impl ImapSession {
             .collect();
 
         let mut matched_items: Vec<SortMessageItem> = Vec::new();
+        let now_ms = Utc::now().timestamp_millis();
         for snap_entry in &sel.snapshot {
             let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
                 continue;
@@ -2500,6 +3032,8 @@ impl ImapSession {
                 &effective,
                 full_msg.as_ref(),
                 &label_id_to_name,
+                now_ms,
+                self.utf8_accept,
             ) {
                 continue;
             }
@@ -2650,6 +3184,7 @@ impl ImapSession {
             .collect();
 
         let mut matched_items: Vec<ThreadMessageItem> = Vec::new();
+        let now_ms = Utc::now().timestamp_millis();
         for snap_entry in &sel.snapshot {
             let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
                 continue;
@@ -2676,6 +3211,8 @@ impl ImapSession {
                 &effective,
                 full_msg.as_ref(),
                 &label_id_to_name,
+                now_ms,
+                self.utf8_accept,
             ) {
                 continue;
             }
@@ -2946,6 +3483,7 @@ impl ImapSession {
                     &current_entry,
                     msg_opt.as_ref(),
                     &label_name_map,
+                    self.utf8_accept,
                 );
             }
 
@@ -3298,10 +3836,13 @@ impl ImapSession {
                 return Ok(());
             }
 
-            // Custom user label: decode RFC 3501 Modified UTF-7 (for Gmail X-GM-LABELS clients
-            // without UTF8=ACCEPT), reject system labels, then resolve by exact name,
-            // case-insensitive name, or user label ID.
-            let decoded_custom = crate::sync::gmail_imap::decode_imap_mutf7(trimmed);
+            // Custom user label: decode RFC 3501 Modified UTF-7 only when UTF8=ACCEPT is not enabled
+            // (so native UTF-8 labels containing '&' pass through verbatim under UTF8=ACCEPT).
+            let decoded_custom = if self.utf8_accept {
+                trimmed.to_string()
+            } else {
+                crate::sync::gmail_imap::decode_imap_mutf7(trimmed)
+            };
             let custom_name = decoded_custom.trim();
             if custom_name.is_empty() {
                 continue;
@@ -3452,7 +3993,11 @@ impl ImapSession {
             updated_snapshot[idx] = new_entry.clone();
 
             if !silent {
-                let labels_str = format_xgm_labels(&new_entry.label_ids, &label_name_map);
+                let labels_str = format_xgm_labels_with_utf8(
+                    &new_entry.label_ids,
+                    &label_name_map,
+                    self.utf8_accept,
+                );
                 let mut parts = Vec::new();
                 if is_uid {
                     parts.push(format!("UID {}", new_entry.uid));
@@ -3854,6 +4399,131 @@ fn parse_xoauth2_payload(decoded: &[u8]) -> Option<(String, String)> {
     }
 }
 
+/// Decoded RFC 7628 `OAUTHBEARER` client initial response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OAuthBearerPayload {
+    authzid: Option<String>,
+    token: String,
+}
+
+/// Unescape RFC 5801 GS2 `saslname` escape sequences (`=2C` -> `,`, `=3D` -> `=`).
+fn unescape_gs2_saslname(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            match &raw[i + 1..i + 3] {
+                "2C" | "2c" => out.push(','),
+                "3D" | "3d" => out.push('='),
+                _ => return None,
+            }
+            i += 3;
+        } else {
+            let ch = raw[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Some(out)
+}
+
+/// Parse a decoded RFC 7628 `OAUTHBEARER` payload:
+/// `n,[a=<authzid>],\x01[host=...\x01][port=...\x01]auth=Bearer <token>\x01\x01`.
+fn parse_oauthbearer_payload(decoded: &[u8]) -> Option<OAuthBearerPayload> {
+    let text = std::str::from_utf8(decoded).ok()?;
+    let (gs2_header, rest) = text.split_once('\x01')?;
+
+    // GS2 header must be `n,[a=<saslname>],` (channel binding not supported).
+    let gs2_parts: Vec<&str> = gs2_header.split(',').collect();
+    if gs2_parts.len() != 3 || gs2_parts[0] != "n" || !gs2_parts[2].is_empty() {
+        return None;
+    }
+    let authzid = if gs2_parts[1].is_empty() {
+        None
+    } else {
+        let raw_authzid = gs2_parts[1].strip_prefix("a=")?;
+        let unescaped = unescape_gs2_saslname(raw_authzid)?;
+        let trimmed = unescaped.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    };
+
+    let kv_body = rest.strip_suffix("\x01\x01")?;
+    let mut token: Option<String> = None;
+    for part in kv_body.split('\x01') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(auth_val) = part.strip_prefix("auth=") {
+            let trimmed = auth_val.trim();
+            if trimmed
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+                && let Some(raw_tok) = trimmed.get(7..)
+            {
+                let tok = raw_tok.trim();
+                if !tok.is_empty() {
+                    token = Some(tok.to_string());
+                }
+            }
+        }
+    }
+
+    let token = token?;
+    Some(OAuthBearerPayload { authzid, token })
+}
+
+/// Return `true` when any mailbox in `mailboxes` is a child of `name` under `'/'`.
+fn mailbox_has_children(name: &str, mailboxes: &[ImapMailboxInfo]) -> bool {
+    let prefix_len = name.len();
+    mailboxes.iter().any(|other| {
+        other.name.len() > prefix_len
+            && other.name.starts_with(name)
+            && other.name.as_bytes()[prefix_len] == b'/'
+    })
+}
+
+/// Synthesize `\Noselect \HasChildren` virtual parent namespaces (such as `[Gmail]` and any
+/// missing intermediate parent of nested labels like `Work/Q4`) in deterministic sorted order.
+fn collect_virtual_parents(mailboxes: &[ImapMailboxInfo]) -> Vec<String> {
+    let existing: HashSet<&str> = mailboxes.iter().map(|m| m.name.as_str()).collect();
+    let mut parents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for mbx in mailboxes {
+        let mut cursor = mbx.name.as_str();
+        while let Some(slash) = cursor.rfind('/') {
+            let parent = &cursor[..slash];
+            if !parent.is_empty() && !existing.contains(parent) {
+                parents.insert(parent.to_string());
+            }
+            cursor = parent;
+        }
+    }
+    parents.into_iter().collect()
+}
+
+/// Map a mailbox to its Gmail legacy `XLIST` special-use attribute.
+fn xlist_special_use_attr(mbx: &ImapMailboxInfo) -> Option<&'static str> {
+    if mbx.name.eq_ignore_ascii_case("INBOX") {
+        return Some("\\Inbox");
+    }
+    match mbx.special_use.as_deref() {
+        Some("\\All") => Some("\\AllMail"),
+        Some("\\Sent") => Some("\\Sent"),
+        Some("\\Drafts") => Some("\\Drafts"),
+        Some("\\Trash") => Some("\\Trash"),
+        Some("\\Junk") => Some("\\Spam"),
+        Some("\\Flagged") => Some("\\Starred"),
+        Some("\\Important") => Some("\\Important"),
+        _ => None,
+    }
+}
+
 fn is_valid_mailbox_name(name: &str) -> bool {
     !name.is_empty() && !name.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
 }
@@ -3935,6 +4605,7 @@ fn write_fetch_item(
     entry: &ImapMessageEntry,
     msg: Option<&StoredMessage>,
     label_name_map: &HashMap<String, String>,
+    utf8_accept: bool,
 ) {
     let upper = item.to_ascii_uppercase();
     let raw_bytes: &[u8] = msg.map(|m| m.raw_rfc2822.as_slice()).unwrap_or(&[]);
@@ -4005,7 +4676,7 @@ fn write_fetch_item(
             out.extend_from_slice(format!("X-GM-THRID {id}").as_bytes());
         }
         "X-GM-LABELS" => {
-            let labels = format_xgm_labels(&entry.label_ids, label_name_map);
+            let labels = format_xgm_labels_with_utf8(&entry.label_ids, label_name_map, utf8_accept);
             out.extend_from_slice(format!("X-GM-LABELS ({labels})").as_bytes());
         }
         _ => {
@@ -4069,7 +4740,16 @@ pub fn derive_xgm_u64(upstream_hex: Option<&str>, fallback_id: &str) -> u64 {
     (raw & 0x7FFF_FFFF_FFFF_FFFF).max(1)
 }
 
+#[cfg(test)]
 fn format_xgm_labels(label_ids: &[String], name_map: &HashMap<String, String>) -> String {
+    format_xgm_labels_with_utf8(label_ids, name_map, false)
+}
+
+fn format_xgm_labels_with_utf8(
+    label_ids: &[String],
+    name_map: &HashMap<String, String>,
+    utf8_accept: bool,
+) -> String {
     let mut out = Vec::new();
     for id in label_ids {
         match id.as_str() {
@@ -4083,7 +4763,7 @@ fn format_xgm_labels(label_ids: &[String], name_map: &HashMap<String, String>) -
             LABEL_IMPORTANT => out.push("\\Important".to_string()),
             other => {
                 let name = name_map.get(other).map(String::as_str).unwrap_or(other);
-                out.push(imap_string(name));
+                out.push(imap_string_with_utf8(name, utf8_accept));
             }
         }
     }
@@ -4261,6 +4941,7 @@ fn parse_list_extended_args(args: &[ImapArg]) -> AppResult<ListExtendedArgs> {
                                 | "UIDNEXT"
                                 | "UIDVALIDITY"
                                 | "UNSEEN"
+                                | "SIZE"
                                 | "HIGHESTMODSEQ"
                         ) {
                             return Err(AppError::BadRequest(format!(
@@ -4304,6 +4985,7 @@ fn format_status_pairs(
             "UIDNEXT" => pairs.push(format!("UIDNEXT {}", info.uid_next)),
             "UIDVALIDITY" => pairs.push(format!("UIDVALIDITY {}", info.uid_validity)),
             "UNSEEN" => pairs.push(format!("UNSEEN {}", info.unseen)),
+            "SIZE" => pairs.push(format!("SIZE {}", info.total_size_bytes)),
             "HIGHESTMODSEQ" => {
                 pairs.push(format!("HIGHESTMODSEQ {}", highest_modseq.unwrap_or(1)));
             }
@@ -4546,6 +5228,8 @@ enum SearchKey {
     SentOn(chrono::NaiveDate),
     Larger(usize),
     Smaller(usize),
+    Younger(u32),
+    Older(u32),
     Modseq(u64),
     XGmMsgId(u64),
     XGmThrId(u64),
@@ -4747,6 +5431,23 @@ fn parse_one_search_key(
                 .map_err(|_| AppError::BadRequest(format!("Invalid SMALLER size: {raw}")))?;
             Ok(SearchKey::Smaller(n))
         }
+        "YOUNGER" => {
+            let raw = next_str(args, pos, "YOUNGER")?;
+            let secs =
+                raw.parse::<u32>().ok().filter(|&v| v >= 1).ok_or_else(|| {
+                    AppError::BadRequest(format!("Invalid YOUNGER seconds: {raw}"))
+                })?;
+            Ok(SearchKey::Younger(secs))
+        }
+        "OLDER" => {
+            let raw = next_str(args, pos, "OLDER")?;
+            let secs = raw
+                .parse::<u32>()
+                .ok()
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| AppError::BadRequest(format!("Invalid OLDER seconds: {raw}")))?;
+            Ok(SearchKey::Older(secs))
+        }
         "MODSEQ" => {
             // RFC 7162 Section 3.1.5: `MODSEQ [<entry-name> <entry-type-req>] <mod-sequence-valzer>`
             let first = next_str(args, pos, "MODSEQ")?;
@@ -4891,6 +5592,8 @@ fn eval_search_criteria(
     entry: &ImapMessageEntry,
     msg: Option<&StoredMessage>,
     label_id_to_name: &HashMap<String, String>,
+    now_ms: i64,
+    utf8_accept: bool,
 ) -> bool {
     let internal_date = Utc
         .timestamp_millis_opt(entry.internal_date_ms)
@@ -4952,6 +5655,12 @@ fn eval_search_criteria(
         SearchKey::SentOn(d) => sent_date(msg).or(internal_date).is_some_and(|md| md == *d),
         SearchKey::Larger(n) => (entry.size_estimate as usize) > *n,
         SearchKey::Smaller(n) => (entry.size_estimate as usize) < *n,
+        SearchKey::Younger(secs) => {
+            entry.internal_date_ms >= now_ms.saturating_sub((*secs as i64).saturating_mul(1000))
+        }
+        SearchKey::Older(secs) => {
+            entry.internal_date_ms <= now_ms.saturating_sub((*secs as i64).saturating_mul(1000))
+        }
         SearchKey::Modseq(n) => entry.modseq() >= *n,
         SearchKey::XGmMsgId(target) => {
             msg.is_some_and(|m| derive_xgm_u64(m.upstream_gmail_id.as_deref(), &m.id) == *target)
@@ -4964,7 +5673,12 @@ fn eval_search_criteria(
             if let Some(sys_id) = resolve_xgm_label_system_id(wanted) {
                 entry.label_ids.iter().any(|id| id == sys_id)
             } else {
-                let wanted_trimmed = wanted.trim();
+                let decoded_wanted = if utf8_accept {
+                    wanted.trim().to_string()
+                } else {
+                    crate::sync::gmail_imap::decode_imap_mutf7(wanted.trim())
+                };
+                let wanted_trimmed = decoded_wanted.trim();
                 entry.label_ids.iter().any(|id| {
                     id.eq_ignore_ascii_case(wanted_trimmed)
                         || label_id_to_name
@@ -4973,14 +5687,16 @@ fn eval_search_criteria(
                 })
             }
         }
-        SearchKey::Not(inner) => !eval_search_criteria(inner, entry, msg, label_id_to_name),
-        SearchKey::Or(a, b) => {
-            eval_search_criteria(a, entry, msg, label_id_to_name)
-                || eval_search_criteria(b, entry, msg, label_id_to_name)
+        SearchKey::Not(inner) => {
+            !eval_search_criteria(inner, entry, msg, label_id_to_name, now_ms, utf8_accept)
         }
-        SearchKey::And(list) => list
-            .iter()
-            .all(|item| eval_search_criteria(item, entry, msg, label_id_to_name)),
+        SearchKey::Or(a, b) => {
+            eval_search_criteria(a, entry, msg, label_id_to_name, now_ms, utf8_accept)
+                || eval_search_criteria(b, entry, msg, label_id_to_name, now_ms, utf8_accept)
+        }
+        SearchKey::And(list) => list.iter().all(|item| {
+            eval_search_criteria(item, entry, msg, label_id_to_name, now_ms, utf8_accept)
+        }),
     }
 }
 
@@ -5056,5 +5772,62 @@ mod tests {
         // Verify no quoted string contains non-ASCII bytes.
         assert!(!formatted.contains("\"Café/重要\""));
         assert!(!formatted.contains("\"日本語\""));
+
+        // With UTF8=ACCEPT enabled, emit UTF-8 labels directly as quoted strings.
+        let utf8_formatted = format_xgm_labels_with_utf8(
+            &[
+                LABEL_INBOX.to_string(),
+                "Label_ascii".to_string(),
+                "Label_utf8".to_string(),
+                "Label_jp".to_string(),
+            ],
+            &names,
+            true,
+        );
+        assert_eq!(
+            utf8_formatted,
+            "\\Inbox \"Work/Urgent\" \"Café/重要\" \"日本語\""
+        );
+    }
+
+    #[test]
+    fn oauthbearer_parser_handles_gs2_escaping_optional_authzid_and_rejects_malformed() {
+        let with_authzid =
+            b"n,a=user=2C1=3Dtest@example.com,\x01host=mail.example.com\x01port=993\x01auth=Bearer tok-abc\x01\x01";
+        assert_eq!(
+            parse_oauthbearer_payload(with_authzid),
+            Some(OAuthBearerPayload {
+                authzid: Some("user,1=test@example.com".to_string()),
+                token: "tok-abc".to_string(),
+            })
+        );
+
+        let without_authzid = b"n,,\x01auth=bearer tok-no-authzid\x01\x01";
+        assert_eq!(
+            parse_oauthbearer_payload(without_authzid),
+            Some(OAuthBearerPayload {
+                authzid: None,
+                token: "tok-no-authzid".to_string(),
+            })
+        );
+
+        // Missing auth=Bearer or bad GS2 header or missing terminator must return None.
+        assert_eq!(parse_oauthbearer_payload(b"n,,\x01\x01"), None);
+        assert_eq!(
+            parse_oauthbearer_payload(b"y,,\x01auth=Bearer tok\x01\x01"),
+            None
+        );
+        assert_eq!(
+            parse_oauthbearer_payload(b"n,a=,\x01auth=Bearer tok\x01\x01"),
+            None
+        );
+        assert_eq!(
+            parse_oauthbearer_payload(b"n,,\x01auth=Basic abc\x01\x01"),
+            None
+        );
+        assert_eq!(
+            parse_oauthbearer_payload(b"n,,\x01auth=Bearer tok\x01"),
+            None
+        );
     }
 }
