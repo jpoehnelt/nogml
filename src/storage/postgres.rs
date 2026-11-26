@@ -4331,6 +4331,29 @@ impl MailStore for PostgresStore {
         Ok(msg)
     }
 
+    async fn record_delivery_status_by_message_id(
+        &self,
+        message_id: &str,
+        status: &str,
+    ) -> AppResult<Option<StoredMessage>> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+        let updated = tx
+            .execute(
+                "UPDATE messages SET delivery_status = $1 WHERE mailbox_id = $2 AND id = $3",
+                &[&status, &mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        let msg = load_message_by_id(&tx, mb, message_id).await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(msg)
+    }
+
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
         let conn = self.ready_conn().await?;
         let mb = self.mailbox_id.as_str();

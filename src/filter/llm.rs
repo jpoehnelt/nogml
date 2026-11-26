@@ -180,6 +180,8 @@ pub struct LlmTriageFilter {
 impl LlmTriageFilter {
     pub fn new(config: LlmTriageConfig) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .timeout(config.timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -248,8 +250,35 @@ impl InboundFilter for LlmTriageFilter {
         };
 
         let status = resp.status();
+        if status.is_redirection() {
+            tracing::warn!(
+                base_url = %self.config.base_url,
+                status = %status,
+                "LlmTriageFilter received redirect (redirects disabled); failing open to Allow"
+            );
+            return Ok(FilterDecision::Allow);
+        }
+
+        let body_bytes = match crate::net_guard::read_bounded_bytes(
+            resp,
+            crate::net_guard::DEFAULT_FILTER_MAX_BODY_BYTES,
+            "LlmTriageFilter",
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(
+                    base_url = %self.config.base_url,
+                    error = %err,
+                    "LlmTriageFilter response exceeded body cap or failed to read; failing open to Allow"
+                );
+                return Ok(FilterDecision::Allow);
+            }
+        };
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body_bytes);
             tracing::warn!(
                 base_url = %self.config.base_url,
                 status = %status,
@@ -259,7 +288,7 @@ impl InboundFilter for LlmTriageFilter {
             return Ok(FilterDecision::Allow);
         }
 
-        let completion: ChatCompletionsResponse = match resp.json().await {
+        let completion: ChatCompletionsResponse = match serde_json::from_slice(&body_bytes) {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(

@@ -1414,6 +1414,7 @@ dependencies = [
  "r2d2_sqlite",
  "rcgen",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pki-types",

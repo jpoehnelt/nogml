@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod mime;
 pub mod models;
+pub mod net_guard;
 pub mod oauth2;
 pub mod resend;
 pub mod search;
@@ -106,6 +107,8 @@ pub struct AppState {
     /// Broadcast receiver signaled (`true`) when the server begins graceful shutdown.
     pub shutdown: watch::Receiver<bool>,
     shutdown_tx: Arc<watch::Sender<bool>>,
+    /// Bounded expiring cache of seen Svix webhook IDs (`svix-id`) preventing replay attacks.
+    pub svix_replay_cache: Arc<crate::resend::svix::SvixReplayCache>,
     /// Per-`(mailbox_id, scope, idempotency_key)` single-flight locks preventing concurrent double-sends.
     idempotency_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
     primary_mailbox_id: String,
@@ -233,6 +236,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             shutdown,
             shutdown_tx: Arc::new(shutdown_tx),
+            svix_replay_cache: Arc::new(crate::resend::svix::SvixReplayCache::new()),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
@@ -319,6 +323,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             shutdown,
             shutdown_tx: Arc::new(shutdown_tx),
+            svix_replay_cache: Arc::new(crate::resend::svix::SvixReplayCache::new()),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
@@ -439,6 +444,7 @@ impl AppState {
             metrics: self.metrics.clone(),
             shutdown: self.shutdown_tx.subscribe(),
             shutdown_tx: self.shutdown_tx.clone(),
+            svix_replay_cache: self.svix_replay_cache.clone(),
             idempotency_locks: self.idempotency_locks.clone(),
             primary_mailbox_id: self.primary_mailbox_id.clone(),
             base_blobs: self.base_blobs.clone(),

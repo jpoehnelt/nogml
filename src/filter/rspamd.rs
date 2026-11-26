@@ -15,6 +15,7 @@ use crate::{
     config::{Config, RspamdRejectAction},
     error::AppResult,
     filter::{FilterDecision, InboundFilter, InboundMessage},
+    net_guard::{DEFAULT_FILTER_MAX_BODY_BYTES, read_bounded_bytes},
 };
 
 /// Configuration for [`RspamdFilter`].
@@ -84,6 +85,8 @@ pub struct RspamdFilter {
 impl RspamdFilter {
     pub fn new(config: RspamdConfig) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .timeout(config.timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -175,12 +178,25 @@ impl InboundFilter for RspamdFilter {
         };
 
         let status = resp.status();
+        if status.is_redirection() {
+            return Ok(self.on_error(&format!(
+                "HTTP {} redirect rejected (redirects disabled)",
+                status.as_u16()
+            )));
+        }
+
+        let body_bytes =
+            match read_bounded_bytes(resp, DEFAULT_FILTER_MAX_BODY_BYTES, "Rspamd").await {
+                Ok(b) => b,
+                Err(err) => return Ok(self.on_error(&err.to_string())),
+            };
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body_bytes);
             return Ok(self.on_error(&format!("HTTP {status}: {body}")));
         }
 
-        let parsed: RspamdResponse = match resp.json().await {
+        let parsed: RspamdResponse = match serde_json::from_slice(&body_bytes) {
             Ok(p) => p,
             Err(err) => return Ok(self.on_error(&format!("invalid JSON response: {err}"))),
         };

@@ -947,6 +947,7 @@ async fn multi_mailbox_resend_and_ses_webhooks_and_sse_isolation() {
     let db_path = tmp.path().join("webhooks.db");
     let mut cfg = multi_mailbox_config(StorageBackend::Sqlite, false);
     cfg.db_path = db_path.clone();
+    cfg.allow_insecure_webhooks = true;
 
     let store = Arc::new(SqliteStore::open(&db_path, ALICE).unwrap());
     let state = AppState::with_backends(cfg, store, Arc::new(NoopResend)).with_transport(Arc::new(
@@ -1223,6 +1224,7 @@ async fn multi_mailbox_simultaneous_imap_clients_and_idle_isolation() {
 
     let mut cfg = multi_mailbox_config(StorageBackend::Sqlite, false);
     cfg.db_path = db_path.clone();
+    cfg.allow_insecure_webhooks = true;
     cfg.imap_bind = Some(imap_addr);
 
     let store = Arc::new(SqliteStore::open(&db_path, ALICE).unwrap());

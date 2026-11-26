@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::{
     AppState,
-    error::AppResult,
+    error::{AppError, AppResult},
     events::{EventSource, MailEvent},
     mime::ComposeEmailInput,
     models::{
@@ -24,10 +24,11 @@ use crate::{
     },
     resend::{
         filter::{FilterDecision, InboundFilter},
-        svix::verify_svix_signature,
-        transport::{InboundEnvelope, IngestOutcome, ingest_inbound_rfc2822},
+        svix::{extract_optional_svix_id, verify_svix_signature_and_id},
+        transport::{InboundEnvelope, IngestOutcome},
     },
     storage::NewAttachmentInput,
+    transport::ingest_inbound_rfc2822_with_config,
 };
 
 /// Headers managed directly by `mail-builder` that should not be duplicated via `extra_headers`.
@@ -55,30 +56,65 @@ pub fn resend_router() -> Router<AppState> {
 
 /// Axum handler for `POST /webhooks/resend`.
 ///
-/// Enforces Svix HMAC-SHA256 verification (401 on failure) when `config.resend_webhook_secret`
-/// is configured, and allows a warning-only dev bypass when `None`.
+/// Enforces Svix HMAC-SHA256 verification (401 on failure) and `svix-id` replay
+/// deduplication when `config.resend_webhook_secret` is configured. Fails closed
+/// (`401`) when `config.resend_webhook_secret` is unset unless
+/// `config.allow_insecure_webhooks` (`NOGML_ALLOW_INSECURE_WEBHOOKS=true`) is explicitly enabled.
 pub async fn webhook_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
-    if let Some(secret) = state
+    let svix_id = if let Some(secret) = state
         .config
         .resend_webhook_secret
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        verify_svix_signature(&headers, &body, secret, Utc::now().timestamp())?;
-    } else {
+        Some(verify_svix_signature_and_id(
+            &headers,
+            &body,
+            secret,
+            Utc::now().timestamp(),
+        )?)
+    } else if state.config.allow_insecure_webhooks {
         tracing::warn!(
-            "Resend webhook secret is not configured; accepting webhook without Svix signature verification (dev mode)"
+            "Resend webhook secret is not configured; accepting webhook because allow_insecure_webhooks=true (dev mode)"
         );
+        extract_optional_svix_id(&headers)
+    } else {
+        return Err(AppError::Unauthorized(
+            "Resend webhook secret is not configured; set RESEND_WEBHOOK_SECRET or enable NOGML_ALLOW_INSECURE_WEBHOOKS=true for local development"
+                .to_string(),
+        ));
+    };
+
+    if let Some(ref id) = svix_id
+        && !state.svix_replay_cache.check_and_record(id)
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "duplicate",
+                "duplicate": true,
+                "svix_id": id,
+            })),
+        )
+            .into_response());
     }
 
-    let event: ResendWebhookEvent = serde_json::from_slice(&body)?;
+    let event: ResendWebhookEvent = match serde_json::from_slice(&body) {
+        Ok(ev) => ev,
+        Err(err) => {
+            if let Some(ref id) = svix_id {
+                state.svix_replay_cache.remove(id);
+            }
+            return Err(err.into());
+        }
+    };
 
-    match event.event_type.as_str() {
+    let result = match event.event_type.as_str() {
         "email.received" => handle_email_received(&state, &event, state.filter.as_ref()).await,
         "email.sent" => handle_delivery_status(&state, &event, "sent").await,
         "email.delivered" => handle_delivery_status(&state, &event, "delivered").await,
@@ -102,7 +138,15 @@ pub async fn webhook_handler(
             )
                 .into_response())
         }
+    };
+
+    if result.is_err()
+        && let Some(ref id) = svix_id
+    {
+        state.svix_replay_cache.remove(id);
     }
+
+    result
 }
 
 fn find_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -209,11 +253,10 @@ fn build_minimal_rfc2822_fallback(input: &ComposeEmailInput) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn collect_resend_recipient_candidates(
-    event: &ResendWebhookEvent,
-    fetched: Option<&ResendReceivedEmail>,
-    raw_bytes: Option<&[u8]>,
-) -> Vec<String> {
+/// Collect envelope-only recipient candidates strictly from the top-level Resend webhook
+/// payload (`data.to`, `data.cc`, `data.bcc`). Never trusts sender-controlled MIME headers
+/// such as `X-Original-To`, `Delivered-To`, or `Envelope-To`.
+fn collect_resend_recipient_candidates(event: &ResendWebhookEvent) -> Vec<String> {
     let mut candidates = Vec::new();
     candidates.extend(event.data.to.iter().cloned());
     if let Some(ref cc) = event.data.cc {
@@ -222,44 +265,12 @@ fn collect_resend_recipient_candidates(
     if let Some(ref bcc) = event.data.bcc {
         candidates.extend(bcc.iter().cloned());
     }
-    if let Some(email) = fetched {
-        candidates.extend(email.to.iter().cloned());
-        candidates.extend(email.cc.iter().cloned());
-        candidates.extend(email.bcc.iter().cloned());
-        for hdr in [
-            "delivered-to",
-            "x-original-to",
-            "envelope-to",
-            "to",
-            "cc",
-            "bcc",
-        ] {
-            if let Some(val) = find_header_ci(&email.headers, hdr) {
-                candidates.push(val.to_string());
-            }
-        }
-    }
-    if let Some(raw) = raw_bytes
-        && let Ok(parsed) = crate::mime::parse_rfc2822(raw)
-    {
-        candidates.extend(parsed.to);
-        candidates.extend(parsed.cc);
-        candidates.extend(parsed.bcc);
-        for hdr in parsed.headers {
-            if matches!(
-                hdr.name.to_ascii_lowercase().as_str(),
-                "delivered-to" | "x-original-to" | "envelope-to"
-            ) {
-                candidates.push(hdr.value);
-            }
-        }
-    }
     candidates
 }
 
 /// Ingest a Resend `email.received` webhook event, fetching full email content and attachments
 /// via the Resend Receiving API (gracefully falling back to webhook metadata on API failure)
-/// and delegating to [`ingest_inbound_rfc2822`] for each matching local mailbox.
+/// and delegating to [`ingest_inbound_rfc2822_with_config`] for each matching local mailbox.
 pub async fn handle_email_received(
     state: &AppState,
     event: &ResendWebhookEvent,
@@ -267,12 +278,28 @@ pub async fn handle_email_received(
 ) -> AppResult<Response> {
     let email_id = event.data.email_id.trim();
 
-    // Fast-path dedup before calling the Resend Receiving API (only when single-mailbox or
-    // every pre-matched target mailbox already has the message).
-    let initial_candidates = collect_resend_recipient_candidates(event, None, None);
-    let initial_targets = state.config.resolve_inbound_mailboxes(&initial_candidates);
-    if !initial_targets.is_empty()
-        && (!state.config.has_explicit_mailbox_routing() || initial_targets.len() == 1)
+    // Resolve target local mailbox(es) strictly from top-level webhook envelope recipients.
+    let recipient_candidates = collect_resend_recipient_candidates(event);
+    let target_mailboxes = state
+        .config
+        .resolve_inbound_mailboxes(&recipient_candidates);
+    if target_mailboxes.is_empty() {
+        tracing::info!(
+            email_id = %email_id,
+            "Ignoring Resend inbound email with no matching local mailbox"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": "no_matching_local_mailbox",
+            })),
+        )
+            .into_response());
+    }
+
+    // Fast-path dedup before calling the Resend Receiving API (when every matched target
+    // mailbox already has the message).
     {
         let mut first_dup: Option<(String, String, String)> = None;
         let mut all_dups = true;
@@ -282,7 +309,7 @@ pub async fn handle_email_received(
             .as_deref()
             .and_then(crate::mime::normalize_message_id);
 
-        for mb in &initial_targets {
+        for mb in &target_mailboxes {
             let mb_store = state.for_mailbox(mb).store;
             let mut found = None;
             if let Some(ref mid) = norm_mid {
@@ -358,27 +385,6 @@ pub async fn handle_email_received(
                 }
             }
         }
-    }
-
-    // Resolve target local mailbox(es) from webhook + fetched metadata + raw RFC 2822 headers.
-    let recipient_candidates =
-        collect_resend_recipient_candidates(event, fetched.as_ref(), raw_rfc2822.as_deref());
-    let target_mailboxes = state
-        .config
-        .resolve_inbound_mailboxes(&recipient_candidates);
-    if target_mailboxes.is_empty() {
-        tracing::info!(
-            email_id = %email_id,
-            "Ignoring Resend inbound email with no matching local mailbox"
-        );
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "status": "ignored",
-                "reason": "no_matching_local_mailbox",
-            })),
-        )
-            .into_response());
     }
 
     // Fetch & download attachments when raw RFC 2822 wasn't downloaded and attachments are indicated.
@@ -572,11 +578,12 @@ pub async fn handle_email_received(
     if target_mailboxes.len() == 1 {
         let mb = &target_mailboxes[0];
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822(
+        let outcome = ingest_inbound_rfc2822_with_config(
             mb_state.store.as_ref(),
             &mb_state.events,
             filter,
             base_envelope,
+            &mb_state.config,
         )
         .await?;
 
@@ -638,11 +645,12 @@ pub async fn handle_email_received(
 
     for mb in &target_mailboxes {
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822(
+        let outcome = ingest_inbound_rfc2822_with_config(
             mb_state.store.as_ref(),
             &mb_state.events,
             filter,
             base_envelope.clone(),
+            &mb_state.config,
         )
         .await?;
 
@@ -764,13 +772,41 @@ async fn handle_delivery_status(
         if let Some(ref mid) = norm_mid
             && let Some(msg) = mb_state.store.find_message_by_rfc_message_id(mid).await?
         {
+            if let Some(existing_resend_id) = msg.resend_id.as_deref().filter(|s| !s.is_empty()) {
+                let _ = mb_state
+                    .store
+                    .record_delivery_status(existing_resend_id, status)
+                    .await?;
+            } else {
+                let _ = mb_state
+                    .store
+                    .record_delivery_status_by_message_id(&msg.id, status)
+                    .await?;
+            }
             message_id = msg.id;
             target_state = Some(mb_state);
             break;
         }
     }
 
-    let publish_state = target_state.as_ref().unwrap_or(state);
+    let Some(publish_state) = target_state else {
+        tracing::debug!(
+            resend_id = %resend_id,
+            delivery_status = %status,
+            "Dropping unmatched Resend delivery webhook event"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": "message_not_found",
+                "delivery_status": status,
+                "resend_id": resend_id,
+            })),
+        )
+            .into_response());
+    };
+
     publish_state.events.publish(
         EventSource::ResendWebhook,
         MailEvent::DeliveryStatus {
@@ -1426,6 +1462,13 @@ mod tests {
         AppState::with_backends(config, store, resend)
     }
 
+    fn test_state_insecure(store: Arc<MockStore>, resend: Arc<dyn ResendClient>) -> AppState {
+        let mut config = Config::for_test();
+        config.resend_webhook_secret = None;
+        config.allow_insecure_webhooks = true;
+        AppState::with_backends(config, store, resend)
+    }
+
     async fn read_json(resp: Response) -> Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -1564,10 +1607,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_dev_bypass_works_when_secret_is_none() {
+    async fn webhook_fails_closed_by_default_and_dev_bypass_requires_opt_in() {
         let store = Arc::new(MockStore::default());
+        store.push_existing(StoredMessage {
+            id: "dev_msg_1".to_string(),
+            thread_id: "thr_dev_1".to_string(),
+            label_ids: vec!["SENT".to_string()],
+            raw_rfc2822: Vec::new(),
+            snippet: "Dev".to_string(),
+            history_id: 1,
+            internal_date_ms: 1_700_000_000_000,
+            size_estimate: 10,
+            subject: "Dev".to_string(),
+            from_addr: "agent@example.com".to_string(),
+            to_addrs: vec!["alice@example.com".to_string()],
+            cc_addrs: vec![],
+            bcc_addrs: vec![],
+            text_body: "Dev".to_string(),
+            html_body: None,
+            has_attachments: false,
+            rfc822_message_id: Some("<dev-1@example.com>".to_string()),
+            in_reply_to: None,
+            references_header: None,
+            resend_id: Some("re_dev_1".to_string()),
+            delivery_status: None,
+            upstream_gmail_id: None,
+            upstream_thread_id: None,
+            source: "local".to_string(),
+            all_mail_uid: 1,
+            is_answered: false,
+            is_deleted: false,
+        });
         let resend = Arc::new(HttpResendClient::new("http://127.0.0.1:9", None));
-        let state = test_state(None, store, resend);
+
+        // 1. Default (secret=None, allow_insecure_webhooks=false) MUST fail closed with 401.
+        let closed_state = test_state(None, store.clone(), resend.clone());
+        let closed_app = resend_router().with_state(closed_state);
+        let closed_resp = closed_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/resend")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "type": "email.delivered",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "data": { "email_id": "re_dev_1" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Explicit allow_insecure_webhooks=true permits unsigned dev webhooks.
+        let state = test_state_insecure(store, resend);
         let mut rx = state.events.subscribe();
         let app = resend_router().with_state(state);
 
@@ -1614,7 +1711,7 @@ mod tests {
     async fn webhook_ignores_unknown_event_type_with_200() {
         let store = Arc::new(MockStore::default());
         let resend = Arc::new(HttpResendClient::new("http://127.0.0.1:9", None));
-        let state = test_state(None, store, resend);
+        let state = test_state_insecure(store, resend);
         let app = resend_router().with_state(state);
 
         let payload = json!({
@@ -1666,7 +1763,7 @@ mod tests {
     async fn webhook_rejects_malformed_json_with_400() {
         let store = Arc::new(MockStore::default());
         let resend = Arc::new(HttpResendClient::new("http://127.0.0.1:9", None));
-        let state = test_state(None, store, resend);
+        let state = test_state_insecure(store, resend);
         let app = resend_router().with_state(state);
 
         let resp = app
@@ -1888,7 +1985,7 @@ mod tests {
 
         let store = Arc::new(MockStore::default());
         let resend = Arc::new(HttpResendClient::new(server.uri(), Some("re_key".into())));
-        let state = test_state(None, store.clone(), resend);
+        let state = test_state_insecure(store.clone(), resend);
         let mut rx = state.events.subscribe();
         let app = resend_router().with_state(state);
 

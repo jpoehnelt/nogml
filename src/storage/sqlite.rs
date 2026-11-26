@@ -4330,6 +4330,33 @@ impl MailStore for SqliteStore {
         .await
     }
 
+    async fn record_delivery_status_by_message_id(
+        &self,
+        message_id: &str,
+        status: &str,
+    ) -> AppResult<Option<StoredMessage>> {
+        let message_id = message_id.to_string();
+        let status = status.to_string();
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let updated = tx
+                .execute(
+                    "UPDATE messages SET delivery_status = ?1 WHERE mailbox_id = ?2 AND id = ?3",
+                    params![&status, mb, &message_id],
+                )
+                .map_err(sql_err)?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let msg = load_message_by_id(&tx, mb, &message_id)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(msg)
+        })
+        .await
+    }
+
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
         self.run_blocking(|conn, mb| {
             let mut mailboxes = Vec::new();

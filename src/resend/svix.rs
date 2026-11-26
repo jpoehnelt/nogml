@@ -1,5 +1,11 @@
 //! Svix / Standard Webhooks HMAC-SHA256 signature verification.
 
+use std::{
+    collections::HashMap,
+    sync::Mutex as StdMutex,
+    time::{Duration, Instant},
+};
+
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
@@ -12,6 +18,96 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum allowed clock skew between webhook timestamp and current time (5 minutes).
 pub const SVIX_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
+
+/// Minimum replay deduplication TTL (>= 600s, covering the full +/- 300s timestamp tolerance window).
+pub const SVIX_REPLAY_TTL_SECS: u64 = 660;
+
+/// Upper bound on cached `svix-id` entries to prevent unbounded memory growth.
+pub const SVIX_REPLAY_MAX_ENTRIES: usize = 50_000;
+
+/// Bounded, expiring in-memory cache of processed `svix-id` / `webhook-id` values
+/// preventing replay attacks within the Svix signature validity window.
+#[derive(Debug)]
+pub struct SvixReplayCache {
+    ttl: Duration,
+    max_entries: usize,
+    entries: StdMutex<HashMap<String, Instant>>,
+}
+
+impl Default for SvixReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SvixReplayCache {
+    /// Construct a replay cache with default TTL (`660s`) and capacity (`50,000`).
+    pub fn new() -> Self {
+        Self::with_ttl_and_capacity(
+            Duration::from_secs(SVIX_REPLAY_TTL_SECS),
+            SVIX_REPLAY_MAX_ENTRIES,
+        )
+    }
+
+    /// Construct a replay cache with custom TTL and maximum entry capacity.
+    pub fn with_ttl_and_capacity(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries: max_entries.max(1),
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Check whether `svix_id` was already seen within the active TTL window; if not,
+    /// record it and return `true` (fresh). Returns `false` if this is a replay.
+    pub fn check_and_record(&self, svix_id: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+
+        if map.len() >= self.max_entries || map.len() > 1024 {
+            map.retain(|_, expires_at| *expires_at > now);
+        }
+
+        if let Some(&expires_at) = map.get(svix_id)
+            && expires_at > now
+        {
+            return false;
+        }
+
+        if map.len() >= self.max_entries {
+            map.retain(|_, expires_at| *expires_at > now);
+            if map.len() >= self.max_entries
+                && let Some(oldest_key) = map
+                    .iter()
+                    .min_by_key(|(_, exp)| **exp)
+                    .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
+
+        map.insert(svix_id.to_string(), now + self.ttl);
+        true
+    }
+
+    /// Remove a previously recorded `svix_id` (e.g. if downstream processing returned an error
+    /// so legitimate webhook retries can be processed).
+    pub fn remove(&self, svix_id: &str) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(svix_id);
+    }
+}
+
+/// Extract an optional `svix-id` (or `webhook-id`) header if present and non-empty.
+pub fn extract_optional_svix_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("svix-id")
+        .or_else(|| headers.get("webhook-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
 
 /// Decode a Svix webhook secret (`whsec_<base64>` or raw `<base64>`) into raw HMAC key bytes.
 fn decode_svix_secret(secret: &str) -> AppResult<Vec<u8>> {
@@ -136,6 +232,16 @@ pub fn verify_svix_signature(
     secret: &str,
     now_epoch_secs: i64,
 ) -> AppResult<()> {
+    verify_svix_signature_and_id(headers, raw_body, secret, now_epoch_secs).map(|_| ())
+}
+
+/// Verify Svix webhook HMAC-SHA256 signature and return the verified `svix-id` / `webhook-id`.
+pub fn verify_svix_signature_and_id(
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    secret: &str,
+    now_epoch_secs: i64,
+) -> AppResult<String> {
     let key = decode_svix_secret(secret)?;
 
     let msg_id = extract_header(headers, "svix-id", "webhook-id")?;
@@ -172,7 +278,7 @@ pub fn verify_svix_signature(
     }
 
     if matched {
-        Ok(())
+        Ok(msg_id.to_string())
     } else {
         Err(AppError::Unauthorized(
             "Invalid webhook signature".to_string(),

@@ -2360,6 +2360,19 @@ impl MailStore for MemoryStore {
         Ok(None)
     }
 
+    async fn record_delivery_status_by_message_id(
+        &self,
+        message_id: &str,
+        status: &str,
+    ) -> AppResult<Option<StoredMessage>> {
+        let mut state = self.write_state()?;
+        if let Some(msg) = state.messages.get_mut(message_id) {
+            msg.delivery_status = Some(status.to_string());
+            return Ok(Some(msg.clone()));
+        }
+        Ok(None)
+    }
+
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
         let state = self.read_state()?;
         let builtins = [

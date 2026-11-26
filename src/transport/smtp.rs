@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
@@ -265,10 +265,11 @@ impl SmtpStream {
 
     async fn read_line(&mut self) -> AppResult<String> {
         let mut buf = Vec::new();
+        let limit = (MAX_SMTP_LINE_BYTES as u64) + 1;
         let fut = async {
             match self {
-                Self::Plain(r) => r.read_until(b'\n', &mut buf).await,
-                Self::Tls(r) => r.read_until(b'\n', &mut buf).await,
+                Self::Plain(r) => r.take(limit).read_until(b'\n', &mut buf).await,
+                Self::Tls(r) => r.take(limit).read_until(b'\n', &mut buf).await,
             }
         };
         let n = timeout(SMTP_IO_TIMEOUT, fut)
@@ -387,32 +388,49 @@ fn sanitize_envelope_addr(raw: &str) -> AppResult<String> {
 /// Apply RFC 5321 Section 4.5.2 dot-stuffing to raw RFC 2822 bytes and append the
 /// terminating `.\r\n` sequence.
 ///
-/// Any line starting with `.` has an extra `.` prepended; bare `\n` line endings are
-/// normalized to `\r\n` while existing `\r\n` endings are preserved verbatim.
+/// Bare `\r` and bare `\n` line endings are normalized to `\r\n` BEFORE dot-stuffing so
+/// bare-CR sequences such as `\r.\r\n` cannot smuggle SMTP `DATA` terminators or commands.
+/// Any line starting with `.` has an extra `.` prepended.
 pub fn dot_stuff_rfc5321(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len() + 32);
-    let mut at_line_start = true;
+    // Normalize CRLF, bare CR, and bare LF to canonical CRLF first.
+    let mut normalized = Vec::with_capacity(raw.len() + 16);
     let mut i = 0;
-
     while i < raw.len() {
         let b = raw[i];
+        if b == b'\r' {
+            normalized.push(b'\r');
+            normalized.push(b'\n');
+            if raw.get(i + 1) == Some(&b'\n') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if b == b'\n' {
+            normalized.push(b'\r');
+            normalized.push(b'\n');
+            i += 1;
+        } else {
+            normalized.push(b);
+            i += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(normalized.len() + 32);
+    let mut at_line_start = true;
+    let mut j = 0;
+    while j < normalized.len() {
+        let b = normalized[j];
         if at_line_start && b == b'.' {
             out.push(b'.');
         }
-
-        if b == b'\r' && raw.get(i + 1) == Some(&b'\n') {
+        if b == b'\r' && normalized.get(j + 1) == Some(&b'\n') {
             out.push(b'\r');
             out.push(b'\n');
-            i += 2;
-            at_line_start = true;
-        } else if b == b'\n' {
-            out.push(b'\r');
-            out.push(b'\n');
-            i += 1;
+            j += 2;
             at_line_start = true;
         } else {
             out.push(b);
-            i += 1;
+            j += 1;
             at_line_start = false;
         }
     }
