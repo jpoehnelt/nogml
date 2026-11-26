@@ -17,10 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     blob::open_blob_store,
-    config::{BlobBackend, Config, StorageBackend, TransportBackend, validate_config},
+    config::{BlobBackend, Config, TransportBackend, validate_config},
     imap::build_tls_acceptor,
     secrets::{SecretResolutionReport, check_secret_file_permissions},
-    storage::{SqliteStore, open_store_async},
+    storage::open_store_async,
     transport::{GmailTransportConfig, SesConfig, SmtpConfig},
 };
 
@@ -257,11 +257,9 @@ async fn check_storage(config: &Config) -> DoctorCheck {
         }
     };
 
-    let mailbox_count = match config.storage {
-        StorageBackend::Sqlite => SqliteStore::list_mailbox_ids(&config.db_path)
-            .map(|ids| ids.len())
-            .unwrap_or_else(|_| config.known_mailboxes().len()),
-        StorageBackend::Memory | StorageBackend::Postgres => config.known_mailboxes().len(),
+    let mailbox_count = match store.list_mailbox_ids().await {
+        Ok(ids) if !ids.is_empty() => ids.len(),
+        _ => config.known_mailboxes().len(),
     };
 
     DoctorCheck {
@@ -920,7 +918,7 @@ mod tests {
         write_secret_file(&secret_path, secret_val, true).unwrap();
 
         let mut cfg = Config::for_test();
-        cfg.storage = StorageBackend::Sqlite;
+        cfg.storage = crate::config::StorageBackend::Sqlite;
         cfg.db_path = dir.path().join("doctor.db");
         cfg.blob_backend = BlobBackend::Fs;
         cfg.blob_dir = dir.path().join("blobs");
@@ -939,5 +937,44 @@ mod tests {
         let rendered = serde_json::to_string(&report).unwrap();
         assert!(!rendered.contains(secret_val));
         assert!(!rendered.contains("re_super_secret_api_key_never_leak"));
+    }
+
+    #[tokio::test]
+    async fn run_doctor_redacts_malformed_webhook_urls_with_userinfo_and_query() {
+        let mut cfg = Config::for_test();
+        cfg.approval_webhook_url = Some(
+            "https://alice:super_secret_pw@bad host/approve?token=approval_leak_123#frag"
+                .to_string(),
+        );
+        cfg.watch_webhook_url = Some(
+            "http://bob:watch_pw_456@exa mple.com:badport/watch?api_key=watch_leak_789".to_string(),
+        );
+
+        let report = run_doctor(&cfg, None, SecretResolutionReport::default()).await;
+        assert!(!report.ok);
+        let config_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "config")
+            .expect("config check");
+        assert_eq!(config_check.status, DoctorStatus::Fail);
+        assert!(config_check.detail.contains("safety.approval_webhook_url"));
+        assert!(config_check.detail.contains("watch.webhook_url"));
+
+        let rendered = serde_json::to_string(&report).unwrap();
+        for forbidden in [
+            "alice",
+            "super_secret_pw",
+            "approval_leak_123",
+            "frag",
+            "bob",
+            "watch_pw_456",
+            "watch_leak_789",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "doctor output leaked '{forbidden}': {rendered}"
+            );
+        }
     }
 }

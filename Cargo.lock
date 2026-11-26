@@ -1489,6 +1489,7 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

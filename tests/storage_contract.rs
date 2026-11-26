@@ -435,6 +435,44 @@ async fn contract_messages_threads_labels_drafts_attachments(store: Arc<dyn Mail
             "history entries must be monotonically non-decreasing"
         );
     }
+    // Filtered keyset pagination (history_types + label_id) and invalid cursor rejection
+    let mut filtered_hist = Vec::new();
+    let mut filtered_tok = None;
+    loop {
+        let page = store
+            .list_history(&HistoryListQuery {
+                start_history_id: start_hid,
+                max_results: 2,
+                page_token: filtered_tok,
+                history_types: vec![HistoryEventKind::MessageAdded, HistoryEventKind::LabelAdded],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        filtered_hist.extend(page.entries);
+        match page.next_page_token {
+            Some(next) => {
+                assert!(next.contains(':'), "expected keyset token, got {next}");
+                filtered_tok = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(!filtered_hist.is_empty());
+    assert!(filtered_hist.iter().all(|e| matches!(
+        e.kind,
+        HistoryEventKind::MessageAdded | HistoryEventKind::LabelAdded
+    )));
+    assert!(matches!(
+        store
+            .list_history(&HistoryListQuery {
+                start_history_id: start_hid,
+                page_token: Some("bad-cursor".to_string()),
+                ..Default::default()
+            })
+            .await,
+        Err(AppError::BadRequest(_))
+    ));
 
     // 4. Draft lifecycle (create, list, get, update replaces message, delete cleans up message)
     let draft = store
@@ -2097,6 +2135,21 @@ async fn contract_multi_mailbox_isolation(
     // Alice's rule remains intact
     let alice_still = alice.get_inbox_rule(&alice_rule.id).await.unwrap().unwrap();
     assert!(alice_still.enabled);
+
+    // list_mailbox_ids returns sorted, deduplicated union including both isolated mailboxes
+    let listed = alice.list_mailbox_ids().await.unwrap();
+    assert!(
+        listed.windows(2).all(|w| w[0] < w[1]),
+        "list_mailbox_ids must be strictly sorted and deduplicated: {listed:?}"
+    );
+    assert!(
+        listed.contains(&alice.mailbox_id().to_string()),
+        "missing alice mailbox in {listed:?}"
+    );
+    assert!(
+        listed.contains(&bob.mailbox_id().to_string()),
+        "missing bob mailbox in {listed:?}"
+    );
 }
 
 async fn contract_contacts_stats_vip_filtering_and_patch(store: Arc<dyn MailStore>) {

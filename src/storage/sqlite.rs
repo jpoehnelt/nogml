@@ -45,10 +45,11 @@ use crate::{
         SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
         UpsertOutcome, UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
         apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip, compute_xgm_label_delta,
-        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
-        normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
-        parse_simple_email_address, validate_and_normalize_contact_email,
-        validate_and_normalize_suppression_email, validate_deliverability_domain,
+        format_history_page_token, normalize_and_validate_domain, normalize_contact_email,
+        normalize_deliverability_domain, normalize_domain_lookup_key, normalize_inbox_rule_actions,
+        normalize_optional_text, parse_history_page_token, parse_simple_email_address,
+        validate_and_normalize_contact_email, validate_and_normalize_suppression_email,
+        validate_deliverability_domain,
     },
 };
 
@@ -465,30 +466,32 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Inspect an existing SQLite database file at `path` and return all distinct `mailbox_id`
-    /// values stored in `meta` (sorted). Returns an empty list if the file does not exist or
-    /// uses a legacy v1 schema without a `mailbox_id` column.
+    /// values stored across `meta`, `settings`, and `inbox_rules` (sorted and deduplicated).
+    /// Returns an empty list if the file does not exist or uses a legacy v1 schema without a
+    /// `mailbox_id` column.
     pub fn list_mailbox_ids(path: &Path) -> AppResult<Vec<String>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
         let conn = Connection::open(path).map_err(sql_err)?;
-        if !table_exists(&conn, "meta")? || !column_exists_conn(&conn, "meta", "mailbox_id")? {
-            return Ok(Vec::new());
-        }
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT mailbox_id FROM meta ORDER BY mailbox_id ASC")
-            .map_err(sql_err)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(sql_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            let mb = r.map_err(sql_err)?;
-            if !mb.trim().is_empty() {
-                out.push(mb);
+        let mut ids = std::collections::BTreeSet::new();
+        for table in ["meta", "settings", "inbox_rules"] {
+            if !table_exists(&conn, table)? || !column_exists_conn(&conn, table, "mailbox_id")? {
+                continue;
+            }
+            let sql = format!("SELECT DISTINCT mailbox_id FROM {table}");
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql_err)?;
+            for r in rows {
+                let norm = crate::config::normalize_mailbox_id(&r.map_err(sql_err)?);
+                if !norm.is_empty() {
+                    ids.insert(norm);
+                }
             }
         }
-        Ok(out)
+        Ok(ids.into_iter().collect())
     }
 
     /// Open (or create) a SQLite database at `path`, run migrations, and seed system labels.
@@ -1139,6 +1142,41 @@ fn str_to_history_kind(s: &str) -> AppResult<HistoryEventKind> {
             "Unknown history event kind: {other}"
         ))),
     }
+}
+
+fn build_sqlite_list_history_sql(has_cursor: bool, kind_count: usize, sql_limit: bool) -> String {
+    let mut sql = String::from(
+        "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source
+         FROM history_events
+         WHERE mailbox_id = ?1",
+    );
+    let mut next_param = 2usize;
+    if has_cursor {
+        sql.push_str(&format!(
+            " AND (history_id, id) > (?{next_param}, ?{})",
+            next_param + 1
+        ));
+        next_param += 2;
+    } else {
+        sql.push_str(&format!(" AND history_id > ?{next_param}"));
+        next_param += 1;
+    }
+    if kind_count > 0 {
+        sql.push_str(" AND kind IN (");
+        for i in 0..kind_count {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", next_param + i));
+        }
+        sql.push(')');
+        next_param += kind_count;
+    }
+    sql.push_str(" ORDER BY history_id ASC, id ASC");
+    if sql_limit {
+        sql.push_str(&format!(" LIMIT ?{next_param}"));
+    }
+    sql
 }
 
 fn ensure_column_exists(
@@ -2934,6 +2972,33 @@ impl MailStore for SqliteStore {
         })
     }
 
+    async fn list_mailbox_ids(&self) -> AppResult<Vec<String>> {
+        self.run_blocking(|conn, _mb| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT mailbox_id FROM meta
+                     UNION
+                     SELECT DISTINCT mailbox_id FROM settings
+                     UNION
+                     SELECT DISTINCT mailbox_id FROM inbox_rules
+                     ORDER BY mailbox_id ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql_err)?;
+            let mut ids = std::collections::BTreeSet::new();
+            for r in rows {
+                let norm = crate::config::normalize_mailbox_id(&r.map_err(sql_err)?);
+                if !norm.is_empty() {
+                    ids.insert(norm);
+                }
+            }
+            Ok(ids.into_iter().collect())
+        })
+        .await
+    }
+
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
         let email = if email_address.trim().is_empty() {
             self.mailbox_id.clone()
@@ -2980,14 +3045,8 @@ impl MailStore for SqliteStore {
                 ));
             }
             let current_hid = read_current_history_id(conn, mb)?;
-            let after_row_id: i64 = match query.page_token.as_deref() {
-                None => 0,
-                Some(s) if s.trim().is_empty() => 0,
-                Some(s) => s
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| AppError::BadRequest(format!("Invalid pageToken: {s}")))?,
-            };
+            let cursor = parse_history_page_token(query.page_token.as_deref())?;
+            let effective_cursor = cursor.filter(|(c_hid, _)| *c_hid > query.start_history_id);
             let max_results = if query.max_results == 0 {
                 100
             } else {
@@ -2995,41 +3054,61 @@ impl MailStore for SqliteStore {
             };
 
             let resolved_label_filter = match query.label_id.as_deref() {
-                Some(l) if !l.trim().is_empty() => Some(
-                    resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.to_string()),
-                ),
+                Some(l) if !l.trim().is_empty() => {
+                    Some(resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.to_string()))
+                }
                 _ => None,
             };
 
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, history_id, kind, message_id, thread_id, label_ids_json, context_labels_json, upstream_gmail_id, source
-                     FROM history_events
-                     WHERE mailbox_id = ?1 AND history_id > ?2 AND id > ?3
-                     ORDER BY id ASC",
-                )
-                .map_err(sql_err)?;
+            let mut kind_filters: Vec<&'static str> = Vec::new();
+            for k in &query.history_types {
+                let s = history_kind_to_str(*k);
+                if !kind_filters.contains(&s) {
+                    kind_filters.push(s);
+                }
+            }
+            let use_sql_limit = resolved_label_filter.is_none();
+            let sql = build_sqlite_list_history_sql(
+                effective_cursor.is_some(),
+                kind_filters.len(),
+                use_sql_limit,
+            );
 
+            let mut sql_params: Vec<SqlValue> = Vec::new();
+            sql_params.push(SqlValue::Text(mb.to_string()));
+            if let Some((c_hid, c_id)) = effective_cursor {
+                sql_params.push(SqlValue::Integer(c_hid.min(i64::MAX as u64) as i64));
+                sql_params.push(SqlValue::Integer(c_id.min(i64::MAX as u64) as i64));
+            } else {
+                sql_params.push(SqlValue::Integer(
+                    query.start_history_id.min(i64::MAX as u64) as i64,
+                ));
+            }
+            for kind_str in &kind_filters {
+                sql_params.push(SqlValue::Text((*kind_str).to_string()));
+            }
+            if use_sql_limit {
+                sql_params.push(SqlValue::Integer((max_results + 1) as i64));
+            }
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
             let rows = stmt
-                .query_map(
-                    params![mb, query.start_history_id.min(i64::MAX as u64) as i64, after_row_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, String>(8)?,
-                        ))
-                    },
-                )
+                .query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
                 .map_err(sql_err)?;
 
-            let mut matched: Vec<(i64, StoredHistoryEntry)> = Vec::new();
+            let mut matched: Vec<(u64, u64, StoredHistoryEntry)> = Vec::new();
             for row in rows {
                 let (
                     row_id,
@@ -3054,10 +3133,13 @@ impl MailStore for SqliteStore {
                 {
                     continue;
                 }
+                let norm_hid = hid.max(1) as u64;
+                let norm_id = row_id.max(1) as u64;
                 matched.push((
-                    row_id,
+                    norm_hid,
+                    norm_id,
                     StoredHistoryEntry {
-                        history_id: hid.max(1) as u64,
+                        history_id: norm_hid,
                         kind,
                         message_id,
                         thread_id,
@@ -3076,11 +3158,13 @@ impl MailStore for SqliteStore {
                 matched.truncate(max_results);
             }
             let next_page_token = if has_more {
-                matched.last().map(|(row_id, _)| row_id.to_string())
+                matched
+                    .last()
+                    .map(|(hid, row_id, _)| format_history_page_token(*hid, *row_id))
             } else {
                 None
             };
-            let entries = matched.into_iter().map(|(_, e)| e).collect();
+            let entries = matched.into_iter().map(|(_, _, e)| e).collect();
 
             Ok(HistoryListPage {
                 entries,
@@ -9197,5 +9281,175 @@ mod tests {
             Some("12345")
         );
         assert_eq!(store.list_sync_states().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_mailbox_ids_unions_meta_settings_and_inbox_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mailboxes.db");
+        let store = SqliteStore::open(&db_path, "primary@example.com").unwrap();
+
+        // Insert mailboxes that exist ONLY in settings or ONLY in inbox_rules (no meta row).
+        store
+            .run_blocking(|conn, _mb| {
+                conn.execute(
+                    "INSERT INTO settings (mailbox_id, key, value_json) VALUES (?1, 'user_settings', '{}')",
+                    params!["Settings-Only@Example.COM"],
+                )
+                .map_err(sql_err)?;
+                conn.execute(
+                    "INSERT INTO inbox_rules (mailbox_id, id, name, enabled, match_query, vip_only, actions_json, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'rule_1', 'r', 1, '', 0, '{}', 1, 1)",
+                    params!["rules-only@example.com"],
+                )
+                .map_err(sql_err)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let expected = vec![
+            "primary@example.com".to_string(),
+            "rules-only@example.com".to_string(),
+            "settings-only@example.com".to_string(),
+        ];
+        assert_eq!(store.list_mailbox_ids().await.unwrap(), expected);
+        assert_eq!(SqliteStore::list_mailbox_ids(&db_path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_history_uses_index_without_temp_btree_and_paginates() {
+        let store = SqliteStore::open_in_memory("me@example.com").unwrap();
+        let start_hid = store.current_history_id().await.unwrap();
+
+        let mut msg_ids = Vec::new();
+        for i in 0..5 {
+            let m = store
+                .insert_message(sample_message(
+                    &format!("Subject {i}"),
+                    "alice@example.com",
+                    "body",
+                    1_700_000_000_000 + i * 1000,
+                ))
+                .await
+                .unwrap();
+            msg_ids.push(m.id);
+        }
+        // Batch modify creates multiple history_events rows sharing the SAME history_id
+        store
+            .batch_modify_labels(&msg_ids, &[LABEL_STARRED.to_string()], &[])
+            .await
+            .unwrap();
+
+        // Verify EXPLAIN QUERY PLAN for both initial and keyset-cursor queries (with/without kind filter and LIMIT)
+        store
+            .run_blocking(|conn, _mb| {
+                let cases = [
+                    (false, 0usize, true),
+                    (true, 0usize, true),
+                    (true, 2usize, true),
+                    (false, 1usize, false),
+                    (true, 0usize, false),
+                ];
+                for (has_cursor, kind_count, sql_limit) in cases {
+                    let sql = build_sqlite_list_history_sql(has_cursor, kind_count, sql_limit);
+                    let explain = format!("EXPLAIN QUERY PLAN {sql}");
+                    let mut stmt = conn.prepare(&explain).map_err(sql_err)?;
+                    let mut plan_params: Vec<SqlValue> = Vec::new();
+                    plan_params.push(SqlValue::Text("me@example.com".to_string()));
+                    if has_cursor {
+                        plan_params.push(SqlValue::Integer(2));
+                        plan_params.push(SqlValue::Integer(2));
+                    } else {
+                        plan_params.push(SqlValue::Integer(1));
+                    }
+                    for i in 0..kind_count {
+                        plan_params.push(SqlValue::Text(if i == 0 {
+                            "messageAdded".to_string()
+                        } else {
+                            "labelAdded".to_string()
+                        }));
+                    }
+                    if sql_limit {
+                        plan_params.push(SqlValue::Integer(11));
+                    }
+                    let details: Vec<String> = stmt
+                        .query_map(rusqlite::params_from_iter(plan_params.iter()), |row| {
+                            row.get::<_, String>(3)
+                        })
+                        .map_err(sql_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(sql_err)?;
+                    let joined = details.join(" | ");
+                    assert!(
+                        joined.contains("idx_history_events_mailbox_hid"),
+                        "expected idx_history_events_mailbox_hid for case ({has_cursor}, {kind_count}, {sql_limit}), got: {joined}"
+                    );
+                    assert!(
+                        !joined.to_ascii_uppercase().contains("TEMP B-TREE"),
+                        "unexpected TEMP B-TREE sort for case ({has_cursor}, {kind_count}, {sql_limit}), got: {joined}"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Paginate across shared history_id boundaries using page size 2
+        let full = store
+            .list_history(&HistoryListQuery {
+                start_history_id: start_hid,
+                max_results: 500,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(full.entries.len(), 10);
+        assert!(full.next_page_token.is_none());
+
+        let mut paged = Vec::new();
+        let mut token = None;
+        let mut pages = 0;
+        loop {
+            let page = store
+                .list_history(&HistoryListQuery {
+                    start_history_id: start_hid,
+                    max_results: 2,
+                    page_token: token,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            pages += 1;
+            paged.extend(page.entries);
+            match page.next_page_token {
+                Some(tok) => {
+                    assert!(
+                        tok.contains(':'),
+                        "expected keyset cursor '<hid>:<id>', got {tok}"
+                    );
+                    token = Some(tok);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 5);
+        assert_eq!(paged.len(), full.entries.len());
+        for (a, b) in paged.iter().zip(full.entries.iter()) {
+            assert_eq!(a.history_id, b.history_id);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.message_id, b.message_id);
+        }
+
+        // Malformed page_token must return BadRequest
+        let bad = store
+            .list_history(&HistoryListQuery {
+                start_history_id: start_hid,
+                page_token: Some("not-a-cursor".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(bad, AppError::BadRequest(_)));
     }
 }

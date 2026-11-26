@@ -751,6 +751,10 @@ pub struct Config {
     /// (`NOGML_ENCRYPTION_PREVIOUS_KEYS` / `NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE`).
     #[serde(default)]
     pub encryption_previous_keys: Vec<String>,
+    /// When `true` and encryption at rest is enabled, reject unencrypted plaintext secrets on read
+    /// (`NOGML_ENCRYPTION_STRICT`, default `false` for migration compatibility).
+    #[serde(default)]
+    pub encryption_strict: bool,
 
     // --- Pluggable search & embeddings ---
     /// Search index backend (`store` [default] or `hybrid`).
@@ -894,6 +898,7 @@ impl Default for Config {
 
             encryption_key: None,
             encryption_previous_keys: Vec::new(),
+            encryption_strict: false,
 
             search_backend: SearchBackend::Store,
             embedding_base_url: None,
@@ -1320,6 +1325,7 @@ impl Config {
             llm_triage_max_body_chars,
             encryption_key,
             encryption_previous_keys,
+            encryption_strict,
             search_backend,
             embedding_base_url,
             embedding_api_key,
@@ -1514,6 +1520,7 @@ impl Config {
                     .is_some_and(|s| !s.trim().is_empty()),
                 "encryption_key": redact_opt(encryption_key),
                 "encryption_previous_keys": redacted_encryption_previous_keys,
+                "encryption_strict": encryption_strict,
             },
             "search": {
                 "backend": search_backend,
@@ -2035,6 +2042,7 @@ impl fmt::Debug for Config {
             llm_triage_max_body_chars,
             encryption_key,
             encryption_previous_keys,
+            encryption_strict,
             search_backend,
             embedding_base_url,
             embedding_api_key,
@@ -2196,6 +2204,7 @@ impl fmt::Debug for Config {
                 "encryption_previous_keys",
                 &redacted_encryption_previous_keys,
             )
+            .field("encryption_strict", encryption_strict)
             .field("search_backend", search_backend)
             .field("embedding_base_url", embedding_base_url)
             .field("embedding_api_key", &redacted_opt(embedding_api_key))
@@ -2722,6 +2731,7 @@ impl std::fmt::Debug for LlmTriageTomlConfig {
 pub struct SecurityTomlConfig {
     pub encryption_key: Option<String>,
     pub encryption_previous_keys: Option<Vec<String>>,
+    pub encryption_strict: Option<bool>,
 }
 
 impl std::fmt::Debug for SecurityTomlConfig {
@@ -2733,6 +2743,7 @@ impl std::fmt::Debug for SecurityTomlConfig {
         f.debug_struct("SecurityTomlConfig")
             .field("encryption_key", &redacted_opt_debug(&self.encryption_key))
             .field("encryption_previous_keys", &redacted_previous)
+            .field("encryption_strict", &self.encryption_strict)
             .finish()
     }
 }
@@ -3179,6 +3190,9 @@ impl TomlConfig {
         if let Some(ref v) = self.security.encryption_previous_keys {
             cfg.encryption_previous_keys = v.clone();
         }
+        if let Some(v) = self.security.encryption_strict {
+            cfg.encryption_strict = v;
+        }
 
         // [search]
         if let Some(v) = self.search.backend {
@@ -3215,11 +3229,49 @@ pub struct ConfigCheckReport {
     pub effective_config: Option<Value>,
 }
 
+/// Strip userinfo (`user:pass@`), query strings (`?...`), and fragments (`#...`)
+/// from a raw (potentially malformed) URL string before echoing it in validation errors.
+pub fn sanitize_url_for_diagnostics(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let (prefix, rest) = match trimmed.find("://") {
+        Some(idx) => (&trimmed[..idx + 3], &trimmed[idx + 3..]),
+        None => ("", trimmed),
+    };
+
+    // Isolate the authority segment before any path slash.
+    let (before_slash, path_and_query) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, ""),
+    };
+
+    // Strip userinfo (`user:pass@`) from authority even if a password contains `?` or `#`,
+    // while avoiding false positives on `@` inside query parameters like `host?email=a@b`.
+    let clean_before_slash = if let Some(at_pos) = before_slash.rfind('@') {
+        let query_pos = before_slash.find(['?', '#']);
+        let at_before_query = query_pos.is_none_or(|q| at_pos < q);
+        let colon_before_query = query_pos.is_some_and(|q| before_slash[..q].contains(':'));
+        if at_before_query || colon_before_query {
+            &before_slash[at_pos + 1..]
+        } else {
+            before_slash
+        }
+    } else {
+        before_slash
+    };
+
+    let reassembled = format!("{prefix}{clean_before_slash}{path_and_query}");
+    match reassembled.find(['?', '#']) {
+        Some(idx) => reassembled[..idx].to_string(),
+        None => reassembled,
+    }
+}
+
 fn validate_optional_url(label: &str, value: Option<&str>, errors: &mut Vec<String>) {
     if let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty())
         && let Err(err) = Url::parse(raw)
     {
-        errors.push(format!("Invalid URL for {label} ('{raw}'): {err}"));
+        let sanitized = sanitize_url_for_diagnostics(raw);
+        errors.push(format!("Invalid URL for {label} ('{sanitized}'): {err}"));
     }
 }
 
@@ -3444,8 +3496,9 @@ pub fn validate_config(
                 "oauth2.redirect_uris[{idx}] must be a non-empty single-line URI"
             ));
         } else if url::Url::parse(trimmed).is_err() {
+            let sanitized = sanitize_url_for_diagnostics(trimmed);
             errors.push(format!(
-                "oauth2.redirect_uris[{idx}] ('{trimmed}') must be a valid absolute URI"
+                "oauth2.redirect_uris[{idx}] ('{sanitized}') must be a valid absolute URI"
             ));
         }
     }
@@ -3683,6 +3736,7 @@ untrusted_content_guard = true
 # Generate a key with: nogml crypto generate-key --kid k1 --output-file /etc/nogml/secrets/encryption_key
 # encryption_key = "file:///etc/nogml/secrets/encryption_key"
 # encryption_previous_keys = ["file:///etc/nogml/secrets/encryption_key_old"]
+# encryption_strict = false
 
 [search]
 backend = "store"
@@ -4013,5 +4067,83 @@ webhook_secret = "env://WEBHOOK_ENV"
         let bad = "[safety]\ndraft_olny = true\n";
         let err = TomlConfig::from_toml_str(bad).unwrap_err();
         assert!(err.to_string().contains("draft_olny"));
+    }
+
+    #[test]
+    fn sanitize_url_for_diagnostics_and_validate_config_redact_secrets() {
+        assert_eq!(
+            sanitize_url_for_diagnostics(
+                "https://alice:topsecret@bad host/hooks?token=secret123#frag"
+            ),
+            "https://bad host/hooks"
+        );
+        assert_eq!(
+            sanitize_url_for_diagnostics("https://user:p?ss@bad host/hooks?token=secret123"),
+            "https://bad host/hooks"
+        );
+        assert_eq!(
+            sanitize_url_for_diagnostics("https://bad host?email=foo@bar&token=secret123"),
+            "https://bad host"
+        );
+        assert_eq!(
+            sanitize_url_for_diagnostics("user:secret@example.com/hook?api_key=xyz"),
+            "example.com/hook"
+        );
+
+        let mut cfg = Config::for_test();
+        cfg.approval_webhook_url =
+            Some("https://alice:approval_pass@bad host/approve?token=approval_tok#sec".to_string());
+        cfg.watch_webhook_url =
+            Some("http://bob:watch_pass@exa mple.com:99999/watch?key=watch_tok".to_string());
+        let report = validate_config(&cfg, None, SecretResolutionReport::default());
+        assert!(!report.ok);
+        let joined = report.errors.join("\n");
+        assert!(joined.contains("safety.approval_webhook_url"));
+        assert!(joined.contains("watch.webhook_url"));
+        assert!(joined.contains("https://bad host/approve"));
+        for secret in [
+            "alice",
+            "approval_pass",
+            "approval_tok",
+            "sec",
+            "bob",
+            "watch_pass",
+            "watch_tok",
+        ] {
+            assert!(
+                !joined.contains(secret),
+                "validate_config leaked '{secret}' in: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_strict_parses_from_toml_and_requires_encryption_key() {
+        let parsed = TomlConfig::from_toml_str("[security]\nencryption_strict = true\n").unwrap();
+        let mut cfg = Config::for_test();
+        parsed.apply_to(&mut cfg);
+        assert!(cfg.encryption_strict);
+
+        // Without encryption_key, validate_config must reject encryption_strict = true
+        let report = validate_config(&cfg, None, SecretResolutionReport::default());
+        assert!(!report.ok);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("encryption_strict")),
+            "expected encryption_strict error, got: {:?}",
+            report.errors
+        );
+
+        // With encryption_key set, validate_config succeeds and redacted output exposes boolean
+        let (_, k1) = crate::crypto::generate_formatted_key("k1").unwrap();
+        cfg.encryption_key = Some(k1);
+        let ok_report = validate_config(&cfg, None, SecretResolutionReport::default());
+        assert!(ok_report.ok, "unexpected errors: {:?}", ok_report.errors);
+        assert_eq!(
+            cfg.redacted_summary()["security"]["encryption_strict"],
+            true
+        );
     }
 }

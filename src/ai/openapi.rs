@@ -503,9 +503,9 @@ fn build_paths() -> Value {
                 "responses": build_responses(
                     vec![("200", json_ok("List of scheduled sends.", json!({
                         "type": "object",
-                        "required": ["scheduled", "count"],
+                        "required": ["scheduled_sends", "count"],
                         "properties": {
-                            "scheduled": { "type": "array", "items": ref_schema("ScheduledSend") },
+                            "scheduled_sends": { "type": "array", "items": ref_schema("ScheduledSend") },
                             "count": { "type": "integer", "minimum": 0 }
                         }
                     })))],
@@ -1615,7 +1615,30 @@ fn build_paths() -> Value {
         }),
     );
 
+    attach_mailbox_header_parameter(&mut paths);
     Value::Object(paths)
+}
+
+fn attach_mailbox_header_parameter(paths: &mut Map<String, Value>) {
+    let mailbox_ref = ref_param("MailboxHeader");
+    for path_item in paths.values_mut() {
+        let Some(item_obj) = path_item.as_object_mut() else {
+            continue;
+        };
+        for operation in item_obj.values_mut() {
+            let Some(op_obj) = operation.as_object_mut() else {
+                continue;
+            };
+            let params = op_obj
+                .entry("parameters".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Value::Array(arr) = params
+                && !arr.iter().any(|p| p == &mailbox_ref)
+            {
+                arr.push(mailbox_ref.clone());
+            }
+        }
+    }
 }
 
 fn merge_json_object(target: &mut Map<String, Value>, source: Value) {
@@ -1961,10 +1984,11 @@ fn build_schemas() -> Value {
             },
             "SnoozedThread": {
                 "type": "object",
-                "required": ["thread_id", "snoozed_until_ms", "created_at_ms"],
+                "required": ["thread_id", "mailbox_id", "snooze_until_ms", "created_at_ms"],
                 "properties": {
                     "thread_id": { "type": "string" },
-                    "snoozed_until_ms": { "type": "integer" },
+                    "mailbox_id": { "type": "string" },
+                    "snooze_until_ms": { "type": "integer" },
                     "created_at_ms": { "type": "integer" }
                 }
             },
@@ -2021,6 +2045,7 @@ fn build_schemas() -> Value {
             "AiSendEmailRequest": {
                 "type": "object",
                 "properties": {
+                    "from": { "type": ["string", "null"], "description": "Optional sender address or alias (defaults to the active mailbox address)." },
                     "to": { "type": "array", "items": { "type": "string" } },
                     "cc": { "type": "array", "items": { "type": "string" } },
                     "bcc": { "type": "array", "items": { "type": "string" } },
@@ -2036,6 +2061,7 @@ fn build_schemas() -> Value {
             "AiCreateDraftRequest": {
                 "type": "object",
                 "properties": {
+                    "from": { "type": ["string", "null"], "description": "Optional sender address or alias (defaults to the active mailbox address)." },
                     "to": { "type": "array", "items": { "type": "string" } },
                     "cc": { "type": "array", "items": { "type": "string" } },
                     "bcc": { "type": "array", "items": { "type": "string" } },
@@ -2189,32 +2215,41 @@ fn build_schemas() -> Value {
             },
             "ScheduledSend": {
                 "type": "object",
-                "required": ["id", "status", "send_at_ms", "created_at_ms"],
+                "required": ["id", "mailbox_id", "status", "send_at_ms", "outbound_message", "created_at_ms", "updated_at_ms"],
                 "properties": {
                     "id": { "type": "string" },
+                    "mailbox_id": { "type": "string" },
                     "status": { "type": "string", "enum": ["pending", "sending", "sent", "canceled", "failed"] },
                     "send_at_ms": { "type": "integer" },
+                    "outbound_message": { "type": "object" },
+                    "reply_to_message_id": { "type": ["string", "null"] },
                     "thread_id": { "type": ["string", "null"] },
-                    "created_at_ms": { "type": "integer" },
                     "sent_message_id": { "type": ["string", "null"] },
                     "provider_message_id": { "type": ["string", "null"] },
-                    "last_error": { "type": ["string", "null"] }
+                    "last_error": { "type": ["string", "null"] },
+                    "created_at_ms": { "type": "integer" },
+                    "updated_at_ms": { "type": "integer" }
                 }
             },
             "PendingApproval": {
                 "type": "object",
-                "required": ["id", "status", "reason", "created_at_ms", "expires_at_ms"],
+                "required": ["id", "status", "reason", "outbound_message", "created_at_ms", "expires_at_ms"],
                 "properties": {
                     "id": { "type": "string" },
                     "status": { "type": "string", "enum": ["pending", "approving", "approved", "rejected", "expired"] },
                     "reason": { "type": "string" },
+                    "requester": { "type": ["object", "null"] },
+                    "outbound_message": { "type": "object" },
+                    "reply_to_message_id": { "type": ["string", "null"] },
                     "thread_id": { "type": ["string", "null"] },
                     "draft_id": { "type": ["string", "null"] },
-                    "created_at_ms": { "type": "integer" },
-                    "expires_at_ms": { "type": "integer" },
+                    "sent_message_id": { "type": ["string", "null"] },
+                    "provider_message_id": { "type": ["string", "null"] },
                     "decided_by": { "type": ["string", "null"] },
                     "decision_note": { "type": ["string", "null"] },
-                    "sent_message_id": { "type": ["string", "null"] }
+                    "created_at_ms": { "type": "integer" },
+                    "expires_at_ms": { "type": "integer" },
+                    "decided_at_ms": { "type": ["integer", "null"] }
                 }
             },
             "ApprovalDecisionRequest": {
@@ -2241,16 +2276,29 @@ fn build_schemas() -> Value {
                     "webhook_secret": { "type": ["string", "null"] }
                 }
             },
+            "InboxRuleActionsView": {
+                "type": "object",
+                "required": ["add_labels", "remove_labels", "archive", "mark_read", "has_webhook_secret"],
+                "properties": {
+                    "add_labels": { "type": "array", "items": { "type": "string" } },
+                    "remove_labels": { "type": "array", "items": { "type": "string" } },
+                    "archive": { "type": "boolean" },
+                    "mark_read": { "type": "boolean" },
+                    "webhook_url": { "type": ["string", "null"] },
+                    "has_webhook_secret": { "type": "boolean" }
+                }
+            },
             "InboxRule": {
                 "type": "object",
-                "required": ["id", "name", "enabled", "vip_only", "actions"],
+                "required": ["id", "mailbox_id", "name", "enabled", "match_query", "vip_only", "actions", "created_at_ms", "updated_at_ms"],
                 "properties": {
                     "id": { "type": "string" },
+                    "mailbox_id": { "type": "string" },
                     "name": { "type": "string" },
                     "enabled": { "type": "boolean" },
-                    "match_query": { "type": ["string", "null"] },
+                    "match_query": { "type": "string" },
                     "vip_only": { "type": "boolean" },
-                    "actions": ref_schema("InboxRuleActions"),
+                    "actions": ref_schema("InboxRuleActionsView"),
                     "created_at_ms": { "type": "integer" },
                     "updated_at_ms": { "type": "integer" }
                 }
@@ -2278,9 +2326,10 @@ fn build_schemas() -> Value {
             },
             "AuditLogEntry": {
                 "type": "object",
-                "required": ["id", "timestamp_ms", "actor", "scopes", "channel", "action", "target_ids", "outcome"],
+                "required": ["id", "mailbox_id", "timestamp_ms", "actor", "scopes", "channel", "action", "target_ids", "outcome"],
                 "properties": {
-                    "id": { "type": "integer" },
+                    "id": { "type": "string" },
+                    "mailbox_id": { "type": "string" },
                     "timestamp_ms": { "type": "integer" },
                     "actor": { "type": "string" },
                     "scopes": { "type": "array", "items": { "type": "string" } },
@@ -2656,6 +2705,13 @@ pub fn openapi_spec() -> Value {
                     "required": false,
                     "description": "Optional field projection mask (for example id,subject,messages(id,from)).",
                     "schema": { "type": "string" }
+                },
+                "MailboxHeader": {
+                    "name": "X-Nogml-Mailbox",
+                    "in": "header",
+                    "required": false,
+                    "description": "Optional target mailbox email address for multi-mailbox or shared-mailbox requests.",
+                    "schema": { "type": "string" }
                 }
             },
             "responses": {
@@ -2782,5 +2838,88 @@ mod tests {
 
         let expected: HashSet<(&str, &str)> = V1_OPENAPI_OPERATIONS.iter().copied().collect();
         assert_eq!(documented, expected);
+    }
+
+    #[test]
+    fn openapi_documents_mailbox_header_and_aligned_dto_schemas() {
+        let spec = openapi_spec();
+        let params = &spec["components"]["parameters"];
+        assert_eq!(params["MailboxHeader"]["name"], "X-Nogml-Mailbox");
+        assert_eq!(params["MailboxHeader"]["in"], "header");
+
+        // Every operation must reference the X-Nogml-Mailbox header parameter.
+        let mailbox_ref = ref_param("MailboxHeader");
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                let op_params = op["parameters"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("missing parameters on {method} {path}"));
+                assert!(
+                    op_params.iter().any(|p| p == &mailbox_ref),
+                    "missing MailboxHeader param ref on {method} {path}"
+                );
+            }
+        }
+
+        // GET /v1/scheduled returns `scheduled_sends` (not `scheduled`).
+        let sched_schema = &spec["paths"]["/v1/scheduled"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert!(sched_schema["properties"].get("scheduled_sends").is_some());
+        assert!(sched_schema["properties"].get("scheduled").is_none());
+
+        let schemas = &spec["components"]["schemas"];
+        // AuditLogEntry: id is string, includes mailbox_id
+        assert_eq!(
+            schemas["AuditLogEntry"]["properties"]["id"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["AuditLogEntry"]["properties"]["mailbox_id"]["type"],
+            "string"
+        );
+        // SnoozedThread: snooze_until_ms + mailbox_id
+        assert!(
+            schemas["SnoozedThread"]["properties"]
+                .get("snooze_until_ms")
+                .is_some()
+        );
+        assert!(
+            schemas["SnoozedThread"]["properties"]
+                .get("snoozed_until_ms")
+                .is_none()
+        );
+        assert_eq!(
+            schemas["SnoozedThread"]["properties"]["mailbox_id"]["type"],
+            "string"
+        );
+        // InboxRule response matches InboxRuleView (has_webhook_secret, mailbox_id, never webhook_secret)
+        assert_eq!(
+            schemas["InboxRule"]["properties"]["mailbox_id"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["InboxRule"]["properties"]["actions"]["$ref"],
+            "#/components/schemas/InboxRuleActionsView"
+        );
+        assert_eq!(
+            schemas["InboxRuleActionsView"]["properties"]["has_webhook_secret"]["type"],
+            "boolean"
+        );
+        assert!(
+            schemas["InboxRuleActionsView"]["properties"]
+                .get("webhook_secret")
+                .is_none()
+        );
+        // AiSendEmailRequest & AiCreateDraftRequest include `from`
+        assert!(
+            schemas["AiSendEmailRequest"]["properties"]
+                .get("from")
+                .is_some()
+        );
+        assert!(
+            schemas["AiCreateDraftRequest"]["properties"]
+                .get("from")
+                .is_some()
+        );
     }
 }

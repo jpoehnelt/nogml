@@ -21,13 +21,14 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
     AppState,
-    config::{Config, StorageBackend, normalize_mailbox_id},
+    config::{Config, normalize_mailbox_id},
     error::{AppError, AppResult},
     secrets::split_token_list,
-    storage::{InboxRulePatch, SqliteStore},
+    storage::InboxRulePatch,
 };
 
 /// Envelope prefix identifying AES-256-GCM v1 encrypted secrets.
@@ -64,11 +65,11 @@ pub fn validate_key_id(kid: &str) -> AppResult<String> {
     Ok(trimmed.to_string())
 }
 
-fn decode_hex_key(raw: &str) -> Option<[u8; KEY_LEN]> {
+fn decode_hex_key(raw: &str) -> Option<Zeroizing<[u8; KEY_LEN]>> {
     if raw.len() != KEY_LEN * 2 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut out = [0u8; KEY_LEN];
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
     let bytes = raw.as_bytes();
     for i in 0..KEY_LEN {
         let hi = hex_nibble(bytes[i * 2])?;
@@ -87,7 +88,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn decode_key_material(raw: &str, label: &str) -> AppResult<[u8; KEY_LEN]> {
+fn decode_key_material(raw: &str, label: &str) -> AppResult<Zeroizing<[u8; KEY_LEN]>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AppError::Config(format!(
@@ -99,16 +100,18 @@ fn decode_key_material(raw: &str, label: &str) -> AppResult<[u8; KEY_LEN]> {
         return Ok(hex_bytes);
     }
 
-    let decoded = STANDARD
-        .decode(trimmed)
-        .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
-        .or_else(|_| URL_SAFE.decode(trimmed))
-        .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
-        .map_err(|_| {
-            AppError::Config(format!(
-                "Invalid encryption key for {label}: expected a 32-byte key encoded as base64 (44 chars) or hex (64 chars)"
-            ))
-        })?;
+    let decoded = Zeroizing::new(
+        STANDARD
+            .decode(trimmed)
+            .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
+            .or_else(|_| URL_SAFE.decode(trimmed))
+            .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
+            .map_err(|_| {
+                AppError::Config(format!(
+                    "Invalid encryption key for {label}: expected a 32-byte key encoded as base64 (44 chars) or hex (64 chars)"
+                ))
+            })?,
+    );
 
     if decoded.len() != KEY_LEN {
         return Err(AppError::Config(format!(
@@ -117,13 +120,13 @@ fn decode_key_material(raw: &str, label: &str) -> AppResult<[u8; KEY_LEN]> {
         )));
     }
 
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     key.copy_from_slice(&decoded);
     Ok(key)
 }
 
 /// Parse an encryption key specification (`<kid>:<key>` or bare `<key>` defaulting to `k1`).
-pub fn parse_key_spec(raw: &str, label: &str) -> AppResult<(String, [u8; KEY_LEN])> {
+pub fn parse_key_spec(raw: &str, label: &str) -> AppResult<(String, Zeroizing<[u8; KEY_LEN]>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AppError::Config(format!(
@@ -143,11 +146,11 @@ pub fn parse_key_spec(raw: &str, label: &str) -> AppResult<(String, [u8; KEY_LEN
 /// Generate a cryptographically random 32-byte key encoded as standard base64 (44 chars).
 pub fn generate_key_base64() -> AppResult<String> {
     let rng = SystemRandom::new();
-    let mut bytes = [0u8; KEY_LEN];
-    rng.fill(&mut bytes).map_err(|_| {
+    let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
+    rng.fill(bytes.as_mut_slice()).map_err(|_| {
         AppError::Internal("System CSPRNG failed to generate key bytes".to_string())
     })?;
-    Ok(STANDARD.encode(bytes))
+    Ok(STANDARD.encode(bytes.as_slice()))
 }
 
 /// Generate a `<kid>:<base64_key>` string using `ring::rand::SystemRandom`.
@@ -164,8 +167,8 @@ struct KeySlot {
 }
 
 impl KeySlot {
-    fn new(kid: String, key_bytes: [u8; KEY_LEN]) -> AppResult<Self> {
-        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes)
+    fn new(kid: String, key_bytes: Zeroizing<[u8; KEY_LEN]>) -> AppResult<Self> {
+        let unbound = UnboundKey::new(&AES_256_GCM, &*key_bytes)
             .map_err(|_| AppError::Config("Failed to initialize AES-256-GCM key".to_string()))?;
         Ok(Self {
             kid,
@@ -174,11 +177,12 @@ impl KeySlot {
     }
 }
 
-/// AES-256-GCM secret cipher supporting transparent legacy plaintext reads and
+/// AES-256-GCM secret cipher supporting optional strict ciphertext-only reads and
 /// zero-downtime multi-key rotation.
 pub struct SecretCipher {
     primary: Option<KeySlot>,
     previous: Vec<KeySlot>,
+    strict: bool,
     rng: SystemRandom,
 }
 
@@ -188,6 +192,7 @@ impl fmt::Debug for SecretCipher {
         let previous_kids: Vec<&str> = self.previous.iter().map(|k| k.kid.as_str()).collect();
         f.debug_struct("SecretCipher")
             .field("enabled", &self.primary.is_some())
+            .field("strict", &self.strict)
             .field("primary_kid", &primary_kid)
             .field("previous_kids", &previous_kids)
             .finish()
@@ -201,25 +206,39 @@ impl Default for SecretCipher {
 }
 
 impl SecretCipher {
-    /// Create a disabled cipher where `encrypt` and `decrypt` act as transparent passthroughs.
+    /// Create a disabled cipher where `encrypt` and `decrypt` act as passthroughs for
+    /// non-`enc:v1:` values while guarding against the reserved `enc:v1:` prefix.
     pub fn disabled() -> Self {
         Self {
             primary: None,
             previous: Vec::new(),
+            strict: false,
             rng: SystemRandom::new(),
         }
     }
 
     /// Construct a [`SecretCipher`] from application [`Config`].
     pub fn from_config(config: &Config) -> AppResult<Self> {
-        Self::from_raw_keys(
+        Self::from_raw_keys_with_strict(
             config.encryption_key.as_deref(),
             &config.encryption_previous_keys,
+            config.encryption_strict,
         )
     }
 
-    /// Construct a [`SecretCipher`] from raw primary and previous key specifications.
+    /// Construct a [`SecretCipher`] from raw primary and previous key specifications
+    /// with `strict = false` for legacy plaintext migration compatibility.
     pub fn from_raw_keys(primary: Option<&str>, previous: &[String]) -> AppResult<Self> {
+        Self::from_raw_keys_with_strict(primary, previous, false)
+    }
+
+    /// Construct a [`SecretCipher`] from raw primary and previous key specifications
+    /// with explicit strictness enforcement.
+    pub fn from_raw_keys_with_strict(
+        primary: Option<&str>,
+        previous: &[String],
+        strict: bool,
+    ) -> AppResult<Self> {
         let primary_trimmed = primary.map(str::trim).filter(|s| !s.is_empty());
         let previous_entries: Vec<String> = previous
             .iter()
@@ -230,6 +249,12 @@ impl SecretCipher {
             if !previous_entries.is_empty() {
                 return Err(AppError::Config(
                     "security.encryption_previous_keys requires security.encryption_key (NOGML_ENCRYPTION_KEY) to be configured"
+                        .to_string(),
+                ));
+            }
+            if strict {
+                return Err(AppError::Config(
+                    "security.encryption_strict requires security.encryption_key (NOGML_ENCRYPTION_KEY) to be configured"
                         .to_string(),
                 ));
             }
@@ -256,6 +281,7 @@ impl SecretCipher {
         Ok(Self {
             primary: Some(primary_slot),
             previous: prev_slots,
+            strict,
             rng: SystemRandom::new(),
         })
     }
@@ -263,6 +289,11 @@ impl SecretCipher {
     /// Returns `true` when encryption at rest is enabled with a primary key.
     pub fn is_enabled(&self) -> bool {
         self.primary.is_some()
+    }
+
+    /// Returns `true` when strict ciphertext-only decryption enforcement is active.
+    pub fn is_strict(&self) -> bool {
+        self.primary.is_some() && self.strict
     }
 
     /// Return the active primary key ID (`kid`) when encryption is enabled.
@@ -284,9 +315,15 @@ impl SecretCipher {
 
     /// Encrypt `plaintext` under the current primary key.
     ///
-    /// Returns `plaintext` unchanged when encryption at rest is disabled.
+    /// When encryption at rest is disabled, returns `plaintext` unchanged unless it begins
+    /// with the reserved `enc:v1:` envelope prefix (which would fail on subsequent reads).
     pub fn encrypt(&self, plaintext: &str) -> AppResult<String> {
         let Some(slot) = self.primary.as_ref() else {
+            if plaintext.starts_with(ENVELOPE_PREFIX) {
+                return Err(AppError::BadRequest(format!(
+                    "Secret value must not start with reserved prefix '{ENVELOPE_PREFIX}' when encryption at rest is disabled"
+                )));
+            }
             return Ok(plaintext.to_string());
         };
 
@@ -297,13 +334,13 @@ impl SecretCipher {
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let aad_str = format!("v1:{}", slot.kid);
 
-        let mut in_out = plaintext.as_bytes().to_vec();
+        let mut in_out = Zeroizing::new(plaintext.as_bytes().to_vec());
         slot.key
-            .seal_in_place_append_tag(nonce, Aad::from(aad_str.as_bytes()), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(aad_str.as_bytes()), &mut *in_out)
             .map_err(|_| AppError::Internal("AES-256-GCM encryption failed".to_string()))?;
 
         let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce_bytes);
-        let ct_b64 = URL_SAFE_NO_PAD.encode(&in_out);
+        let ct_b64 = URL_SAFE_NO_PAD.encode(&*in_out);
         Ok(format!(
             "{ENVELOPE_PREFIX}{}:{nonce_b64}:{ct_b64}",
             slot.kid
@@ -313,10 +350,17 @@ impl SecretCipher {
     /// Decrypt an `enc:v1:...` envelope using the matching `kid` from the primary or
     /// previous keys.
     ///
-    /// Values that do NOT start with `enc:v1:` are returned unchanged for transparent
-    /// backward compatibility with legacy plaintext rows.
+    /// When `strict` is `false`, values that do NOT start with `enc:v1:` are returned
+    /// unchanged for transparent backward compatibility with legacy plaintext rows.
+    /// When encryption is enabled and `strict` is `true`, non-`enc:v1:` values are rejected.
     pub fn decrypt(&self, value: &str) -> AppResult<String> {
         let Some(rest) = value.strip_prefix(ENVELOPE_PREFIX) else {
+            if self.primary.is_some() && self.strict {
+                return Err(AppError::Config(
+                    "Unencrypted plaintext secret rejected because security.encryption_strict (NOGML_ENCRYPTION_STRICT) is enabled; run `nogml crypto rotate-key` before enabling strict mode"
+                        .to_string(),
+                ));
+            }
             return Ok(value.to_string());
         };
 
@@ -362,13 +406,15 @@ impl SecretCipher {
         nonce_bytes.copy_from_slice(&nonce_vec);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut ct = URL_SAFE_NO_PAD
-            .decode(ct_b64.trim_end_matches('='))
-            .map_err(|_| {
-                AppError::Config(format!(
-                    "Malformed ciphertext encoding in secret encrypted with key ID '{kid}'"
-                ))
-            })?;
+        let mut ct = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(ct_b64.trim_end_matches('='))
+                .map_err(|_| {
+                    AppError::Config(format!(
+                        "Malformed ciphertext encoding in secret encrypted with key ID '{kid}'"
+                    ))
+                })?,
+        );
         if ct.len() < AES_256_GCM.tag_len() {
             return Err(AppError::Config(format!(
                 "Truncated ciphertext in secret encrypted with key ID '{kid}'"
@@ -385,11 +431,18 @@ impl SecretCipher {
                 ))
             })?;
 
-        String::from_utf8(plain_bytes.to_vec()).map_err(|_| {
+        let plain_str = std::str::from_utf8(plain_bytes).map_err(|_| {
             AppError::Config(format!(
                 "Decrypted secret for key ID '{kid}' is not valid UTF-8"
             ))
-        })
+        })?;
+        Ok(plain_str.to_owned())
+    }
+
+    /// Decrypt `value` and wrap the returned plaintext string in [`Zeroizing`] so it is
+    /// wiped from memory when dropped.
+    pub fn decrypt_zeroizing(&self, value: &str) -> AppResult<Zeroizing<String>> {
+        self.decrypt(value).map(Zeroizing::new)
     }
 
     /// Returns `true` when encryption is enabled and `value` is either plaintext
@@ -439,15 +492,10 @@ pub async fn rotate_secrets(state: &AppState) -> AppResult<KeyRotationReport> {
         .to_string();
 
     let mut mailboxes = state.config.known_mailboxes();
-    if state.config.storage == StorageBackend::Sqlite
-        && state.config.db_path.exists()
-        && let Ok(db_mailboxes) = SqliteStore::list_mailbox_ids(&state.config.db_path)
-    {
-        for raw_mb in db_mailboxes {
-            let norm = normalize_mailbox_id(&raw_mb);
-            if !norm.is_empty() && !mailboxes.contains(&norm) {
-                mailboxes.push(norm);
-            }
+    for raw_mb in state.store.list_mailbox_ids().await? {
+        let norm = normalize_mailbox_id(&raw_mb);
+        if !norm.is_empty() && !mailboxes.contains(&norm) {
+            mailboxes.push(norm);
         }
     }
 
@@ -468,7 +516,7 @@ pub async fn rotate_secrets(state: &AppState) -> AppResult<KeyRotationReport> {
                 && !raw_pw.is_empty()
                 && mb_state.cipher.needs_reencrypt(raw_pw)
             {
-                let plain = mb_state.cipher.decrypt(raw_pw)?;
+                let plain = mb_state.cipher.decrypt_zeroizing(raw_pw)?;
                 msa.password = Some(mb_state.cipher.encrypt(&plain)?);
                 settings_dirty = true;
                 send_as_rotated += 1;
@@ -484,7 +532,7 @@ pub async fn rotate_secrets(state: &AppState) -> AppResult<KeyRotationReport> {
                 && !raw_secret.is_empty()
                 && mb_state.cipher.needs_reencrypt(raw_secret)
             {
-                let plain = mb_state.cipher.decrypt(raw_secret)?;
+                let plain = mb_state.cipher.decrypt_zeroizing(raw_secret)?;
                 let encrypted = mb_state.cipher.encrypt(&plain)?;
                 let mut next_actions = rule.actions.clone();
                 next_actions.webhook_secret = Some(encrypted);
@@ -668,5 +716,153 @@ mod tests {
         let (_, k1b) = generate_formatted_key("k1").unwrap();
         assert!(SecretCipher::from_raw_keys(Some(&k1a), &[k1b]).is_err());
         assert!(SecretCipher::from_raw_keys(None, &[k1a]).is_err());
+        assert!(SecretCipher::from_raw_keys_with_strict(None, &[], true).is_err());
+    }
+
+    #[test]
+    fn strict_mode_rejects_plaintext_and_accepts_ciphertext() {
+        let (_, k1) = generate_formatted_key("k1").unwrap();
+        let strict_cipher = SecretCipher::from_raw_keys_with_strict(Some(&k1), &[], true).unwrap();
+        assert!(strict_cipher.is_enabled());
+        assert!(strict_cipher.is_strict());
+
+        let err = strict_cipher.decrypt("legacy-plaintext").unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+        assert!(err.to_string().contains("encryption_strict"));
+
+        let enc = strict_cipher.encrypt("strict-secret").unwrap();
+        assert_eq!(strict_cipher.decrypt(&enc).unwrap(), "strict-secret");
+        assert_eq!(
+            &*strict_cipher.decrypt_zeroizing(&enc).unwrap(),
+            "strict-secret"
+        );
+    }
+
+    #[test]
+    fn disabled_mode_rejects_reserved_envelope_prefix_consistently() {
+        let disabled = SecretCipher::disabled();
+        assert!(!disabled.is_enabled());
+        assert!(!disabled.is_strict());
+
+        let err_enc = disabled.encrypt("enc:v1:k1:abc:def").unwrap_err();
+        assert!(matches!(err_enc, AppError::BadRequest(_)));
+        assert!(err_enc.to_string().contains("enc:v1:"));
+
+        let err_dec = disabled.decrypt("enc:v1:k1:abc:def").unwrap_err();
+        assert!(matches!(err_dec, AppError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn rotate_secrets_discovers_unconfigured_mailboxes_via_store() {
+        use std::sync::Arc;
+
+        use crate::{
+            models::{SendAs, SmtpMsa},
+            storage::{InboxRuleActions, MailStore, MemoryStore, NewInboxRule},
+        };
+
+        let (_, k1) = generate_formatted_key("k1").unwrap();
+        let (_, k2) = generate_formatted_key("k2").unwrap();
+        let c1 = SecretCipher::from_raw_keys(Some(&k1), &[]).unwrap();
+
+        let store = Arc::new(MemoryStore::new("primary@example.com"));
+        // Seed an unconfigured mailbox not listed in Config::mailboxes
+        let dynamic_store = store.for_mailbox("dynamic@example.com");
+        let mut settings = dynamic_store.get_settings().await.unwrap();
+        settings.send_as.push(SendAs {
+            send_as_email: "dynamic@example.com".to_string(),
+            display_name: None,
+            reply_to_address: None,
+            signature: None,
+            is_primary: Some(true),
+            is_default: Some(true),
+            treat_as_alias: Some(false),
+            verification_status: Some("accepted".to_string()),
+            smtp_msa: Some(SmtpMsa {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                security_mode: Some("starttls".to_string()),
+                username: Some("dyn".to_string()),
+                password: Some(c1.encrypt("dyn-smtp-pass").unwrap()),
+            }),
+        });
+        dynamic_store.save_settings(settings).await.unwrap();
+        dynamic_store
+            .create_inbox_rule(&NewInboxRule {
+                name: "dyn-webhook".to_string(),
+                enabled: true,
+                match_query: "from:alerts@example.com".to_string(),
+                vip_only: false,
+                actions: InboxRuleActions {
+                    webhook_url: Some("https://hooks.example.com/dyn".to_string()),
+                    webhook_secret: Some("legacy-plain-webhook-secret".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        let mut cfg = Config::for_test();
+        cfg.user_email = "primary@example.com".to_string();
+        cfg.mailboxes.clear();
+        cfg.encryption_key = Some(k2.clone());
+        cfg.encryption_previous_keys = vec![k1];
+
+        let resend = Arc::new(crate::resend::HttpResendClient::from_config(&cfg));
+        let state = AppState::with_backends(cfg, store.clone(), resend);
+        let report = rotate_secrets(&state).await.unwrap();
+        assert!(report.ok);
+        assert_eq!(report.primary_kid, "k2");
+        assert_eq!(report.mailboxes_scanned, 2);
+        assert_eq!(report.send_as_rotated, 1);
+        assert_eq!(report.rules_rotated, 1);
+
+        // Verify stored secrets in the dynamically discovered mailbox are now under k2
+        let c2_strict = SecretCipher::from_raw_keys_with_strict(Some(&k2), &[], true).unwrap();
+        let rotated_settings = dynamic_store.get_settings().await.unwrap();
+        let stored_pw = rotated_settings
+            .send_as
+            .iter()
+            .find_map(|s| s.smtp_msa.as_ref()?.password.as_deref())
+            .unwrap();
+        assert!(stored_pw.starts_with("enc:v1:k2:"));
+        assert_eq!(c2_strict.decrypt(stored_pw).unwrap(), "dyn-smtp-pass");
+
+        let rotated_rules = dynamic_store.list_inbox_rules().await.unwrap();
+        let stored_wh = rotated_rules[0].actions.webhook_secret.as_deref().unwrap();
+        assert!(stored_wh.starts_with("enc:v1:k2:"));
+        assert_eq!(
+            c2_strict.decrypt(stored_wh).unwrap(),
+            "legacy-plain-webhook-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_secrets_propagates_list_mailbox_ids_errors() {
+        use std::sync::Arc;
+
+        use crate::storage::SqliteStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("broken_rotate.db");
+        let store = Arc::new(SqliteStore::open(&db_path, "primary@example.com").unwrap());
+
+        // Break the inbox_rules table so list_mailbox_ids fails at the SQL layer
+        let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+        raw_conn.execute("DROP TABLE inbox_rules", []).unwrap();
+        drop(raw_conn);
+
+        let (_, k1) = generate_formatted_key("k1").unwrap();
+        let mut cfg = Config::for_test();
+        cfg.user_email = "primary@example.com".to_string();
+        cfg.encryption_key = Some(k1);
+
+        let resend = Arc::new(crate::resend::HttpResendClient::from_config(&cfg));
+        let state = AppState::with_backends(cfg, store, resend);
+        let err = rotate_secrets(&state).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "expected storage error, got {err:?}"
+        );
     }
 }
