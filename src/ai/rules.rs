@@ -1085,6 +1085,17 @@ pub async fn execute_test_rule(
 
         let matched = if rule.match_query.trim().is_empty() {
             rule.vip_only
+        } else if crate::search::query_uses_filename(&parsed_query) && msg.raw_rfc2822.is_empty() {
+            let mut hydrated = msg.clone();
+            if let Ok(Some(full)) = state.store.get_message(&msg.id).await {
+                hydrated.raw_rfc2822 = full.raw_rfc2822;
+            }
+            if hydrated.raw_rfc2822.is_empty()
+                && let Ok(raw) = state.load_raw_rfc2822(&hydrated).await
+            {
+                hydrated.raw_rfc2822 = raw;
+            }
+            matches_message(&parsed_query, &hydrated)
         } else {
             matches_message(&parsed_query, msg)
         };

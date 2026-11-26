@@ -154,6 +154,7 @@ impl MailStore for TestMailStore {
         let history_id = self.seq.fetch_add(1, Ordering::Relaxed);
         let has_attachments = !input.attachments.is_empty();
 
+        let unsubscribe = crate::mime::parse_unsubscribe_from_raw(&input.raw_rfc2822);
         let msg = StoredMessage {
             id: id.clone(),
             thread_id,
@@ -182,6 +183,7 @@ impl MailStore for TestMailStore {
             all_mail_uid: history_id as u32,
             is_answered: input.is_answered,
             is_deleted: input.is_deleted,
+            unsubscribe,
         };
 
         let mut data = self.data.write().unwrap();
@@ -308,6 +310,7 @@ impl MailStore for TestMailStore {
             .filter(|a| a.message_id == message_id)
             .map(|a| AttachmentMeta {
                 id: a.id.clone(),
+                part_id: (!a.part_id.is_empty()).then(|| a.part_id.clone()),
                 filename: a.filename.clone(),
                 content_type: a.content_type.clone(),
                 size_bytes: a.size_bytes,
@@ -1405,6 +1408,7 @@ fn untrusted_content_guard_sanitizes_and_tags_meta() {
         all_mail_uid: 1,
         is_answered: false,
         is_deleted: false,
+        unsubscribe: None,
     };
 
     let compact = to_compact_message(&msg, &cfg_guard, true, 5, true, true);
@@ -1953,4 +1957,31 @@ async fn sse_events_replays_last_event_id_filters_and_streams_live() {
     assert!(collected.contains(&format!("id: {}", e3.id)));
     assert!(collected.contains("\"m3\""));
     assert!(collected.contains("\"m4\""));
+}
+
+#[tokio::test]
+async fn modify_messages_rejects_more_than_500_targets_with_400() {
+    let (state, _store, _resend) = make_test_state(Config::for_test());
+    let app = ai::router().with_state(state);
+
+    let too_many_ids: Vec<String> = (0..=ai::MAX_MODIFY_BATCH_IDS)
+        .map(|i| format!("msg_{i}"))
+        .collect();
+    let payload = json!({
+        "message_ids": too_many_ids,
+        "mark_read": true
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/modify")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

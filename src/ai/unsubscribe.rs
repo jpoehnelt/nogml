@@ -254,21 +254,26 @@ pub async fn execute_unsubscribe_with_source(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Message '{message_id}' not found")))?;
 
-    let raw_bytes = if msg.raw_rfc2822.is_empty() {
-        state.load_raw_rfc2822(&msg).await?
+    let info = if let Some(cached) = msg.unsubscribe.clone() {
+        cached
     } else {
-        msg.raw_rfc2822.clone()
+        let raw_bytes = if msg.raw_rfc2822.is_empty() {
+            state.load_raw_rfc2822(&msg).await?
+        } else {
+            msg.raw_rfc2822.clone()
+        };
+        parse_unsubscribe_from_raw(&raw_bytes).ok_or_else(|| {
+            AppError::validation(
+                format!(
+                    "Message '{message_id}' does not contain supported List-Unsubscribe headers"
+                ),
+                Some(
+                    "Only messages with RFC 2369/8058 List-Unsubscribe headers can be unsubscribed automatically."
+                        .to_string(),
+                ),
+            )
+        })?
     };
-
-    let info = parse_unsubscribe_from_raw(&raw_bytes).ok_or_else(|| {
-        AppError::validation(
-            format!("Message '{message_id}' does not contain supported List-Unsubscribe headers"),
-            Some(
-                "Only messages with RFC 2369/8058 List-Unsubscribe headers can be unsubscribed automatically."
-                    .to_string(),
-            ),
-        )
-    })?;
 
     let (method, mut warnings) = select_method(&info, prefer_mailto)?;
     let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());

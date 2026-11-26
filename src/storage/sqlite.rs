@@ -24,8 +24,8 @@ use crate::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LABEL_DRAFT, LABEL_INBOX,
         LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, PopSettings,
         Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
-        VacationSettings, WaitingOn, apply_thread_annotation_patch, default_extracted_object,
-        is_system_label, truncate_to_millis,
+        UnsubscribeInfo, VacationSettings, WaitingOn, apply_thread_annotation_patch,
+        default_extracted_object, is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -33,14 +33,15 @@ use crate::{
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
         IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
         ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRuleActions, InboxRulePatch,
-        MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule,
-        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval,
-        ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft,
-        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        MAX_SQL_LIMIT, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, WatchSubscription, apply_inbox_rule_patch,
-        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
-        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
+        clamp_sql_limit, compute_contact_is_vip, normalize_contact_email,
+        normalize_inbox_rule_actions, normalize_optional_text, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
 };
 
@@ -74,7 +75,7 @@ CREATE TABLE IF NOT EXISTS labels (
     upstream_label_id TEXT,
     PRIMARY KEY (mailbox_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_labels_mailbox_name_nocase ON labels (mailbox_id, name COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_mailbox_name_nocase ON labels (mailbox_id, name COLLATE NOCASE);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_mailbox_upstream
     ON labels (mailbox_id, upstream_label_id) WHERE upstream_label_id IS NOT NULL;
 
@@ -125,6 +126,7 @@ CREATE TABLE IF NOT EXISTS messages (
     all_mail_uid INTEGER NOT NULL,
     is_answered INTEGER NOT NULL DEFAULT 0,
     is_deleted INTEGER NOT NULL DEFAULT 0,
+    unsubscribe_json TEXT,
     PRIMARY KEY (mailbox_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_thread_id
@@ -331,10 +333,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_ts_seq
     ON audit_log (mailbox_id, timestamp_ms DESC, seq DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_action_ts
-    ON audit_log (mailbox_id, action, timestamp_ms DESC, seq DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_actor_ts
-    ON audit_log (mailbox_id, actor, timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_lower_action_ts
+    ON audit_log (mailbox_id, LOWER(action), timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_lower_actor_ts
+    ON audit_log (mailbox_id, LOWER(actor), timestamp_ms DESC, seq DESC);
 
 CREATE TABLE IF NOT EXISTS snoozed_threads (
     mailbox_id TEXT NOT NULL,
@@ -486,7 +488,31 @@ impl SqliteStore {
             migrate_v1_to_multi_mailbox(&mut conn, &self.mailbox_id)?;
         }
 
+        // Upgrade legacy non-unique case-insensitive label index if present.
+        let label_idx_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_labels_mailbox_name_nocase'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some(sql) = label_idx_sql
+            && !sql.to_ascii_uppercase().contains("UNIQUE")
+        {
+            conn.execute("DROP INDEX IF EXISTS idx_labels_mailbox_name_nocase", [])
+                .map_err(sql_err)?;
+        }
+
+        // Drop superseded non-functional audit indexes in favor of LOWER(action)/LOWER(actor).
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_audit_log_mailbox_action_ts;
+             DROP INDEX IF EXISTS idx_audit_log_mailbox_actor_ts;",
+        )
+        .map_err(sql_err)?;
+
         conn.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
+        ensure_column_exists(&conn, "messages", "unsubscribe_json", "TEXT")?;
         ensure_mailbox_seeded(&mut conn, &self.mailbox_id)?;
         if let Ok(mut seeded) = self.seeded_mailboxes.lock() {
             seeded.insert(self.mailbox_id.clone());
@@ -501,10 +527,21 @@ impl SqliteStore {
     {
         let pool = self.pool.clone();
         let mailbox_id = self.mailbox_id.clone();
+        let seeded_mailboxes = self.seeded_mailboxes.clone();
+        let needs_seed = !seeded_mailboxes
+            .lock()
+            .map(|s| s.contains(&mailbox_id))
+            .unwrap_or(false);
         tokio::task::spawn_blocking(move || {
             let mut conn = pool
                 .get()
                 .map_err(|e| AppError::Storage(format!("SQLite pool error: {e}")))?;
+            if needs_seed {
+                ensure_mailbox_seeded(&mut conn, &mailbox_id)?;
+                if let Ok(mut seeded) = seeded_mailboxes.lock() {
+                    seeded.insert(mailbox_id.clone());
+                }
+            }
             f(&mut conn, &mailbox_id)
         })
         .await
@@ -899,6 +936,22 @@ fn sql_err(err: rusqlite::Error) -> AppError {
     AppError::Storage(err.to_string())
 }
 
+fn escape_like_pattern(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('%');
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('%');
+    out
+}
+
 fn new_hex_id() -> String {
     Uuid::new_v4().simple().to_string()[..16].to_string()
 }
@@ -998,12 +1051,12 @@ fn str_to_history_kind(s: &str) -> AppResult<HistoryEventKind> {
 }
 
 fn ensure_column_exists(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     table: &str,
     column: &str,
     definition: &str,
 ) -> AppResult<()> {
-    let mut stmt = tx
+    let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(sql_err)?;
     let exists = stmt
@@ -1013,7 +1066,7 @@ fn ensure_column_exists(
         .any(|name| name == column);
     drop(stmt);
     if !exists {
-        tx.execute(
+        conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
             [],
         )
@@ -1227,19 +1280,61 @@ fn load_labels_for_messages(
     Ok(map)
 }
 
-fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+/// Lightweight column projection for message/thread/draft list queries that omits large
+/// `raw_rfc2822` and `html_body` BLOB/TEXT payloads.
+const MESSAGE_SUMMARY_COLUMNS: &str = "\
+    m.id, m.thread_id, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+/// Column projection for `search_messages_ai` (omits `raw_rfc2822` BLOB while retaining
+/// `html_body` for `GET /v1/messages?include_html=true` and `unsubscribe_json`).
+const MESSAGE_SEARCH_COLUMNS: &str = "\
+    m.id, m.thread_id, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.html_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+/// Column projection for `filename:` search fallback (includes `raw_rfc2822`, omits `html_body`).
+const MESSAGE_FILENAME_SEARCH_COLUMNS: &str = "\
+    m.id, m.thread_id, m.raw_rfc2822, m.snippet, m.history_id, m.internal_date_ms, m.size_estimate, \
+    m.subject, m.from_addr, m.to_addrs_json, m.cc_addrs_json, m.bcc_addrs_json, \
+    m.text_body, m.has_attachments, m.rfc822_message_id, m.in_reply_to, \
+    m.references_header, m.resend_id, m.delivery_status, m.upstream_gmail_id, \
+    m.upstream_thread_id, m.source, m.all_mail_uid, m.is_answered, m.is_deleted, \
+    m.unsubscribe_json";
+
+fn decode_unsubscribe_json(raw: Option<String>) -> Option<UnsubscribeInfo> {
+    raw.and_then(|s| serde_json::from_str::<UnsubscribeInfo>(&s).ok())
+}
+
+fn message_from_row_opts(
+    row: &rusqlite::Row<'_>,
+    include_raw: bool,
+    include_html: bool,
+) -> rusqlite::Result<StoredMessage> {
     let to_json: String = row.get("to_addrs_json")?;
     let cc_json: String = row.get("cc_addrs_json")?;
     let bcc_json: String = row.get("bcc_addrs_json")?;
     let to_addrs: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
     let cc_addrs: Vec<String> = serde_json::from_str(&cc_json).unwrap_or_default();
     let bcc_addrs: Vec<String> = serde_json::from_str(&bcc_json).unwrap_or_default();
+    let unsubscribe_json: Option<String> = row.get("unsubscribe_json")?;
 
     Ok(StoredMessage {
         id: row.get("id")?,
         thread_id: row.get("thread_id")?,
         label_ids: Vec::new(),
-        raw_rfc2822: row.get("raw_rfc2822")?,
+        raw_rfc2822: if include_raw {
+            row.get("raw_rfc2822")?
+        } else {
+            Vec::new()
+        },
         snippet: row.get("snippet")?,
         history_id: row.get::<_, i64>("history_id")?.max(0) as u64,
         internal_date_ms: row.get("internal_date_ms")?,
@@ -1250,7 +1345,11 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> 
         cc_addrs,
         bcc_addrs,
         text_body: row.get("text_body")?,
-        html_body: row.get("html_body")?,
+        html_body: if include_html {
+            row.get("html_body")?
+        } else {
+            None
+        },
         has_attachments: row.get::<_, i64>("has_attachments")? != 0,
         rfc822_message_id: row.get("rfc822_message_id")?,
         in_reply_to: row.get("in_reply_to")?,
@@ -1263,7 +1362,24 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> 
         all_mail_uid: row.get::<_, i64>("all_mail_uid")?.max(0) as u32,
         is_answered: row.get::<_, i64>("is_answered")? != 0,
         is_deleted: row.get::<_, i64>("is_deleted")? != 0,
+        unsubscribe: decode_unsubscribe_json(unsubscribe_json),
     })
+}
+
+fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    message_from_row_opts(row, true, true)
+}
+
+fn message_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    message_from_row_opts(row, false, false)
+}
+
+fn message_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    message_from_row_opts(row, false, true)
+}
+
+fn message_filename_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    message_from_row_opts(row, true, false)
 }
 
 fn load_message_by_id(
@@ -1388,6 +1504,12 @@ fn insert_message_tx(
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
     let bcc_json = serde_json::to_string(&input.bcc_addrs)
         .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
+    let unsubscribe = crate::mime::parse_unsubscribe_from_raw(&input.raw_rfc2822);
+    let unsubscribe_json = unsubscribe
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
 
     tx.execute(
         "INSERT INTO messages (
@@ -1396,14 +1518,14 @@ fn insert_message_tx(
             text_body, html_body, has_attachments,
             rfc822_message_id, rfc822_message_id_norm, in_reply_to, references_header,
             resend_id, delivery_status, upstream_gmail_id, upstream_thread_id,
-            source, all_mail_uid, is_answered, is_deleted
+            source, all_mail_uid, is_answered, is_deleted, unsubscribe_json
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
             ?9, ?10, ?11, ?12, ?13,
             ?14, ?15, ?16,
             ?17, ?18, ?19, ?20,
             ?21, NULL, ?22, ?23,
-            ?24, ?25, ?26, ?27
+            ?24, ?25, ?26, ?27, ?28
         )",
         params![
             mailbox_id,
@@ -1433,6 +1555,7 @@ fn insert_message_tx(
             all_mail_uid as i64,
             if input.is_answered { 1_i64 } else { 0_i64 },
             if input.is_deleted { 1_i64 } else { 0_i64 },
+            &unsubscribe_json,
         ],
     )
     .map_err(sql_err)?;
@@ -1525,6 +1648,7 @@ fn insert_message_tx(
         all_mail_uid,
         is_answered: input.is_answered,
         is_deleted: input.is_deleted,
+        unsubscribe,
     })
 }
 
@@ -2061,39 +2185,6 @@ fn upsert_thread_annotation_conn(
     Ok(())
 }
 
-fn load_thread_annotations_filtered(
-    conn: &Connection,
-    mb: &str,
-    needs_reply: Option<bool>,
-    waiting_on: Option<WaitingOn>,
-) -> AppResult<HashMap<String, ThreadAnnotation>> {
-    let mut sql = String::from(
-        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
-                extracted_json, updated_by, updated_at_ms
-         FROM thread_annotations
-         WHERE mailbox_id = ?1",
-    );
-    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
-    if let Some(nr) = needs_reply {
-        bind.push(SqlValue::Integer(i64::from(nr)));
-        sql.push_str(&format!(" AND needs_reply = ?{}", bind.len()));
-    }
-    if let Some(wo) = waiting_on {
-        bind.push(SqlValue::Text(wo.as_str().to_string()));
-        sql.push_str(&format!(" AND waiting_on = ?{}", bind.len()));
-    }
-    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(bind), thread_annotation_from_row)
-        .map_err(sql_err)?;
-    let mut map = HashMap::new();
-    for r in rows {
-        let ann = r.map_err(sql_err)?;
-        map.insert(ann.thread_id.clone(), ann);
-    }
-    Ok(map)
-}
-
 fn load_thread_annotations_for_ids(
     conn: &Connection,
     mb: &str,
@@ -2493,6 +2584,78 @@ fn parse_query_with_labels(
     Ok(parsed)
 }
 
+fn resolve_label_filter_ids(
+    conn: &Connection,
+    mailbox_id: &str,
+    label_ids: &[String],
+) -> AppResult<Vec<String>> {
+    let mut resolved = Vec::with_capacity(label_ids.len());
+    for lid in label_ids {
+        resolved
+            .push(resolve_existing_label_id(conn, mailbox_id, lid)?.unwrap_or_else(|| lid.clone()));
+    }
+    Ok(resolved)
+}
+
+fn has_spam_or_trash_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(LABEL_TRASH) || l.eq_ignore_ascii_case(LABEL_SPAM))
+}
+
+fn load_messages_for_threads_summary(
+    conn: &Connection,
+    mailbox_id: &str,
+    thread_ids: &[String],
+    include_spam_trash: bool,
+) -> AppResult<HashMap<String, Vec<StoredMessage>>> {
+    let mut by_thread: HashMap<String, Vec<StoredMessage>> = HashMap::new();
+    if thread_ids.is_empty() {
+        return Ok(by_thread);
+    }
+
+    let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mailbox_id.to_string())];
+    let mut placeholders = Vec::with_capacity(thread_ids.len());
+    for tid in thread_ids {
+        bind_values.push(SqlValue::Text(tid.clone()));
+        placeholders.push(format!("?{}", bind_values.len()));
+    }
+
+    let mut sql = format!(
+        "SELECT {MESSAGE_SUMMARY_COLUMNS} FROM messages m WHERE m.mailbox_id = ?1 AND m.thread_id IN ({})",
+        placeholders.join(", ")
+    );
+    if !include_spam_trash {
+        bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+        let p1 = bind_values.len();
+        bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+        let p2 = bind_values.len();
+        sql.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+        ));
+    }
+    sql.push_str(" ORDER BY m.internal_date_ms ASC, m.id ASC");
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(bind_values.iter()),
+            message_summary_from_row,
+        )
+        .map_err(sql_err)?;
+    let mut messages = Vec::new();
+    for r in rows {
+        messages.push(r.map_err(sql_err)?);
+    }
+    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let mut label_map = load_labels_for_messages(conn, mailbox_id, &ids)?;
+    for mut m in messages {
+        m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+        by_thread.entry(m.thread_id.clone()).or_default().push(m);
+    }
+    Ok(by_thread)
+}
+
 fn load_all_messages_filtered(
     conn: &Connection,
     mailbox_id: &str,
@@ -2505,14 +2668,21 @@ fn load_all_messages_filtered(
         None => None,
     };
 
-    let explicit_spam_trash = label_ids
-        .iter()
-        .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+    let resolved_labels = resolve_label_filter_ids(conn, mailbox_id, label_ids)?;
+    let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
     let effective_include_spam_trash = include_spam_trash
         || explicit_spam_trash
         || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-    let mut sql = String::from("SELECT m.* FROM messages m WHERE m.mailbox_id = ?1");
+    let needs_raw = parsed_q
+        .as_ref()
+        .is_some_and(crate::search::query_uses_filename);
+    let cols = if needs_raw {
+        MESSAGE_FILENAME_SEARCH_COLUMNS
+    } else {
+        MESSAGE_SUMMARY_COLUMNS
+    };
+    let mut sql = format!("SELECT {cols} FROM messages m WHERE m.mailbox_id = ?1");
     let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mailbox_id.to_string())];
 
     if !effective_include_spam_trash {
@@ -2525,10 +2695,8 @@ fn load_all_messages_filtered(
         ));
     }
 
-    for lid in label_ids {
-        let resolved =
-            resolve_existing_label_id(conn, mailbox_id, lid)?.unwrap_or_else(|| lid.clone());
-        bind_values.push(SqlValue::Text(resolved));
+    for resolved in &resolved_labels {
+        bind_values.push(SqlValue::Text(resolved.clone()));
         let p = bind_values.len();
         sql.push_str(&format!(
             " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
@@ -2538,11 +2706,13 @@ fn load_all_messages_filtered(
     sql.push_str(" ORDER BY m.internal_date_ms DESC, m.id DESC");
 
     let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let row_mapper = if needs_raw {
+        message_filename_search_from_row
+    } else {
+        message_summary_from_row
+    };
     let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(bind_values.iter()),
-            message_from_row,
-        )
+        .query_map(rusqlite::params_from_iter(bind_values.iter()), row_mapper)
         .map_err(sql_err)?;
     let mut messages = Vec::new();
     for r in rows {
@@ -2622,35 +2792,8 @@ impl MailStore for SqliteStore {
             normalized
         };
 
-        let already_seeded = self
-            .seeded_mailboxes
-            .lock()
-            .map(|s| s.contains(&target))
-            .unwrap_or(false);
-
-        if !already_seeded {
-            match self.pool.get() {
-                Ok(mut conn) => {
-                    if let Err(err) = ensure_mailbox_seeded(&mut conn, &target) {
-                        tracing::warn!(
-                            mailbox_id = %target,
-                            error = %err,
-                            "Failed to seed SQLite mailbox metadata"
-                        );
-                    } else if let Ok(mut seeded) = self.seeded_mailboxes.lock() {
-                        seeded.insert(target.clone());
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        mailbox_id = %target,
-                        error = %err,
-                        "Failed to acquire SQLite pool connection to seed mailbox"
-                    );
-                }
-            }
-        }
-
+        // Never block Tokio async worker threads here; `run_blocking` lazily seeds
+        // unknown mailboxes on the blocking thread pool and propagates errors via `AppResult`.
         Arc::new(Self {
             pool: self.pool.clone(),
             mailbox_id: target,
@@ -2736,7 +2879,7 @@ impl MailStore for SqliteStore {
 
             let rows = stmt
                 .query_map(
-                    params![mb, query.start_history_id as i64, after_row_id],
+                    params![mb, query.start_history_id.min(i64::MAX as u64) as i64, after_row_id],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -2839,25 +2982,108 @@ impl MailStore for SqliteStore {
                 query.max_results.min(500)
             };
             let offset = parse_offset_token(query.page_token.as_deref())?;
+            let raw_q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+            // Fast SQL path when no Gmail `q=` operator requires in-Rust evaluation:
+            // push label filtering, COUNT(*), LIMIT/OFFSET, and BLOB-free projection into SQL.
+            if raw_q.is_none() {
+                let resolved_labels = resolve_label_filter_ids(conn, mb, &query.label_ids)?;
+                let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
+                let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
+
+                let mut where_sql = String::from("m.mailbox_id = ?1");
+                let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+
+                if !effective_include_spam_trash {
+                    bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+                    let p1 = bind_values.len();
+                    bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+                    let p2 = bind_values.len();
+                    where_sql.push_str(&format!(
+                        " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                    ));
+                }
+
+                for resolved in &resolved_labels {
+                    bind_values.push(SqlValue::Text(resolved.clone()));
+                    let p = bind_values.len();
+                    where_sql.push_str(&format!(
+                        " AND EXISTS (SELECT 1 FROM message_labels ml_in WHERE ml_in.mailbox_id = m.mailbox_id AND ml_in.message_id = m.id AND ml_in.label_id = ?{p})"
+                    ));
+                }
+
+                let count_sql = format!("SELECT COUNT(*) FROM messages m WHERE {where_sql}");
+                let total_i64: i64 = conn
+                    .query_row(
+                        &count_sql,
+                        rusqlite::params_from_iter(bind_values.iter()),
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_err)?;
+                let total = total_i64.max(0) as usize;
+
+                if offset >= total {
+                    return Ok(MessageListPage {
+                        messages: Vec::new(),
+                        next_page_token: None,
+                        result_size_estimate: total.min(u32::MAX as usize) as u32,
+                    });
+                }
+
+                bind_values.push(SqlValue::Integer(max_results as i64));
+                let p_lim = bind_values.len();
+                bind_values.push(SqlValue::Integer(
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ));
+                let p_off = bind_values.len();
+
+                let page_sql = format!(
+                    "SELECT {MESSAGE_SUMMARY_COLUMNS} FROM messages m WHERE {where_sql} \
+                     ORDER BY m.internal_date_ms DESC, m.id DESC LIMIT ?{p_lim} OFFSET ?{p_off}"
+                );
+                let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(bind_values.iter()),
+                        message_summary_from_row,
+                    )
+                    .map_err(sql_err)?;
+                let mut page_msgs = Vec::new();
+                for r in rows {
+                    page_msgs.push(r.map_err(sql_err)?);
+                }
+
+                let ids: Vec<String> = page_msgs.iter().map(|m| m.id.clone()).collect();
+                let mut label_map = load_labels_for_messages(conn, mb, &ids)?;
+                for m in &mut page_msgs {
+                    m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+                }
+
+                let next_offset = offset.saturating_add(page_msgs.len());
+                let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+                return Ok(MessageListPage {
+                    messages: page_msgs,
+                    next_page_token,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
+            }
+
             let all = load_all_messages_filtered(
                 conn,
                 mb,
                 &query.label_ids,
                 query.include_spam_trash,
-                query.q.as_deref(),
+                raw_q,
             )?;
             let total = all.len();
             let page_msgs: Vec<StoredMessage> =
                 all.into_iter().skip(offset).take(max_results).collect();
-            let next_page_token = if offset + page_msgs.len() < total {
-                Some((offset + page_msgs.len()).to_string())
-            } else {
-                None
-            };
+            let next_offset = offset.saturating_add(page_msgs.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
             Ok(MessageListPage {
                 messages: page_msgs,
                 next_page_token,
-                result_size_estimate: total as u32,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
             })
         })
         .await
@@ -3013,7 +3239,7 @@ impl MailStore for SqliteStore {
         self.run_blocking(move |conn, mb| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, filename, content_type, size_bytes
+                    "SELECT id, part_id, filename, content_type, size_bytes
                      FROM attachments
                      WHERE mailbox_id = ?1 AND message_id = ?2
                      ORDER BY part_id ASC, id ASC",
@@ -3021,11 +3247,13 @@ impl MailStore for SqliteStore {
                 .map_err(sql_err)?;
             let rows = stmt
                 .query_map(params![mb, message_id], |row| {
+                    let part_id: String = row.get(1)?;
                     Ok(AttachmentMeta {
                         id: row.get(0)?,
-                        filename: row.get(1)?,
-                        content_type: row.get(2)?,
-                        size_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                        part_id: (!part_id.is_empty()).then_some(part_id),
+                        filename: row.get(2)?,
+                        content_type: row.get(3)?,
+                        size_bytes: row.get::<_, i64>(4)?.max(0) as u64,
                     })
                 })
                 .map_err(sql_err)?;
@@ -3053,23 +3281,158 @@ impl MailStore for SqliteStore {
                 None => None,
             };
 
-            let explicit_spam_trash = query
-                .label_ids
-                .iter()
-                .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+            let required_labels = resolve_label_filter_ids(conn, mb, &query.label_ids)?;
+            let explicit_spam_trash = has_spam_or_trash_label(&required_labels);
             let effective_include_spam_trash = query.include_spam_trash
                 || explicit_spam_trash
                 || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-            let mut required_labels = Vec::new();
-            for l in &query.label_ids {
-                required_labels
-                    .push(resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.clone()));
+            // Fast SQL path when no Gmail `q=` query requires in-Rust evaluation:
+            // push GROUP BY thread_id, label EXISTS filters, COUNT(*), and LIMIT/OFFSET into SQL.
+            if parsed_q.is_none() {
+                let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+                let mut visible_where = String::from("m.mailbox_id = ?1");
+                if !effective_include_spam_trash {
+                    bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+                    let p1 = bind_values.len();
+                    bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+                    let p2 = bind_values.len();
+                    visible_where.push_str(&format!(
+                        " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                    ));
+                }
+
+                let mut thread_where = Vec::new();
+                for req in &required_labels {
+                    bind_values.push(SqlValue::Text(req.clone()));
+                    let p = bind_values.len();
+                    thread_where.push(format!(
+                        "EXISTS (SELECT 1 FROM visible_msgs v2 INNER JOIN message_labels ml ON ml.mailbox_id = ?1 AND ml.message_id = v2.id WHERE v2.thread_id = vm.thread_id AND ml.label_id = ?{p})"
+                    ));
+                }
+                let thread_where_sql = if thread_where.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", thread_where.join(" AND "))
+                };
+
+                let cte = format!(
+                    "WITH visible_msgs AS (SELECT m.id, m.thread_id, m.internal_date_ms FROM messages m WHERE {visible_where})"
+                );
+
+                let count_sql = format!(
+                    "{cte} SELECT COUNT(*) FROM (SELECT vm.thread_id FROM visible_msgs vm{thread_where_sql} GROUP BY vm.thread_id)"
+                );
+                let total_i64: i64 = conn
+                    .query_row(
+                        &count_sql,
+                        rusqlite::params_from_iter(bind_values.iter()),
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_err)?;
+                let total = total_i64.max(0) as usize;
+
+                if offset >= total {
+                    return Ok(ThreadListPage {
+                        threads: Vec::new(),
+                        next_page_token: None,
+                        result_size_estimate: total.min(u32::MAX as usize) as u32,
+                    });
+                }
+
+                bind_values.push(SqlValue::Integer(max_results as i64));
+                let p_lim = bind_values.len();
+                bind_values.push(SqlValue::Integer(
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ));
+                let p_off = bind_values.len();
+
+                let page_sql = format!(
+                    "{cte} SELECT vm.thread_id, MAX(vm.internal_date_ms) AS max_ts \
+                     FROM visible_msgs vm{thread_where_sql} \
+                     GROUP BY vm.thread_id \
+                     ORDER BY max_ts DESC, vm.thread_id DESC \
+                     LIMIT ?{p_lim} OFFSET ?{p_off}"
+                );
+                let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(sql_err)?;
+                let mut page_thread_ids = Vec::new();
+                for r in rows {
+                    page_thread_ids.push(r.map_err(sql_err)?);
+                }
+
+                let mut by_thread = load_messages_for_threads_summary(
+                    conn,
+                    mb,
+                    &page_thread_ids,
+                    effective_include_spam_trash,
+                )?;
+                let mut page = Vec::with_capacity(page_thread_ids.len());
+                for tid in page_thread_ids {
+                    let msgs = by_thread.remove(&tid).unwrap_or_default();
+                    let snippet = msgs.last().map(|m| m.snippet.clone()).unwrap_or_default();
+                    let history_id = msgs.iter().map(|m| m.history_id).max().unwrap_or(1);
+                    page.push(StoredThreadDetail {
+                        id: tid,
+                        snippet,
+                        history_id,
+                        messages: msgs,
+                    });
+                }
+
+                let next_offset = offset.saturating_add(page.len());
+                let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+                return Ok(ThreadListPage {
+                    threads: page,
+                    next_page_token,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
             }
 
-            // Load visible messages (filtered only by spam/trash visibility) so threads contain all visible messages.
-            let visible_msgs =
-                load_all_messages_filtered(conn, mb, &[], effective_include_spam_trash, None)?;
+            // Complex Gmail `q=` fallback: still avoids loading `html_body` (and avoids
+            // `raw_rfc2822` unless `filename:` is present).
+            let needs_raw = parsed_q
+                .as_ref()
+                .is_some_and(crate::search::query_uses_filename);
+            let cols = if needs_raw {
+                MESSAGE_FILENAME_SEARCH_COLUMNS
+            } else {
+                MESSAGE_SUMMARY_COLUMNS
+            };
+            let mut sql = format!("SELECT {cols} FROM messages m WHERE m.mailbox_id = ?1");
+            let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+            if !effective_include_spam_trash {
+                bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+                let p1 = bind_values.len();
+                bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+                let p2 = bind_values.len();
+                sql.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                ));
+            }
+            sql.push_str(" ORDER BY m.internal_date_ms DESC, m.id DESC");
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let row_mapper = if needs_raw {
+                message_filename_search_from_row
+            } else {
+                message_summary_from_row
+            };
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(bind_values.iter()), row_mapper)
+                .map_err(sql_err)?;
+            let mut visible_msgs = Vec::new();
+            for r in rows {
+                visible_msgs.push(r.map_err(sql_err)?);
+            }
+            let ids: Vec<String> = visible_msgs.iter().map(|m| m.id.clone()).collect();
+            let mut label_map = load_labels_for_messages(conn, mb, &ids)?;
+            for m in &mut visible_msgs {
+                m.label_ids = label_map.remove(&m.id).unwrap_or_default();
+            }
 
             let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
             for msg in visible_msgs {
@@ -3125,16 +3488,13 @@ impl MailStore for SqliteStore {
                 .take(max_results)
                 .map(|(_, t)| t)
                 .collect();
-            let next_page_token = if offset + page.len() < total {
-                Some((offset + page.len()).to_string())
-            } else {
-                None
-            };
+            let next_offset = offset.saturating_add(page.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
 
             Ok(ThreadListPage {
                 threads: page,
                 next_page_token,
-                result_size_estimate: total as u32,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
             })
         })
         .await
@@ -3629,20 +3989,120 @@ impl MailStore for SqliteStore {
             let effective_include_spam_trash = query.include_spam_trash
                 || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
-            let mut stmt = conn
-                .prepare(
-                    "SELECT d.id AS draft_id, d.updated_at_ms, m.*
-                     FROM drafts d
-                     INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id
-                     WHERE d.mailbox_id = ?1
-                     ORDER BY d.updated_at_ms DESC, d.id DESC",
-                )
-                .map_err(sql_err)?;
+            let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+            let mut where_sql = String::from("d.mailbox_id = ?1");
+            if !effective_include_spam_trash {
+                bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+                let p1 = bind_values.len();
+                bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+                let p2 = bind_values.len();
+                where_sql.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                ));
+            }
+
+            if parsed_q.is_none() {
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM drafts d \
+                     INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+                     WHERE {where_sql}"
+                );
+                let total_i64: i64 = conn
+                    .query_row(
+                        &count_sql,
+                        rusqlite::params_from_iter(bind_values.iter()),
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_err)?;
+                let total = total_i64.max(0) as usize;
+
+                if offset >= total {
+                    return Ok(DraftListPage {
+                        drafts: Vec::new(),
+                        next_page_token: None,
+                        result_size_estimate: total.min(u32::MAX as usize) as u32,
+                    });
+                }
+
+                bind_values.push(SqlValue::Integer(max_results as i64));
+                let p_lim = bind_values.len();
+                bind_values.push(SqlValue::Integer(
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ));
+                let p_off = bind_values.len();
+
+                let page_sql = format!(
+                    "SELECT d.id AS draft_id, d.updated_at_ms, {MESSAGE_SUMMARY_COLUMNS} \
+                     FROM drafts d \
+                     INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+                     WHERE {where_sql} \
+                     ORDER BY d.updated_at_ms DESC, d.id DESC \
+                     LIMIT ?{p_lim} OFFSET ?{p_off}"
+                );
+                let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+                        let draft_id: String = row.get("draft_id")?;
+                        let updated_ms: i64 = row.get("updated_at_ms")?;
+                        let msg = message_summary_from_row(row)?;
+                        Ok((draft_id, updated_ms, msg))
+                    })
+                    .map_err(sql_err)?;
+
+                let mut raw = Vec::new();
+                for r in rows {
+                    raw.push(r.map_err(sql_err)?);
+                }
+                let msg_ids: Vec<String> = raw.iter().map(|(_, _, m)| m.id.clone()).collect();
+                let mut label_map = load_labels_for_messages(conn, mb, &msg_ids)?;
+
+                let page: Vec<StoredDraft> = raw
+                    .into_iter()
+                    .map(|(draft_id, updated_ms, mut msg)| {
+                        msg.label_ids = label_map.remove(&msg.id).unwrap_or_default();
+                        StoredDraft {
+                            id: draft_id,
+                            message: msg,
+                            updated_at: DateTime::from_timestamp_millis(updated_ms)
+                                .unwrap_or_else(Utc::now),
+                        }
+                    })
+                    .collect();
+
+                let next_offset = offset.saturating_add(page.len());
+                let next_page_token = (next_offset < total).then(|| next_offset.to_string());
+                return Ok(DraftListPage {
+                    drafts: page,
+                    next_page_token,
+                    result_size_estimate: total.min(u32::MAX as usize) as u32,
+                });
+            }
+
+            let needs_raw = parsed_q
+                .as_ref()
+                .is_some_and(crate::search::query_uses_filename);
+            let cols = if needs_raw {
+                MESSAGE_FILENAME_SEARCH_COLUMNS
+            } else {
+                MESSAGE_SUMMARY_COLUMNS
+            };
+            let sql = format!(
+                "SELECT d.id AS draft_id, d.updated_at_ms, {cols} \
+                 FROM drafts d \
+                 INNER JOIN messages m ON m.mailbox_id = d.mailbox_id AND m.id = d.message_id \
+                 WHERE {where_sql} \
+                 ORDER BY d.updated_at_ms DESC, d.id DESC"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![mb], |row| {
+                .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
                     let draft_id: String = row.get("draft_id")?;
                     let updated_ms: i64 = row.get("updated_at_ms")?;
-                    let msg = message_from_row(row)?;
+                    let msg = if needs_raw {
+                        message_filename_search_from_row(row)?
+                    } else {
+                        message_summary_from_row(row)?
+                    };
                     Ok((draft_id, updated_ms, msg))
                 })
                 .map_err(sql_err)?;
@@ -3657,14 +4117,6 @@ impl MailStore for SqliteStore {
             let mut drafts = Vec::new();
             for (draft_id, updated_ms, mut msg) in raw {
                 msg.label_ids = label_map.remove(&msg.id).unwrap_or_default();
-                if !effective_include_spam_trash
-                    && msg
-                        .label_ids
-                        .iter()
-                        .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
-                {
-                    continue;
-                }
                 if let Some(ref pq) = parsed_q
                     && !crate::search::matches_message(pq, &msg)
                 {
@@ -3681,16 +4133,13 @@ impl MailStore for SqliteStore {
             let total = drafts.len();
             let page: Vec<StoredDraft> =
                 drafts.into_iter().skip(offset).take(max_results).collect();
-            let next_page_token = if offset + page.len() < total {
-                Some((offset + page.len()).to_string())
-            } else {
-                None
-            };
+            let next_offset = offset.saturating_add(page.len());
+            let next_page_token = (next_offset < total).then(|| next_offset.to_string());
 
             Ok(DraftListPage {
                 drafts: page,
                 next_page_token,
-                result_size_estimate: total as u32,
+                result_size_estimate: total.min(u32::MAX as usize) as u32,
             })
         })
         .await
@@ -3833,17 +4282,11 @@ impl MailStore for SqliteStore {
                 _ => None,
             };
 
-            let mut resolved_labels = Vec::new();
-            for l in &query.labels {
-                resolved_labels
-                    .push(resolve_existing_label_id(conn, mb, l)?.unwrap_or_else(|| l.clone()));
-            }
-            let explicit_spam_trash = resolved_labels
-                .iter()
-                .any(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+            let resolved_labels = resolve_label_filter_ids(conn, mb, &query.labels)?;
+            let explicit_spam_trash = has_spam_or_trash_label(&resolved_labels);
             let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
 
-            let mut sql = String::from("SELECT m.* FROM messages m");
+            let mut sql = format!("SELECT {MESSAGE_SEARCH_COLUMNS} FROM messages m");
             let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
             let mut where_clauses: Vec<String> = vec!["m.mailbox_id = ?1".to_string()];
 
@@ -3858,11 +4301,11 @@ impl MailStore for SqliteStore {
                         let p = bind_values.len();
                         where_clauses.push(format!("messages_fts MATCH ?{p}"));
                     } else {
-                        let like_pat = format!("%{}%", trimmed.to_ascii_lowercase());
+                        let like_pat = escape_like_pattern(&trimmed.to_ascii_lowercase());
                         bind_values.push(SqlValue::Text(like_pat));
                         let p = bind_values.len();
                         where_clauses.push(format!(
-                            "(LOWER(m.subject) LIKE ?{p} OR LOWER(m.from_addr) LIKE ?{p} OR LOWER(m.to_addrs_json) LIKE ?{p} OR LOWER(m.cc_addrs_json) LIKE ?{p} OR LOWER(m.text_body) LIKE ?{p} OR LOWER(m.snippet) LIKE ?{p})"
+                            "(LOWER(m.subject) LIKE ?{p} ESCAPE '\\' OR LOWER(m.from_addr) LIKE ?{p} ESCAPE '\\' OR LOWER(m.to_addrs_json) LIKE ?{p} ESCAPE '\\' OR LOWER(m.cc_addrs_json) LIKE ?{p} ESCAPE '\\' OR LOWER(m.text_body) LIKE ?{p} ESCAPE '\\' OR LOWER(m.snippet) LIKE ?{p} ESCAPE '\\')"
                         ));
                     }
                 }
@@ -3911,23 +4354,21 @@ impl MailStore for SqliteStore {
             if let Some(ref from_filter) = query.from
                 && !from_filter.trim().is_empty()
             {
-                bind_values.push(SqlValue::Text(format!(
-                    "%{}%",
-                    from_filter.trim().to_ascii_lowercase()
+                bind_values.push(SqlValue::Text(escape_like_pattern(
+                    &from_filter.trim().to_ascii_lowercase(),
                 )));
                 let p = bind_values.len();
-                where_clauses.push(format!("LOWER(m.from_addr) LIKE ?{p}"));
+                where_clauses.push(format!("LOWER(m.from_addr) LIKE ?{p} ESCAPE '\\'"));
             }
 
             if let Some(ref to_filter) = query.to
                 && !to_filter.trim().is_empty()
             {
-                bind_values.push(SqlValue::Text(format!(
-                    "%{}%",
-                    to_filter.trim().to_ascii_lowercase()
+                bind_values.push(SqlValue::Text(escape_like_pattern(
+                    &to_filter.trim().to_ascii_lowercase(),
                 )));
                 let p = bind_values.len();
-                where_clauses.push(format!("LOWER(m.to_addrs_json) LIKE ?{p}"));
+                where_clauses.push(format!("LOWER(m.to_addrs_json) LIKE ?{p} ESCAPE '\\'"));
             }
 
             if let Some(after) = query.after {
@@ -3970,7 +4411,10 @@ impl MailStore for SqliteStore {
 
             let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
             let rows = stmt
-                .query_map(rusqlite::params_from_iter(bind_values.iter()), message_from_row)
+                .query_map(
+                    rusqlite::params_from_iter(bind_values.iter()),
+                    message_search_from_row,
+                )
                 .map_err(sql_err)?;
             let mut messages = Vec::new();
             for r in rows {
@@ -4024,142 +4468,150 @@ impl MailStore for SqliteStore {
                 ),
                 _ => None,
             };
-            let explicit_spam_trash = resolved_label
-                .as_deref()
-                .is_some_and(|l| l == LABEL_TRASH || l == LABEL_SPAM);
+            let explicit_spam_trash = resolved_label.as_deref().is_some_and(|l| {
+                l.eq_ignore_ascii_case(LABEL_TRASH) || l.eq_ignore_ascii_case(LABEL_SPAM)
+            });
             let effective_include_spam_trash = query.include_spam_trash || explicit_spam_trash;
 
-            // Optional FTS5 candidate thread set when `q` is provided
-            let fts_matching_threads: Option<HashSet<String>> = match query.q.as_deref() {
-                Some(raw_q) if !raw_q.trim().is_empty() => {
-                    let trimmed = raw_q.trim();
-                    let mut set = HashSet::new();
-                    if let Some(fts_query) = build_fts5_query(trimmed) {
-                        let mut stmt = conn
-                            .prepare(
-                                "SELECT DISTINCT m.thread_id
-                                 FROM messages m
-                                 INNER JOIN messages_fts f ON f.mailbox_id = m.mailbox_id AND f.message_id = m.id
-                                 WHERE m.mailbox_id = ?1 AND messages_fts MATCH ?2",
-                            )
-                            .map_err(sql_err)?;
-                        let rows = stmt
-                            .query_map(params![mb, fts_query], |row| row.get::<_, String>(0))
-                            .map_err(sql_err)?;
-                        for r in rows {
-                            set.insert(r.map_err(sql_err)?);
-                        }
-                    } else {
-                        let pat = format!("%{}%", trimmed.to_ascii_lowercase());
-                        let mut stmt = conn
-                            .prepare(
-                                "SELECT DISTINCT thread_id FROM messages
-                                 WHERE mailbox_id = ?1
-                                   AND (LOWER(subject) LIKE ?2 OR LOWER(from_addr) LIKE ?2 OR LOWER(text_body) LIKE ?2 OR LOWER(snippet) LIKE ?2)",
-                            )
-                            .map_err(sql_err)?;
-                        let rows = stmt
-                            .query_map(params![mb, pat], |row| row.get::<_, String>(0))
-                            .map_err(sql_err)?;
-                        for r in rows {
-                            set.insert(r.map_err(sql_err)?);
-                        }
-                    }
-                    Some(set)
+            let mut bind_values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+            let mut visible_where = String::from("m.mailbox_id = ?1");
+            if !effective_include_spam_trash {
+                bind_values.push(SqlValue::Text(LABEL_TRASH.to_string()));
+                let p1 = bind_values.len();
+                bind_values.push(SqlValue::Text(LABEL_SPAM.to_string()));
+                let p2 = bind_values.len();
+                visible_where.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM message_labels ml_ex WHERE ml_ex.mailbox_id = m.mailbox_id AND ml_ex.message_id = m.id AND ml_ex.label_id IN (?{p1}, ?{p2}))"
+                ));
+            }
+
+            let mut from_sql = String::from("FROM visible_msgs vm");
+            let mut thread_where: Vec<String> = Vec::new();
+
+            if query.needs_reply.is_some() || query.waiting_on.is_some() {
+                from_sql.push_str(
+                    " INNER JOIN thread_annotations ta ON ta.mailbox_id = ?1 AND ta.thread_id = vm.thread_id",
+                );
+                if let Some(nr) = query.needs_reply {
+                    bind_values.push(SqlValue::Integer(if nr { 1 } else { 0 }));
+                    let p = bind_values.len();
+                    thread_where.push(format!("ta.needs_reply = ?{p}"));
                 }
-                _ => None,
+                if let Some(wo) = query.waiting_on {
+                    bind_values.push(SqlValue::Text(wo.as_str().to_string()));
+                    let p = bind_values.len();
+                    thread_where.push(format!("ta.waiting_on = ?{p}"));
+                }
+            }
+
+            if let Some(raw_q) = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(fts_query) = build_fts5_query(raw_q) {
+                    bind_values.push(SqlValue::Text(fts_query));
+                    let p = bind_values.len();
+                    thread_where.push(format!(
+                        "EXISTS (SELECT 1 FROM messages mq INNER JOIN messages_fts f ON f.mailbox_id = mq.mailbox_id AND f.message_id = mq.id WHERE mq.mailbox_id = ?1 AND mq.thread_id = vm.thread_id AND messages_fts MATCH ?{p})"
+                    ));
+                } else {
+                    let pat = escape_like_pattern(&raw_q.to_ascii_lowercase());
+                    bind_values.push(SqlValue::Text(pat));
+                    let p = bind_values.len();
+                    thread_where.push(format!(
+                        "EXISTS (SELECT 1 FROM messages mq WHERE mq.mailbox_id = ?1 AND mq.thread_id = vm.thread_id AND (LOWER(mq.subject) LIKE ?{p} ESCAPE '\\' OR LOWER(mq.from_addr) LIKE ?{p} ESCAPE '\\' OR LOWER(mq.text_body) LIKE ?{p} ESCAPE '\\' OR LOWER(mq.snippet) LIKE ?{p} ESCAPE '\\'))"
+                    ));
+                }
+            }
+
+            if let Some(ref req_label) = resolved_label {
+                bind_values.push(SqlValue::Text(req_label.clone()));
+                let p = bind_values.len();
+                thread_where.push(format!(
+                    "EXISTS (SELECT 1 FROM visible_msgs v_lbl INNER JOIN message_labels ml ON ml.mailbox_id = ?1 AND ml.message_id = v_lbl.id WHERE v_lbl.thread_id = vm.thread_id AND ml.label_id = ?{p})"
+                ));
+            }
+
+            if query.unread_only {
+                bind_values.push(SqlValue::Text(LABEL_UNREAD.to_string()));
+                let p = bind_values.len();
+                thread_where.push(format!(
+                    "EXISTS (SELECT 1 FROM visible_msgs v_unr INNER JOIN message_labels ml ON ml.mailbox_id = ?1 AND ml.message_id = v_unr.id WHERE v_unr.thread_id = vm.thread_id AND ml.label_id = ?{p})"
+                ));
+            }
+
+            let mut having_sql = String::new();
+            if let Some((cursor_ts, cursor_id)) = cursor {
+                bind_values.push(SqlValue::Integer(cursor_ts));
+                let p_ts = bind_values.len();
+                bind_values.push(SqlValue::Text(cursor_id));
+                let p_id = bind_values.len();
+                having_sql = format!(
+                    " HAVING (MAX(vm.internal_date_ms) < ?{p_ts} OR (MAX(vm.internal_date_ms) = ?{p_ts} AND vm.thread_id < ?{p_id}))"
+                );
+            }
+
+            bind_values.push(SqlValue::Integer((limit + 1) as i64));
+            let p_lim = bind_values.len();
+
+            let where_sql = if thread_where.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", thread_where.join(" AND "))
             };
+            let sql = format!(
+                "WITH visible_msgs AS (SELECT m.id, m.thread_id, m.internal_date_ms FROM messages m WHERE {visible_where}) \
+                 SELECT vm.thread_id, MAX(vm.internal_date_ms) AS max_ts \
+                 {from_sql}{where_sql} \
+                 GROUP BY vm.thread_id{having_sql} \
+                 ORDER BY max_ts DESC, vm.thread_id DESC \
+                 LIMIT ?{p_lim}"
+            );
 
-            let filtered_annotations: Option<HashMap<String, ThreadAnnotation>> =
-                if query.needs_reply.is_some() || query.waiting_on.is_some() {
-                    let map = load_thread_annotations_filtered(
-                        conn,
-                        mb,
-                        query.needs_reply,
-                        query.waiting_on,
-                    )?;
-                    if map.is_empty() {
-                        return Ok(AiThreadPage {
-                            threads: Vec::new(),
-                            next_cursor: None,
-                            has_more: false,
-                        });
-                    }
-                    Some(map)
-                } else {
-                    None
-                };
-
-            let visible_msgs =
-                load_all_messages_filtered(conn, mb, &[], effective_include_spam_trash, None)?;
-
-            let mut by_thread: BTreeMap<String, Vec<StoredMessage>> = BTreeMap::new();
-            for msg in visible_msgs {
-                by_thread.entry(msg.thread_id.clone()).or_default().push(msg);
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_err)?;
+            let mut page_threads: Vec<(String, i64)> = Vec::new();
+            for r in rows {
+                page_threads.push(r.map_err(sql_err)?);
             }
 
-            let mut summaries: Vec<(i64, ThreadSummary)> = Vec::new();
-            for (tid, mut msgs) in by_thread {
-                if let Some(ref fts_set) = fts_matching_threads
-                    && !fts_set.contains(&tid)
-                {
-                    continue;
-                }
-                let annotation = if let Some(ref ann_map) = filtered_annotations {
-                    let Some(ann) = ann_map.get(&tid) else {
-                        continue;
-                    };
-                    Some(ann.clone())
-                } else {
-                    None
-                };
-                msgs.sort_by(|a, b| {
-                    a.internal_date_ms
-                        .cmp(&b.internal_date_ms)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-                let summary = build_thread_summary(&tid, &msgs, annotation);
-                if let Some(ref req_label) = resolved_label
-                    && !summary.labels.contains(req_label)
-                {
-                    continue;
-                }
-                if query.unread_only && !summary.unread {
-                    continue;
-                }
-                let max_ts = msgs
-                    .iter()
-                    .map(|m| m.internal_date_ms)
-                    .max()
-                    .unwrap_or(0);
-                if let Some((cursor_ts, ref cursor_id)) = cursor
-                    && !(max_ts < cursor_ts || (max_ts == cursor_ts && tid.as_str() < cursor_id.as_str()))
-                {
-                    continue;
-                }
-                summaries.push((max_ts, summary));
-            }
-
-            summaries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
-            let has_more = summaries.len() > limit;
+            let has_more = page_threads.len() > limit;
             if has_more {
-                summaries.truncate(limit);
+                page_threads.truncate(limit);
             }
+
+            if page_threads.is_empty() {
+                return Ok(AiThreadPage {
+                    threads: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                });
+            }
+
+            let thread_ids: Vec<String> = page_threads.iter().map(|(tid, _)| tid.clone()).collect();
+            let mut by_thread = load_messages_for_threads_summary(
+                conn,
+                mb,
+                &thread_ids,
+                effective_include_spam_trash,
+            )?;
+            let mut ann_map = load_thread_annotations_for_ids(conn, mb, &thread_ids)?;
+
+            let mut threads = Vec::with_capacity(page_threads.len());
+            for (tid, _) in &page_threads {
+                let msgs = by_thread.remove(tid).unwrap_or_default();
+                let annotation = ann_map.remove(tid);
+                threads.push(build_thread_summary(tid, &msgs, annotation));
+            }
+
             let next_cursor = if has_more {
-                summaries
+                page_threads
                     .last()
-                    .map(|(ts, s)| encode_keyset_cursor(*ts, &s.id))
+                    .map(|(tid, ts)| encode_keyset_cursor(*ts, tid))
             } else {
                 None
             };
-            let mut threads: Vec<ThreadSummary> = summaries.into_iter().map(|(_, s)| s).collect();
-            if filtered_annotations.is_none() && !threads.is_empty() {
-                let ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
-                let mut ann_map = load_thread_annotations_for_ids(conn, mb, &ids)?;
-                for thread in &mut threads {
-                    thread.annotation = ann_map.remove(&thread.id);
-                }
-            }
 
             Ok(AiThreadPage {
                 threads,
@@ -4360,63 +4812,135 @@ impl MailStore for SqliteStore {
 
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>> {
         self.run_blocking(|conn, mb| {
-            let mut mailboxes = Vec::new();
-            let builtins = [
-                ResolvedMailbox::Label {
-                    id: LABEL_INBOX.to_string(),
-                    name: "INBOX".to_string(),
-                    special_use: None,
-                },
-                ResolvedMailbox::AllMail,
-                ResolvedMailbox::Label {
-                    id: LABEL_SENT.to_string(),
-                    name: SENT_MAILBOX.to_string(),
-                    special_use: Some("\\Sent"),
-                },
-                ResolvedMailbox::Label {
-                    id: LABEL_DRAFT.to_string(),
-                    name: DRAFTS_MAILBOX.to_string(),
-                    special_use: Some("\\Drafts"),
-                },
-                ResolvedMailbox::Label {
-                    id: LABEL_TRASH.to_string(),
-                    name: TRASH_MAILBOX.to_string(),
-                    special_use: Some("\\Trash"),
-                },
-                ResolvedMailbox::Label {
-                    id: LABEL_SPAM.to_string(),
-                    name: SPAM_MAILBOX.to_string(),
-                    special_use: Some("\\Junk"),
-                },
-                ResolvedMailbox::Label {
-                    id: LABEL_STARRED.to_string(),
-                    name: STARRED_MAILBOX.to_string(),
-                    special_use: Some("\\Flagged"),
-                },
-            ];
-            for item in &builtins {
-                mailboxes.push(load_imap_mailbox_info_resolved(conn, mb, item)?);
-            }
-
-            let mut stmt = conn
+            // 1. Load all label metadata (system + user) in a single query.
+            let mut label_stmt = conn
                 .prepare(
-                    "SELECT id, name FROM labels WHERE mailbox_id = ?1 AND label_type = 'user' ORDER BY name ASC",
+                    "SELECT id, name, label_type, uid_validity, uid_next
+                     FROM labels
+                     WHERE mailbox_id = ?1
+                     ORDER BY name ASC",
                 )
                 .map_err(sql_err)?;
-            let user_labels: Vec<(String, String)> = stmt
-                .query_map(params![mb], |row| Ok((row.get(0)?, row.get(1)?)))
+            let label_rows: Vec<(String, String, String, i64, i64)> = label_stmt
+                .query_map(params![mb], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
                 .map_err(sql_err)?;
-            drop(stmt);
+            drop(label_stmt);
+
+            let mut label_meta: HashMap<String, (u32, u32)> = HashMap::with_capacity(label_rows.len());
+            let mut user_labels: Vec<(String, String)> = Vec::new();
+            for (id, name, label_type, uv, un) in label_rows {
+                label_meta.insert(id.clone(), (uv.max(1) as u32, un.max(1) as u32));
+                if label_type == "user" {
+                    user_labels.push((id, name));
+                }
+            }
+
+            // 2. Batch total & unseen counts across every label in a single GROUP BY query.
+            let mut counts_stmt = conn
+                .prepare(
+                    "SELECT ml.label_id,
+                            COUNT(*) AS total,
+                            SUM(CASE WHEN mu.message_id IS NOT NULL THEN 1 ELSE 0 END) AS unseen
+                     FROM message_labels ml
+                     LEFT JOIN message_labels mu
+                        ON mu.mailbox_id = ml.mailbox_id
+                       AND mu.message_id = ml.message_id
+                       AND mu.label_id = ?2
+                     WHERE ml.mailbox_id = ?1
+                     GROUP BY ml.label_id",
+                )
+                .map_err(sql_err)?;
+            let mut label_counts: HashMap<String, (u32, u32)> = HashMap::new();
+            let count_rows = counts_stmt
+                .query_map(params![mb, LABEL_UNREAD], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u32,
+                        row.get::<_, i64>(2)?.max(0) as u32,
+                    ))
+                })
+                .map_err(sql_err)?;
+            for r in count_rows {
+                let (lid, total, unseen) = r.map_err(sql_err)?;
+                label_counts.insert(lid, (total, unseen));
+            }
+            drop(counts_stmt);
+
+            // 3. Load `[Gmail]/All Mail` UID metadata + total/unseen counts in a single query.
+            let (all_uv, all_un, all_messages, all_unseen): (i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT im.uid_validity,
+                            im.uid_next,
+                            (SELECT COUNT(*) FROM messages m
+                             WHERE m.mailbox_id = ?1
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM message_labels ml
+                                   WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?3, ?4)
+                               )),
+                            (SELECT COUNT(*) FROM messages m
+                             WHERE m.mailbox_id = ?1
+                               AND EXISTS (
+                                   SELECT 1 FROM message_labels mu
+                                   WHERE mu.mailbox_id = m.mailbox_id AND mu.message_id = m.id AND mu.label_id = ?5
+                               )
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM message_labels ml
+                                   WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?3, ?4)
+                               ))
+                     FROM imap_meta im
+                     WHERE im.mailbox_id = ?1 AND im.mailbox_name = ?2",
+                    params![mb, ALL_MAIL_MAILBOX, LABEL_TRASH, LABEL_SPAM, LABEL_UNREAD],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(sql_err)?;
+
+            let make_label_info = |id: &str, name: &str, special_use: Option<&str>| {
+                let (uid_validity, uid_next) = label_meta.get(id).copied().unwrap_or((1, 1));
+                let (messages, unseen) = label_counts.get(id).copied().unwrap_or((0, 0));
+                ImapMailboxInfo {
+                    name: name.to_string(),
+                    label_id: Some(id.to_string()),
+                    special_use: special_use.map(ToString::to_string),
+                    uid_validity,
+                    uid_next,
+                    messages,
+                    unseen,
+                }
+            };
+
+            let mut mailboxes = Vec::with_capacity(7 + user_labels.len());
+            mailboxes.push(make_label_info(LABEL_INBOX, "INBOX", None));
+            mailboxes.push(ImapMailboxInfo {
+                name: ALL_MAIL_MAILBOX.to_string(),
+                label_id: None,
+                special_use: Some("\\All".to_string()),
+                uid_validity: all_uv.max(1) as u32,
+                uid_next: all_un.max(1) as u32,
+                messages: all_messages.max(0) as u32,
+                unseen: all_unseen.max(0) as u32,
+            });
+            mailboxes.push(make_label_info(LABEL_SENT, SENT_MAILBOX, Some("\\Sent")));
+            mailboxes.push(make_label_info(LABEL_DRAFT, DRAFTS_MAILBOX, Some("\\Drafts")));
+            mailboxes.push(make_label_info(LABEL_TRASH, TRASH_MAILBOX, Some("\\Trash")));
+            mailboxes.push(make_label_info(LABEL_SPAM, SPAM_MAILBOX, Some("\\Junk")));
+            mailboxes.push(make_label_info(
+                LABEL_STARRED,
+                STARRED_MAILBOX,
+                Some("\\Flagged"),
+            ));
 
             for (id, name) in user_labels {
-                let item = ResolvedMailbox::Label {
-                    id,
-                    name,
-                    special_use: None,
-                };
-                mailboxes.push(load_imap_mailbox_info_resolved(conn, mb, &item)?);
+                mailboxes.push(make_label_info(&id, &name, None));
             }
             Ok(mailboxes)
         })
@@ -4862,9 +5386,10 @@ impl MailStore for SqliteStore {
                 )
                 .map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![mb, mailbox_key, since_modseq as i64], |row| {
-                    Ok(row.get::<_, i64>(0)?.max(1) as u32)
-                })
+                .query_map(
+                    params![mb, mailbox_key, since_modseq.min(i64::MAX as u64) as i64],
+                    |row| Ok(row.get::<_, i64>(0)?.max(1) as u32),
+                )
                 .map_err(sql_err)?;
             let mut uids = Vec::new();
             for r in rows {
@@ -4923,16 +5448,31 @@ impl MailStore for SqliteStore {
                 let labels_changed = !to_add.is_empty() || !to_remove.is_empty();
 
                 if flags_changed {
-                    tx.execute(
-                        "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE mailbox_id = ?3 AND id = ?4",
-                        params![
-                            if input.is_answered { 1_i64 } else { 0_i64 },
-                            if input.is_deleted { 1_i64 } else { 0_i64 },
-                            mb,
-                            &existing_id
-                        ],
-                    )
-                    .map_err(sql_err)?;
+                    if !labels_changed {
+                        let new_hid = bump_history_id(&tx, mb)?;
+                        tx.execute(
+                            "UPDATE messages SET is_answered = ?1, is_deleted = ?2, history_id = ?3 WHERE mailbox_id = ?4 AND id = ?5",
+                            params![
+                                if input.is_answered { 1_i64 } else { 0_i64 },
+                                if input.is_deleted { 1_i64 } else { 0_i64 },
+                                new_hid as i64,
+                                mb,
+                                &existing_id
+                            ],
+                        )
+                        .map_err(sql_err)?;
+                    } else {
+                        tx.execute(
+                            "UPDATE messages SET is_answered = ?1, is_deleted = ?2 WHERE mailbox_id = ?3 AND id = ?4",
+                            params![
+                                if input.is_answered { 1_i64 } else { 0_i64 },
+                                if input.is_deleted { 1_i64 } else { 0_i64 },
+                                mb,
+                                &existing_id
+                            ],
+                        )
+                        .map_err(sql_err)?;
+                    }
                 }
 
                 let updated = if labels_changed {
@@ -5353,7 +5893,7 @@ impl MailStore for SqliteStore {
         status: Option<ApprovalStatus>,
         limit: usize,
     ) -> AppResult<Vec<PendingApproval>> {
-        let limit = if limit == 0 { 20 } else { limit } as i64;
+        let limit = clamp_sql_limit(limit, 20, MAX_SQL_LIMIT);
         self.run_blocking(move |conn, mb| {
             let now_ms = Utc::now().timestamp_millis();
             let mut results = Vec::new();
@@ -5702,7 +6242,7 @@ impl MailStore for SqliteStore {
     }
 
     async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>> {
-        let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+        let limit = clamp_sql_limit(query.limit, 50, MAX_SQL_LIMIT);
         let q_pattern = query
             .q
             .as_deref()
@@ -5918,6 +6458,11 @@ impl MailStore for SqliteStore {
             let created_at_ms = Utc::now().timestamp_millis();
             let expires_at_ms = created_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
             conn.execute(
+                "DELETE FROM idempotency_keys WHERE mailbox_id = ?1 AND expires_at_ms <= ?2",
+                params![mb, created_at_ms],
+            )
+            .map_err(sql_err)?;
+            conn.execute(
                 "INSERT INTO idempotency_keys (
                     mailbox_id, scope, key, response_json, created_at_ms, expires_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -5982,7 +6527,7 @@ impl MailStore for SqliteStore {
     async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>> {
         let query = query.clone();
         self.run_blocking(move |conn, mb| {
-            let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+            let limit = clamp_sql_limit(query.limit, 50, MAX_SQL_LIMIT);
             let mut sql = String::from(
                 "SELECT id, mailbox_id, timestamp_ms, actor, scopes_json, channel,
                         action, target_ids_json, outcome, detail
@@ -6247,7 +6792,7 @@ impl MailStore for SqliteStore {
         status: Option<ScheduledSendStatus>,
         limit: usize,
     ) -> AppResult<Vec<ScheduledSend>> {
-        let limit = if limit == 0 { 20 } else { limit } as i64;
+        let limit = clamp_sql_limit(limit, 20, MAX_SQL_LIMIT);
         self.run_blocking(move |conn, mb| {
             let mut results = Vec::new();
             match status {

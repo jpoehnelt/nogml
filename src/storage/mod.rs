@@ -21,7 +21,7 @@ use crate::{
     models::{
         AttachmentMeta, AutoForwarding, ContactSummary, EmailAddress, ImapSettings, LABEL_DRAFT,
         LABEL_STARRED, LABEL_UNREAD, LabelColor, PopSettings, Profile, SendAs, ThreadSummary,
-        VacationSettings,
+        UnsubscribeInfo, VacationSettings,
     },
     transport::OutboundMessage,
 };
@@ -74,6 +74,22 @@ pub struct StoredMessage {
     pub all_mail_uid: u32,
     pub is_answered: bool,
     pub is_deleted: bool,
+
+    /// Pre-parsed RFC 2369 / 8058 `List-Unsubscribe` metadata captured at ingest time so
+    /// thread/message reads never need to download offloaded raw RFC 2822 blobs just to
+    /// inspect unsubscribe headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribe: Option<UnsubscribeInfo>,
+}
+
+/// Hard ceiling applied to caller-supplied SQL `LIMIT` values before casting to `i64`
+/// so extreme values like `usize::MAX` never wrap negative.
+pub const MAX_SQL_LIMIT: usize = 10_000;
+
+/// Clamp a caller-supplied `limit` (`0` -> `default`) into `[1, max]` before casting to `i64`.
+pub fn clamp_sql_limit(limit: usize, default: usize, max: usize) -> i64 {
+    let effective = if limit == 0 { default } else { limit };
+    effective.clamp(1, max.max(1)) as i64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

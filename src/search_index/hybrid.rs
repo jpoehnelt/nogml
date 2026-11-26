@@ -32,6 +32,13 @@ const MAX_EMBED_CHARS: usize = 8_000;
 
 const RRF_CURSOR_PREFIX: &str = "rrf:";
 const SCORE_TIE_EPSILON: f64 = 1e-12;
+/// Hard ceiling on RRF offset cursors so forged cursors like `base64("rrf:<usize::MAX>")`
+/// cannot overflow arithmetic or trigger unbounded full-mailbox scans.
+pub const MAX_RRF_OFFSET: usize = 1_000;
+/// Hard cap on lexical/vector candidate retrieval per hybrid query.
+const MAX_HYBRID_CANDIDATES: usize = 1_000;
+/// Hard cap on per-message `store.get_message` hydrations during vector filtering.
+const MAX_VECTOR_HYDRATION_SCAN: usize = 2_000;
 
 /// L2-normalize an embedding vector. Returns a zero vector if the norm is zero or non-finite.
 pub fn normalize_l2(vector: &[f32]) -> Vec<f32> {
@@ -142,10 +149,24 @@ enum ParsedCursor {
     KeysetFallback,
 }
 
+fn is_keyset_cursor_text(text: &str) -> bool {
+    if let Some((ts_str, id)) = text.split_once(':') {
+        ts_str.parse::<i64>().is_ok() && !id.is_empty()
+    } else {
+        false
+    }
+}
+
 fn parse_cursor(raw: Option<&str>) -> AppResult<ParsedCursor> {
     let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(ParsedCursor::None);
     };
+
+    // Check for plaintext `<timestamp_ms>:<id>` keyset cursors FIRST (as emitted by
+    // SQLite/Postgres/Memory lexical search fallback) before attempting base64 decoding.
+    if is_keyset_cursor_text(trimmed) {
+        return Ok(ParsedCursor::KeysetFallback);
+    }
 
     let bytes = URL_SAFE_NO_PAD
         .decode(trimmed.as_bytes())
@@ -157,14 +178,16 @@ fn parse_cursor(raw: Option<&str>) -> AppResult<ParsedCursor> {
         let offset = rest
             .parse::<usize>()
             .map_err(|_| AppError::BadRequest("Invalid pagination cursor".to_string()))?;
+        if offset > MAX_RRF_OFFSET {
+            return Err(AppError::BadRequest(format!(
+                "Pagination cursor offset exceeds maximum supported depth ({MAX_RRF_OFFSET})"
+            )));
+        }
         return Ok(ParsedCursor::RrfOffset(offset));
     }
 
-    // Also allow keyset cursors (`<timestamp_ms>:<id>`) emitted if a prior page fell back to lexical search.
-    if let Some((ts_str, id)) = text.split_once(':')
-        && ts_str.parse::<i64>().is_ok()
-        && !id.is_empty()
-    {
+    // Also allow base64-encoded keyset cursors (`<timestamp_ms>:<id>`) if a caller wrapped one.
+    if is_keyset_cursor_text(&text) {
         return Ok(ParsedCursor::KeysetFallback);
     }
 
@@ -423,7 +446,11 @@ impl SearchIndex for HybridSearchIndex {
             ParsedCursor::KeysetFallback => return self.lexical.search(query).await,
         };
 
-        let candidate_k = (offset + limit).max(20).saturating_mul(4).clamp(100, 1000);
+        let candidate_k = offset
+            .saturating_add(limit)
+            .max(20)
+            .saturating_mul(4)
+            .clamp(100, MAX_HYBRID_CANDIDATES);
 
         let query_vec = match self.provider.embed(&[raw_q.to_string()]).await {
             Ok(mut vecs) => match vecs.pop() {
@@ -449,23 +476,30 @@ impl SearchIndex for HybridSearchIndex {
 
         let Some(query_vec) = query_vec else {
             if is_rrf_cursor {
+                let target_candidates = offset
+                    .saturating_add(limit)
+                    .saturating_add(1)
+                    .min(MAX_HYBRID_CANDIDATES.saturating_add(1));
                 let lexical_msgs = self
-                    .fetch_lexical_candidates(query, offset + limit + 1)
+                    .fetch_lexical_candidates(query, target_candidates)
                     .await?;
                 let mut sliced: Vec<StoredMessage> = lexical_msgs
                     .into_iter()
                     .skip(offset)
-                    .take(limit + 1)
+                    .take(limit.saturating_add(1))
                     .collect();
                 let has_more = sliced.len() > limit;
                 if has_more {
                     sliced.truncate(limit);
                 }
-                let next_cursor = has_more.then(|| encode_rrf_cursor(offset + limit));
+                let next_offset = offset.saturating_add(limit);
+                let next_cursor = (has_more && next_offset <= MAX_RRF_OFFSET)
+                    .then(|| encode_rrf_cursor(next_offset));
+                let page_has_more = next_cursor.is_some();
                 return Ok(AiMessagePage {
                     messages: sliced,
                     next_cursor,
-                    has_more,
+                    has_more: page_has_more,
                 });
             }
             return self.lexical.search(query).await;
@@ -498,14 +532,17 @@ impl SearchIndex for HybridSearchIndex {
         });
 
         let resolved_labels = self.resolve_labels(&query.labels).await?;
+        let hydration_budget = candidate_k.saturating_mul(4).min(MAX_VECTOR_HYDRATION_SCAN);
+        let mut hydrated_count = 0usize;
         let mut vector_ids = Vec::new();
         for (msg_id, _sim) in scored {
-            if vector_ids.len() >= candidate_k {
+            if vector_ids.len() >= candidate_k || hydrated_count >= hydration_budget {
                 break;
             }
             let msg = if let Some(existing) = msg_cache.get(&msg_id) {
                 existing.clone()
             } else {
+                hydrated_count += 1;
                 let Some(loaded) = self.store.get_message(&msg_id).await? else {
                     continue;
                 };
@@ -546,7 +583,7 @@ impl SearchIndex for HybridSearchIndex {
         let mut page_msgs: Vec<StoredMessage> = fused
             .into_iter()
             .skip(offset)
-            .take(limit + 1)
+            .take(limit.saturating_add(1))
             .map(|(msg, _)| msg)
             .collect();
 
@@ -554,12 +591,15 @@ impl SearchIndex for HybridSearchIndex {
         if has_more {
             page_msgs.truncate(limit);
         }
-        let next_cursor = has_more.then(|| encode_rrf_cursor(offset + limit));
+        let next_offset = offset.saturating_add(limit);
+        let next_cursor =
+            (has_more && next_offset <= MAX_RRF_OFFSET).then(|| encode_rrf_cursor(next_offset));
+        let page_has_more = next_cursor.is_some();
 
         Ok(AiMessagePage {
             messages: page_msgs,
             next_cursor,
-            has_more,
+            has_more: page_has_more,
         })
     }
 

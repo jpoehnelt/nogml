@@ -300,14 +300,12 @@ async fn load_attachment_id_map(
 
     let metas = state.store.list_attachment_meta(&stored.id).await?;
     for meta in metas {
-        if let Some(att) = state.store.get_attachment(&stored.id, &meta.id).await? {
-            map.insert(att.part_id, att.id.clone());
-            if let Some(ref fname) = att.filename
-                && !fname.is_empty()
-            {
-                map.entry(fname.clone()).or_insert(att.id);
-            }
-        } else if let Some(ref fname) = meta.filename
+        if let Some(ref part_id) = meta.part_id
+            && !part_id.is_empty()
+        {
+            map.insert(part_id.clone(), meta.id.clone());
+        }
+        if let Some(ref fname) = meta.filename
             && !fname.is_empty()
         {
             map.entry(fname.clone()).or_insert(meta.id);

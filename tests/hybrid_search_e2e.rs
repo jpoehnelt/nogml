@@ -688,3 +688,117 @@ async fn cli_search_reindex_backfills_sqlite_embeddings_and_enables_semantic_sea
     assert_eq!(fail_report["indexed"], 0);
     assert_eq!(fail_report["failed"], 2);
 }
+
+#[tokio::test]
+async fn hybrid_search_keyset_fallback_pagination_and_overflow_cursor_rejection() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("provider unavailable"))
+        .mount(&mock)
+        .await;
+
+    let mut cfg = Config::for_test();
+    cfg.search_backend = SearchBackend::Hybrid;
+    cfg.embedding_base_url = Some(mock.uri());
+    cfg.embedding_model = "nomic-embed-text".to_string();
+
+    let state = AppState::from_config(cfg).unwrap();
+    for (idx, ts) in [1_700_000_001_000_i64, 1_700_000_002_000, 1_700_000_003_000]
+        .into_iter()
+        .enumerate()
+    {
+        let msg = state
+            .store
+            .insert_message(make_message(
+                &format!("m_ks_{idx}"),
+                "ops@example.com",
+                "agent@example.com",
+                &format!("Canary deployment note {idx}"),
+                "Canary rollout steps for service.",
+                vec![LABEL_INBOX, LABEL_UNREAD],
+                ts,
+                false,
+            ))
+            .await
+            .unwrap();
+        state.post_store_message(&msg).await.unwrap();
+    }
+
+    let app = build_router(state);
+
+    // 1. Page 1 falls back to lexical search and emits a plaintext `<ts_ms>:<id>` keyset cursor.
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=canary&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+    let page1: Value =
+        serde_json::from_slice(&res1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page1["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(page1["has_more"], true);
+    let keyset_cursor = page1["next_cursor"]
+        .as_str()
+        .expect("plaintext keyset cursor");
+    assert!(
+        keyset_cursor.contains(':'),
+        "expected plaintext <ts>:<id> keyset cursor, got: {keyset_cursor}"
+    );
+
+    // 2. Passing the plaintext keyset cursor back to `/v1/search` MUST succeed (not 400).
+    let encoded_cursor = keyset_cursor.replace(':', "%3A");
+    let res2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/search?q=canary&limit=1&cursor={encoded_cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let page2: Value =
+        serde_json::from_slice(&res2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page2["messages"].as_array().unwrap().len(), 1);
+    assert_ne!(page1["messages"][0]["id"], page2["messages"][0]["id"]);
+
+    // 3. Forged overflow cursor `base64("rrf:<usize::MAX>")` must be rejected with 400.
+    let overflow_cursor = URL_SAFE_NO_PAD.encode(format!("rrf:{}", usize::MAX).as_bytes());
+    let res_overflow = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/search?q=canary&limit=10&cursor={overflow_cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_overflow.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Excessive RRF cursor beyond MAX_RRF_OFFSET must also be rejected with 400.
+    let huge_cursor = URL_SAFE_NO_PAD.encode(b"rrf:50000");
+    let res_huge = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/search?q=canary&limit=10&cursor={huge_cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_huge.status(), StatusCode::BAD_REQUEST);
+}

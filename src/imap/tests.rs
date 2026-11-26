@@ -222,6 +222,7 @@ impl TestMailStore {
             all_mail_uid,
             is_answered: input.is_answered,
             is_deleted: input.is_deleted,
+            unsubscribe: None,
         };
         inner.messages.insert(id, stored.clone());
         stored
