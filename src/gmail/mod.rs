@@ -4,6 +4,7 @@
 //! Owned by the `gmail-api` worker.
 
 pub mod batch;
+pub mod compat;
 pub mod fields;
 pub mod query;
 pub mod settings;
@@ -218,6 +219,10 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
             "/gmail/v1/users/{userId}/settings/pop",
             get(settings::get_pop).put(settings::update_pop),
         )
+        // Google OAuth2 userinfo & People API client compatibility endpoints
+        .route("/oauth2/v2/userinfo", get(compat::get_userinfo_v2))
+        .route("/oauth2/v3/userinfo", get(compat::get_userinfo_v3))
+        .route("/v1/people/me", get(compat::get_people_me))
         .layer(middleware::from_fn(fields_and_alt_middleware))
 }
 

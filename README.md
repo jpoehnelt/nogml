@@ -284,6 +284,8 @@ Every CLI flag has a matching environment variable:
 
 ## Connecting clients
 
+For complete setup instructions, configuration templates (Superhuman, Google SDKs, Apple Mail, Thunderbird, `himalaya`, `mutt`, Claude Desktop, Cursor), known caveats, and running the opt-in live provider smoke tests (`cargo test --test live_smoke -- --ignored --nocapture`), see the [Client compatibility guide](docs/clients.md).
+
 ### MCP client
 
 ```json
@@ -304,6 +306,7 @@ For HTTP clients, connect to `http://127.0.0.1:8080/mcp`.
 Point the Gmail API base URL at `http://127.0.0.1:8080` with `Authorization: Bearer <token>`:
 
 - `GET /gmail/v1/users/me/profile`
+- `GET /oauth2/v2/userinfo`, `GET /oauth2/v3/userinfo`, and `GET /v1/people/me?personFields=names,emailAddresses`
 - `GET /gmail/v1/users/me/messages?q=from:alice has:attachment`
 - `GET /gmail/v1/users/me/messages/{id}?format=full&fields=id,snippet,payload/headers`
 - `POST /upload/gmail/v1/users/me/messages/send?uploadType=multipart`

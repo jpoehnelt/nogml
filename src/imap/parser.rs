@@ -512,14 +512,22 @@ fn wildcard_match_rec(p: &[char], s: &[char], delim: char) -> bool {
     }
 }
 
-/// Format an IMAP quoted string (escaping `\` and `"`), or a literal `{N}\r\n...` if it contains CR/LF or non-ASCII.
+/// Format an IMAP quoted string (escaping `\` and `"`), or a literal `{N}\r\n...` if it contains
+/// CR/LF, control characters, or non-ASCII bytes. NUL bytes are stripped because RFC 3501 forbids
+/// NUL octets in both quoted strings and literals.
 pub fn imap_string(s: &str) -> String {
-    if s.bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == 0 || !b.is_ascii())
-    {
-        format!("{{{}}}\r\n{}", s.len(), s)
+    let sanitized: std::borrow::Cow<'_, str> = if s.contains('\0') {
+        std::borrow::Cow::Owned(s.replace('\0', ""))
     } else {
-        imap_quote(s)
+        std::borrow::Cow::Borrowed(s)
+    };
+    if sanitized
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0x7f || (b < 0x20 && b != b'\t') || !b.is_ascii())
+    {
+        format!("{{{}}}\r\n{}", sanitized.len(), sanitized)
+    } else {
+        imap_quote(&sanitized)
     }
 }
 

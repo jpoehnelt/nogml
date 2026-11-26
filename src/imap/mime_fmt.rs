@@ -272,29 +272,40 @@ pub fn format_envelope(raw: &[u8]) -> String {
 }
 
 fn format_envelope_ref(msg: MessageRef<'_>) -> String {
-    let date = msg.date().map(|d| d.to_rfc822()).or_else(|| {
-        msg.headers()
-            .get(mail_parser::HeaderName::Date)
-            .map(|h| String::from_utf8_lossy(h.raw_value()).trim().to_string())
-    });
+    let date = msg
+        .date()
+        .map(|d| d.to_rfc822())
+        .or_else(|| {
+            msg.headers()
+                .get(mail_parser::HeaderName::Date)
+                .map(|h| String::from_utf8_lossy(h.raw_value()).trim().to_string())
+        })
+        .filter(|s| !s.is_empty());
     let subject = msg.subject();
     let from = format_addr_list(msg.from());
-    let sender = msg
-        .sender()
-        .map(|s| format_addr_list(Some(s)))
-        .unwrap_or_else(|| from.clone());
-    let reply_to = msg
-        .reply_to()
-        .map(|r| format_addr_list(Some(r)))
-        .unwrap_or_else(|| from.clone());
+    // RFC 3501 Section 7.4.2: absent or empty Sender / Reply-To defaults to From.
+    let sender = match format_addr_list(msg.sender()) {
+        s if s != "NIL" => s,
+        _ => from.clone(),
+    };
+    let reply_to = match format_addr_list(msg.reply_to()) {
+        s if s != "NIL" => s,
+        _ => from.clone(),
+    };
     let to = format_addr_list(msg.to());
     let cc = format_addr_list(msg.cc());
     let bcc = format_addr_list(msg.bcc());
     let in_reply_to = msg
         .in_reply_to()
         .and_then(|l| l.first())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(format_angle_id);
-    let message_id = msg.message_id().map(format_angle_id);
+    let message_id = msg
+        .message_id()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(format_angle_id);
 
     format!(
         "({} {} {} {} {} {} {} {} {} {})",
@@ -326,14 +337,20 @@ fn format_addr_list(list: Option<AddressList<'_>>) -> String {
     };
     let mut entries = Vec::new();
     for mbx in list.mailboxes() {
-        let name = imap_nstring(mbx.name());
-        let (local, host) = match mbx.address() {
+        let name = imap_nstring(mbx.name().map(str::trim).filter(|s| !s.is_empty()));
+        let (local, host) = match mbx.address().map(str::trim).filter(|s| !s.is_empty()) {
             Some(addr) => match addr.split_once('@') {
-                Some((l, h)) => (imap_nstring(Some(l)), imap_nstring(Some(h))),
+                Some((l, h)) => (
+                    imap_nstring(Some(l).filter(|s| !s.is_empty())),
+                    imap_nstring(Some(h).filter(|s| !s.is_empty())),
+                ),
                 None => (imap_nstring(Some(addr)), "NIL".to_string()),
             },
             None => ("NIL".to_string(), "NIL".to_string()),
         };
+        if name == "NIL" && local == "NIL" && host == "NIL" {
+            continue;
+        }
         entries.push(format!("({name} NIL {local} {host})"));
     }
     if entries.is_empty() {
@@ -343,14 +360,30 @@ fn format_addr_list(list: Option<AddressList<'_>>) -> String {
     }
 }
 
+fn format_empty_text_part(extended: bool) -> String {
+    if extended {
+        r#"("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 0 0 NIL NIL NIL NIL)"#.to_string()
+    } else {
+        r#"("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 0 0)"#.to_string()
+    }
+}
+
+fn count_body_lines(raw_body: &[u8]) -> usize {
+    if raw_body.is_empty() {
+        return 0;
+    }
+    let newlines = raw_body.iter().filter(|&&b| b == b'\n').count();
+    if raw_body.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
 /// Format an RFC 3501 `BODYSTRUCTURE` (when `extended == true`) or `BODY` (when `extended == false`).
 pub fn format_bodystructure(raw: &[u8], extended: bool) -> String {
     let Some(parsed) = MessageParser::new().parse(raw) else {
-        return if extended {
-            r#"("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 0 0 NIL NIL NIL NIL)"#.to_string()
-        } else {
-            r#"("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 0 0)"#.to_string()
-        };
+        return format_empty_text_part(extended);
     };
     format_part_bodystructure(parsed.root_part(), extended)
 }
@@ -361,9 +394,15 @@ fn format_part_bodystructure(part: MessagePart<'_>, extended: bool) -> String {
         for child in part.children() {
             children_str.push_str(&format_part_bodystructure(child, extended));
         }
+        // RFC 3501 `body-type-mpart = 1*body SP media-subtype ...` requires at least one child body.
+        if children_str.is_empty() {
+            children_str.push_str(&format_empty_text_part(extended));
+        }
         let subtype = part
             .content_type()
             .and_then(|ct| ct.subtype())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .unwrap_or("mixed")
             .to_ascii_uppercase();
         if !extended {
@@ -377,23 +416,60 @@ fn format_part_bodystructure(part: MessagePart<'_>, extended: bool) -> String {
         );
     }
 
+    let raw_body = part.raw_body();
     let (ctype, subtype) = match part.content_type() {
-        Some(ct) => (
-            ct.ctype().to_ascii_uppercase(),
-            ct.subtype().unwrap_or("plain").to_ascii_uppercase(),
-        ),
+        Some(ct) => {
+            let main = ct.ctype().trim();
+            if main.is_empty() {
+                ("TEXT".to_string(), "PLAIN".to_string())
+            } else {
+                let main_upper = main.to_ascii_uppercase();
+                let default_sub = if main_upper == "TEXT" {
+                    "PLAIN"
+                } else {
+                    "OCTET-STREAM"
+                };
+                let sub = ct
+                    .subtype()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_ascii_uppercase)
+                    .unwrap_or_else(|| default_sub.to_string());
+                (main_upper, sub)
+            }
+        }
         None => ("TEXT".to_string(), "PLAIN".to_string()),
     };
 
-    let params = format_ct_params(part.content_type());
-    let content_id = imap_nstring(part.content_id().map(format_angle_id).as_deref());
-    let desc = imap_nstring(part.content_description());
+    // RFC 2045 Section 5.2: omitted Content-Type defaults to text/plain with US-ASCII (or UTF-8 if 8-bit).
+    let params = match part.content_type() {
+        Some(ct) => format_ct_params(Some(ct)),
+        None => {
+            let charset = if raw_body.is_ascii() {
+                "US-ASCII"
+            } else {
+                "UTF-8"
+            };
+            format!(r#"("CHARSET" "{charset}")"#)
+        }
+    };
+    let content_id = imap_nstring(
+        part.content_id()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(format_angle_id)
+            .as_deref(),
+    );
+    let desc = imap_nstring(
+        part.content_description()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    );
     let encoding = part
         .content_transfer_encoding()
         .map(|s| s.trim().to_ascii_uppercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "7BIT".to_string());
-    let raw_body = part.raw_body();
     let octets = raw_body.len();
 
     let mut fields = vec![
@@ -407,18 +483,16 @@ fn format_part_bodystructure(part: MessagePart<'_>, extended: bool) -> String {
     ];
 
     if ctype == "TEXT" {
-        let lines = raw_body.iter().filter(|&&b| b == b'\n').count();
-        fields.push(lines.to_string());
+        fields.push(count_body_lines(raw_body).to_string());
     } else if ctype == "MESSAGE" && subtype == "RFC822" {
         if let Some(nested) = part.nested() {
             fields.push(format_envelope_ref(nested));
             fields.push(format_part_bodystructure(nested.root_part(), extended));
         } else {
             fields.push("(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)".to_string());
-            fields.push(r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 0 0)"#.to_string());
+            fields.push(format_empty_text_part(extended));
         }
-        let lines = raw_body.iter().filter(|&&b| b == b'\n').count();
-        fields.push(lines.to_string());
+        fields.push(count_body_lines(raw_body).to_string());
     }
 
     if extended {
@@ -426,7 +500,11 @@ fn format_part_bodystructure(part: MessagePart<'_>, extended: bool) -> String {
         fields.push("NIL".to_string());
         fields.push(format_disposition(part.content_disposition()));
         fields.push("NIL".to_string());
-        fields.push(imap_nstring(part.content_location()));
+        fields.push(imap_nstring(
+            part.content_location()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ));
     }
 
     format!("({})", fields.join(" "))
@@ -438,7 +516,11 @@ fn format_ct_params(ct: Option<mail_parser::ContentType<'_>>) -> String {
     };
     let mut pairs = Vec::new();
     for (k, v) in ct.attributes() {
-        pairs.push(imap_quote(&k.to_ascii_uppercase()));
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        pairs.push(imap_quote(&key.to_ascii_uppercase()));
         pairs.push(imap_string(v));
     }
     if pairs.is_empty() {
@@ -452,11 +534,12 @@ fn format_disposition(cd: Option<mail_parser::ContentType<'_>>) -> String {
     let Some(cd) = cd else {
         return "NIL".to_string();
     };
+    let dtype = cd.ctype().trim();
+    if dtype.is_empty() {
+        return "NIL".to_string();
+    }
     let params = format_ct_params(Some(cd));
-    format!(
-        "({} {params})",
-        imap_quote(&cd.ctype().to_ascii_uppercase())
-    )
+    format!("({} {params})", imap_quote(&dtype.to_ascii_uppercase()))
 }
 
 /// Parse raw RFC 2822 bytes into a [`NewMessageInput`] suitable for `MailStore::imap_append` or sync upsert.
