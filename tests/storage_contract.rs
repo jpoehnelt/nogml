@@ -987,7 +987,19 @@ async fn contract_upsert_dedup_settings_watch_sync_state(store: Arc<dyn MailStor
     store.clear_watch().await.unwrap();
     assert!(store.get_watch().await.unwrap().is_none());
 
-    // 7. SyncState round-trip including bidirectional push checkpoints
+    // 7. SyncState round-trip including bidirectional push checkpoints & per-folder IMAP state
+    let mut folder_states = std::collections::HashMap::new();
+    let mut uid_map = std::collections::BTreeMap::new();
+    uid_map.insert(42, "msg_42".to_string());
+    folder_states.insert(
+        ALL_MAIL_MAILBOX.to_string(),
+        nogml::storage::ImapFolderSyncState {
+            uid_validity: Some(7),
+            last_uid: Some(42),
+            highest_modseq: Some(88),
+            uid_to_message_id: uid_map,
+        },
+    );
     let st = SyncState {
         account_key: "primary".to_string(),
         provider: "gmail_api".to_string(),
@@ -995,6 +1007,8 @@ async fn contract_upsert_dedup_settings_watch_sync_state(store: Arc<dyn MailStor
         imap_mailbox: Some(ALL_MAIL_MAILBOX.to_string()),
         imap_uid_validity: Some(7),
         imap_last_uid: Some(42),
+        imap_highest_modseq: Some(88),
+        imap_folder_states: folder_states,
         last_sync_at: Some(Utc::now()),
         last_full_sync_at: None,
         status: "ok".to_string(),
@@ -1006,9 +1020,53 @@ async fn contract_upsert_dedup_settings_watch_sync_state(store: Arc<dyn MailStor
     store.save_sync_state(st).await.unwrap();
     let got_st = store.get_sync_state("primary").await.unwrap().unwrap();
     assert_eq!(got_st.last_history_id.as_deref(), Some("555"));
+    assert_eq!(got_st.imap_highest_modseq, Some(88));
+    let got_folder = got_st
+        .imap_folder_states
+        .get(ALL_MAIL_MAILBOX)
+        .expect("folder state persisted");
+    assert_eq!(got_folder.uid_validity, Some(7));
+    assert_eq!(got_folder.last_uid, Some(42));
+    assert_eq!(got_folder.highest_modseq, Some(88));
+    assert_eq!(
+        got_folder.uid_to_message_id.get(&42).map(String::as_str),
+        Some("msg_42")
+    );
     assert_eq!(got_st.last_pushed_history_id, Some(33));
     assert_eq!(got_st.messages_pushed, 4);
     assert_eq!(store.list_sync_states().await.unwrap().len(), 1);
+
+    // 8. Link upstream ID & update synced IMAP flags without emitting local history mutations
+    let unlinked = store
+        .insert_message(sample_message(
+            "Local Sent",
+            "me@example.com",
+            "sent body",
+            1_700_000_050_000,
+        ))
+        .await
+        .unwrap();
+    assert!(unlinked.upstream_gmail_id.is_none());
+    let linked = store
+        .link_message_upstream_id(&unlinked.id, "up_linked_1", Some("thr_linked_1"))
+        .await
+        .unwrap();
+    assert!(linked);
+    let found = store
+        .find_message_by_upstream_id("up_linked_1")
+        .await
+        .unwrap()
+        .expect("message linked by upstream_id");
+    assert_eq!(found.id, unlinked.id);
+    assert_eq!(found.upstream_thread_id.as_deref(), Some("thr_linked_1"));
+
+    let flagged = store
+        .update_synced_message_flags(&unlinked.id, true, false)
+        .await
+        .unwrap()
+        .expect("flagged message");
+    assert!(flagged.is_answered);
+    assert!(!flagged.is_deleted);
 }
 
 async fn contract_pending_approvals_atomic_transitions(store: Arc<dyn MailStore>) {

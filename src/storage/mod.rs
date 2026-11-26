@@ -8,7 +8,10 @@ pub mod memory;
 pub mod postgres;
 pub mod sqlite;
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -476,6 +479,20 @@ pub struct UpsertOutcome {
     pub message: StoredMessage,
 }
 
+/// Per-folder IMAP sync checkpoint persisted inside [`SyncState::imap_folder_states`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImapFolderSyncState {
+    pub uid_validity: Option<u32>,
+    pub last_uid: Option<u32>,
+    /// Highest RFC 7162 `MODSEQ` observed in this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highest_modseq: Option<u64>,
+    /// Bounded mapping of synced IMAP UID -> local `MailStore` message ID for fast
+    /// `CONDSTORE`/`QRESYNC` `VANISHED` and non-`CONDSTORE` reconciliation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub uid_to_message_id: BTreeMap<u32, String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub account_key: String,
@@ -485,6 +502,12 @@ pub struct SyncState {
     pub imap_mailbox: Option<String>,
     pub imap_uid_validity: Option<u32>,
     pub imap_last_uid: Option<u32>,
+    /// Highest RFC 7162 `MODSEQ` observed on the primary IMAP mailbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_highest_modseq: Option<u64>,
+    /// Per-folder IMAP checkpoints (`mailbox_name -> ImapFolderSyncState`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub imap_folder_states: HashMap<String, ImapFolderSyncState>,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_full_sync_at: Option<DateTime<Utc>>,
     pub status: String,
@@ -1553,6 +1576,26 @@ pub trait MailStore: Send + Sync {
     ) -> AppResult<StoredMessage> {
         self.modify_message_labels(id, add_labels, remove_labels)
             .await
+    }
+    /// Update `is_answered` / `is_deleted` flags on a synced message without recording a local
+    /// history mutation (prevents echo loops during bidirectional sync).
+    async fn update_synced_message_flags(
+        &self,
+        _id: &str,
+        _is_answered: bool,
+        _is_deleted: bool,
+    ) -> AppResult<Option<StoredMessage>> {
+        Ok(None)
+    }
+    /// Link an existing local message to its upstream ID (and optional upstream thread ID) after
+    /// pushing it upstream (e.g. via IMAP `APPEND` + `APPENDUID`). Does not emit a local history event.
+    async fn link_message_upstream_id(
+        &self,
+        _message_id: &str,
+        _upstream_gmail_id: &str,
+        _upstream_thread_id: Option<&str>,
+    ) -> AppResult<bool> {
+        Ok(false)
     }
     async fn find_message_by_upstream_id(
         &self,

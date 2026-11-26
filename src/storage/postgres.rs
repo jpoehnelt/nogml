@@ -68,7 +68,7 @@ pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 9;
+const CURRENT_SCHEMA_VERSION: i32 = 10;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -250,6 +250,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     imap_mailbox TEXT,
     imap_uid_validity BIGINT,
     imap_last_uid BIGINT,
+    imap_highest_modseq BIGINT,
+    imap_folder_states_json TEXT NOT NULL DEFAULT '{}',
     last_sync_at_ms BIGINT,
     last_full_sync_at_ms BIGINT,
     status TEXT NOT NULL,
@@ -259,6 +261,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     messages_pushed BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (mailbox_id, account_key)
 );
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS imap_highest_modseq BIGINT;
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS imap_folder_states_json TEXT NOT NULL DEFAULT '{}';
 
 CREATE TABLE IF NOT EXISTS watch_state (
     mailbox_id TEXT PRIMARY KEY,
@@ -3145,6 +3149,11 @@ fn normalize_pending_approval(
 fn sync_state_from_row(row: &Row) -> SyncState {
     let last_sync_ms: Option<i64> = row.get(6);
     let last_full_ms: Option<i64> = row.get(7);
+    let folder_states_raw: Option<String> = row.get(14);
+    let imap_folder_states = folder_states_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     SyncState {
         account_key: row.get(0),
         provider: row.get(1),
@@ -3152,6 +3161,8 @@ fn sync_state_from_row(row: &Row) -> SyncState {
         imap_mailbox: row.get(3),
         imap_uid_validity: row.get::<_, Option<i64>>(4).map(|v| v.max(0) as u32),
         imap_last_uid: row.get::<_, Option<i64>>(5).map(|v| v.max(0) as u32),
+        imap_highest_modseq: row.get::<_, Option<i64>>(13).map(|v| v.max(0) as u64),
+        imap_folder_states,
         last_sync_at: last_sync_ms.and_then(DateTime::from_timestamp_millis),
         last_full_sync_at: last_full_ms.and_then(DateTime::from_timestamp_millis),
         status: row.get(8),
@@ -5922,6 +5933,64 @@ impl MailStore for PostgresStore {
         Ok(updated)
     }
 
+    async fn update_synced_message_flags(
+        &self,
+        id: &str,
+        is_answered: bool,
+        is_deleted: bool,
+    ) -> AppResult<Option<StoredMessage>> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+        let Some(existing) = load_message_by_id(&tx, mb, id).await? else {
+            return Ok(None);
+        };
+        if existing.is_answered != is_answered || existing.is_deleted != is_deleted {
+            let new_hid = bump_history_id(&tx, mb).await?;
+            let new_hid_i64 = new_hid as i64;
+            tx.execute(
+                "UPDATE messages SET is_answered = $1, is_deleted = $2, history_id = $3
+                 WHERE mailbox_id = $4 AND id = $5",
+                &[&is_answered, &is_deleted, &new_hid_i64, &mb, &id],
+            )
+            .await
+            .map_err(pg_err)?;
+            let updated = load_message_by_id(&tx, mb, id).await?;
+            tx.commit().await.map_err(pg_err)?;
+            return Ok(updated);
+        }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(Some(existing))
+    }
+
+    async fn link_message_upstream_id(
+        &self,
+        message_id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<bool> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let changed = if let Some(tid) = upstream_thread_id {
+            conn.execute(
+                "UPDATE messages SET upstream_gmail_id = $1, upstream_thread_id = $2
+                 WHERE mailbox_id = $3 AND id = $4",
+                &[&upstream_gmail_id, &tid, &mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?
+        } else {
+            conn.execute(
+                "UPDATE messages SET upstream_gmail_id = $1
+                 WHERE mailbox_id = $2 AND id = $3",
+                &[&upstream_gmail_id, &mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?
+        };
+        Ok(changed > 0)
+    }
+
     async fn find_message_by_upstream_id(
         &self,
         upstream_gmail_id: &str,
@@ -5975,7 +6044,8 @@ impl MailStore for PostgresStore {
             .query_opt(
                 "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                         imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                        messages_synced, last_pushed_history_id, messages_pushed
+                        messages_synced, last_pushed_history_id, messages_pushed,
+                        imap_highest_modseq, imap_folder_states_json
                  FROM sync_state WHERE mailbox_id = $1 AND account_key = $2",
                 &[&mb, &account_key],
             )
@@ -5989,6 +6059,11 @@ impl MailStore for PostgresStore {
         let mb = self.mailbox_id.as_str();
         let uv = state.imap_uid_validity.map(|v| v as i64);
         let last_uid = state.imap_last_uid.map(|v| v as i64);
+        let highest_modseq = state
+            .imap_highest_modseq
+            .map(|v| v.min(i64::MAX as u64) as i64);
+        let folder_states_json = serde_json::to_string(&state.imap_folder_states)
+            .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
         let last_sync_ms = state.last_sync_at.map(|dt| dt.timestamp_millis());
         let last_full_ms = state.last_full_sync_at.map(|dt| dt.timestamp_millis());
         let messages_synced = state.messages_synced as i64;
@@ -5999,8 +6074,9 @@ impl MailStore for PostgresStore {
             "INSERT INTO sync_state (
                 mailbox_id, account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                 imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                messages_synced, last_pushed_history_id, messages_pushed
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                messages_synced, last_pushed_history_id, messages_pushed,
+                imap_highest_modseq, imap_folder_states_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (mailbox_id, account_key) DO UPDATE SET
                 provider = EXCLUDED.provider,
                 last_history_id = EXCLUDED.last_history_id,
@@ -6013,7 +6089,9 @@ impl MailStore for PostgresStore {
                 last_error = EXCLUDED.last_error,
                 messages_synced = EXCLUDED.messages_synced,
                 last_pushed_history_id = EXCLUDED.last_pushed_history_id,
-                messages_pushed = EXCLUDED.messages_pushed",
+                messages_pushed = EXCLUDED.messages_pushed,
+                imap_highest_modseq = EXCLUDED.imap_highest_modseq,
+                imap_folder_states_json = EXCLUDED.imap_folder_states_json",
             &[
                 &mb,
                 &state.account_key,
@@ -6029,6 +6107,8 @@ impl MailStore for PostgresStore {
                 &messages_synced,
                 &last_pushed_hid,
                 &messages_pushed,
+                &highest_modseq,
+                &folder_states_json,
             ],
         )
         .await
@@ -6043,7 +6123,8 @@ impl MailStore for PostgresStore {
             .query(
                 "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                         imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                        messages_synced, last_pushed_history_id, messages_pushed
+                        messages_synced, last_pushed_history_id, messages_pushed,
+                        imap_highest_modseq, imap_folder_states_json
                  FROM sync_state WHERE mailbox_id = $1 ORDER BY account_key ASC",
                 &[&mb],
             )
@@ -7861,7 +7942,9 @@ mod tests {
 
     #[test]
     fn postgres_schema_version_9_includes_domains_table_and_indexes() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+        const {
+            assert!(CURRENT_SCHEMA_VERSION >= 9);
+        }
         assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS domains"));
         for col in [
             "id TEXT PRIMARY KEY",
@@ -7886,6 +7969,22 @@ mod tests {
             assert!(
                 SCHEMA_SQL.contains(col),
                 "Postgres SCHEMA_SQL missing expected DDL fragment: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_schema_version_10_includes_sync_state_imap_columns() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+        for ddl in [
+            "imap_highest_modseq BIGINT",
+            "imap_folder_states_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS imap_highest_modseq BIGINT;",
+            "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS imap_folder_states_json TEXT NOT NULL DEFAULT '{}';",
+        ] {
+            assert!(
+                SCHEMA_SQL.contains(ddl),
+                "Postgres SCHEMA_SQL missing expected sync_state DDL fragment: {ddl}"
             );
         }
     }

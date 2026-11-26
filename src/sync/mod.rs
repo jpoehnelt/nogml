@@ -29,7 +29,7 @@ use crate::{
     error::AppResult,
     events::{EventSource, MailEvent},
     filter::{FilterDecision, InboundMessage, apply_filter_labels},
-    models::{LABEL_INBOX, LABEL_TRASH, LABEL_UNREAD, SyncStatusResponse},
+    models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_TRASH, LABEL_UNREAD, SyncStatusResponse},
     storage::{
         HISTORY_SOURCE_SYNC, HistoryEventKind, HistoryListQuery, NewMessageInput, SyncState,
         UpsertOutcome, UpsertOutcomeKind,
@@ -55,6 +55,11 @@ pub enum LocalMutationKind {
     },
     /// Permanently delete the upstream message.
     Delete,
+    /// Append a locally created Sent or Draft message (without an `upstream_id`) upstream.
+    AppendMessage {
+        /// `true` for Drafts (`[Gmail]/Drafts` / `Drafts`), `false` for Sent (`[Gmail]/Sent Mail` / `Sent`).
+        is_draft: bool,
+    },
 }
 
 /// Collapsed local mutation on a single upstream-linked message ready to replay upstream.
@@ -462,6 +467,7 @@ async fn run_sync_source_inner(
 #[derive(Default)]
 struct PendingMutation {
     upstream_id: Option<String>,
+    created: bool,
     deleted: bool,
     added: BTreeSet<String>,
     removed: BTreeSet<String>,
@@ -500,6 +506,9 @@ async fn collect_local_mutations(
         acc.max_history_id = acc.max_history_id.max(entry.history_id);
 
         match entry.kind {
+            HistoryEventKind::MessageAdded => {
+                acc.created = true;
+            }
             HistoryEventKind::MessageDeleted => {
                 acc.deleted = true;
                 acc.added.clear();
@@ -530,12 +539,33 @@ async fn collect_local_mutations(
         let stored = state.store.get_message(&msg_id).await?;
         let upstream_id = acc
             .upstream_id
-            .or_else(|| stored.as_ref().and_then(|m| m.upstream_gmail_id.clone()));
-        let Some(upstream_id) = upstream_id.filter(|s| !s.trim().is_empty()) else {
-            // Purely local message (no upstream linkage) -> never push upstream.
+            .or_else(|| stored.as_ref().and_then(|m| m.upstream_gmail_id.clone()))
+            .filter(|s| !s.trim().is_empty());
+        let rfc822_message_id = stored.as_ref().and_then(|m| m.rfc822_message_id.clone());
+
+        let Some(upstream_id) = upstream_id else {
+            // Locally created Sent or Draft message with no upstream linkage yet -> APPEND upstream.
+            if acc.created
+                && !acc.deleted
+                && let Some(ref msg) = stored
+                && msg.source != "gmail_imap"
+                && msg.source != "gmail_api"
+                && !msg.label_ids.iter().any(|l| l == LABEL_TRASH)
+            {
+                let is_draft = msg.label_ids.iter().any(|l| l == LABEL_DRAFT);
+                let is_sent = msg.label_ids.iter().any(|l| l == LABEL_SENT);
+                if is_draft || is_sent {
+                    mutations.push(LocalMutation {
+                        local_message_id: msg_id,
+                        upstream_id: String::new(),
+                        rfc822_message_id,
+                        history_id: acc.max_history_id,
+                        kind: LocalMutationKind::AppendMessage { is_draft },
+                    });
+                }
+            }
             continue;
         };
-        let rfc822_message_id = stored.as_ref().and_then(|m| m.rfc822_message_id.clone());
 
         if acc.deleted {
             mutations.push(LocalMutation {
@@ -657,6 +687,19 @@ async fn resolve_pull_conflicts(
                     }
                 }
                 LocalMutationKind::Delete => {}
+                LocalMutationKind::AppendMessage { .. } => {}
+            }
+        }
+        if matches!(mutation.kind, LocalMutationKind::AppendMessage { .. }) {
+            // If `pull()` already matched and linked this local message by RFC 2822 Message-ID,
+            // do not append a duplicate copy upstream.
+            if let Some(msg) = state.store.get_message(&mutation.local_message_id).await?
+                && msg
+                    .upstream_gmail_id
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+            {
+                continue;
             }
         }
         resolved.push(mutation);
@@ -689,6 +732,42 @@ async fn compute_next_pushed_history_id(
     }
 }
 
+/// Return the set of label IDs touched by unpushed local mutations since `after_hid`, keyed by
+/// local message ID. Used by non-`CONDSTORE` IMAP reconciliation so stale flag snapshots do not
+/// clobber pending local edits before `push_changes()` runs.
+pub(crate) async fn pending_local_label_touches(
+    state: &AppState,
+    after_hid: u64,
+) -> AppResult<HashMap<String, HashSet<String>>> {
+    let cur_hid = state.store.current_history_id().await?;
+    if cur_hid <= after_hid {
+        return Ok(HashMap::new());
+    }
+    let entries = load_mutation_history_range(state, after_hid, cur_hid).await?;
+    let mut touched: HashMap<String, HashSet<String>> = HashMap::new();
+    for entry in entries {
+        if entry.source == HISTORY_SOURCE_SYNC {
+            continue;
+        }
+        match entry.kind {
+            HistoryEventKind::LabelAdded | HistoryEventKind::LabelRemoved => {
+                touched
+                    .entry(entry.message_id)
+                    .or_default()
+                    .extend(entry.label_ids);
+            }
+            HistoryEventKind::MessageDeleted => {
+                touched
+                    .entry(entry.message_id)
+                    .or_default()
+                    .insert("__DELETED__".to_string());
+            }
+            HistoryEventKind::MessageAdded => {}
+        }
+    }
+    Ok(touched)
+}
+
 async fn load_mutation_history_range(
     state: &AppState,
     after_hid: u64,
@@ -707,6 +786,7 @@ async fn load_mutation_history_range(
                 page_token: page_token.clone(),
                 label_id: None,
                 history_types: vec![
+                    HistoryEventKind::MessageAdded,
                     HistoryEventKind::LabelAdded,
                     HistoryEventKind::LabelRemoved,
                     HistoryEventKind::MessageDeleted,
@@ -761,6 +841,21 @@ pub async fn get_sync_status(state: &AppState) -> AppResult<SyncStatusResponse> 
     let bidirectional_enabled = state.config.sync_bidirectional;
 
     let extra = active_state.as_ref().map(|s| {
+        let folder_summary: HashMap<&str, serde_json::Value> = s
+            .imap_folder_states
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    json!({
+                        "uid_validity": v.uid_validity,
+                        "last_uid": v.last_uid,
+                        "highest_modseq": v.highest_modseq,
+                        "tracked_uids": v.uid_to_message_id.len(),
+                    }),
+                )
+            })
+            .collect();
         json!({
             "account_key": s.account_key,
             "messages_synced": s.messages_synced,
@@ -771,6 +866,9 @@ pub async fn get_sync_status(state: &AppState) -> AppResult<SyncStatusResponse> 
             "imap_mailbox": s.imap_mailbox,
             "imap_uid_validity": s.imap_uid_validity,
             "imap_last_uid": s.imap_last_uid,
+            "imap_highest_modseq": s.imap_highest_modseq,
+            "imap_folders": folder_summary,
+            "imap_idle_enabled": state.config.sync_mode == SyncMode::Imap && state.config.gmail_imap_idle,
             "sync_interval_secs": state.config.sync_interval_secs,
         })
     });
@@ -811,25 +909,40 @@ pub async fn run_background_sync(state: AppState, shutdown: watch::Receiver<bool
             continue;
         }
         covered_mailboxes.insert(norm_mb);
-        if acct.interval_secs == 0 {
-            continue;
-        }
         let acct_state = state.for_sync_account(acct);
-        let acct_shutdown = shutdown.clone();
-        let interval_secs = acct.interval_secs;
-        handles.push(tokio::spawn(async move {
-            run_single_sync_loop(acct_state, interval_secs, acct_shutdown).await;
-        }));
+        if acct.interval_secs > 0 {
+            let loop_state = acct_state.clone();
+            let acct_shutdown = shutdown.clone();
+            let interval_secs = acct.interval_secs;
+            handles.push(tokio::spawn(async move {
+                run_single_sync_loop(loop_state, interval_secs, acct_shutdown).await;
+            }));
+        }
+        if acct.mode == SyncMode::Imap && acct.gmail_imap_idle {
+            let idle_shutdown = shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                gmail_imap::run_imap_idle_listener(acct_state, idle_shutdown).await;
+            }));
+        }
     }
 
     let primary_mb = crate::config::normalize_mailbox_id(state.mailbox_id());
-    if state.config.sync_interval_secs > 0 && !covered_mailboxes.contains(&primary_mb) {
-        let interval_secs = state.config.sync_interval_secs;
-        let legacy_state = state.clone();
-        let legacy_shutdown = shutdown.clone();
-        handles.push(tokio::spawn(async move {
-            run_single_sync_loop(legacy_state, interval_secs, legacy_shutdown).await;
-        }));
+    if !covered_mailboxes.contains(&primary_mb) {
+        if state.config.sync_interval_secs > 0 {
+            let interval_secs = state.config.sync_interval_secs;
+            let legacy_state = state.clone();
+            let legacy_shutdown = shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                run_single_sync_loop(legacy_state, interval_secs, legacy_shutdown).await;
+            }));
+        }
+        if state.config.sync_mode == SyncMode::Imap && state.config.gmail_imap_idle {
+            let idle_state = state.clone();
+            let idle_shutdown = shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                gmail_imap::run_imap_idle_listener(idle_state, idle_shutdown).await;
+            }));
+        }
     }
 
     for handle in handles {

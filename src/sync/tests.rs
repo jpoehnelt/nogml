@@ -580,3 +580,167 @@ async fn test_gmail_api_query_max_messages_and_error_state_persistence() {
     assert_eq!(status.state, "error");
     assert!(status.last_error.is_some());
 }
+
+#[test]
+fn test_xgm_labels_mapping_and_quoting() {
+    use std::collections::HashMap;
+
+    use crate::{
+        models::{
+            LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
+            LABEL_TRASH, LABEL_UNREAD,
+        },
+        sync::gmail_imap::{map_local_label_to_xgm_token, quote_imap_string},
+    };
+
+    let mut user_names = HashMap::new();
+    user_names.insert("Label_1".to_string(), "Work/Urgent".to_string());
+    user_names.insert("Label_2".to_string(), "A \"B\" \\ C".to_string());
+    user_names.insert("Label_3".to_string(), "Café/重要".to_string());
+    user_names.insert("Label_bad_crlf".to_string(), "Bad\r\nLOGOUT".to_string());
+    user_names.insert("Label_bad_nul".to_string(), "Bad\0Null".to_string());
+
+    // System labels
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_INBOX, &user_names).as_deref(),
+        Some("\\Inbox")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_STARRED, &user_names).as_deref(),
+        Some("\\Starred")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_IMPORTANT, &user_names).as_deref(),
+        Some("\\Important")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_SPAM, &user_names).as_deref(),
+        Some("\\Spam")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_TRASH, &user_names).as_deref(),
+        Some("\\Trash")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_SENT, &user_names).as_deref(),
+        Some("\\Sent")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_DRAFT, &user_names).as_deref(),
+        Some("\\Draft")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token(LABEL_UNREAD, &user_names),
+        None
+    );
+
+    // Custom labels: escaping, UTF-8, and injection rejection
+    assert_eq!(
+        map_local_label_to_xgm_token("Label_1", &user_names).as_deref(),
+        Some("\"Work/Urgent\"")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token("Label_2", &user_names).as_deref(),
+        Some("\"A \\\"B\\\" \\\\ C\"")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token("Label_3", &user_names).as_deref(),
+        Some("\"Café/重要\"")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token("Label_bad_crlf", &user_names),
+        None
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token("Label_bad_nul", &user_names),
+        None
+    );
+    assert_eq!(quote_imap_string("   "), None);
+    assert_eq!(quote_imap_string("line1\nline2"), None);
+}
+
+#[test]
+fn test_appenduid_vanished_xoauth2_and_internaldate_helpers() {
+    use async_imap::imap_proto::{ResponseCode, rfc4315::UidSetMember};
+
+    use crate::sync::gmail_imap::{
+        build_xoauth2_sasl_payload, expand_uid_ranges, format_imap_internaldate,
+        parse_appenduid_response_code, parse_imap_fallback_upstream_id,
+    };
+
+    // APPENDUID parsing
+    let code_single = ResponseCode::AppendUid(42, vec![UidSetMember::Uid(99)]);
+    assert_eq!(
+        parse_appenduid_response_code(Some(&code_single)),
+        Some((42, 99))
+    );
+    let code_range = ResponseCode::AppendUid(7, vec![UidSetMember::UidRange(10..=12)]);
+    assert_eq!(
+        parse_appenduid_response_code(Some(&code_range)),
+        Some((7, 10))
+    );
+    assert_eq!(
+        parse_appenduid_response_code(Some(&ResponseCode::TryCreate)),
+        None
+    );
+    assert_eq!(parse_appenduid_response_code(None), None);
+
+    // VANISHED expansion with upper bound & cap
+    assert_eq!(
+        expand_uid_ranges(&[2..=4, 7..=9], 8, 100),
+        vec![2, 3, 4, 7, 8]
+    );
+    let huge_ranges = [1..=u32::MAX, 10..=20];
+    assert_eq!(
+        expand_uid_ranges(&huge_ranges, u32::MAX, 5),
+        vec![1, 2, 3, 4, 5]
+    );
+
+    // XOAUTH2 SASL payload framing
+    let sasl = build_xoauth2_sasl_payload("alice@example.com", "ya29.secret-tok");
+    assert_eq!(
+        sasl,
+        b"user=alice@example.com\x01auth=Bearer ya29.secret-tok\x01\x01"
+    );
+
+    // RFC 3501 INTERNALDATE formatting (2025-01-04T12:34:56Z = 1735994096000)
+    assert_eq!(
+        format_imap_internaldate(1_735_994_096_000),
+        "04-Jan-2025 12:34:56 +0000"
+    );
+
+    // Fallback upstream ID parser
+    assert_eq!(
+        parse_imap_fallback_upstream_id("imap:[Gmail]/Sent Mail:17:42"),
+        Some(("[Gmail]/Sent Mail", 17, 42))
+    );
+    assert_eq!(parse_imap_fallback_upstream_id("18f123456789abcd"), None);
+}
+
+#[test]
+fn test_config_imap_parity_fields_and_oauth2_configured() {
+    use crate::config::{Config, SyncMode};
+
+    let mut cfg = Config::for_test();
+    cfg.sync_mode = SyncMode::Imap;
+    cfg.gmail_imap_user = Some("oauth@example.com".to_string());
+    cfg.gmail_imap_password = None;
+    assert!(!cfg.gmail_sync_configured());
+
+    // OAuth2 static token or refresh flow makes SyncMode::Imap configured without App Password.
+    cfg.gmail_access_token = Some("ya29.tok".to_string());
+    assert!(cfg.gmail_sync_configured());
+
+    cfg.gmail_access_token = None;
+    cfg.gmail_client_id = Some("cid".to_string());
+    cfg.gmail_client_secret = Some("csec".to_string());
+    cfg.gmail_refresh_token = Some("rtok".to_string());
+    assert!(cfg.gmail_sync_configured());
+
+    // IDLE alone activates background sync.
+    cfg.sync_interval_secs = 0;
+    cfg.gmail_imap_idle = false;
+    assert!(!cfg.has_background_sync());
+    cfg.gmail_imap_idle = true;
+    assert!(cfg.has_background_sync());
+}

@@ -499,6 +499,34 @@ struct CommonConfigArgs {
     )]
     gmail_imap_mailbox: String,
 
+    /// Comma-separated IMAP folders to sync with independent per-folder checkpoints
+    /// (for non-Gmail IMAP servers lacking `[Gmail]/All Mail`).
+    #[arg(
+        long,
+        env = "NOGML_GMAIL_IMAP_FOLDERS",
+        value_delimiter = ',',
+        global = true
+    )]
+    gmail_imap_folders: Vec<String>,
+
+    /// Target archive folder for non-Gmail IMAP servers without `X-GM-EXT-1`.
+    #[arg(
+        long,
+        env = "NOGML_GMAIL_IMAP_ARCHIVE_MAILBOX",
+        default_value = "Archive",
+        global = true
+    )]
+    gmail_imap_archive_mailbox: String,
+
+    /// Maintain a dedicated read-only IMAP IDLE connection to trigger immediate incremental sync.
+    #[arg(
+        long,
+        env = "NOGML_GMAIL_IMAP_IDLE",
+        default_value_t = false,
+        global = true
+    )]
+    gmail_imap_idle: bool,
+
     #[arg(long, env = "NOGML_SYNC_QUERY", global = true)]
     sync_query: Option<String>,
 
@@ -1526,6 +1554,20 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "gmail_imap_mailbox") {
             cfg.gmail_imap_mailbox = self.gmail_imap_mailbox;
+        }
+        if is_explicit(root_matches, "gmail_imap_folders") {
+            cfg.gmail_imap_folders = self
+                .gmail_imap_folders
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if is_explicit(root_matches, "gmail_imap_archive_mailbox") {
+            cfg.gmail_imap_archive_mailbox = self.gmail_imap_archive_mailbox;
+        }
+        if is_explicit(root_matches, "gmail_imap_idle") {
+            cfg.gmail_imap_idle = self.gmail_imap_idle;
         }
         if is_explicit(root_matches, "sync_query") {
             cfg.sync_query = self.sync_query;

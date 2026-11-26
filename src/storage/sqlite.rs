@@ -221,6 +221,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     imap_mailbox TEXT,
     imap_uid_validity INTEGER,
     imap_last_uid INTEGER,
+    imap_highest_modseq INTEGER,
+    imap_folder_states_json TEXT NOT NULL DEFAULT '{}',
     last_sync_at_ms INTEGER,
     last_full_sync_at_ms INTEGER,
     status TEXT NOT NULL,
@@ -544,6 +546,13 @@ impl SqliteStore {
             "history_events",
             "source",
             "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        ensure_column_exists(&conn, "sync_state", "imap_highest_modseq", "INTEGER")?;
+        ensure_column_exists(
+            &conn,
+            "sync_state",
+            "imap_folder_states_json",
+            "TEXT NOT NULL DEFAULT '{}'",
         )?;
         ensure_mailbox_seeded(&mut conn, &self.mailbox_id)?;
         if let Ok(mut seeded) = self.seeded_mailboxes.lock() {
@@ -5691,6 +5700,74 @@ impl MailStore for SqliteStore {
         .await
     }
 
+    async fn update_synced_message_flags(
+        &self,
+        id: &str,
+        is_answered: bool,
+        is_deleted: bool,
+    ) -> AppResult<Option<StoredMessage>> {
+        let id = id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let Some(existing) = load_message_by_id(&tx, mb, &id)? else {
+                return Ok(None);
+            };
+            if existing.is_answered != is_answered || existing.is_deleted != is_deleted {
+                let new_hid = bump_history_id(&tx, mb)?;
+                tx.execute(
+                    "UPDATE messages SET is_answered = ?1, is_deleted = ?2, history_id = ?3
+                     WHERE mailbox_id = ?4 AND id = ?5",
+                    params![
+                        if is_answered { 1_i64 } else { 0_i64 },
+                        if is_deleted { 1_i64 } else { 0_i64 },
+                        new_hid as i64,
+                        mb,
+                        &id,
+                    ],
+                )
+                .map_err(sql_err)?;
+                let updated = load_message_by_id(&tx, mb, &id)?;
+                tx.commit().map_err(sql_err)?;
+                return Ok(updated);
+            }
+            tx.commit().map_err(sql_err)?;
+            Ok(Some(existing))
+        })
+        .await
+    }
+
+    async fn link_message_upstream_id(
+        &self,
+        message_id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<bool> {
+        let message_id = message_id.to_string();
+        let upstream_gmail_id = upstream_gmail_id.to_string();
+        let upstream_thread_id = upstream_thread_id.map(str::to_string);
+        self.run_blocking(move |conn, mb| {
+            let changed = if let Some(ref tid) = upstream_thread_id {
+                conn.execute(
+                    "UPDATE messages SET upstream_gmail_id = ?1, upstream_thread_id = ?2
+                     WHERE mailbox_id = ?3 AND id = ?4",
+                    params![&upstream_gmail_id, tid, mb, &message_id],
+                )
+                .map_err(sql_err)?
+            } else {
+                conn.execute(
+                    "UPDATE messages SET upstream_gmail_id = ?1
+                     WHERE mailbox_id = ?2 AND id = ?3",
+                    params![&upstream_gmail_id, mb, &message_id],
+                )
+                .map_err(sql_err)?
+            };
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     async fn find_message_by_upstream_id(
         &self,
         upstream_gmail_id: &str,
@@ -5746,7 +5823,8 @@ impl MailStore for SqliteStore {
             conn.query_row(
                 "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                         imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                        messages_synced, last_pushed_history_id, messages_pushed
+                        messages_synced, last_pushed_history_id, messages_pushed,
+                        imap_highest_modseq, imap_folder_states_json
                  FROM sync_state WHERE mailbox_id = ?1 AND account_key = ?2",
                 params![mb, account_key],
                 sync_state_from_row,
@@ -5759,12 +5837,15 @@ impl MailStore for SqliteStore {
 
     async fn save_sync_state(&self, state: SyncState) -> AppResult<()> {
         self.run_blocking(move |conn, mb| {
+            let folder_states_json = serde_json::to_string(&state.imap_folder_states)
+                .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
             conn.execute(
                 "INSERT INTO sync_state (
                     mailbox_id, account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                     imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                    messages_synced, last_pushed_history_id, messages_pushed
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    messages_synced, last_pushed_history_id, messages_pushed,
+                    imap_highest_modseq, imap_folder_states_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(mailbox_id, account_key) DO UPDATE SET
                     provider = excluded.provider,
                     last_history_id = excluded.last_history_id,
@@ -5777,7 +5858,9 @@ impl MailStore for SqliteStore {
                     last_error = excluded.last_error,
                     messages_synced = excluded.messages_synced,
                     last_pushed_history_id = excluded.last_pushed_history_id,
-                    messages_pushed = excluded.messages_pushed",
+                    messages_pushed = excluded.messages_pushed,
+                    imap_highest_modseq = excluded.imap_highest_modseq,
+                    imap_folder_states_json = excluded.imap_folder_states_json",
                 params![
                     mb,
                     &state.account_key,
@@ -5793,6 +5876,8 @@ impl MailStore for SqliteStore {
                     state.messages_synced as i64,
                     state.last_pushed_history_id.map(|v| v as i64),
                     state.messages_pushed as i64,
+                    state.imap_highest_modseq.map(|v| v.min(i64::MAX as u64) as i64),
+                    &folder_states_json,
                 ],
             )
             .map_err(sql_err)?;
@@ -5807,7 +5892,8 @@ impl MailStore for SqliteStore {
                 .prepare(
                     "SELECT account_key, provider, last_history_id, imap_mailbox, imap_uid_validity,
                             imap_last_uid, last_sync_at_ms, last_full_sync_at_ms, status, last_error,
-                            messages_synced, last_pushed_history_id, messages_pushed
+                            messages_synced, last_pushed_history_id, messages_pushed,
+                            imap_highest_modseq, imap_folder_states_json
                      FROM sync_state WHERE mailbox_id = ?1 ORDER BY account_key ASC",
                 )
                 .map_err(sql_err)?;
@@ -7960,6 +8046,11 @@ fn normalize_pending_approval(
 fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
     let last_sync_ms: Option<i64> = row.get(6)?;
     let last_full_ms: Option<i64> = row.get(7)?;
+    let folder_states_raw: Option<String> = row.get(14)?;
+    let imap_folder_states = folder_states_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Ok(SyncState {
         account_key: row.get(0)?,
         provider: row.get(1)?,
@@ -7967,6 +8058,8 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
         imap_mailbox: row.get(3)?,
         imap_uid_validity: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u32),
         imap_last_uid: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u32),
+        imap_highest_modseq: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+        imap_folder_states,
         last_sync_at: last_sync_ms.and_then(DateTime::from_timestamp_millis),
         last_full_sync_at: last_full_ms.and_then(DateTime::from_timestamp_millis),
         status: row.get(8)?,
