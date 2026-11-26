@@ -12,6 +12,7 @@ pub mod filter;
 pub mod gmail;
 pub mod imap;
 pub mod mcp;
+pub mod metrics;
 pub mod mime;
 pub mod models;
 pub mod oauth2;
@@ -35,7 +36,7 @@ use axum::{
     extract::{FromRef, FromRequestParts},
     http::request::Parts,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::{
     ai::safety::{OutboundPolicy, open_outbound_policy},
@@ -49,6 +50,7 @@ use crate::{
     events::EventBus,
     filter::{InboundFilter, open_filter},
     gmail::upload::ResumableUploadStore,
+    metrics::Metrics,
     models::{LABEL_DRAFT, LABEL_SENT},
     resend::{HttpResendClient, ResendClient, ResendTransport},
     search_index::{SearchIndex, StoreSearchIndex, open_search_index},
@@ -99,6 +101,11 @@ pub struct AppState {
     pub scheduled_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks redeemed single-use local OAuth2 authorization code JTIs.
     pub used_oauth_codes: Arc<Mutex<HashSet<String>>>,
+    /// Shared operational metrics exported at `GET /metrics`.
+    pub metrics: Arc<Metrics>,
+    /// Broadcast receiver signaled (`true`) when the server begins graceful shutdown.
+    pub shutdown: watch::Receiver<bool>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
     /// Per-`(mailbox_id, scope, idempotency_key)` single-flight locks preventing concurrent double-sends.
     idempotency_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
     primary_mailbox_id: String,
@@ -205,6 +212,8 @@ impl AppState {
             events = events.with_bridge(bridge.clone());
         }
 
+        let (shutdown_tx, shutdown) = watch::channel(false);
+
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -221,6 +230,9 @@ impl AppState {
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            metrics: Arc::new(Metrics::new()),
+            shutdown,
+            shutdown_tx: Arc::new(shutdown_tx),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
@@ -286,6 +298,7 @@ impl AppState {
         let sync_lock = Arc::new(Mutex::new(()));
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
+        let (shutdown_tx, shutdown) = watch::channel(false);
 
         Self {
             config: Arc::new(config),
@@ -303,6 +316,9 @@ impl AppState {
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashSet::new())),
+            metrics: Arc::new(Metrics::new()),
+            shutdown,
+            shutdown_tx: Arc::new(shutdown_tx),
             idempotency_locks: Arc::new(StdMutex::new(HashMap::new())),
             primary_mailbox_id,
             base_blobs,
@@ -310,6 +326,35 @@ impl AppState {
             #[cfg(feature = "postgres")]
             pg_event_bridge: None,
         }
+    }
+
+    /// Evaluate `self.outbound_policy` and record the resulting decision in `self.metrics`.
+    pub async fn evaluate_outbound_policy(
+        &self,
+        check: &crate::ai::safety::OutboundCheck,
+    ) -> AppResult<crate::ai::safety::OutboundDecision> {
+        let res = self.outbound_policy.evaluate(check).await;
+        match &res {
+            Ok(decision) => self.metrics.record_policy_decision(decision),
+            Err(
+                crate::error::AppError::RecipientNotAllowed { .. }
+                | crate::error::AppError::PolicyDenied { .. }
+                | crate::error::AppError::DraftOnlyBlocked { .. }
+                | crate::error::AppError::Validation { .. },
+            ) => self.metrics.inc_policy_deny(),
+            Err(_) => {}
+        }
+        res
+    }
+
+    /// Signal graceful shutdown to all active long-lived handlers (such as `/v1/events` SSE streams).
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Subscribe to the server shutdown signal channel.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
     }
 
     /// Return the normalized mailbox ID active on this `AppState`.
@@ -391,6 +436,9 @@ impl AppState {
             approval_in_flight: self.approval_in_flight.clone(),
             scheduled_in_flight: self.scheduled_in_flight.clone(),
             used_oauth_codes: self.used_oauth_codes.clone(),
+            metrics: self.metrics.clone(),
+            shutdown: self.shutdown_tx.subscribe(),
+            shutdown_tx: self.shutdown_tx.clone(),
             idempotency_locks: self.idempotency_locks.clone(),
             primary_mailbox_id: self.primary_mailbox_id.clone(),
             base_blobs: self.base_blobs.clone(),

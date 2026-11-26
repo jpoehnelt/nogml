@@ -15,7 +15,7 @@ pub(crate) mod tests;
 pub mod unsubscribe;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -33,10 +33,9 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use chrono::{DateTime, Utc};
-use futures_util::stream::{self, Stream, StreamExt};
+use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -409,7 +408,7 @@ pub async fn execute_send_email_with_context(
         is_draft_send: false,
         agent_policy,
     };
-    let decision = state.outbound_policy.evaluate(&policy_check).await?;
+    let decision = state.evaluate_outbound_policy(&policy_check).await?;
 
     let rfc_message_id = format!("<{}@{}>", Uuid::new_v4(), state.config.default_domain);
     let raw_rfc2822 = build_outbound_rfc2822(&resolved, &rfc_message_id)?;
@@ -690,6 +689,7 @@ pub async fn execute_send_email_with_context(
         .await?;
 
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_sent();
 
     state.events.publish(
         source,
@@ -1031,7 +1031,8 @@ pub async fn execute_send_draft_with_context(
         is_draft_send: true,
         agent_policy,
     };
-    match state.outbound_policy.evaluate(&policy_check).await? {
+    let decision = state.evaluate_outbound_policy(&policy_check).await?;
+    match decision {
         OutboundDecision::Deny { code, reason, hint } => {
             state
                 .record_audit(
@@ -1181,6 +1182,7 @@ pub async fn execute_send_draft_with_context(
         .await?;
 
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_sent();
 
     state.events.publish(
         source,
@@ -2343,6 +2345,7 @@ pub async fn execute_approve_approval(
         )
         .await?;
 
+    state.metrics.inc_messages_sent();
     state.events.publish(
         source,
         MailEvent::MessageSent {
@@ -4517,7 +4520,7 @@ async fn events_sse_handler(
     let rx = state.events.subscribe();
 
     let mut last_replayed_id = since_id.unwrap_or(0);
-    let replay_events: Vec<Result<Event, Infallible>> = if let Some(since) = since_id {
+    let replay_events: VecDeque<Event> = if let Some(since) = since_id {
         state
             .events
             .events_since(since, SSE_REPLAY_LIMIT)
@@ -4530,45 +4533,96 @@ async fn events_sse_handler(
                     return None;
                 }
                 let data = serde_json::to_string(&env).ok()?;
-                Some(Ok(Event::default()
-                    .id(env.id.to_string())
-                    .event(env.event.event_type())
-                    .data(data)))
+                Some(
+                    Event::default()
+                        .id(env.id.to_string())
+                        .event(env.event.event_type())
+                        .data(data),
+                )
             })
             .collect()
     } else {
-        Vec::new()
+        VecDeque::new()
     };
 
-    let active_mailbox = state.mailbox_id().to_string();
-    let live_stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let env = match item {
-            Ok(env) => env,
-            Err(_) => return std::future::ready(None),
-        };
-        if !active_mailbox.is_empty()
-            && !env.mailbox_id.is_empty()
-            && !env.mailbox_id.eq_ignore_ascii_case(&active_mailbox)
-        {
-            return std::future::ready(None);
-        }
-        if env.id <= last_replayed_id {
-            return std::future::ready(None);
-        }
-        if !event_matches_filter(&env, &types, label.as_deref(), thread_id.as_deref()) {
-            return std::future::ready(None);
-        }
-        let Ok(data) = serde_json::to_string(&env) else {
-            return std::future::ready(None);
-        };
-        let event = Event::default()
-            .id(env.id.to_string())
-            .event(env.event.event_type())
-            .data(data);
-        std::future::ready(Some(Ok(event)))
-    });
+    struct SseStreamState {
+        replay: VecDeque<Event>,
+        rx: tokio::sync::broadcast::Receiver<EventEnvelope>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        active_mailbox: String,
+        last_replayed_id: u64,
+        types: Vec<String>,
+        label: Option<String>,
+        thread_id: Option<String>,
+        _conn_guard: crate::metrics::ActiveGaugeGuard,
+    }
 
-    let combined = stream::iter(replay_events).chain(live_stream);
+    let stream_state = SseStreamState {
+        replay: replay_events,
+        rx,
+        shutdown: state.subscribe_shutdown(),
+        active_mailbox: state.mailbox_id().to_string(),
+        last_replayed_id,
+        types,
+        label,
+        thread_id,
+        _conn_guard: state.metrics.track_sse_connection(),
+    };
+
+    let combined = stream::unfold(stream_state, |mut st| async move {
+        if *st.shutdown.borrow() {
+            return None;
+        }
+        if let Some(ev) = st.replay.pop_front() {
+            return Some((Ok(ev), st));
+        }
+        loop {
+            if *st.shutdown.borrow() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                changed = st.shutdown.changed() => {
+                    if changed.is_err() || *st.shutdown.borrow() {
+                        return None;
+                    }
+                }
+                recv = st.rx.recv() => {
+                    match recv {
+                        Ok(env) => {
+                            if !st.active_mailbox.is_empty()
+                                && !env.mailbox_id.is_empty()
+                                && !env.mailbox_id.eq_ignore_ascii_case(&st.active_mailbox)
+                            {
+                                continue;
+                            }
+                            if env.id <= st.last_replayed_id {
+                                continue;
+                            }
+                            if !event_matches_filter(
+                                &env,
+                                &st.types,
+                                st.label.as_deref(),
+                                st.thread_id.as_deref(),
+                            ) {
+                                continue;
+                            }
+                            let Ok(data) = serde_json::to_string(&env) else {
+                                continue;
+                            };
+                            let event = Event::default()
+                                .id(env.id.to_string())
+                                .event(env.event.event_type())
+                                .data(data);
+                            return Some((Ok(event), st));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            }
+        }
+    });
 
     Ok(Sse::new(combined).keep_alive(
         KeepAlive::new()

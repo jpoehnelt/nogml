@@ -41,7 +41,7 @@ use nogml::{
         SecretResolutionReport, ValueOrigin, generate_bearer_token, read_secret_file,
         resolve_secret_value, system_env_lookup, write_secret_file,
     },
-    storage::{AiSearchQuery, AiThreadQuery, SqliteStore, open_store_async},
+    storage::{AiSearchQuery, AiThreadQuery, SqliteStore},
     sync::{self, SyncRunOptions},
 };
 
@@ -2141,6 +2141,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 })
             };
 
+            let shutdown_state = state.clone();
             let router = build_router(state);
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -2151,6 +2152,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     info!("Shutdown signal received, draining subsystems");
+                    shutdown_state.trigger_shutdown();
                     let _ = shutdown_tx.send(true);
                 })
                 .await;
@@ -2227,14 +2229,48 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
             let config = finalize_runtime_config(loaded, true)?;
             match action {
                 StorageCommand::MigrateBlobs { to } => {
-                    let store = open_store_async(&config).await?;
-                    let source = open_blob_store(&config)?;
+                    let mailboxes = config.known_mailboxes();
                     let mut target_config = config.clone();
                     target_config.blob_backend = to;
-                    let target = open_blob_store(&target_config)?;
-                    let report =
-                        migrate_blobs(store.as_ref(), source.as_ref(), target.as_ref()).await?;
-                    emit_output(serde_json::to_value(report)?, None, false)?;
+                    let target_base = open_blob_store(&target_config)?;
+                    let state = AppState::from_config_async(config).await?;
+                    let source_backend = state.blobs.backend_name().to_string();
+                    let target_backend = target_base.backend_name().to_string();
+
+                    let mut per_mailbox = Vec::with_capacity(mailboxes.len());
+                    let mut total_messages = 0u64;
+                    let mut total_attachments = 0u64;
+                    let mut total_bytes = 0u64;
+
+                    for mb in &mailboxes {
+                        let mb_state = state.for_mailbox(mb);
+                        let target_state = mb_state.clone().with_blobs(target_base.clone());
+                        let report = migrate_blobs(
+                            mb_state.store.as_ref(),
+                            mb_state.blobs.as_ref(),
+                            target_state.blobs.as_ref(),
+                        )
+                        .await?;
+                        total_messages += report.messages_migrated;
+                        total_attachments += report.attachments_migrated;
+                        total_bytes += report.bytes_copied;
+                        per_mailbox.push(serde_json::json!({
+                            "mailbox_id": mb,
+                            "messages_migrated": report.messages_migrated,
+                            "attachments_migrated": report.attachments_migrated,
+                            "bytes_copied": report.bytes_copied,
+                        }));
+                    }
+
+                    let summary = serde_json::json!({
+                        "source_backend": source_backend,
+                        "target_backend": target_backend,
+                        "messages_migrated": total_messages,
+                        "attachments_migrated": total_attachments,
+                        "bytes_copied": total_bytes,
+                        "mailboxes": per_mailbox,
+                    });
+                    emit_output(summary, None, false)?;
                     Ok(ExitCode::SUCCESS)
                 }
             }
@@ -2248,9 +2284,33 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
             let state = AppState::from_config_async(config).await?;
             match action {
                 SearchCommand::Reindex => {
-                    let report =
-                        reindex_mailbox(state.store.as_ref(), state.search.as_ref()).await?;
-                    emit_output(serde_json::to_value(report)?, None, false)?;
+                    let mailboxes = state.config.known_mailboxes();
+                    let backend = state.search.backend_name().to_string();
+                    let mut per_mailbox = Vec::with_capacity(mailboxes.len());
+                    let mut total_indexed = 0u64;
+                    let mut total_failed = 0u64;
+
+                    for mb in &mailboxes {
+                        let mb_state = state.for_mailbox(mb);
+                        let report =
+                            reindex_mailbox(mb_state.store.as_ref(), mb_state.search.as_ref())
+                                .await?;
+                        total_indexed += report.indexed;
+                        total_failed += report.failed;
+                        per_mailbox.push(serde_json::json!({
+                            "mailbox_id": mb,
+                            "indexed": report.indexed,
+                            "failed": report.failed,
+                        }));
+                    }
+
+                    let summary = serde_json::json!({
+                        "backend": backend,
+                        "indexed": total_indexed,
+                        "failed": total_failed,
+                        "mailboxes": per_mailbox,
+                    });
+                    emit_output(summary, None, false)?;
                     Ok(ExitCode::SUCCESS)
                 }
             }

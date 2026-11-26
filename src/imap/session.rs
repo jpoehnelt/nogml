@@ -129,6 +129,7 @@ pub async fn handle_connection(
     tls_acceptor: Option<TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let _imap_conn_guard = state.metrics.track_imap_connection();
     let mut reader = BufReader::new(stream);
     let mut session = ImapSession {
         base_state: state.clone(),
@@ -1482,7 +1483,9 @@ impl ImapSession {
         };
 
         let mut target_mailbox = mailbox;
-        match self.state.filter.evaluate(&inbound_msg).await? {
+        let decision = self.state.filter.evaluate(&inbound_msg).await?;
+        self.state.metrics.record_filter_decision(&decision);
+        match decision {
             FilterDecision::Reject { reason } => {
                 write_flush(
                     stream,
@@ -1506,6 +1509,7 @@ impl ImapSession {
 
         match self.state.store.imap_append(&target_mailbox, input).await {
             Ok((uid_validity, uid, stored)) => {
+                self.state.metrics.inc_messages_received();
                 self.state.events.publish(
                     EventSource::Imap,
                     MailEvent::MessageReceived {
