@@ -15,7 +15,7 @@ use crate::{
     ai::safety::{sanitize_untrusted_text, validate_resource_id},
     config::Config,
     error::AppResult,
-    filter::{FilterDecision, InboundFilter, InboundMessage},
+    filter::{FilterDecision, InboundFilter, InboundMessage, is_protected_security_label},
     models::{LABEL_DRAFT, LABEL_SENT, LABEL_SPAM, LABEL_TRASH},
 };
 
@@ -140,12 +140,21 @@ fn sanitize_labels(raw: &[String], disallow_system_control_adds: bool) -> Vec<St
             tracing::warn!(label = %candidate, "LlmTriageFilter dropped unsafe label from model output");
             continue;
         }
-        if disallow_system_control_adds
-            && matches!(trimmed, LABEL_SENT | LABEL_DRAFT | LABEL_TRASH | LABEL_SPAM)
-        {
+        if disallow_system_control_adds {
+            if [LABEL_SENT, LABEL_DRAFT, LABEL_TRASH, LABEL_SPAM]
+                .iter()
+                .any(|restricted| trimmed.eq_ignore_ascii_case(restricted))
+            {
+                tracing::warn!(
+                    label = %trimmed,
+                    "LlmTriageFilter dropped restricted system label from add_labels"
+                );
+                continue;
+            }
+        } else if is_protected_security_label(trimmed) {
             tracing::warn!(
                 label = %trimmed,
-                "LlmTriageFilter dropped restricted system label from add_labels"
+                "LlmTriageFilter dropped protected security label from remove_labels"
             );
             continue;
         }
@@ -327,5 +336,37 @@ impl InboundFilter for LlmTriageFilter {
 
     fn backend_name(&self) -> &'static str {
         "llm_triage"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::LABEL_AUTH_FAIL;
+
+    #[test]
+    fn sanitize_labels_blocks_removing_protected_security_labels() {
+        let removed = sanitize_labels(
+            &[
+                LABEL_AUTH_FAIL.to_string(),
+                "auth_fail".to_string(),
+                LABEL_SPAM.to_string(),
+                "spam".to_string(),
+                LABEL_TRASH.to_string(),
+                "UNREAD".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(removed, vec!["UNREAD".to_string()]);
+
+        let added = sanitize_labels(
+            &[
+                "IMPORTANT".to_string(),
+                "spam".to_string(),
+                LABEL_TRASH.to_string(),
+            ],
+            true,
+        );
+        assert_eq!(added, vec!["IMPORTANT".to_string()]);
     }
 }

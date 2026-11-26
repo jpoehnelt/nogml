@@ -17,7 +17,7 @@ use crate::{
     error::{AppError, AppResult},
     events::{EventBus, EventSource, MailEvent},
     models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_UNREAD},
-    search::{SearchQuery, matches_message, parse_query},
+    search::{SearchQuery, matches_message, parse_query, try_parse_query},
     storage::{
         InboxRule, InboxRuleActions, InboxRulePatch, InboxRuleView, MailStore, MessageListQuery,
         NewInboxRule, NewLabelInput, StoredMessage, normalize_inbox_rule_actions,
@@ -322,7 +322,7 @@ pub fn validate_match_query(raw: &str, vip_only: bool) -> AppResult<SearchQuery>
         ));
     }
 
-    let parsed = parse_query(trimmed);
+    let parsed = try_parse_query(trimmed)?;
     if parsed.terms.is_empty() {
         return Err(AppError::validation(
             "Invalid match_query: query produced no searchable terms",

@@ -2541,7 +2541,7 @@ async fn parse_query_with_labels(
     mailbox_id: &str,
     raw_q: &str,
 ) -> AppResult<crate::search::SearchQuery> {
-    let mut parsed = crate::search::parse_query(raw_q);
+    let mut parsed = crate::search::try_parse_query(raw_q)?;
     if !parsed.terms.is_empty() {
         let map = load_label_name_to_id_map(client, mailbox_id).await?;
         parsed.terms = parsed

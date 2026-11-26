@@ -113,7 +113,9 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool
 }
 
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 fn has_forbidden_uri_chars(uri: &str) -> bool {
@@ -362,5 +364,33 @@ mod tests {
             "List-Unsubscribe: <https://evil.example.com/in-body>\r\n"
         );
         assert!(parse_unsubscribe_from_raw(body_only.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn handles_multibyte_utf8_in_list_unsubscribe_without_panicking() {
+        let headers = vec![
+            hdr(
+                "List-Unsubscribe",
+                "<éééé>, <日本語テスト>, <https://example.com/u>",
+            ),
+            hdr("List-Unsubscribe-Post", "List-Unsubscribe=One-Click"),
+        ];
+        let info = parse_unsubscribe_headers(&headers).expect("valid https url still parsed");
+        assert_eq!(info.https_url.as_deref(), Some("https://example.com/u"));
+        assert!(info.one_click);
+
+        // Only multi-byte invalid URI must return None instead of panicking on char boundary.
+        let only_utf8 = vec![hdr("List-Unsubscribe", "<éééé>")];
+        assert!(parse_unsubscribe_headers(&only_utf8).is_none());
+
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: agent@example.com\r\n",
+            "Subject: UTF-8 Unsub\r\n",
+            "List-Unsubscribe: <éééé>\r\n",
+            "\r\n",
+            "Hello\r\n"
+        );
+        assert!(parse_unsubscribe_from_raw(raw.as_bytes()).is_none());
     }
 }
