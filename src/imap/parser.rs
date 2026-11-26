@@ -338,8 +338,8 @@ pub async fn read_crlf_line_into<R: AsyncBufRead + Unpin>(
     Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
 }
 
-/// Check if a line ends with `{N}` or `{N+}`.
-/// Returns `(prefix_before_brace, byte_length, is_literal_plus)`.
+/// Check if a line ends with `{N}`, `{N+}`, `~{N}`, or `~{N+}` (RFC 3501 / 7888 / 6855 `literal8`).
+/// Returns `(prefix_before_literal, byte_length, is_literal_plus)`.
 pub fn parse_trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
     let without_close = line.strip_suffix('}')?;
     let open_idx = without_close.rfind('{')?;
@@ -355,7 +355,9 @@ pub fn parse_trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
         return None;
     }
     let len = digits.parse::<usize>().ok()?;
-    Some((&line[..open_idx], len, non_sync))
+    let prefix = &line[..open_idx];
+    let prefix = prefix.strip_suffix('~').unwrap_or(prefix);
+    Some((prefix, len, non_sync))
 }
 
 /// Tokenize raw chunks into an [`ImapCommand`].
@@ -659,15 +661,26 @@ pub fn imap_wildcard_match(pattern: &str, name: &str, delim: char) -> bool {
 /// CR/LF, control characters, or non-ASCII bytes. NUL bytes are stripped because RFC 3501 forbids
 /// NUL octets in both quoted strings and literals.
 pub fn imap_string(s: &str) -> String {
+    imap_string_with_utf8(s, false)
+}
+
+/// Format an IMAP string, permitting unescaped UTF-8 inside quoted strings when `utf8_accept`
+/// is `true` (RFC 6855 `UTF8=ACCEPT`), and falling back to `{N}\r\n...` literals only for CR/LF
+/// or ASCII control characters (or non-ASCII bytes when `utf8_accept` is `false`).
+pub fn imap_string_with_utf8(s: &str, utf8_accept: bool) -> String {
     let sanitized: std::borrow::Cow<'_, str> = if s.contains('\0') {
         std::borrow::Cow::Owned(s.replace('\0', ""))
     } else {
         std::borrow::Cow::Borrowed(s)
     };
-    if sanitized
-        .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == 0x7f || (b < 0x20 && b != b'\t') || !b.is_ascii())
-    {
+    let needs_literal = sanitized.bytes().any(|b| {
+        b == b'\r'
+            || b == b'\n'
+            || b == 0x7f
+            || (b < 0x20 && b != b'\t')
+            || (!utf8_accept && !b.is_ascii())
+    });
+    if needs_literal {
         format!("{{{}}}\r\n{}", sanitized.len(), sanitized)
     } else {
         imap_quote(&sanitized)

@@ -22,11 +22,11 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AttachmentMeta, AutoForwarding, Delegate, EmailAddress, ForwardingAddress, GmailFilter,
-        ImapSettings, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH,
-        LABEL_UNREAD, LabelColor, LanguageSettings, PopSettings, Profile, SYSTEM_LABEL_IDS, SendAs,
-        ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary, UnsubscribeInfo, VacationSettings,
-        WaitingOn, apply_thread_annotation_patch, default_extracted_object, is_system_label,
-        truncate_to_millis,
+        ImapSettings, LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM,
+        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, LanguageSettings, PopSettings,
+        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
+        UnsubscribeInfo, VacationSettings, WaitingOn, apply_thread_annotation_patch,
+        default_extracted_object, is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -59,6 +59,7 @@ const DRAFTS_MAILBOX: &str = "[Gmail]/Drafts";
 const TRASH_MAILBOX: &str = "[Gmail]/Trash";
 const SPAM_MAILBOX: &str = "[Gmail]/Spam";
 const STARRED_MAILBOX: &str = "[Gmail]/Starred";
+const IMPORTANT_MAILBOX: &str = "[Gmail]/Important";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -2449,6 +2450,13 @@ fn resolve_imap_mailbox(
             special_use: Some("\\Flagged"),
         }));
     }
+    if mailbox_name == IMPORTANT_MAILBOX {
+        return Ok(Some(ResolvedMailbox::Label {
+            id: LABEL_IMPORTANT.to_string(),
+            name: IMPORTANT_MAILBOX.to_string(),
+            special_use: Some("\\Important"),
+        }));
+    }
 
     let user_label: Option<(String, String)> = conn
         .query_row(
@@ -2479,16 +2487,16 @@ fn load_imap_mailbox_info_resolved(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
-            let messages: i64 = conn
+            let (messages, total_size): (i64, i64) = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM messages m
+                    "SELECT COUNT(*), COALESCE(SUM(MAX(m.size_estimate, 0)), 0) FROM messages m
                      WHERE m.mailbox_id = ?1
                        AND NOT EXISTS (
                            SELECT 1 FROM message_labels ml
                            WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?2, ?3)
                        )",
                     params![mailbox_id, LABEL_TRASH, LABEL_SPAM],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
             let unseen: i64 = conn
@@ -2515,6 +2523,7 @@ fn load_imap_mailbox_info_resolved(
                 uid_next: un.max(1) as u32,
                 messages: messages.max(0) as u32,
                 unseen: unseen.max(0) as u32,
+                total_size_bytes: total_size.max(0) as u64,
             })
         }
         ResolvedMailbox::Label {
@@ -2529,11 +2538,15 @@ fn load_imap_mailbox_info_resolved(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
-            let messages: i64 = conn
+            let (messages, total_size): (i64, i64) = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM message_labels WHERE mailbox_id = ?1 AND label_id = ?2",
+                    "SELECT COUNT(*), COALESCE(SUM(MAX(m.size_estimate, 0)), 0)
+                     FROM message_labels ml
+                     INNER JOIN messages m
+                        ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                     WHERE ml.mailbox_id = ?1 AND ml.label_id = ?2",
                     params![mailbox_id, id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_err)?;
             let unseen: i64 = conn
@@ -2554,6 +2567,7 @@ fn load_imap_mailbox_info_resolved(
                 uid_next: un.max(1) as u32,
                 messages: messages.max(0) as u32,
                 unseen: unseen.max(0) as u32,
+                total_size_bytes: total_size.max(0) as u64,
             })
         }
     }
@@ -5066,13 +5080,17 @@ impl MailStore for SqliteStore {
                 }
             }
 
-            // 2. Batch total & unseen counts across every label in a single GROUP BY query.
+            // 2. Batch total, unseen, and RFC 822 size totals across every label in a single GROUP BY query.
             let mut counts_stmt = conn
                 .prepare(
                     "SELECT ml.label_id,
                             COUNT(*) AS total,
-                            SUM(CASE WHEN mu.message_id IS NOT NULL THEN 1 ELSE 0 END) AS unseen
+                            SUM(CASE WHEN mu.message_id IS NOT NULL THEN 1 ELSE 0 END) AS unseen,
+                            COALESCE(SUM(MAX(m.size_estimate, 0)), 0) AS total_size
                      FROM message_labels ml
+                     INNER JOIN messages m
+                        ON m.mailbox_id = ml.mailbox_id
+                       AND m.id = ml.message_id
                      LEFT JOIN message_labels mu
                         ON mu.mailbox_id = ml.mailbox_id
                        AND mu.message_id = ml.message_id
@@ -5081,25 +5099,26 @@ impl MailStore for SqliteStore {
                      GROUP BY ml.label_id",
                 )
                 .map_err(sql_err)?;
-            let mut label_counts: HashMap<String, (u32, u32)> = HashMap::new();
+            let mut label_counts: HashMap<String, (u32, u32, u64)> = HashMap::new();
             let count_rows = counts_stmt
                 .query_map(params![mb, LABEL_UNREAD], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?.max(0) as u32,
                         row.get::<_, i64>(2)?.max(0) as u32,
+                        row.get::<_, i64>(3)?.max(0) as u64,
                     ))
                 })
                 .map_err(sql_err)?;
             for r in count_rows {
-                let (lid, total, unseen) = r.map_err(sql_err)?;
-                label_counts.insert(lid, (total, unseen));
+                let (lid, total, unseen, total_size) = r.map_err(sql_err)?;
+                label_counts.insert(lid, (total, unseen, total_size));
             }
             drop(counts_stmt);
 
-            // 3. Load `[Gmail]/All Mail` UID metadata + total/unseen counts in a single query.
-            let (all_uv, all_un, all_messages, all_unseen): (i64, i64, i64, i64) = conn
-                .query_row(
+            // 3. Load `[Gmail]/All Mail` UID metadata + total/unseen/size counts in a single query.
+            let (all_uv, all_un, all_messages, all_unseen, all_size): (i64, i64, i64, i64, i64) =
+                conn.query_row(
                     "SELECT im.uid_validity,
                             im.uid_next,
                             (SELECT COUNT(*) FROM messages m
@@ -5117,17 +5136,24 @@ impl MailStore for SqliteStore {
                                AND NOT EXISTS (
                                    SELECT 1 FROM message_labels ml
                                    WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?3, ?4)
+                               )),
+                            (SELECT COALESCE(SUM(MAX(m.size_estimate, 0)), 0) FROM messages m
+                             WHERE m.mailbox_id = ?1
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM message_labels ml
+                                   WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN (?3, ?4)
                                ))
                      FROM imap_meta im
                      WHERE im.mailbox_id = ?1 AND im.mailbox_name = ?2",
                     params![mb, ALL_MAIL_MAILBOX, LABEL_TRASH, LABEL_SPAM, LABEL_UNREAD],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .map_err(sql_err)?;
 
             let make_label_info = |id: &str, name: &str, special_use: Option<&str>| {
                 let (uid_validity, uid_next) = label_meta.get(id).copied().unwrap_or((1, 1));
-                let (messages, unseen) = label_counts.get(id).copied().unwrap_or((0, 0));
+                let (messages, unseen, total_size_bytes) =
+                    label_counts.get(id).copied().unwrap_or((0, 0, 0));
                 ImapMailboxInfo {
                     name: name.to_string(),
                     label_id: Some(id.to_string()),
@@ -5136,10 +5162,11 @@ impl MailStore for SqliteStore {
                     uid_next,
                     messages,
                     unseen,
+                    total_size_bytes,
                 }
             };
 
-            let mut mailboxes = Vec::with_capacity(7 + user_labels.len());
+            let mut mailboxes = Vec::with_capacity(8 + user_labels.len());
             mailboxes.push(make_label_info(LABEL_INBOX, "INBOX", None));
             mailboxes.push(ImapMailboxInfo {
                 name: ALL_MAIL_MAILBOX.to_string(),
@@ -5149,6 +5176,7 @@ impl MailStore for SqliteStore {
                 uid_next: all_un.max(1) as u32,
                 messages: all_messages.max(0) as u32,
                 unseen: all_unseen.max(0) as u32,
+                total_size_bytes: all_size.max(0) as u64,
             });
             mailboxes.push(make_label_info(LABEL_SENT, SENT_MAILBOX, Some("\\Sent")));
             mailboxes.push(make_label_info(LABEL_DRAFT, DRAFTS_MAILBOX, Some("\\Drafts")));
@@ -5158,6 +5186,11 @@ impl MailStore for SqliteStore {
                 LABEL_STARRED,
                 STARRED_MAILBOX,
                 Some("\\Flagged"),
+            ));
+            mailboxes.push(make_label_info(
+                LABEL_IMPORTANT,
+                IMPORTANT_MAILBOX,
+                Some("\\Important"),
             ));
 
             for (id, name) in user_labels {
@@ -5175,6 +5208,20 @@ impl MailStore for SqliteStore {
                 return Ok(None);
             };
             Ok(Some(load_imap_mailbox_info_resolved(conn, mb, &resolved)?))
+        })
+        .await
+    }
+
+    async fn imap_total_storage_bytes(&self) -> AppResult<u64> {
+        self.run_blocking(|conn, mb| {
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(MAX(size_estimate, 0)), 0) FROM messages WHERE mailbox_id = ?1",
+                    params![mb],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            Ok(total.max(0) as u64)
         })
         .await
     }

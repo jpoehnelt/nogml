@@ -29,9 +29,9 @@ use crate::{
         serve_plain_listener,
     },
     models::{
-        AttachmentMeta, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
-        LABEL_TRASH, LABEL_UNREAD, Profile, ResendReceivedAttachment, ResendReceivedEmail,
-        ResendSendEmailRequest, ResendSendEmailResponse, SYSTEM_LABEL_IDS,
+        AttachmentMeta, LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM,
+        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, Profile, ResendReceivedAttachment,
+        ResendReceivedEmail, ResendSendEmailRequest, ResendSendEmailResponse, SYSTEM_LABEL_IDS,
     },
     resend::ResendClient,
     storage::{
@@ -146,6 +146,10 @@ impl TestMailStore {
             "[Gmail]/Starred" => Some((
                 "[Gmail]/Starred".to_string(),
                 Some(LABEL_STARRED.to_string()),
+            )),
+            "[Gmail]/Important" => Some((
+                "[Gmail]/Important".to_string(),
+                Some(LABEL_IMPORTANT.to_string()),
             )),
             other => inner
                 .labels
@@ -590,6 +594,11 @@ impl MailStore for TestMailStore {
                 Some(LABEL_STARRED.to_string()),
                 Some("\\Flagged".to_string()),
             ),
+            (
+                "[Gmail]/Important".to_string(),
+                Some(LABEL_IMPORTANT.to_string()),
+                Some("\\Important".to_string()),
+            ),
         ];
         let mut user_labels: Vec<_> = inner
             .labels
@@ -609,6 +618,9 @@ impl MailStore for TestMailStore {
                 .iter()
                 .filter(|e| e.label_ids.iter().any(|l| l == LABEL_UNREAD))
                 .count() as u32;
+            let total_size_bytes = entries.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(e.size_estimate.max(0) as u64)
+            });
             let (uid_validity, uid_next) = match &label_id {
                 Some(lid) => inner
                     .labels
@@ -625,6 +637,7 @@ impl MailStore for TestMailStore {
                 uid_next,
                 messages: entries.len() as u32,
                 unseen,
+                total_size_bytes,
             });
         }
         Ok(out)
@@ -634,6 +647,12 @@ impl MailStore for TestMailStore {
         Ok(list.into_iter().find(|m| {
             m.name == mailbox_name
                 || (mailbox_name.eq_ignore_ascii_case("INBOX") && m.name == "INBOX")
+        }))
+    }
+    async fn imap_total_storage_bytes(&self) -> AppResult<u64> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.messages.values().fold(0u64, |acc, m| {
+            acc.saturating_add(m.size_estimate.max(0) as u64)
         }))
     }
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {
@@ -3179,6 +3198,846 @@ async fn test_imap_sort_and_thread_utf8_subjects_and_25000_references() {
         "UID THREAD ORDEREDSUBJECT with UTF-8 subjects must succeed, got {thread_os_resp:?}"
     );
     assert!(thread_os_resp.last().unwrap().starts_with("TH2 OK"));
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_compress_deflate_roundtrip_duplicate_and_zip_bomb() {
+    use crate::imap::deflate::{DeflateImapStream, DeflateLimits};
+    use crate::storage::MemoryStore;
+    use flate2::{Compress, Compression, FlushCompress};
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let raw = b"From: alice@example.com\r\nTo: agent@example.com\r\nSubject: Compress Test\r\n\r\nHello DEFLATE world!\r\n".to_vec();
+    store
+        .insert_message(crate::imap::mime_fmt::parse_raw_to_new_message_input(
+            raw,
+            vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
+            Some(1_780_000_000_000),
+            "test",
+            None,
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    // 1. Pre-auth COMPRESS rejected with BAD; COMPRESS=DEFLATE not advertised before auth.
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(
+        !greeting.contains("COMPRESS=DEFLATE"),
+        "COMPRESS=DEFLATE must not be advertised pre-auth: {greeting}"
+    );
+    let pre_comp = send_cmd(&mut reader, "C0", "COMPRESS DEFLATE").await;
+    assert!(
+        pre_comp.last().unwrap().starts_with("C0 BAD"),
+        "unauthenticated COMPRESS must return BAD, got {pre_comp:?}"
+    );
+
+    // 2. Authenticate and confirm COMPRESS=DEFLATE advertised post-auth.
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    assert!(login.last().unwrap().contains("COMPRESS=DEFLATE"));
+
+    // Unknown compression mechanism rejected with NO.
+    let bad_mech = send_cmd(&mut reader, "C1", "COMPRESS LZ4").await;
+    assert!(bad_mech.last().unwrap().starts_with("C1 NO"));
+
+    // 3. Negotiate COMPRESS DEFLATE: response line is uncompressed, then stream switches to raw RFC 1951.
+    let comp_ok = send_cmd(&mut reader, "C2", "COMPRESS DEFLATE").await;
+    assert_eq!(comp_ok, vec!["C2 OK COMPRESS completed\r\n"]);
+
+    let leftover = reader.buffer().to_vec();
+    let tcp = reader.into_inner();
+    let client_deflate = DeflateImapStream::new(
+        tcp,
+        leftover,
+        DeflateLimits::for_max_body_bytes(40 * 1024 * 1024),
+    );
+    let mut comp_reader = BufReader::new(client_deflate);
+
+    async fn send_comp_cmd(
+        r: &mut BufReader<DeflateImapStream<TcpStream>>,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<String> {
+        let line = format!("{tag} {cmd}\r\n");
+        r.get_mut().write_all(line.as_bytes()).await.unwrap();
+        r.get_mut().flush().await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            let mut l = String::new();
+            let n = r.read_line(&mut l).await.unwrap();
+            assert!(n > 0, "unexpected EOF on compressed IMAP stream");
+            let trimmed = l.trim_end_matches(['\r', '\n']).to_string();
+            let done = trimmed.starts_with(&format!("{tag} "));
+            out.push(trimmed);
+            if done {
+                break;
+            }
+        }
+        out
+    }
+
+    // Compressed round-trip: NOOP, SELECT, FETCH, duplicate COMPRESS -> [COMPRESSIONACTIVE], LOGOUT.
+    let noop = send_comp_cmd(&mut comp_reader, "D1", "NOOP").await;
+    assert_eq!(noop, vec!["D1 OK NOOP completed"]);
+
+    let sel = send_comp_cmd(&mut comp_reader, "D2", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l == "* 1 EXISTS"));
+    assert!(sel.last().unwrap().starts_with("D2 OK [READ-WRITE]"));
+
+    let fetch = send_comp_cmd(&mut comp_reader, "D3", "FETCH 1 (UID FLAGS RFC822.SIZE)").await;
+    assert!(fetch.iter().any(|l| l.contains("FETCH (UID 1")));
+    assert!(fetch.last().unwrap().starts_with("D3 OK"));
+
+    let dup_comp = send_comp_cmd(&mut comp_reader, "D4", "COMPRESS DEFLATE").await;
+    assert!(
+        dup_comp
+            .last()
+            .unwrap()
+            .starts_with("D4 NO [COMPRESSIONACTIVE]"),
+        "duplicate COMPRESS must return NO [COMPRESSIONACTIVE], got {dup_comp:?}"
+    );
+
+    let bye = send_comp_cmd(&mut comp_reader, "D5", "LOGOUT").await;
+    assert!(bye.last().unwrap().starts_with("D5 OK LOGOUT"));
+
+    // 4. Zip-bomb DoS test over live TCP COMPRESS DEFLATE connection.
+    let bomb_tcp = TcpStream::connect(addr).await.unwrap();
+    let mut bomb_reader = BufReader::new(bomb_tcp);
+    let mut g2 = String::new();
+    bomb_reader.read_line(&mut g2).await.unwrap();
+    let l2 = send_cmd(
+        &mut bomb_reader,
+        "L2",
+        "LOGIN agent@example.com secret-pass",
+    )
+    .await;
+    assert!(l2.last().unwrap().starts_with("L2 OK"));
+    let c3 = send_cmd(&mut bomb_reader, "C3", "COMPRESS DEFLATE").await;
+    assert_eq!(c3, vec!["C3 OK COMPRESS completed\r\n"]);
+
+    let mut raw_tcp = bomb_reader.into_inner();
+    let bomb_plain = vec![b'A'; 512 * 1024];
+    let mut compressor = Compress::new(Compression::best(), false);
+    let mut bomb_wire = Vec::new();
+    let mut offset = 0usize;
+    while offset < bomb_plain.len() {
+        let before = compressor.total_in();
+        bomb_wire.reserve(1024);
+        compressor
+            .compress_vec(&bomb_plain[offset..], &mut bomb_wire, FlushCompress::None)
+            .unwrap();
+        offset += (compressor.total_in() - before) as usize;
+    }
+    bomb_wire.reserve(1024);
+    compressor
+        .compress_vec(&[], &mut bomb_wire, FlushCompress::Sync)
+        .unwrap();
+    assert!(bomb_wire.len() < 2048);
+
+    raw_tcp.write_all(&bomb_wire).await.unwrap();
+    raw_tcp.flush().await.unwrap();
+
+    // Server must trip the decompression ratio cap and close the connection cleanly.
+    let mut resp_bytes = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut raw_tcp, &mut resp_bytes),
+    )
+    .await
+    .expect("server must disconnect zip-bomb client promptly")
+    .unwrap();
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_utf8_accept_enable_labels_and_append_literal8() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    assert!(login.last().unwrap().contains("UTF8=ACCEPT"));
+
+    // APPEND UTF8 (~{N}) before ENABLE UTF8=ACCEPT must fail with BAD.
+    let utf8_msg = "From: café@example.com\r\nTo: agent@example.com\r\nSubject: 日本語テスト\r\n\r\nこんにちは世界!\r\n";
+    let pre_enable = send_cmd(
+        &mut reader,
+        "A0",
+        &format!("APPEND INBOX UTF8 (~{{{}+}}\r\n{utf8_msg})", utf8_msg.len()),
+    )
+    .await;
+    assert!(
+        pre_enable.last().unwrap().starts_with("A0 BAD"),
+        "APPEND UTF8 before ENABLE UTF8=ACCEPT must return BAD, got {pre_enable:?}"
+    );
+
+    // Enable UTF8=ACCEPT.
+    let en = send_cmd(&mut reader, "E1", "ENABLE UTF8=ACCEPT").await;
+    assert!(en.iter().any(|l| l.trim() == "* ENABLED UTF8=ACCEPT"));
+    assert!(en.last().unwrap().starts_with("E1 OK"));
+
+    // APPEND with synchronizing `UTF8 (~{N}\r\n...)`.
+    reader
+        .get_mut()
+        .write_all(
+            format!(
+                "A1 APPEND INBOX (\\Seen) \"05-Jan-2026 12:00:00 +0000\" UTF8 (~{{{}}}\r\n",
+                utf8_msg.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let mut cont = String::new();
+    reader.read_line(&mut cont).await.unwrap();
+    assert!(cont.starts_with('+'), "expected + Ready, got {cont:?}");
+    reader
+        .get_mut()
+        .write_all(format!("{utf8_msg})\r\n").as_bytes())
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let mut a1_resp = String::new();
+    reader.read_line(&mut a1_resp).await.unwrap();
+    assert!(
+        a1_resp.starts_with("A1 OK [APPENDUID "),
+        "APPEND UTF8 (~{{N}}) must succeed, got {a1_resp:?}"
+    );
+
+    // APPEND with non-synchronizing `UTF8 (~{N+}\r\n...)`.
+    let a2 = send_cmd(
+        &mut reader,
+        "A2",
+        &format!(
+            "APPEND INBOX (\\Flagged) UTF8 (~{{{}+}}\r\n{utf8_msg})",
+            utf8_msg.len()
+        ),
+    )
+    .await;
+    assert!(
+        a2.last().unwrap().starts_with("A2 OK [APPENDUID "),
+        "APPEND UTF8 (~{{N+}}) must succeed, got {a2:?}"
+    );
+
+    // Create UTF-8 mailbox & label containing '&' and verify clean UTF-8 emission under UTF8=ACCEPT.
+    let c1 = send_cmd(&mut reader, "CR1", r#"CREATE "Café/重要""#).await;
+    assert!(c1.last().unwrap().starts_with("CR1 OK"));
+    let c2 = send_cmd(&mut reader, "CR2", r#"CREATE "R&D-Team""#).await;
+    assert!(c2.last().unwrap().starts_with("CR2 OK"));
+
+    let list = send_cmd(&mut reader, "LS1", r#"LIST "" "*""#).await;
+    assert!(
+        list.iter().any(|l| l.contains(r#""Café/重要""#)),
+        "LIST under UTF8=ACCEPT must emit UTF-8 quoted mailbox name, got {list:?}"
+    );
+    assert!(
+        list.iter().any(|l| l.contains(r#""R&D-Team""#)),
+        "LIST under UTF8=ACCEPT must preserve '&', got {list:?}"
+    );
+
+    let sel = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l.trim() == "* 2 EXISTS"));
+
+    let store_lbl = send_cmd(
+        &mut reader,
+        "ST1",
+        r#"STORE 1 +X-GM-LABELS ("Café/重要" "R&D-Team")"#,
+    )
+    .await;
+    assert!(
+        store_lbl
+            .iter()
+            .any(|l| l.contains(r#""Café/重要""#) && l.contains(r#""R&D-Team""#)),
+        "STORE X-GM-LABELS under UTF8=ACCEPT must emit UTF-8 quoted labels, got {store_lbl:?}"
+    );
+
+    let fetch_lbl = send_cmd(&mut reader, "F1", "FETCH 1 (X-GM-LABELS)").await;
+    assert!(
+        fetch_lbl
+            .iter()
+            .any(|l| l.contains(r#""Café/重要""#) && l.contains(r#""R&D-Team""#)),
+        "FETCH X-GM-LABELS under UTF8=ACCEPT must emit UTF-8 quoted labels, got {fetch_lbl:?}"
+    );
+
+    let search_lbl = send_cmd(&mut reader, "SR1", r#"SEARCH X-GM-LABELS "Café/重要""#).await;
+    assert!(
+        search_lbl.iter().any(|l| l.trim() == "* SEARCH 1"),
+        "SEARCH X-GM-LABELS UTF-8 must match message 1, got {search_lbl:?}"
+    );
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_quota_getquotaroot_and_getquota_memory_and_sqlite() {
+    use crate::storage::{MemoryStore, SqliteStore};
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let db_path = tmp_dir.path().join("quota-test.db");
+
+    let stores: Vec<(&str, Arc<dyn MailStore>)> = vec![
+        ("memory", Arc::new(MemoryStore::new("agent@example.com"))),
+        (
+            "sqlite",
+            Arc::new(SqliteStore::open(&db_path, "agent@example.com").unwrap()),
+        ),
+    ];
+
+    for (backend_name, store) in stores {
+        let raw = format!(
+            "From: sender@example.com\r\nTo: agent@example.com\r\nSubject: Quota {backend_name}\r\n\r\n{}\r\n",
+            "x".repeat(3000)
+        )
+        .into_bytes();
+        let expected_size = raw.len() as u64;
+        store
+            .insert_message(crate::imap::mime_fmt::parse_raw_to_new_message_input(
+                raw,
+                vec![LABEL_INBOX.to_string()],
+                Some(1_780_000_000_000),
+                "test",
+                None,
+                None,
+                false,
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let quota_bytes: u64 = 100 * 1024 * 1024; // 100 MiB = 102400 KiB
+        let cfg = Config {
+            user_email: "agent@example.com".to_string(),
+            imap_username: Some("agent@example.com".to_string()),
+            imap_password: Some("secret-pass".to_string()),
+            imap_quota_bytes: quota_bytes,
+            ..Config::default()
+        };
+        let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+        let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+
+        let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+        assert!(login.last().unwrap().contains("QUOTA"));
+
+        let expected_kb = expected_size.div_ceil(1024);
+        let expected_limit_kb = quota_bytes / 1024;
+
+        let qr = send_cmd(&mut reader, "Q1", "GETQUOTAROOT INBOX").await;
+        assert!(
+            qr.iter().any(|l| l.trim() == r#"* QUOTAROOT "INBOX" """#),
+            "[{backend_name}] missing QUOTAROOT line: {qr:?}"
+        );
+        assert!(
+            qr.iter().any(|l| {
+                l.trim() == format!(r#"* QUOTA "" (STORAGE {expected_kb} {expected_limit_kb})"#)
+            }),
+            "[{backend_name}] unexpected QUOTA line: {qr:?}"
+        );
+        assert!(qr.last().unwrap().starts_with("Q1 OK"));
+
+        let gq = send_cmd(&mut reader, "Q2", r#"GETQUOTA """#).await;
+        assert!(
+            gq.iter().any(|l| {
+                l.trim() == format!(r#"* QUOTA "" (STORAGE {expected_kb} {expected_limit_kb})"#)
+            }),
+            "[{backend_name}] GETQUOTA mismatch: {gq:?}"
+        );
+        assert!(gq.last().unwrap().starts_with("Q2 OK"));
+
+        // Unknown quota root and nonexistent mailbox return NO.
+        let bad_root = send_cmd(&mut reader, "Q3", r#"GETQUOTA "other""#).await;
+        assert!(bad_root.last().unwrap().starts_with("Q3 NO"));
+        let bad_mbx = send_cmd(&mut reader, "Q4", r#"GETQUOTAROOT "NoSuchFolder""#).await;
+        assert!(bad_mbx.last().unwrap().starts_with("Q4 NO"));
+
+        // Verify STATUS (SIZE) and LIST-STATUS (SIZE) report exact byte total on both backends.
+        let st = send_cmd(&mut reader, "ST1", "STATUS INBOX (MESSAGES SIZE)").await;
+        assert!(
+            st.iter()
+                .any(|l| l.trim()
+                    == format!(r#"* STATUS "INBOX" (MESSAGES 1 SIZE {expected_size})"#)),
+            "[{backend_name}] STATUS SIZE mismatch: {st:?}"
+        );
+        let ls = send_cmd(
+            &mut reader,
+            "LS1",
+            r#"LIST "" "INBOX" RETURN (STATUS (MESSAGES SIZE))"#,
+        )
+        .await;
+        assert!(
+            ls.iter()
+                .any(|l| l.trim()
+                    == format!(r#"* STATUS "INBOX" (MESSAGES 1 SIZE {expected_size})"#)),
+            "[{backend_name}] LIST-STATUS SIZE mismatch: {ls:?}"
+        );
+
+        let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+        let _ = shutdown_tx.send(true);
+    }
+}
+
+#[tokio::test]
+async fn test_imap_xlist_and_children_hierarchy() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    store
+        .create_label(NewLabelInput {
+            name: "Work".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .create_label(NewLabelInput {
+            name: "Work/Q4".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .create_label(NewLabelInput {
+            name: "Projects/Deep/Leaf".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    let cap_line = login.last().unwrap();
+    assert!(cap_line.contains("CHILDREN"));
+    assert!(cap_line.contains("XLIST"));
+
+    // LIST "" "*" verifies \HasChildren / \HasNoChildren on [Gmail], Work/Work/Q4, and virtual parents.
+    let list = send_cmd(&mut reader, "LS1", r#"LIST "" "*""#).await;
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\Noselect \HasChildren) "/" "[Gmail]""#)
+    );
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\HasChildren) "/" "Work""#)
+    );
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\HasNoChildren) "/" "Work/Q4""#)
+    );
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\Noselect \HasChildren) "/" "Projects""#)
+    );
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\Noselect \HasChildren) "/" "Projects/Deep""#)
+    );
+    assert!(
+        list.iter()
+            .any(|l| l.trim() == r#"* LIST (\HasNoChildren) "/" "Projects/Deep/Leaf""#)
+    );
+
+    // XLIST "" "" returns hierarchy delimiter.
+    let xdelim = send_cmd(&mut reader, "X0", r#"XLIST "" """#).await;
+    assert!(
+        xdelim
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\Noselect) "/" """#)
+    );
+    assert!(xdelim.last().unwrap().starts_with("X0 OK XLIST"));
+
+    // XLIST "" "*" returns Gmail-compatible attributes.
+    let xlist = send_cmd(&mut reader, "X1", r#"XLIST "" "*""#).await;
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Inbox) "/" "INBOX""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\Noselect \HasChildren) "/" "[Gmail]""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \AllMail) "/" "[Gmail]/All Mail""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Drafts) "/" "[Gmail]/Drafts""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Trash) "/" "[Gmail]/Trash""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Spam) "/" "[Gmail]/Spam""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Starred) "/" "[Gmail]/Starred""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren \Important) "/" "[Gmail]/Important""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasChildren) "/" "Work""#)
+    );
+    assert!(
+        xlist
+            .iter()
+            .any(|l| l.trim() == r#"* XLIST (\HasNoChildren) "/" "Work/Q4""#)
+    );
+    assert!(xlist.last().unwrap().starts_with("X1 OK XLIST"));
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_authenticate_oauthbearer_sasl_ir_authzid_challenge_and_tls_gate() {
+    use crate::{
+        auth::{AuthScope, ScopedTokenConfig},
+        imap::build_tls_acceptor,
+        storage::MemoryStore,
+    };
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        mailboxes: vec!["other@example.com".to_string()],
+        auth_tokens: vec!["primary-tok".to_string()],
+        scoped_tokens: vec![ScopedTokenConfig {
+            token: "scoped-agent-tok".to_string(),
+            scopes: vec![AuthScope::Read],
+            mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        }],
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+
+    // 1. Plaintext listener with TLS configured must hide AUTH=OAUTHBEARER and reject auth.
+    let tmp = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_path = tmp.path().join("cert.pem");
+    let key_path = tmp.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    let tls_acceptor = build_tls_acceptor(&cert_path, &key_path).unwrap();
+
+    let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tls_addr = tls_listener.local_addr().unwrap();
+    let (tls_shutdown_tx, tls_shutdown_rx) = watch::channel(false);
+    let st_tls = state.clone();
+    tokio::spawn(async move {
+        let _ =
+            serve_plain_listener(tls_listener, st_tls, Some(tls_acceptor), tls_shutdown_rx).await;
+    });
+
+    let mut tls_reader = BufReader::new(TcpStream::connect(tls_addr).await.unwrap());
+    let mut tls_greeting = String::new();
+    tls_reader.read_line(&mut tls_greeting).await.unwrap();
+    assert!(tls_greeting.contains("STARTTLS"));
+    assert!(tls_greeting.contains("LOGINDISABLED"));
+    assert!(!tls_greeting.contains("AUTH=OAUTHBEARER"));
+    let denied = send_cmd(&mut tls_reader, "O0", "AUTHENTICATE OAUTHBEARER").await;
+    assert!(
+        denied
+            .last()
+            .unwrap()
+            .starts_with("O0 NO [PRIVACYREQUIRED]")
+    );
+    let _ = tls_shutdown_tx.send(true);
+
+    // 2. Plaintext listener without TLS: advertises AUTH=OAUTHBEARER alongside AUTH=XOAUTH2.
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    // 2a. SASL-IR success with explicit authzid.
+    let mut r1 = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let mut g1 = String::new();
+    r1.read_line(&mut g1).await.unwrap();
+    assert!(g1.contains("AUTH=OAUTHBEARER"));
+    assert!(g1.contains("AUTH=XOAUTH2"));
+
+    let ok_payload = base64::engine::general_purpose::STANDARD.encode(
+        "n,a=agent@example.com,\x01host=localhost\x01port=1143\x01auth=Bearer primary-tok\x01\x01",
+    );
+    let auth1 = send_cmd(
+        &mut r1,
+        "O1",
+        &format!("AUTHENTICATE OAUTHBEARER {ok_payload}"),
+    )
+    .await;
+    assert!(
+        auth1.last().unwrap().starts_with("O1 OK [CAPABILITY "),
+        "OAUTHBEARER SASL-IR must succeed, got {auth1:?}"
+    );
+    let _ = send_cmd(&mut r1, "B1", "LOGOUT").await;
+
+    // 2b. Continuation flow (without SASL-IR) and omitted authzid (`n,,\x01auth=Bearer ...`).
+    let mut r2 = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let mut g2 = String::new();
+    r2.read_line(&mut g2).await.unwrap();
+    r2.get_mut()
+        .write_all(b"O2 AUTHENTICATE OAUTHBEARER\r\n")
+        .await
+        .unwrap();
+    r2.get_mut().flush().await.unwrap();
+    let mut cont = String::new();
+    r2.read_line(&mut cont).await.unwrap();
+    assert_eq!(cont, "+ \r\n");
+
+    let no_authzid_payload = base64::engine::general_purpose::STANDARD
+        .encode("n,,\x01auth=Bearer scoped-agent-tok\x01\x01");
+    r2.get_mut()
+        .write_all(format!("{no_authzid_payload}\r\n").as_bytes())
+        .await
+        .unwrap();
+    r2.get_mut().flush().await.unwrap();
+    let mut o2_resp = String::new();
+    r2.read_line(&mut o2_resp).await.unwrap();
+    assert!(
+        o2_resp.starts_with("O2 OK [CAPABILITY "),
+        "OAUTHBEARER continuation without authzid must succeed, got {o2_resp:?}"
+    );
+    let _ = send_cmd(&mut r2, "B2", "LOGOUT").await;
+
+    // 2c. Unauthorized authzid (`other@example.com` using `agent@example.com` scoped token) ->
+    // RFC 7628 JSON error challenge -> client ack `AQ==` -> NO [AUTHORIZATIONFAILED].
+    let mut r3 = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let mut g3 = String::new();
+    r3.read_line(&mut g3).await.unwrap();
+    let unauthz_payload = base64::engine::general_purpose::STANDARD
+        .encode("n,a=other@example.com,\x01auth=Bearer scoped-agent-tok\x01\x01");
+    r3.get_mut()
+        .write_all(format!("O3 AUTHENTICATE OAUTHBEARER {unauthz_payload}\r\n").as_bytes())
+        .await
+        .unwrap();
+    r3.get_mut().flush().await.unwrap();
+
+    let mut challenge_line = String::new();
+    r3.read_line(&mut challenge_line).await.unwrap();
+    assert!(
+        challenge_line.starts_with("+ "),
+        "expected RFC 7628 JSON challenge, got {challenge_line:?}"
+    );
+    let challenge_b64 = challenge_line[2..].trim();
+    let challenge_json: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(challenge_b64)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(challenge_json["status"], "invalid_token");
+
+    r3.get_mut().write_all(b"AQ==\r\n").await.unwrap();
+    r3.get_mut().flush().await.unwrap();
+    let mut fail_line = String::new();
+    r3.read_line(&mut fail_line).await.unwrap();
+    assert!(
+        fail_line.starts_with("O3 NO [AUTHORIZATIONFAILED]"),
+        "unauthorized authzid must return NO [AUTHORIZATIONFAILED], got {fail_line:?}"
+    );
+
+    // 2d. Invalid bearer token -> RFC 7628 JSON challenge -> NO [AUTHENTICATIONFAILED].
+    let bad_tok_payload = base64::engine::general_purpose::STANDARD
+        .encode("n,a=agent@example.com,\x01auth=Bearer wrong-secret-token\x01\x01");
+    r3.get_mut()
+        .write_all(format!("O4 AUTHENTICATE OAUTHBEARER {bad_tok_payload}\r\n").as_bytes())
+        .await
+        .unwrap();
+    r3.get_mut().flush().await.unwrap();
+    let mut c4 = String::new();
+    r3.read_line(&mut c4).await.unwrap();
+    assert!(c4.starts_with("+ "));
+    assert!(!c4.contains("wrong-secret-token"));
+    r3.get_mut().write_all(b"AQ==\r\n").await.unwrap();
+    r3.get_mut().flush().await.unwrap();
+    let mut f4 = String::new();
+    r3.read_line(&mut f4).await.unwrap();
+    assert!(f4.starts_with("O4 NO [AUTHENTICATIONFAILED]"));
+    assert!(!f4.contains("wrong-secret-token"));
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_appendlimit_status_size_and_within_search_sort_thread() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Message 1: 2 hours old (7200s ago)
+    let raw_old = b"From: old@example.com\r\nTo: agent@example.com\r\nSubject: Old Message\r\nMessage-ID: <old-within@example.com>\r\n\r\nOld body\r\n".to_vec();
+    store
+        .insert_message(crate::imap::mime_fmt::parse_raw_to_new_message_input(
+            raw_old.clone(),
+            vec![LABEL_INBOX.to_string()],
+            Some(now_ms - 7_200_000),
+            "test",
+            None,
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+
+    // Message 2: 30 seconds old
+    let raw_recent = b"From: new@example.com\r\nTo: agent@example.com\r\nSubject: Recent Message\r\nMessage-ID: <new-within@example.com>\r\n\r\nRecent body\r\n".to_vec();
+    store
+        .insert_message(crate::imap::mime_fmt::parse_raw_to_new_message_input(
+            raw_recent.clone(),
+            vec![LABEL_INBOX.to_string()],
+            Some(now_ms - 30_000),
+            "test",
+            None,
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        max_body_bytes: 256,
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store, Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let mut reader = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    let cap_line = login.last().unwrap();
+    assert!(cap_line.contains("APPENDLIMIT=256"));
+    assert!(cap_line.contains("STATUS=SIZE"));
+    assert!(cap_line.contains("WITHIN"));
+
+    // Oversized APPEND (sync literal 300 > 256) returns NO [TOOBIG] without sending + Ready.
+    let toobig = send_cmd(&mut reader, "AP1", "APPEND INBOX {300}").await;
+    assert!(
+        toobig.last().unwrap().starts_with("AP1 NO [TOOBIG]"),
+        "APPEND exceeding APPENDLIMIT must return NO [TOOBIG], got {toobig:?}"
+    );
+
+    // Oversized quoted APPEND also returns NO [TOOBIG].
+    let big_quoted = format!("APPEND INBOX \"{}\"", "a".repeat(260));
+    let toobig_q = send_cmd(&mut reader, "AP2", &big_quoted).await;
+    assert!(
+        toobig_q.last().unwrap().starts_with("AP2 NO [TOOBIG]"),
+        "quoted APPEND exceeding APPENDLIMIT must return NO [TOOBIG], got {toobig_q:?}"
+    );
+
+    // STATUS INBOX (SIZE) equals raw_old.len() + raw_recent.len().
+    let expected_total_size = raw_old.len() + raw_recent.len();
+    let st = send_cmd(&mut reader, "ST1", "STATUS INBOX (MESSAGES SIZE)").await;
+    assert!(
+        st.iter()
+            .any(|l| l.trim()
+                == format!(r#"* STATUS "INBOX" (MESSAGES 2 SIZE {expected_total_size})"#)),
+        "expected STATUS SIZE {expected_total_size}, got {st:?}"
+    );
+
+    // Select INBOX and test WITHIN (YOUNGER / OLDER) across SEARCH, UID SEARCH, SORT, THREAD.
+    let sel = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l.trim() == "* 2 EXISTS"));
+
+    let s_younger = send_cmd(&mut reader, "W1", "SEARCH YOUNGER 600").await;
+    assert!(s_younger.iter().any(|l| l.trim() == "* SEARCH 2"));
+    assert!(s_younger.last().unwrap().starts_with("W1 OK"));
+
+    let s_older = send_cmd(&mut reader, "W2", "UID SEARCH OLDER 600").await;
+    assert!(s_older.iter().any(|l| l.trim() == "* SEARCH 1"));
+    assert!(s_older.last().unwrap().starts_with("W2 OK"));
+
+    let sort_younger = send_cmd(&mut reader, "W3", "UID SORT (ARRIVAL) UTF-8 YOUNGER 600").await;
+    assert!(sort_younger.iter().any(|l| l.trim() == "* SORT 2"));
+    assert!(sort_younger.last().unwrap().starts_with("W3 OK"));
+
+    let thread_older = send_cmd(&mut reader, "W4", "UID THREAD REFERENCES UTF-8 OLDER 600").await;
+    assert!(thread_older.iter().any(|l| l.trim() == "* THREAD (1)"));
+    assert!(thread_older.last().unwrap().starts_with("W4 OK"));
+
+    // RFC 5032 nz-number validation: 0 must be rejected with BAD.
+    let bad_zero = send_cmd(&mut reader, "W5", "SEARCH YOUNGER 0").await;
+    assert!(bad_zero.last().unwrap().starts_with("W5 BAD"));
+    let bad_older_zero = send_cmd(&mut reader, "W6", "SEARCH OLDER 0").await;
+    assert!(bad_older_zero.last().unwrap().starts_with("W6 BAD"));
 
     let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
     let _ = shutdown_tx.send(true);

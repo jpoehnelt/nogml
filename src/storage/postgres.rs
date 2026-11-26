@@ -25,11 +25,11 @@ use crate::{
     events::{EventBridge, EventBus, EventEnvelope, MailEvent},
     models::{
         AttachmentMeta, AutoForwarding, Delegate, EmailAddress, ForwardingAddress, GmailFilter,
-        ImapSettings, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH,
-        LABEL_UNREAD, LabelColor, LanguageSettings, PopSettings, Profile, SYSTEM_LABEL_IDS, SendAs,
-        ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary, UnsubscribeInfo, VacationSettings,
-        WaitingOn, apply_thread_annotation_patch, default_extracted_object, is_system_label,
-        truncate_to_millis,
+        ImapSettings, LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM,
+        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, LanguageSettings, PopSettings,
+        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
+        UnsubscribeInfo, VacationSettings, WaitingOn, apply_thread_annotation_patch,
+        default_extracted_object, is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -62,6 +62,7 @@ const DRAFTS_MAILBOX: &str = "[Gmail]/Drafts";
 const TRASH_MAILBOX: &str = "[Gmail]/Trash";
 const SPAM_MAILBOX: &str = "[Gmail]/Spam";
 const STARRED_MAILBOX: &str = "[Gmail]/Starred";
+const IMPORTANT_MAILBOX: &str = "[Gmail]/Important";
 
 /// Default PostgreSQL `LISTEN`/`NOTIFY` channel used for cross-node `EventBus` fan-out.
 pub const PG_EVENTS_CHANNEL: &str = "nogml_events";
@@ -2699,6 +2700,13 @@ async fn resolve_imap_mailbox(
             special_use: Some("\\Flagged"),
         }));
     }
+    if mailbox_name == IMPORTANT_MAILBOX {
+        return Ok(Some(ResolvedMailbox::Label {
+            id: LABEL_IMPORTANT.to_string(),
+            name: IMPORTANT_MAILBOX.to_string(),
+            special_use: Some("\\Important"),
+        }));
+    }
 
     let row = client
         .query_opt(
@@ -2731,9 +2739,9 @@ async fn load_imap_mailbox_info_resolved(
             let uv: i64 = row.get(0);
             let un: i64 = row.get(1);
 
-            let messages: i64 = client
+            let count_row = client
                 .query_one(
-                    "SELECT COUNT(*) FROM messages m
+                    "SELECT COUNT(*), COALESCE(SUM(GREATEST(m.size_estimate, 0)), 0)::BIGINT FROM messages m
                      WHERE m.mailbox_id = $1
                        AND NOT EXISTS (
                            SELECT 1 FROM message_labels ml
@@ -2742,8 +2750,9 @@ async fn load_imap_mailbox_info_resolved(
                     &[&mailbox_id, &LABEL_TRASH, &LABEL_SPAM],
                 )
                 .await
-                .map_err(pg_err)?
-                .get(0);
+                .map_err(pg_err)?;
+            let messages: i64 = count_row.get(0);
+            let total_size: i64 = count_row.get(1);
             let unseen: i64 = client
                 .query_one(
                     "SELECT COUNT(*) FROM messages m
@@ -2770,6 +2779,7 @@ async fn load_imap_mailbox_info_resolved(
                 uid_next: un.max(1) as u32,
                 messages: messages.max(0) as u32,
                 unseen: unseen.max(0) as u32,
+                total_size_bytes: total_size.max(0) as u64,
             })
         }
         ResolvedMailbox::Label {
@@ -2787,14 +2797,19 @@ async fn load_imap_mailbox_info_resolved(
             let uv: i64 = row.get(0);
             let un: i64 = row.get(1);
 
-            let messages: i64 = client
+            let count_row = client
                 .query_one(
-                    "SELECT COUNT(*) FROM message_labels WHERE mailbox_id = $1 AND label_id = $2",
+                    "SELECT COUNT(*), COALESCE(SUM(GREATEST(m.size_estimate, 0)), 0)::BIGINT
+                     FROM message_labels ml
+                     INNER JOIN messages m
+                        ON m.mailbox_id = ml.mailbox_id AND m.id = ml.message_id
+                     WHERE ml.mailbox_id = $1 AND ml.label_id = $2",
                     &[&mailbox_id, id],
                 )
                 .await
-                .map_err(pg_err)?
-                .get(0);
+                .map_err(pg_err)?;
+            let messages: i64 = count_row.get(0);
+            let total_size: i64 = count_row.get(1);
             let unseen: i64 = client
                 .query_one(
                     "SELECT COUNT(*) FROM message_labels ml
@@ -2815,6 +2830,7 @@ async fn load_imap_mailbox_info_resolved(
                 uid_next: un.max(1) as u32,
                 messages: messages.max(0) as u32,
                 unseen: unseen.max(0) as u32,
+                total_size_bytes: total_size.max(0) as u64,
             })
         }
     }
@@ -5310,13 +5326,17 @@ impl MailStore for PostgresStore {
             }
         }
 
-        // 2. Batch total & unseen counts across every label in a single GROUP BY query.
+        // 2. Batch total, unseen, and RFC 822 size totals across every label in a single GROUP BY query.
         let count_rows = conn
             .query(
                 "SELECT ml.label_id,
                         COUNT(*) AS total,
-                        COUNT(mu.message_id) AS unseen
+                        COUNT(mu.message_id) AS unseen,
+                        COALESCE(SUM(GREATEST(m.size_estimate, 0)), 0)::BIGINT AS total_size
                  FROM message_labels ml
+                 INNER JOIN messages m
+                    ON m.mailbox_id = ml.mailbox_id
+                   AND m.id = ml.message_id
                  LEFT JOIN message_labels mu
                     ON mu.mailbox_id = ml.mailbox_id
                    AND mu.message_id = ml.message_id
@@ -5327,16 +5347,24 @@ impl MailStore for PostgresStore {
             )
             .await
             .map_err(pg_err)?;
-        let mut label_counts: HashMap<String, (u32, u32)> =
+        let mut label_counts: HashMap<String, (u32, u32, u64)> =
             HashMap::with_capacity(count_rows.len());
         for row in count_rows {
             let lid: String = row.get(0);
             let total: i64 = row.get(1);
             let unseen: i64 = row.get(2);
-            label_counts.insert(lid, (total.max(0) as u32, unseen.max(0) as u32));
+            let total_size: i64 = row.get(3);
+            label_counts.insert(
+                lid,
+                (
+                    total.max(0) as u32,
+                    unseen.max(0) as u32,
+                    total_size.max(0) as u64,
+                ),
+            );
         }
 
-        // 3. Load `[Gmail]/All Mail` UID metadata + counts in a single query.
+        // 3. Load `[Gmail]/All Mail` UID metadata + counts + total size in a single query.
         let all_row = conn
             .query_one(
                 "SELECT im.uid_validity,
@@ -5356,6 +5384,12 @@ impl MailStore for PostgresStore {
                            AND NOT EXISTS (
                                SELECT 1 FROM message_labels ml
                                WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN ($3, $4)
+                           )),
+                        (SELECT COALESCE(SUM(GREATEST(m.size_estimate, 0)), 0)::BIGINT FROM messages m
+                         WHERE m.mailbox_id = $1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM message_labels ml
+                               WHERE ml.mailbox_id = m.mailbox_id AND ml.message_id = m.id AND ml.label_id IN ($3, $4)
                            ))
                  FROM imap_meta im
                  WHERE im.mailbox_id = $1 AND im.mailbox_name = $2",
@@ -5372,7 +5406,8 @@ impl MailStore for PostgresStore {
 
         let make_label_info = |id: &str, name: &str, special_use: Option<&str>| {
             let (uid_validity, uid_next) = label_meta.get(id).copied().unwrap_or((1, 1));
-            let (messages, unseen) = label_counts.get(id).copied().unwrap_or((0, 0));
+            let (messages, unseen, total_size_bytes) =
+                label_counts.get(id).copied().unwrap_or((0, 0, 0));
             ImapMailboxInfo {
                 name: name.to_string(),
                 label_id: Some(id.to_string()),
@@ -5381,10 +5416,11 @@ impl MailStore for PostgresStore {
                 uid_next,
                 messages,
                 unseen,
+                total_size_bytes,
             }
         };
 
-        let mut mailboxes = Vec::with_capacity(7 + user_labels.len());
+        let mut mailboxes = Vec::with_capacity(8 + user_labels.len());
         mailboxes.push(make_label_info(LABEL_INBOX, "INBOX", None));
         mailboxes.push(ImapMailboxInfo {
             name: ALL_MAIL_MAILBOX.to_string(),
@@ -5394,6 +5430,7 @@ impl MailStore for PostgresStore {
             uid_next: all_row.get::<_, i64>(1).max(1) as u32,
             messages: all_row.get::<_, i64>(2).max(0) as u32,
             unseen: all_row.get::<_, i64>(3).max(0) as u32,
+            total_size_bytes: all_row.get::<_, i64>(4).max(0) as u64,
         });
         mailboxes.push(make_label_info(LABEL_SENT, SENT_MAILBOX, Some("\\Sent")));
         mailboxes.push(make_label_info(
@@ -5407,6 +5444,11 @@ impl MailStore for PostgresStore {
             LABEL_STARRED,
             STARRED_MAILBOX,
             Some("\\Flagged"),
+        ));
+        mailboxes.push(make_label_info(
+            LABEL_IMPORTANT,
+            IMPORTANT_MAILBOX,
+            Some("\\Important"),
         ));
 
         for (id, name) in user_labels {
@@ -5424,6 +5466,20 @@ impl MailStore for PostgresStore {
         Ok(Some(
             load_imap_mailbox_info_resolved(&conn, mb, &resolved).await?,
         ))
+    }
+
+    async fn imap_total_storage_bytes(&self) -> AppResult<u64> {
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let total: i64 = conn
+            .query_one(
+                "SELECT COALESCE(SUM(GREATEST(size_estimate, 0)), 0)::BIGINT FROM messages WHERE mailbox_id = $1",
+                &[&mb],
+            )
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        Ok(total.max(0) as u64)
     }
 
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {

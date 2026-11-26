@@ -14,10 +14,10 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        AttachmentMeta, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM,
-        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, Profile, SYSTEM_LABEL_IDS,
-        ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary, apply_thread_annotation_patch,
-        is_system_label, truncate_to_millis,
+        AttachmentMeta, EmailAddress, LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT,
+        LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, Profile,
+        SYSTEM_LABEL_IDS, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
+        apply_thread_annotation_patch, is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
@@ -49,6 +49,7 @@ const DRAFTS_MAILBOX: &str = "[Gmail]/Drafts";
 const TRASH_MAILBOX: &str = "[Gmail]/Trash";
 const SPAM_MAILBOX: &str = "[Gmail]/Spam";
 const STARRED_MAILBOX: &str = "[Gmail]/Starred";
+const IMPORTANT_MAILBOX: &str = "[Gmail]/Important";
 
 #[derive(Debug, Clone)]
 struct MemLabel {
@@ -713,6 +714,13 @@ impl MemoryState {
                 special_use: Some("\\Flagged"),
             });
         }
+        if mailbox_name == IMPORTANT_MAILBOX {
+            return Some(ResolvedMailbox::Label {
+                id: LABEL_IMPORTANT.to_string(),
+                name: IMPORTANT_MAILBOX.to_string(),
+                special_use: Some("\\Important"),
+            });
+        }
         self.labels
             .values()
             .find(|l| l.label_type == "user" && l.name == mailbox_name)
@@ -728,6 +736,7 @@ impl MemoryState {
             ResolvedMailbox::AllMail => {
                 let mut messages = 0_u32;
                 let mut unseen = 0_u32;
+                let mut total_size_bytes = 0_u64;
                 for m in self.messages.values() {
                     if !m
                         .label_ids
@@ -735,6 +744,8 @@ impl MemoryState {
                         .any(|l| l == LABEL_TRASH || l == LABEL_SPAM)
                     {
                         messages += 1;
+                        total_size_bytes =
+                            total_size_bytes.saturating_add(m.size_estimate.max(0) as u64);
                         if m.label_ids.iter().any(|l| l == LABEL_UNREAD) {
                             unseen += 1;
                         }
@@ -748,6 +759,7 @@ impl MemoryState {
                     uid_next: self.all_mail_uid_next,
                     messages,
                     unseen,
+                    total_size_bytes,
                 }
             }
             ResolvedMailbox::Label {
@@ -762,9 +774,12 @@ impl MemoryState {
                     .unwrap_or((1, 1));
                 let mut messages = 0_u32;
                 let mut unseen = 0_u32;
+                let mut total_size_bytes = 0_u64;
                 for m in self.messages.values() {
                     if m.label_ids.iter().any(|l| l == id) {
                         messages += 1;
+                        total_size_bytes =
+                            total_size_bytes.saturating_add(m.size_estimate.max(0) as u64);
                         if m.label_ids.iter().any(|l| l == LABEL_UNREAD) {
                             unseen += 1;
                         }
@@ -778,6 +793,7 @@ impl MemoryState {
                     uid_next,
                     messages,
                     unseen,
+                    total_size_bytes,
                 }
             }
         }
@@ -2493,6 +2509,11 @@ impl MailStore for MemoryStore {
                 name: STARRED_MAILBOX.to_string(),
                 special_use: Some("\\Flagged"),
             },
+            ResolvedMailbox::Label {
+                id: LABEL_IMPORTANT.to_string(),
+                name: IMPORTANT_MAILBOX.to_string(),
+                special_use: Some("\\Important"),
+            },
         ];
 
         let mut mailboxes: Vec<ImapMailboxInfo> = builtins
@@ -2525,6 +2546,14 @@ impl MailStore for MemoryStore {
         Ok(state
             .resolve_imap_mailbox(mailbox_name)
             .map(|mb| state.imap_mailbox_info_resolved(&mb)))
+    }
+
+    async fn imap_total_storage_bytes(&self) -> AppResult<u64> {
+        let state = self.read_state()?;
+        let total = state.messages.values().fold(0u64, |acc, m| {
+            acc.saturating_add(m.size_estimate.max(0) as u64)
+        });
+        Ok(total)
     }
 
     async fn imap_list_messages(&self, mailbox_name: &str) -> AppResult<Vec<ImapMessageEntry>> {

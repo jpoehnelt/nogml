@@ -830,3 +830,99 @@ fn test_imap_xoauth2_target_validation_and_mutf7_roundtrip() {
     assert_eq!(decode_imap_mutf7("R&D"), "R&D");
     assert_eq!(decode_imap_mutf7("Bad&/invalid-"), "Bad&/invalid-");
 }
+
+#[tokio::test]
+async fn test_gmail_imap_sync_negotiates_utf8_accept_for_native_utf8_labels() {
+    use tokio::{net::TcpListener, sync::watch};
+
+    use crate::{
+        config::{Config, SyncMode},
+        imap::{mime_fmt::parse_raw_to_new_message_input, serve_plain_listener},
+        models::LABEL_INBOX,
+        storage::NewLabelInput,
+        sync::{SyncRunOptions, run_gmail_sync},
+    };
+
+    let mut up_cfg = Config::for_test();
+    up_cfg.user_email = "agent@example.com".to_string();
+    up_cfg.imap_username = Some("agent@example.com".to_string());
+    up_cfg.imap_password = Some("secret-pass".to_string());
+    let upstream_state = test_app_state(up_cfg);
+
+    let utf8_lbl = upstream_state
+        .store
+        .create_label(NewLabelInput {
+            name: "Café/重要".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let amp_lbl = upstream_state
+        .store
+        .create_label(NewLabelInput {
+            name: "R&D-Team".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let raw = b"From: alice@upstream.test\r\nSubject: UTF8 Labels Sync\r\nMessage-ID: <utf8-lbl-1@upstream.test>\r\n\r\nHello\r\n".to_vec();
+    let msg = parse_raw_to_new_message_input(
+        raw,
+        vec![
+            LABEL_INBOX.to_string(),
+            utf8_lbl.id.clone(),
+            amp_lbl.id.clone(),
+        ],
+        None,
+        "local",
+        Some("18f9999999990001".to_string()),
+        None,
+        false,
+        false,
+    );
+    upstream_state.store.insert_message(msg).await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let up_clone = upstream_state.clone();
+    tokio::spawn(async move {
+        let _ = serve_plain_listener(listener, up_clone, None, shutdown_rx).await;
+    });
+
+    let mut local_cfg = Config::for_test();
+    local_cfg.sync_mode = SyncMode::Imap;
+    local_cfg.gmail_imap_host = addr.ip().to_string();
+    local_cfg.gmail_imap_port = addr.port();
+    local_cfg.gmail_imap_tls = false;
+    local_cfg.gmail_imap_user = Some("agent@example.com".to_string());
+    local_cfg.gmail_imap_password = Some("secret-pass".to_string());
+    local_cfg.gmail_imap_mailbox = "[Gmail]/All Mail".to_string();
+    let local_state = test_app_state(local_cfg);
+
+    let report = run_gmail_sync(&local_state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.messages_added, 1);
+
+    let local_labels = local_state.store.list_labels().await.unwrap();
+    assert!(
+        local_labels.iter().any(|l| l.name == "Café/重要"),
+        "expected native UTF-8 label 'Café/重要' after ENABLE UTF8=ACCEPT, got {:?}",
+        local_labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        local_labels.iter().any(|l| l.name == "R&D-Team"),
+        "expected literal '&' label 'R&D-Team' without MUTF-7 corruption, got {:?}",
+        local_labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let _ = shutdown_tx.send(true);
+}

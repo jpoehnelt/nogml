@@ -240,6 +240,13 @@ fn default_gmail_imap_archive_mailbox() -> String {
     "Archive".to_string()
 }
 
+/// Default IMAP storage quota reported by RFC 2087 `GETQUOTAROOT` / `GETQUOTA` (15 GiB).
+pub const DEFAULT_IMAP_QUOTA_BYTES: u64 = 15 * 1024 * 1024 * 1024;
+
+fn default_imap_quota_bytes() -> u64 {
+    DEFAULT_IMAP_QUOTA_BYTES
+}
+
 fn default_deliverability_max_bounce_rate() -> f64 {
     crate::deliverability::DEFAULT_MAX_BOUNCE_RATE
 }
@@ -666,6 +673,9 @@ pub struct Config {
     pub imap_tls_key: Option<PathBuf>,
     pub imap_username: Option<String>,
     pub imap_password: Option<String>,
+    /// Reported IMAP RFC 2087 `QUOTA` storage limit in bytes (default 15 GiB).
+    #[serde(default = "default_imap_quota_bytes")]
+    pub imap_quota_bytes: u64,
 
     // --- Upstream Gmail sync ---
     pub sync_mode: SyncMode,
@@ -852,6 +862,7 @@ impl Default for Config {
             imap_tls_key: None,
             imap_username: None,
             imap_password: None,
+            imap_quota_bytes: DEFAULT_IMAP_QUOTA_BYTES,
 
             sync_mode: SyncMode::Api,
             gmail_client_id: None,
@@ -1285,6 +1296,7 @@ impl Config {
             imap_tls_key,
             imap_username,
             imap_password,
+            imap_quota_bytes,
             sync_mode,
             gmail_client_id,
             gmail_client_secret,
@@ -1462,6 +1474,7 @@ impl Config {
                 "tls_key": imap_tls_key,
                 "username": imap_username,
                 "password": redact_opt(imap_password),
+                "quota_bytes": imap_quota_bytes,
             },
             "sync": {
                 "mode": sync_mode,
@@ -2002,6 +2015,7 @@ impl fmt::Debug for Config {
             imap_tls_key,
             imap_username,
             imap_password,
+            imap_quota_bytes,
             sync_mode,
             gmail_client_id,
             gmail_client_secret,
@@ -2155,6 +2169,7 @@ impl fmt::Debug for Config {
             .field("imap_tls_key", imap_tls_key)
             .field("imap_username", imap_username)
             .field("imap_password", &redacted_opt(imap_password))
+            .field("imap_quota_bytes", imap_quota_bytes)
             .field("sync_mode", sync_mode)
             .field("gmail_client_id", gmail_client_id)
             .field("gmail_client_secret", &redacted_opt(gmail_client_secret))
@@ -2569,6 +2584,7 @@ pub struct ImapTomlConfig {
     pub tls_key: Option<PathBuf>,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub quota_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for ImapTomlConfig {
@@ -2580,6 +2596,7 @@ impl std::fmt::Debug for ImapTomlConfig {
             .field("tls_key", &self.tls_key)
             .field("username", &self.username)
             .field("password", &redacted_opt_debug(&self.password))
+            .field("quota_bytes", &self.quota_bytes)
             .finish()
     }
 }
@@ -3054,6 +3071,9 @@ impl TomlConfig {
         }
         if let Some(ref v) = self.imap.password {
             cfg.imap_password = Some(v.clone());
+        }
+        if let Some(v) = self.imap.quota_bytes {
+            cfg.imap_quota_bytes = v;
         }
 
         // [sync]
