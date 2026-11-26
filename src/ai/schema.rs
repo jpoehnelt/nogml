@@ -32,16 +32,37 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
         "mail.threads": {
             "endpoint": "GET /v1/threads",
             "mcp_tool": "list_threads",
-            "description": "List conversation thread summaries.",
+            "description": "List conversation thread summaries, optionally filtered by annotation fields.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "q": { "type": "string" },
                     "label": { "type": "string" },
                     "unread_only": { "type": "boolean", "default": false },
+                    "needs_reply": { "type": "boolean" },
+                    "waiting_on": { "type": "string", "enum": ["me", "them", "none"] },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "cursor": { "type": "string" },
                     "fields": { "type": "string" }
+                }
+            }
+        },
+        "mail.annotations": {
+            "endpoint": "GET /v1/threads/{id}/annotations | PUT /v1/threads/{id}/annotations | PATCH /v1/threads/{id}/annotations | DELETE /v1/threads/{id}/annotations",
+            "mcp_tool": "get_thread_annotations | annotate_thread",
+            "description": "Read, replace, patch, or delete persistent structured annotations and extracted state on a thread.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "needs_reply": { "type": "boolean" },
+                    "waiting_on": { "type": "string", "enum": ["me", "them", "none"] },
+                    "priority": { "type": "string" },
+                    "due_at": { "type": "string", "format": "date-time" },
+                    "extracted": { "type": "object" },
+                    "updated_by": { "type": "string" }
                 }
             }
         },
@@ -267,6 +288,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "draft" | "create_draft" => "mail.draft",
             "send_draft" => "mail.send_draft",
             "triage" | "triage_thread" => "mail.triage",
+            "annotations" | "annotate_thread" | "get_thread_annotations" => "mail.annotations",
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
@@ -301,6 +323,10 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "GET /v1/threads",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
+            "GET /v1/threads/{id}/annotations",
+            "PUT /v1/threads/{id}/annotations",
+            "PATCH /v1/threads/{id}/annotations",
+            "DELETE /v1/threads/{id}/annotations",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",

@@ -808,6 +808,30 @@ impl MailStore for MockStore {
             notes: patch.notes.clone(),
         })
     }
+    async fn get_thread_annotation(
+        &self,
+        _thread_id: &str,
+    ) -> AppResult<Option<crate::models::ThreadAnnotation>> {
+        Ok(None)
+    }
+    async fn upsert_thread_annotation(
+        &self,
+        _thread_id: &str,
+        _annotation: &crate::models::ThreadAnnotation,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        unimplemented!()
+    }
+    async fn patch_thread_annotation(
+        &self,
+        _thread_id: &str,
+        _patch: &crate::models::ThreadAnnotationPatch,
+        _updated_by: Option<&str>,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        unimplemented!()
+    }
+    async fn delete_thread_annotation(&self, _thread_id: &str) -> AppResult<()> {
+        Ok(())
+    }
 }
 
 fn test_app_with_config(cfg: Config) -> (AppState, Arc<MockResend>, Router) {

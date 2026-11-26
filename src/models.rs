@@ -770,6 +770,175 @@ pub struct CompactMessage {
     pub meta: Option<UntrustedMeta>,
 }
 
+/// Who a conversation thread is currently waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingOn {
+    Me,
+    Them,
+    None,
+}
+
+impl WaitingOn {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Me => "me",
+            Self::Them => "them",
+            Self::None => "none",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "me" => Some(Self::Me),
+            "them" => Some(Self::Them),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WaitingOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn default_extracted_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+/// Normalize a timestamp to millisecond precision so in-memory, SQLite, and Postgres
+/// backends produce identical round-trip values.
+pub fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(dt.timestamp_millis()).unwrap_or(dt)
+}
+
+/// Persistent agent-authored structured annotation and extracted state on a thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadAnnotation {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_reply: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<WaitingOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_extracted_object")]
+    pub extracted: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Partial update payload for [`ThreadAnnotation`]. Omitted (`None`) fields preserve
+/// existing stored values; when both existing and incoming `extracted` values are JSON
+/// objects, top-level keys are shallow-merged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThreadAnnotationPatch {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub needs_reply: Option<bool>,
+    #[serde(default)]
+    pub waiting_on: Option<WaitingOn>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub due_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub extracted: Option<Value>,
+}
+
+/// Request body for `PUT /v1/threads/{id}/annotations` (full replace).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpsertThreadAnnotationRequest {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub needs_reply: Option<bool>,
+    #[serde(default)]
+    pub waiting_on: Option<WaitingOn>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub due_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_extracted_object")]
+    pub extracted: Value,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+/// Request body for `PATCH /v1/threads/{id}/annotations` (partial update).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatchThreadAnnotationRequest {
+    #[serde(flatten)]
+    pub patch: ThreadAnnotationPatch,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+/// Apply a [`ThreadAnnotationPatch`] onto an optional existing [`ThreadAnnotation`],
+/// shallow-merging JSON object keys in `extracted` when both sides are JSON objects.
+pub fn apply_thread_annotation_patch(
+    existing: Option<ThreadAnnotation>,
+    thread_id: &str,
+    patch: &ThreadAnnotationPatch,
+    updated_by: Option<&str>,
+    now: DateTime<Utc>,
+) -> ThreadAnnotation {
+    let now = truncate_to_millis(now);
+    let mut merged = existing.unwrap_or_else(|| ThreadAnnotation {
+        thread_id: thread_id.to_string(),
+        summary: None,
+        needs_reply: None,
+        waiting_on: None,
+        priority: None,
+        due_at: None,
+        extracted: default_extracted_object(),
+        updated_by: None,
+        updated_at: now,
+    });
+    merged.thread_id = thread_id.to_string();
+
+    if let Some(summary) = &patch.summary {
+        merged.summary = Some(summary.clone());
+    }
+    if let Some(needs_reply) = patch.needs_reply {
+        merged.needs_reply = Some(needs_reply);
+    }
+    if let Some(waiting_on) = patch.waiting_on {
+        merged.waiting_on = Some(waiting_on);
+    }
+    if let Some(priority) = &patch.priority {
+        merged.priority = Some(priority.clone());
+    }
+    if let Some(due_at) = patch.due_at {
+        merged.due_at = Some(truncate_to_millis(due_at));
+    }
+    if let Some(incoming_extracted) = &patch.extracted {
+        match (&mut merged.extracted, incoming_extracted) {
+            (Value::Object(existing_map), Value::Object(incoming_map)) => {
+                for (k, v) in incoming_map {
+                    existing_map.insert(k.clone(), v.clone());
+                }
+            }
+            _ => {
+                merged.extracted = incoming_extracted.clone();
+            }
+        }
+    }
+    if let Some(actor) = updated_by.map(str::trim).filter(|s| !s.is_empty()) {
+        merged.updated_by = Some(actor.to_string());
+    }
+    merged.updated_at = now;
+    merged
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadSummary {
     pub id: String,
@@ -783,6 +952,8 @@ pub struct ThreadSummary {
     pub has_attachments: bool,
     pub message_count: usize,
     pub last_message_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<ThreadAnnotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -795,6 +966,8 @@ pub struct ThreadDetail {
     pub message_count: usize,
     pub last_message_at: DateTime<Utc>,
     pub messages: Vec<CompactMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<ThreadAnnotation>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<UntrustedMeta>,
 }

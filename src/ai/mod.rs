@@ -51,8 +51,9 @@ use crate::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
         AiTriageRequest, AiUnsubscribeRequest, AttachmentTextExtraction, CompactMessage,
         ContactSummary, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED,
-        LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest, ThreadDetail, ThreadSummary,
-        UnsubscribeInfo,
+        LABEL_TRASH, LABEL_UNREAD, PatchThreadAnnotationRequest, SyncTriggerRequest,
+        ThreadAnnotation, ThreadDetail, ThreadSummary, UnsubscribeInfo,
+        UpsertThreadAnnotationRequest, WaitingOn, truncate_to_millis,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactPatch, ContactQuery, ContactRecord,
@@ -105,6 +106,13 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/threads", get(list_threads))
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/triage", post(triage_thread_handler))
+        .route(
+            "/v1/threads/{id}/annotations",
+            get(get_thread_annotations_handler)
+                .put(put_thread_annotations_handler)
+                .patch(patch_thread_annotations_handler)
+                .delete(delete_thread_annotations_handler),
+        )
         .route("/v1/messages", get(list_messages))
         .route("/v1/messages/send", post(send_message_handler))
         .route("/v1/messages/modify", post(modify_messages_handler))
@@ -957,6 +965,123 @@ pub async fn execute_modify_labels_with_source(
     }))
 }
 
+/// Parse a `waiting_on` query filter (`me`, `them`, `none`, or empty).
+pub fn parse_waiting_on_filter(raw: Option<&str>) -> AppResult<Option<WaitingOn>> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => WaitingOn::parse_str(s).map(Some).ok_or_else(|| {
+            AppError::validation(
+                format!("Invalid waiting_on filter '{s}'"),
+                Some("Use one of: me, them, or none.".to_string()),
+            )
+        }),
+    }
+}
+
+/// Read persisted structured annotation for a thread (shared across REST and MCP).
+pub async fn execute_get_thread_annotations(state: &AppState, thread_id: &str) -> AppResult<Value> {
+    validate_resource_id(thread_id)?;
+    let _ = state
+        .store
+        .get_thread(thread_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Thread '{thread_id}' not found")))?;
+    let annotation = state.store.get_thread_annotation(thread_id).await?;
+    Ok(json!({
+        "thread_id": thread_id,
+        "annotation": annotation,
+    }))
+}
+
+/// Replace persisted structured annotation for a thread (`PUT /v1/threads/{id}/annotations`).
+pub async fn execute_upsert_thread_annotation(
+    state: &AppState,
+    thread_id: &str,
+    req: UpsertThreadAnnotationRequest,
+    principal: Option<&Principal>,
+) -> AppResult<Value> {
+    validate_resource_id(thread_id)?;
+    let _ = state
+        .store
+        .get_thread(thread_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Thread '{thread_id}' not found")))?;
+
+    let updated_by = req
+        .updated_by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| principal.map(|p| p.mailbox_id.clone()));
+
+    let annotation = ThreadAnnotation {
+        thread_id: thread_id.to_string(),
+        summary: req.summary,
+        needs_reply: req.needs_reply,
+        waiting_on: req.waiting_on,
+        priority: req.priority,
+        due_at: req.due_at.map(truncate_to_millis),
+        extracted: req.extracted,
+        updated_by,
+        updated_at: truncate_to_millis(Utc::now()),
+    };
+    let saved = state
+        .store
+        .upsert_thread_annotation(thread_id, &annotation)
+        .await?;
+    Ok(json!({
+        "thread_id": saved.thread_id,
+        "annotation": saved,
+    }))
+}
+
+/// Partially update persisted structured annotation for a thread (`PATCH /v1/threads/{id}/annotations` and MCP `annotate_thread`).
+pub async fn execute_patch_thread_annotation(
+    state: &AppState,
+    thread_id: &str,
+    req: PatchThreadAnnotationRequest,
+    principal: Option<&Principal>,
+) -> AppResult<Value> {
+    validate_resource_id(thread_id)?;
+    let _ = state
+        .store
+        .get_thread(thread_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Thread '{thread_id}' not found")))?;
+
+    let updated_by = req
+        .updated_by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| principal.map(|p| p.mailbox_id.clone()));
+
+    let saved = state
+        .store
+        .patch_thread_annotation(thread_id, &req.patch, updated_by.as_deref())
+        .await?;
+    Ok(json!({
+        "thread_id": saved.thread_id,
+        "annotation": saved,
+    }))
+}
+
+/// Delete persisted structured annotation for a thread (`DELETE /v1/threads/{id}/annotations`).
+pub async fn execute_delete_thread_annotation(
+    state: &AppState,
+    thread_id: &str,
+) -> AppResult<Value> {
+    validate_resource_id(thread_id)?;
+    let _ = state
+        .store
+        .get_thread(thread_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Thread '{thread_id}' not found")))?;
+    state.store.delete_thread_annotation(thread_id).await?;
+    Ok(json!({
+        "thread_id": thread_id,
+        "deleted": true,
+    }))
+}
+
 /// Parse an approval status query string (`pending`, `approved`, `rejected`, `expired`, `all`, or empty).
 pub fn parse_approval_status_filter(raw: Option<&str>) -> AppResult<Option<ApprovalStatus>> {
     match raw.map(str::trim) {
@@ -1478,6 +1603,7 @@ pub async fn build_thread_detail(
     } else {
         DateTime::from_timestamp_millis(last_ms).unwrap_or_else(Utc::now)
     };
+    let annotation = state.store.get_thread_annotation(&detail.id).await?;
 
     Ok(ThreadDetail {
         id: detail.id,
@@ -1488,6 +1614,7 @@ pub async fn build_thread_detail(
         message_count: compact_messages.len(),
         last_message_at,
         messages: compact_messages,
+        annotation,
         meta: untrusted_meta(&state.config),
     })
 }
@@ -2065,6 +2192,8 @@ struct ListThreadsParams {
     label: Option<String>,
     #[serde(default)]
     unread_only: bool,
+    needs_reply: Option<bool>,
+    waiting_on: Option<String>,
     #[serde(default)]
     include_spam_trash: bool,
     limit: Option<usize>,
@@ -2203,6 +2332,10 @@ async fn get_capabilities(
             "GET /v1/threads",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
+            "GET /v1/threads/{id}/annotations",
+            "PUT /v1/threads/{id}/annotations",
+            "PATCH /v1/threads/{id}/annotations",
+            "DELETE /v1/threads/{id}/annotations",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",
@@ -2270,6 +2403,7 @@ async fn list_threads(
     if let Some(lbl) = params.label.as_deref() {
         validate_resource_id(lbl)?;
     }
+    let waiting_on = parse_waiting_on_filter(params.waiting_on.as_deref())?;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
@@ -2281,6 +2415,8 @@ async fn list_threads(
             q: params.q,
             label: params.label,
             unread_only: params.unread_only,
+            needs_reply: params.needs_reply,
+            waiting_on,
             include_spam_trash: params.include_spam_trash,
             limit,
             cursor: params.cursor,
@@ -2335,6 +2471,54 @@ async fn triage_thread_handler(
     Json(req): Json<AiTriageRequest>,
 ) -> Result<Json<Value>, AiError> {
     let res = execute_triage_thread_with_source(&state, &id, req, EventSource::Api).await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn get_thread_annotations_handler(
+    MailboxState(state): MailboxState,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_get_thread_annotations(&state, &id).await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn put_thread_annotations_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<UpsertThreadAnnotationRequest>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_upsert_thread_annotation(
+        &state,
+        &id,
+        req,
+        principal.as_ref().map(|Extension(p)| p),
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn patch_thread_annotations_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<PatchThreadAnnotationRequest>,
+) -> Result<Json<Value>, AiError> {
+    let res =
+        execute_patch_thread_annotation(&state, &id, req, principal.as_ref().map(|Extension(p)| p))
+            .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn delete_thread_annotations_handler(
+    MailboxState(state): MailboxState,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_delete_thread_annotation(&state, &id).await?;
     Ok(Json(project_fields(res, query.fields.as_deref())?))
 }
 

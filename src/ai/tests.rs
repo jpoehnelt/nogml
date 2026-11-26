@@ -61,6 +61,7 @@ struct StoreData {
     labels: HashMap<String, StoredLabel>,
     sync_states: HashMap<String, SyncState>,
     settings: Option<UserSettings>,
+    thread_annotations: HashMap<String, crate::models::ThreadAnnotation>,
 }
 
 #[derive(Clone)]
@@ -664,6 +665,18 @@ impl MailStore for TestMailStore {
                 .map(|m| parse_simple_email_address(&m.from_addr))
                 .collect();
 
+            let annotation = data.thread_annotations.get(&tid).cloned();
+            if let Some(expected_nr) = query.needs_reply
+                && annotation.as_ref().and_then(|a| a.needs_reply) != Some(expected_nr)
+            {
+                continue;
+            }
+            if let Some(expected_wo) = query.waiting_on
+                && annotation.as_ref().and_then(|a| a.waiting_on) != Some(expected_wo)
+            {
+                continue;
+            }
+
             threads.push(ThreadSummary {
                 id: tid,
                 subject,
@@ -675,6 +688,7 @@ impl MailStore for TestMailStore {
                 has_attachments: msgs.iter().any(|m| m.has_attachments),
                 message_count: msgs.len(),
                 last_message_at: DateTime::from_timestamp_millis(last_ms).unwrap_or_else(Utc::now),
+                annotation,
             });
         }
 
@@ -720,6 +734,53 @@ impl MailStore for TestMailStore {
             affected_message_ids: affected,
             labels: combined_labels,
         })
+    }
+
+    async fn get_thread_annotation(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<crate::models::ThreadAnnotation>> {
+        let data = self.data.read().unwrap();
+        Ok(data.thread_annotations.get(thread_id).cloned())
+    }
+
+    async fn upsert_thread_annotation(
+        &self,
+        thread_id: &str,
+        annotation: &crate::models::ThreadAnnotation,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        let mut data = self.data.write().unwrap();
+        let mut stored = annotation.clone();
+        stored.thread_id = thread_id.to_string();
+        data.thread_annotations
+            .insert(thread_id.to_string(), stored.clone());
+        Ok(stored)
+    }
+
+    async fn patch_thread_annotation(
+        &self,
+        thread_id: &str,
+        patch: &crate::models::ThreadAnnotationPatch,
+        updated_by: Option<&str>,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        let mut data = self.data.write().unwrap();
+        let existing = data.thread_annotations.get(thread_id).cloned();
+        let merged = crate::models::apply_thread_annotation_patch(
+            existing,
+            thread_id,
+            patch,
+            updated_by,
+            Utc::now(),
+        );
+        data.thread_annotations
+            .insert(thread_id.to_string(), merged.clone());
+        Ok(merged)
+    }
+
+    async fn delete_thread_annotation(&self, thread_id: &str) -> AppResult<()> {
+        let mut data = self.data.write().unwrap();
+        data.thread_annotations.remove(thread_id);
+        Ok(())
     }
 
     async fn find_message_by_resend_id(

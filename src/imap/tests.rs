@@ -927,6 +927,30 @@ impl MailStore for TestMailStore {
     ) -> AppResult<Vec<crate::storage::PendingApproval>> {
         unimplemented!()
     }
+    async fn get_thread_annotation(
+        &self,
+        _: &str,
+    ) -> AppResult<Option<crate::models::ThreadAnnotation>> {
+        Ok(None)
+    }
+    async fn upsert_thread_annotation(
+        &self,
+        _: &str,
+        _: &crate::models::ThreadAnnotation,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        unimplemented!()
+    }
+    async fn patch_thread_annotation(
+        &self,
+        _: &str,
+        _: &crate::models::ThreadAnnotationPatch,
+        _: Option<&str>,
+    ) -> AppResult<crate::models::ThreadAnnotation> {
+        unimplemented!()
+    }
+    async fn delete_thread_annotation(&self, _: &str) -> AppResult<()> {
+        Ok(())
+    }
     async fn resolve_pending_approval(
         &self,
         _: &str,

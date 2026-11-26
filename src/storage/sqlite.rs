@@ -23,7 +23,9 @@ use crate::{
     models::{
         AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LABEL_DRAFT, LABEL_INBOX,
         LABEL_SENT, LABEL_SPAM, LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD, LabelColor, PopSettings,
-        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadSummary, VacationSettings, is_system_label,
+        Profile, SYSTEM_LABEL_IDS, SendAs, ThreadAnnotation, ThreadAnnotationPatch, ThreadSummary,
+        VacationSettings, WaitingOn, apply_thread_annotation_patch, default_extracted_object,
+        is_system_label, truncate_to_millis,
     },
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
@@ -281,6 +283,22 @@ CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_vip_activity
     ON contacts (mailbox_id, is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC);
 CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_domain
     ON contacts (mailbox_id, domain);
+
+CREATE TABLE IF NOT EXISTS thread_annotations (
+    mailbox_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    summary TEXT,
+    needs_reply INTEGER,
+    waiting_on TEXT,
+    priority TEXT,
+    due_at_ms INTEGER,
+    extracted_json TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_annotations_mailbox_triage
+    ON thread_annotations (mailbox_id, needs_reply, waiting_on);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -1815,7 +1833,11 @@ fn build_fts5_query(raw: &str) -> Option<String> {
     }
 }
 
-fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSummary {
+fn build_thread_summary(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    annotation: Option<ThreadAnnotation>,
+) -> ThreadSummary {
     let subject = messages
         .first()
         .map(|m| m.subject.clone())
@@ -1876,7 +1898,151 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         has_attachments,
         message_count: messages.len(),
         last_message_at,
+        annotation,
     }
+}
+
+fn thread_annotation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadAnnotation> {
+    let needs_reply: Option<i64> = row.get(2)?;
+    let waiting_on: Option<String> = row.get(3)?;
+    let due_at_ms: Option<i64> = row.get(5)?;
+    let extracted_json: String = row.get(6)?;
+    let updated_at_ms: i64 = row.get(8)?;
+
+    Ok(ThreadAnnotation {
+        thread_id: row.get(0)?,
+        summary: row.get(1)?,
+        needs_reply: needs_reply.map(|v| v != 0),
+        waiting_on: waiting_on.as_deref().and_then(WaitingOn::parse_str),
+        priority: row.get(4)?,
+        due_at: due_at_ms.and_then(DateTime::from_timestamp_millis),
+        extracted: serde_json::from_str(&extracted_json)
+            .unwrap_or_else(|_| default_extracted_object()),
+        updated_by: row.get(7)?,
+        updated_at: DateTime::from_timestamp_millis(updated_at_ms).unwrap_or_else(Utc::now),
+    })
+}
+
+fn load_thread_annotation_conn(
+    conn: &Connection,
+    mb: &str,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAnnotation>> {
+    conn.query_row(
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = ?1 AND thread_id = ?2",
+        params![mb, thread_id],
+        thread_annotation_from_row,
+    )
+    .optional()
+    .map_err(sql_err)
+}
+
+fn upsert_thread_annotation_conn(
+    conn: &Connection,
+    mb: &str,
+    annotation: &ThreadAnnotation,
+) -> AppResult<()> {
+    let extracted_json = serde_json::to_string(&annotation.extracted)
+        .map_err(|e| AppError::Storage(format!("JSON encode error: {e}")))?;
+    conn.execute(
+        "INSERT INTO thread_annotations (
+            mailbox_id, thread_id, summary, needs_reply, waiting_on, priority,
+            due_at_ms, extracted_json, updated_by, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(mailbox_id, thread_id) DO UPDATE SET
+            summary = excluded.summary,
+            needs_reply = excluded.needs_reply,
+            waiting_on = excluded.waiting_on,
+            priority = excluded.priority,
+            due_at_ms = excluded.due_at_ms,
+            extracted_json = excluded.extracted_json,
+            updated_by = excluded.updated_by,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            mb,
+            &annotation.thread_id,
+            &annotation.summary,
+            annotation.needs_reply.map(i64::from),
+            annotation.waiting_on.map(|w| w.as_str()),
+            &annotation.priority,
+            annotation.due_at.map(|dt| dt.timestamp_millis()),
+            extracted_json,
+            &annotation.updated_by,
+            annotation.updated_at.timestamp_millis(),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn load_thread_annotations_filtered(
+    conn: &Connection,
+    mb: &str,
+    needs_reply: Option<bool>,
+    waiting_on: Option<WaitingOn>,
+) -> AppResult<HashMap<String, ThreadAnnotation>> {
+    let mut sql = String::from(
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = ?1",
+    );
+    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+    if let Some(nr) = needs_reply {
+        bind.push(SqlValue::Integer(i64::from(nr)));
+        sql.push_str(&format!(" AND needs_reply = ?{}", bind.len()));
+    }
+    if let Some(wo) = waiting_on {
+        bind.push(SqlValue::Text(wo.as_str().to_string()));
+        sql.push_str(&format!(" AND waiting_on = ?{}", bind.len()));
+    }
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(bind), thread_annotation_from_row)
+        .map_err(sql_err)?;
+    let mut map = HashMap::new();
+    for r in rows {
+        let ann = r.map_err(sql_err)?;
+        map.insert(ann.thread_id.clone(), ann);
+    }
+    Ok(map)
+}
+
+fn load_thread_annotations_for_ids(
+    conn: &Connection,
+    mb: &str,
+    thread_ids: &[String],
+) -> AppResult<HashMap<String, ThreadAnnotation>> {
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut bind: Vec<SqlValue> = Vec::with_capacity(thread_ids.len() + 1);
+    bind.push(SqlValue::Text(mb.to_string()));
+    let mut placeholders = Vec::with_capacity(thread_ids.len());
+    for tid in thread_ids {
+        bind.push(SqlValue::Text(tid.clone()));
+        placeholders.push(format!("?{}", bind.len()));
+    }
+    let sql = format!(
+        "SELECT thread_id, summary, needs_reply, waiting_on, priority, due_at_ms,
+                extracted_json, updated_by, updated_at_ms
+         FROM thread_annotations
+         WHERE mailbox_id = ?1 AND thread_id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(bind), thread_annotation_from_row)
+        .map_err(sql_err)?;
+    let mut map = HashMap::new();
+    for r in rows {
+        let ann = r.map_err(sql_err)?;
+        map.insert(ann.thread_id.clone(), ann);
+    }
+    Ok(map)
 }
 
 enum ResolvedMailbox {
@@ -2985,6 +3151,11 @@ impl MailStore for SqliteStore {
             for mid in &msg_ids {
                 delete_message_tx(&tx, mb, mid)?;
             }
+            tx.execute(
+                "DELETE FROM thread_annotations WHERE mailbox_id = ?1 AND thread_id = ?2",
+                params![mb, &thread_id],
+            )
+            .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
             Ok(true)
         })
@@ -3811,6 +3982,26 @@ impl MailStore for SqliteStore {
                 _ => None,
             };
 
+            let filtered_annotations: Option<HashMap<String, ThreadAnnotation>> =
+                if query.needs_reply.is_some() || query.waiting_on.is_some() {
+                    let map = load_thread_annotations_filtered(
+                        conn,
+                        mb,
+                        query.needs_reply,
+                        query.waiting_on,
+                    )?;
+                    if map.is_empty() {
+                        return Ok(AiThreadPage {
+                            threads: Vec::new(),
+                            next_cursor: None,
+                            has_more: false,
+                        });
+                    }
+                    Some(map)
+                } else {
+                    None
+                };
+
             let visible_msgs =
                 load_all_messages_filtered(conn, mb, &[], effective_include_spam_trash, None)?;
 
@@ -3826,12 +4017,20 @@ impl MailStore for SqliteStore {
                 {
                     continue;
                 }
+                let annotation = if let Some(ref ann_map) = filtered_annotations {
+                    let Some(ann) = ann_map.get(&tid) else {
+                        continue;
+                    };
+                    Some(ann.clone())
+                } else {
+                    None
+                };
                 msgs.sort_by(|a, b| {
                     a.internal_date_ms
                         .cmp(&b.internal_date_ms)
                         .then_with(|| a.id.cmp(&b.id))
                 });
-                let summary = build_thread_summary(&tid, &msgs);
+                let summary = build_thread_summary(&tid, &msgs, annotation);
                 if let Some(ref req_label) = resolved_label
                     && !summary.labels.contains(req_label)
                 {
@@ -3865,7 +4064,14 @@ impl MailStore for SqliteStore {
             } else {
                 None
             };
-            let threads = summaries.into_iter().map(|(_, s)| s).collect();
+            let mut threads: Vec<ThreadSummary> = summaries.into_iter().map(|(_, s)| s).collect();
+            if filtered_annotations.is_none() && !threads.is_empty() {
+                let ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+                let mut ann_map = load_thread_annotations_for_ids(conn, mb, &ids)?;
+                for thread in &mut threads {
+                    thread.annotation = ann_map.remove(&thread.id);
+                }
+            }
 
             Ok(AiThreadPage {
                 threads,
@@ -3895,6 +4101,69 @@ impl MailStore for SqliteStore {
             affected_message_ids,
             labels,
         })
+    }
+
+    async fn get_thread_annotation(&self, thread_id: &str) -> AppResult<Option<ThreadAnnotation>> {
+        let thread_id = thread_id.to_string();
+        self.run_blocking(move |conn, mb| load_thread_annotation_conn(conn, mb, &thread_id))
+            .await
+    }
+
+    async fn upsert_thread_annotation(
+        &self,
+        thread_id: &str,
+        annotation: &ThreadAnnotation,
+    ) -> AppResult<ThreadAnnotation> {
+        let mut stored = annotation.clone();
+        stored.thread_id = thread_id.to_string();
+        stored.due_at = stored.due_at.map(truncate_to_millis);
+        stored.updated_at = truncate_to_millis(stored.updated_at);
+        self.run_blocking(move |conn, mb| {
+            upsert_thread_annotation_conn(conn, mb, &stored)?;
+            Ok(stored)
+        })
+        .await
+    }
+
+    async fn patch_thread_annotation(
+        &self,
+        thread_id: &str,
+        patch: &ThreadAnnotationPatch,
+        updated_by: Option<&str>,
+    ) -> AppResult<ThreadAnnotation> {
+        let thread_id = thread_id.to_string();
+        let patch = patch.clone();
+        let updated_by = updated_by.map(ToString::to_string);
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = load_thread_annotation_conn(&tx, mb, &thread_id)?;
+            let merged = apply_thread_annotation_patch(
+                existing,
+                &thread_id,
+                &patch,
+                updated_by.as_deref(),
+                Utc::now(),
+            );
+            upsert_thread_annotation_conn(&tx, mb, &merged)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(merged)
+        })
+        .await
+    }
+
+    async fn delete_thread_annotation(&self, thread_id: &str) -> AppResult<()> {
+        let thread_id = thread_id.to_string();
+        self.run_blocking(move |conn, mb| {
+            conn.execute(
+                "DELETE FROM thread_annotations WHERE mailbox_id = ?1 AND thread_id = ?2",
+                params![mb, &thread_id],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn find_message_by_resend_id(&self, resend_id: &str) -> AppResult<Option<StoredMessage>> {
