@@ -32,6 +32,7 @@ use nogml::{
         TransportBackend, render_starter_toml, validate_config,
     },
     crypto::{DEFAULT_KEY_ID, generate_formatted_key, rotate_secrets},
+    doctor::{DoctorReport, run_doctor},
     ensure_crypto_provider,
     error::{AppError, AppResult},
     events::EventSource,
@@ -706,11 +707,25 @@ enum Command {
         action: AuthCommand,
     },
 
-    /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints.
+    /// Print runtime JSON schemas for CLI commands and `/v1/` endpoints (or OpenAPI 3.1 with `--openapi`).
     Schema {
         /// Optional command or endpoint name to inspect.
         #[arg(long)]
         command: Option<String>,
+
+        /// Print the OpenAPI 3.1.0 JSON specification instead of the CLI schema manifest.
+        #[arg(long, default_value_t = false)]
+        openapi: bool,
+    },
+
+    /// Run live operational diagnostics (config, secrets, storage, blobs, IMAP TLS, transport, security posture).
+    Doctor(Box<ServeArgs>),
+
+    /// Generate shell completions for `bash`, `zsh`, `fish`, `elvish`, or `powershell`.
+    Completions {
+        /// Target shell (`bash`, `zsh`, `fish`, `elvish`, or `powershell`).
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Mail operations (auto-JSON when piped or `--json` is passed).
@@ -2823,9 +2838,43 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
             }
         },
 
-        Command::Schema { command } => {
-            let schema = ai::runtime_schema(command.as_deref());
+        Command::Schema { command, openapi } => {
+            let schema = if openapi {
+                ai::openapi_spec()
+            } else {
+                ai::runtime_schema(command.as_deref())
+            };
             emit_output(schema, None, true)?;
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Doctor(serve_args) => {
+            init_tracing(cli.log_json, true);
+            let doctor_matches = matches.subcommand_matches("doctor");
+            let report = match cli.common.load_layered(
+                Some(*serve_args),
+                &matches,
+                doctor_matches,
+                cli.log_json,
+            ) {
+                Ok(loaded) => {
+                    run_doctor(&loaded.config, loaded.config_file, loaded.resolution).await
+                }
+                Err(err) => DoctorReport::config_load_failure(err.to_string()),
+            };
+
+            let exit = if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            };
+            emit_output(serde_json::to_value(&report)?, None, false)?;
+            Ok(exit)
+        }
+
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "nogml", &mut std::io::stdout());
             Ok(ExitCode::SUCCESS)
         }
 

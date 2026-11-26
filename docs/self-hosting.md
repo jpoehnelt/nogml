@@ -11,7 +11,7 @@ Ready-to-use templates live in [`deploy/`](../deploy):
 
 ## Configuration and secret loading
 
-`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`, `crypto`, `auth`).
+`nogml` reads a structured TOML file via `--config <path>` or `NOGML_CONFIG` across all subcommands (`serve`, `mcp`, `sync`, `mail`, `storage`, `search`, `config`, `crypto`, `doctor`, `auth`).
 
 Precedence from highest to lowest:
 
@@ -40,6 +40,20 @@ nogml config check --config /etc/nogml/nogml.toml
 ```
 
 `nogml config check` prints a JSON report (`{ "ok", "config_file", "warnings", "errors", "effective_config" }`) with every secret, token, password, and database URL replaced by `"[REDACTED]"`. It exits `0` when valid and `2` on any configuration error.
+
+Run live operational diagnostics with `nogml doctor`:
+
+```bash
+nogml doctor --config /etc/nogml/nogml.toml
+```
+
+`nogml doctor` checks config validation, secret file Unix permissions (`mode & 0o077 != 0`), live `MailStore` connectivity, `BlobStore` reachability and filesystem writability, IMAP TLS certificate validity and expiry (warning under 30 days remaining and failing when expired), active transport credentials, and production security posture (`auth_tokens`/`scoped_tokens`, `allow_insecure_webhooks`, `allow_private_endpoints`). It prints structured JSON (pretty on a TTY, compact when piped), never prints secret values, and exits `0` when no check fails or `2` if any check fails.
+
+Generate shell completion scripts for `bash`, `zsh`, `fish`, `elvish`, or `powershell`:
+
+```bash
+nogml completions zsh > "${fpath[1]}/_nogml"
+```
 
 ### Mint per-agent scoped tokens (`nogml auth mint-token`)
 
@@ -163,6 +177,7 @@ curl -fsS -H "Authorization: Bearer $(cat secrets/nogml_auth_tokens)" \
 - `GET /healthz` is unauthenticated and reports process liveness.
 - `GET /readyz` is unauthenticated and probes `MailStore` plus external `BlobStore` reachability. On dependency errors, full diagnostics are logged server-side and the endpoint returns HTTP `503` with sanitized status flags (`{"status":"not_ready","store":"ok|error","blobs":"ok|error"}`).
 - `GET /metrics` exposes Prometheus text format (`text/plain; version=0.0.4; charset=utf-8`) for `nogml_http_requests_total`, `nogml_messages_sent_total`, `nogml_messages_received_total`, `nogml_imap_active_connections`, `nogml_sse_active_connections`, `nogml_sync_runs_total`, `nogml_filter_decisions_total`, and `nogml_policy_decisions_total`. When auth tokens are configured, Prometheus scrapers must send a valid bearer token (a `read`-scoped token from `[[auth.scoped_tokens]]` is sufficient).
+- `GET /v1/openapi.json` (also printable offline via `nogml schema --openapi`) serves the OpenAPI 3.1.0 specification covering all `/v1/*` endpoints, component schemas, error envelopes, and bearer, API key, and OAuth2 security schemes.
 - On `SIGTERM` or `SIGINT`, `nogml serve` signals active `/v1/events` SSE streams to close cleanly so HTTP graceful shutdown completes promptly before draining background workers.
 
 ## Bare-metal Linux with systemd

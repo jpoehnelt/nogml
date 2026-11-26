@@ -483,6 +483,8 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "endpoints": [
             "GET /v1/capabilities",
+            "GET /v1/openapi.json",
+            "GET /v1/briefing",
             "GET /v1/threads",
             "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
