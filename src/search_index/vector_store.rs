@@ -424,17 +424,51 @@ impl PostgresVectorStore {
     async fn ensure_ready(&self) -> AppResult<deadpool_postgres::Object> {
         self.schema_ready
             .get_or_try_init(|| async {
-                let conn =
+                let mut conn =
                     self.pool.get().await.map_err(|e| {
                         AppError::Storage(format!("Postgres vector pool error: {e}"))
                     })?;
-                conn.batch_execute(PG_VECTOR_SCHEMA_SQL)
+
+                let exists: bool = conn
+                    .query_one("SELECT to_regclass('message_embeddings') IS NOT NULL", &[])
                     .await
                     .map_err(|e| {
+                        AppError::Storage(format!("Failed to check Postgres vector schema: {e}"))
+                    })?
+                    .get(0);
+                if exists {
+                    return Ok::<(), AppError>(());
+                }
+
+                let tx = conn.transaction().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to begin Postgres vector DDL tx: {e}"))
+                })?;
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&crate::storage::postgres::SCHEMA_ADVISORY_LOCK_KEY],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Storage(format!("Failed to acquire Postgres DDL advisory lock: {e}"))
+                })?;
+
+                let exists_after_lock: bool = tx
+                    .query_one("SELECT to_regclass('message_embeddings') IS NOT NULL", &[])
+                    .await
+                    .map_err(|e| {
+                        AppError::Storage(format!("Failed to re-check Postgres vector schema: {e}"))
+                    })?
+                    .get(0);
+                if !exists_after_lock {
+                    tx.batch_execute(PG_VECTOR_SCHEMA_SQL).await.map_err(|e| {
                         AppError::Storage(format!(
                             "Failed to initialize Postgres vector schema: {e}"
                         ))
                     })?;
+                }
+                tx.commit().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to commit Postgres vector DDL tx: {e}"))
+                })?;
                 Ok::<(), AppError>(())
             })
             .await?;

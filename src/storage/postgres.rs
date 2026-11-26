@@ -59,7 +59,7 @@ const STARRED_MAILBOX: &str = "[Gmail]/Starred";
 pub const PG_EVENTS_CHANNEL: &str = "nogml_events";
 
 /// Advisory lock key serializing idempotent DDL startup across concurrent nodes.
-const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
+pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 
 /// Monotonic schema version tracked in `nogml_schema_meta`.
 ///
@@ -1250,6 +1250,16 @@ async fn ensure_mailbox_seeded(
 }
 
 fn pg_err(err: tokio_postgres::Error) -> AppError {
+    if let Some(db) = err.as_db_error() {
+        let mut msg = format!("{}: {} ({})", err, db.message(), db.code().code());
+        if let Some(detail) = db.detail() {
+            msg.push_str(&format!(" [detail: {detail}]"));
+        }
+        if let Some(constraint) = db.constraint() {
+            msg.push_str(&format!(" [constraint: {constraint}]"));
+        }
+        return AppError::Storage(msg);
+    }
     AppError::Storage(err.to_string())
 }
 
