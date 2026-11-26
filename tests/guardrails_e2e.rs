@@ -122,6 +122,7 @@ async fn e2e_first_contact_approval_gate_allows_after_prior_sent_and_isolates_ma
         ScopedTokenConfig {
             token: "tok_alice".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,
@@ -135,6 +136,7 @@ async fn e2e_first_contact_approval_gate_allows_after_prior_sent_and_isolates_ma
         ScopedTokenConfig {
             token: "tok_bob".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,

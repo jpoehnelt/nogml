@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 
 use crate::{
     AppState, ai,
-    auth::{AuthScope, Principal},
+    auth::{AuthScope, Principal, ResolvedMailbox, extract_mailbox_header},
     config::DraftOnlyAction,
     error::{AppError, AppResult},
     events::EventSource,
@@ -69,6 +69,20 @@ impl McpServer {
     /// [`crate::auth::AgentPolicyOverride`].
     pub fn with_principal(state: AppState, principal: Principal) -> Self {
         let scoped = state.for_mailbox(&principal.mailbox_id);
+        Self {
+            state: scoped,
+            principal,
+        }
+    }
+
+    /// Construct an MCP server bound to an authenticated HTTP [`Principal`] targeting an
+    /// explicit authorized mailbox (either `principal.mailbox_id` or a shared mailbox).
+    pub fn with_principal_and_mailbox(
+        state: AppState,
+        principal: Principal,
+        target_mailbox: &str,
+    ) -> Self {
+        let scoped = state.for_mailbox(target_mailbox);
         Self {
             state: scoped,
             principal,
@@ -1445,6 +1459,7 @@ fn is_scope_forbidden_payload(payload: &Value) -> bool {
 async fn mcp_http_post(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    resolved_mailbox: Option<Extension<ResolvedMailbox>>,
     req_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1452,7 +1467,24 @@ async fn mcp_http_post(
     let resolved_principal = principal
         .map(|Extension(p)| p)
         .unwrap_or_else(|| Principal::full_access(&state.config.user_email));
-    let server = McpServer::with_principal(state, resolved_principal);
+
+    let target_mailbox = if let Some(Extension(ResolvedMailbox(mb))) = resolved_mailbox {
+        mb
+    } else {
+        match extract_mailbox_header(&req_headers) {
+            Ok(Some(requested)) => {
+                if !resolved_principal.can_access_mailbox(&requested) {
+                    return AppError::Forbidden(format!("Access denied for mailbox '{requested}'"))
+                        .into_response();
+                }
+                crate::config::normalize_mailbox_id(&requested)
+            }
+            Ok(None) => resolved_principal.mailbox_id.clone(),
+            Err(err) => return err.into_response(),
+        }
+    };
+
+    let server = McpServer::with_principal_and_mailbox(state, resolved_principal, &target_mailbox);
 
     let parsed = match serde_json::from_slice::<Value>(&body) {
         Ok(val) => val,
@@ -1821,6 +1853,7 @@ fn tool_catalog() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "from": { "type": "string", "description": "Optional sender address (must match the active mailbox or one of its configured aliases)" },
                     "to": { "type": "array", "items": { "type": "string" } },
                     "cc": { "type": "array", "items": { "type": "string" } },
                     "bcc": { "type": "array", "items": { "type": "string" } },
@@ -1846,6 +1879,7 @@ fn tool_catalog() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "from": { "type": "string", "description": "Optional sender address (must match the active mailbox or one of its configured aliases)" },
                     "to": { "type": "array", "items": { "type": "string" } },
                     "cc": { "type": "array", "items": { "type": "string" } },
                     "bcc": { "type": "array", "items": { "type": "string" } },

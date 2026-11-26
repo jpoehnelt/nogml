@@ -348,6 +348,7 @@ async fn userinfo_v2_v3_and_oauth2_discovery_compatibility() {
         ScopedTokenConfig {
             token: "tok-alice-read".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -356,6 +357,7 @@ async fn userinfo_v2_v3_and_oauth2_discovery_compatibility() {
         ScopedTokenConfig {
             token: "tok-bob-admin".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,
@@ -504,6 +506,7 @@ async fn people_me_endpoint_and_person_fields_filtering() {
     cfg.scoped_tokens = vec![ScopedTokenConfig {
         token: "tok-bob".to_string(),
         mailbox_id: Some("bob@example.com".to_string()),
+        shared_mailboxes: Vec::new(),
         scopes: vec![AuthScope::Read, AuthScope::Admin],
         draft_only: None,
         allowed_recipients: None,

@@ -191,6 +191,22 @@ pub async fn get_people_me(
             }
         }
 
+        for alias in state.config.aliases_for_mailbox(&email) {
+            if seen.insert(alias.to_ascii_lowercase()) {
+                emails.push(json!({
+                    "metadata": {
+                        "primary": false,
+                        "verified": true,
+                        "source": {
+                            "type": "ACCOUNT",
+                            "id": email,
+                        }
+                    },
+                    "value": alias,
+                }));
+            }
+        }
+
         body.insert("emailAddresses".to_string(), Value::Array(emails));
     }
 

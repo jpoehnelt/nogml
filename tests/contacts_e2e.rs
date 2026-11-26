@@ -490,6 +490,7 @@ async fn contacts_enforce_multi_mailbox_isolation_and_auth_scopes() {
         ScopedTokenConfig {
             token: "tok_alice_rw".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
             draft_only: None,
             allowed_recipients: None,
@@ -498,6 +499,7 @@ async fn contacts_enforce_multi_mailbox_isolation_and_auth_scopes() {
         ScopedTokenConfig {
             token: "tok_alice_ro".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -506,6 +508,7 @@ async fn contacts_enforce_multi_mailbox_isolation_and_auth_scopes() {
         ScopedTokenConfig {
             token: "tok_bob_rw".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
             draft_only: None,
             allowed_recipients: None,

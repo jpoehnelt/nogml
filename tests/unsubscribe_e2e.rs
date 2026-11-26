@@ -621,6 +621,7 @@ async fn unsubscribe_enforces_scopes_and_rejects_messages_without_headers() {
         ScopedTokenConfig {
             token: "tok_read".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -629,6 +630,7 @@ async fn unsubscribe_enforces_scopes_and_rejects_messages_without_headers() {
         ScopedTokenConfig {
             token: "tok_write".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -637,6 +639,7 @@ async fn unsubscribe_enforces_scopes_and_rejects_messages_without_headers() {
         ScopedTokenConfig {
             token: "tok_send".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Send],
             draft_only: None,
             allowed_recipients: None,

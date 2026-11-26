@@ -37,6 +37,7 @@ fn scoped(token: &str, mailbox: &str, scopes: Vec<AuthScope>) -> ScopedTokenConf
     ScopedTokenConfig {
         token: token.to_string(),
         mailbox_id: Some(mailbox.to_string()),
+        shared_mailboxes: Vec::new(),
         scopes,
         draft_only: None,
         allowed_recipients: None,

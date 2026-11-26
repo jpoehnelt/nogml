@@ -88,6 +88,42 @@ nogml auth gmail \
 
 Pass `--no-browser` on headless or SSH hosts to print the authorization URL to stderr without launching a local browser. `nogml auth gmail` binds an ephemeral loopback callback (`http://127.0.0.1:<port>/callback`), verifies the CSRF `state`, exchanges the authorization code with the PKCE `code_verifier`, writes the refresh token with mode `0600`, and prints a redacted JSON summary with the `[sync]` `gmail_refresh_token = "file://..."` snippet. Raw tokens are never written to logs or stdout.
 
+### Multi-account sync, mailbox aliases, and shared mailboxes
+
+Configure multiple upstream Gmail sync accounts, inbound/outbound aliases, and shared team mailboxes in `nogml.toml` without separate cron jobs:
+
+```toml
+[mailboxes.aliases]
+"j@example.com" = "justin@example.com"
+"sales@example.com" = "team@example.com"
+
+[[auth.scoped_tokens]]
+token = "file:///etc/nogml/secrets/alice_token"
+mailbox_id = "alice@example.com"
+shared_mailboxes = ["team@example.com"]
+scopes = ["read", "write", "send"]
+
+[[sync.accounts]]
+mailbox_id = "alice@example.com"
+mode = "api"
+interval_secs = 60
+gmail_client_id = "alice-client.apps.googleusercontent.com"
+gmail_client_secret = "env://ALICE_GMAIL_CLIENT_SECRET"
+gmail_refresh_token = "file:///etc/nogml/secrets/alice_refresh"
+
+[[sync.accounts]]
+mailbox_id = "bob@example.com"
+mode = "api"
+interval_secs = 60
+gmail_client_id = "bob-client.apps.googleusercontent.com"
+gmail_client_secret = "env://BOB_GMAIL_CLIENT_SECRET"
+gmail_refresh_token = "file:///etc/nogml/secrets/bob_refresh"
+```
+
+- `nogml serve` spawns an independent periodic background sync loop per `[[sync.accounts]]` entry (with per-mailbox locks so one slow account never blocks another), and `nogml sync gmail --mailbox <email>` selects the matching account automatically.
+- `[mailboxes.aliases]` (or `NOGML_MAILBOX_ALIASES=j@example.com=justin@example.com,sales@example.com=team@example.com`) routes Resend and SES webhook recipients to their target mailbox and allows sending from configured aliases via `From` / Gmail `settings/sendAs`.
+- Scoped tokens with `shared_mailboxes` can read and send in those mailboxes via `/gmail/v1/users/<shared>/...`, `X-Nogml-Mailbox: <shared>` on `/v1/*` and `POST /mcp`, and IMAP `LOGIN`, `AUTHENTICATE PLAIN`, or `AUTHENTICATE XOAUTH2`, while remaining blocked (`403`) from all other mailboxes.
+
 ### Secret reference formats
 
 All secret fields support three non-plaintext mechanisms so secrets never need to be checked into `nogml.toml` or exposed in process command lines:

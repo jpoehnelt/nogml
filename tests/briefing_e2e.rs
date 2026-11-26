@@ -703,6 +703,7 @@ async fn briefing_is_isolated_per_mailbox_and_requires_read_scope() {
         ScopedTokenConfig {
             token: "tok_alice".to_string(),
             mailbox_id: Some(ALICE.to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -711,6 +712,7 @@ async fn briefing_is_isolated_per_mailbox_and_requires_read_scope() {
         ScopedTokenConfig {
             token: "tok_bob".to_string(),
             mailbox_id: Some(BOB.to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -719,6 +721,7 @@ async fn briefing_is_isolated_per_mailbox_and_requires_read_scope() {
         ScopedTokenConfig {
             token: "tok_nowrite".to_string(),
             mailbox_id: Some(ALICE.to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,

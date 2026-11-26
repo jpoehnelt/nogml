@@ -781,20 +781,23 @@ impl ImapSession {
         };
 
         match auth_result {
-            Ok(principal) => {
+            Ok(mut principal) => {
                 if let Some((authzid, authcid)) = plain_authzid_check
                     && !authzid.is_empty()
                     && !authzid.eq_ignore_ascii_case(&authcid)
-                    && !principal.has_scope(AuthScope::Admin)
                 {
-                    return self
-                        .record_auth_failure(
-                            tag,
-                            "AUTHORIZATIONFAILED",
-                            "Authorization identity does not match authentication identity",
-                            stream,
-                        )
-                        .await;
+                    if principal.can_access_mailbox(&authzid) {
+                        principal.mailbox_id = crate::config::normalize_mailbox_id(&authzid);
+                    } else if !principal.has_scope(AuthScope::Admin) {
+                        return self
+                            .record_auth_failure(
+                                tag,
+                                "AUTHORIZATIONFAILED",
+                                "Authorization identity does not match authentication identity",
+                                stream,
+                            )
+                            .await;
+                    }
                 }
                 self.failed_auth_attempts = 0;
                 self.state = self.base_state.for_mailbox(&principal.mailbox_id);

@@ -31,6 +31,31 @@ fn redact_send_as(mut entry: SendAs) -> SendAs {
     entry
 }
 
+fn merge_configured_alias_send_as(
+    state: &crate::AppState,
+    mut entries: Vec<SendAs>,
+) -> Vec<SendAs> {
+    for alias in state.config.aliases_for_mailbox(state.mailbox_id()) {
+        if !entries
+            .iter()
+            .any(|s| s.send_as_email.eq_ignore_ascii_case(&alias))
+        {
+            entries.push(SendAs {
+                send_as_email: alias,
+                display_name: None,
+                reply_to_address: None,
+                signature: None,
+                is_primary: Some(false),
+                is_default: Some(false),
+                treat_as_alias: Some(true),
+                smtp_msa: None,
+                verification_status: Some("accepted".to_string()),
+            });
+        }
+    }
+    entries
+}
+
 /// `GET /gmail/v1/users/{userId}/settings/sendAs`
 pub async fn list_send_as(
     MailboxState(state): MailboxState,
@@ -38,8 +63,9 @@ pub async fn list_send_as(
 ) -> AppResult<Json<ListSendAsResponse>> {
     resolve_user_id(&user_id, &state.config)?;
     let settings = state.store.get_settings().await?;
+    let merged = merge_configured_alias_send_as(&state, settings.send_as);
     Ok(Json(ListSendAsResponse {
-        send_as: settings.send_as.into_iter().map(redact_send_as).collect(),
+        send_as: merged.into_iter().map(redact_send_as).collect(),
     }))
 }
 
@@ -51,8 +77,8 @@ pub async fn get_send_as(
     resolve_user_id(&user_id, &state.config)?;
     validate_resource_id(&send_as_email)?;
     let settings = state.store.get_settings().await?;
-    let entry = settings
-        .send_as
+    let merged = merge_configured_alias_send_as(&state, settings.send_as);
+    let entry = merged
         .into_iter()
         .find(|s| s.send_as_email.eq_ignore_ascii_case(&send_as_email))
         .ok_or_else(|| AppError::NotFound(format!("SendAs alias '{send_as_email}' not found")))?;

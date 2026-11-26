@@ -212,6 +212,7 @@ pub fn mint_scoped_token(opts: &MintTokenOptions) -> AppResult<MintedTokenResult
     let entry = ScopedTokenConfig {
         token: token_field,
         mailbox_id,
+        shared_mailboxes: Vec::new(),
         scopes,
         draft_only: opts.draft_only,
         allowed_recipients,
