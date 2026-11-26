@@ -568,6 +568,72 @@ fn parse_query_at(q: &str, now_ms: i64) -> SearchQuery {
     })
 }
 
+/// Rewrite `label:` and `in:` terms inside a parsed [`SearchQuery`] using a lowercased
+/// label-name-to-ID map (including `/` replaced with `-`) so user label display names
+/// match messages storing opaque label IDs (e.g. `Label_1234`).
+pub fn rewrite_query_labels(
+    mut query: SearchQuery,
+    name_to_id: &std::collections::HashMap<String, String>,
+) -> SearchQuery {
+    fn rewrite_term(
+        term: SearchTerm,
+        name_to_id: &std::collections::HashMap<String, String>,
+    ) -> SearchTerm {
+        match term {
+            SearchTerm::Label(val) => {
+                let key_exact = val.to_ascii_lowercase();
+                let key_hyphen = key_exact.replace('/', "-");
+                if let Some(id) = name_to_id
+                    .get(&key_exact)
+                    .or_else(|| name_to_id.get(&key_hyphen))
+                {
+                    SearchTerm::Or(vec![SearchTerm::Label(val), SearchTerm::Label(id.clone())])
+                } else {
+                    SearchTerm::Label(val)
+                }
+            }
+            SearchTerm::InMailbox(val) => {
+                let key_exact = val.to_ascii_lowercase();
+                let key_hyphen = key_exact.replace('/', "-");
+                if let Some(id) = name_to_id
+                    .get(&key_exact)
+                    .or_else(|| name_to_id.get(&key_hyphen))
+                {
+                    SearchTerm::Or(vec![
+                        SearchTerm::InMailbox(val),
+                        SearchTerm::Label(id.clone()),
+                    ])
+                } else {
+                    SearchTerm::InMailbox(val)
+                }
+            }
+            SearchTerm::Not(inner) => SearchTerm::Not(Box::new(rewrite_term(*inner, name_to_id))),
+            SearchTerm::And(terms) => SearchTerm::And(
+                terms
+                    .into_iter()
+                    .map(|t| rewrite_term(t, name_to_id))
+                    .collect(),
+            ),
+            SearchTerm::Or(terms) => SearchTerm::Or(
+                terms
+                    .into_iter()
+                    .map(|t| rewrite_term(t, name_to_id))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    if !name_to_id.is_empty() && !query.terms.is_empty() {
+        query.terms = query
+            .terms
+            .into_iter()
+            .map(|t| rewrite_term(t, name_to_id))
+            .collect();
+    }
+    query
+}
+
 /// Returns `true` if any term in `query` inspects raw RFC 2822 MIME bytes (e.g. `filename:`).
 pub fn query_uses_filename(query: &SearchQuery) -> bool {
     fn term_uses_filename(term: &SearchTerm) -> bool {

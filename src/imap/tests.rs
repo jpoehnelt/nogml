@@ -352,6 +352,8 @@ impl MailStore for TestMailStore {
                 Self::alloc_label_uid(&mut inner, a, id);
             }
         }
+        inner.next_id += 1;
+        msg.history_id = msg.history_id.max(inner.next_id) + 1;
         inner.messages.insert(id.to_string(), msg.clone());
         Ok(msg)
     }
@@ -1709,6 +1711,7 @@ async fn test_imap_condstore_qresync_enable_and_edge_cases() {
 
     let store = Arc::new(MemoryStore::new("agent@example.com"));
     let cfg = Config {
+        user_email: "agent@example.com".to_string(),
         imap_username: Some("agent@example.com".to_string()),
         imap_password: Some("secret-pass".to_string()),
         ..Config::default()
@@ -1946,5 +1949,943 @@ async fn test_imap_condstore_qresync_enable_and_edge_cases() {
     assert!(qmismatch.last().unwrap().starts_with("Q2 OK"));
 
     let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_xgm_raw_search_and_xgm_labels_store_and_search() {
+    use crate::{
+        mime::{ComposeEmailInput, build_rfc2822},
+        storage::{HISTORY_SOURCE_LOCAL, HistoryEventKind, MemoryStore, NewAttachmentInput},
+    };
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+
+    // Seed 3 messages covering Gmail query operators (from, to, subject, has:attachment,
+    // filename, is:unread, is:starred, label, before, after, quotes, -negation, OR).
+    let raw1 = build_rfc2822(&ComposeEmailInput {
+        from: "Alice <alice@example.com>".to_string(),
+        to: vec!["Bob <bob@example.com>".to_string()],
+        subject: "Q4 Finance Report".to_string(),
+        text: Some("Attached is the Q4 budget review.".to_string()),
+        attachments: vec![NewAttachmentInput {
+            part_id: "1".to_string(),
+            filename: Some("Q4_Report.pdf".to_string()),
+            content_type: "application/pdf".to_string(),
+            content_id: None,
+            data: b"%PDF-1.4 sample".to_vec(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let raw2 = build_rfc2822(&ComposeEmailInput {
+        from: "Alice <alice@example.com>".to_string(),
+        to: vec!["Carol <carol@example.com>".to_string()],
+        subject: "Q4 Finance Report".to_string(),
+        text: Some("Updated Q4 invoice attached.".to_string()),
+        attachments: vec![NewAttachmentInput {
+            part_id: "1".to_string(),
+            filename: Some("Invoice_2026.csv".to_string()),
+            content_type: "text/csv".to_string(),
+            content_id: None,
+            data: b"item,amount\ncloud,42\n".to_vec(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let raw3 = build_rfc2822(&ComposeEmailInput {
+        from: "Dave <dave@example.com>".to_string(),
+        to: vec!["Bob <bob@example.com>".to_string()],
+        subject: "Lunch Plans".to_string(),
+        text: Some("Tacos at noon?".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Timestamps:
+    // Msg 1: 2026-06-15T12:00:00Z
+    // Msg 2: 2026-06-20T12:00:00Z
+    // Msg 3: 2026-06-01T12:00:00Z
+    let mut input1 = crate::imap::mime_fmt::parse_raw_to_new_message_input(
+        raw1,
+        vec![
+            LABEL_INBOX.to_string(),
+            LABEL_UNREAD.to_string(),
+            LABEL_STARRED.to_string(),
+        ],
+        Some(1_781_524_800_000),
+        "test",
+        None,
+        None,
+        false,
+        false,
+    );
+    input1.attachments = vec![NewAttachmentInput {
+        part_id: "1".to_string(),
+        filename: Some("Q4_Report.pdf".to_string()),
+        content_type: "application/pdf".to_string(),
+        content_id: None,
+        data: b"%PDF-1.4 sample".to_vec(),
+    }];
+    store.insert_message(input1).await.unwrap();
+
+    let mut input2 = crate::imap::mime_fmt::parse_raw_to_new_message_input(
+        raw2,
+        vec![LABEL_INBOX.to_string()],
+        Some(1_781_956_800_000),
+        "test",
+        None,
+        None,
+        false,
+        false,
+    );
+    input2.attachments = vec![NewAttachmentInput {
+        part_id: "1".to_string(),
+        filename: Some("Invoice_2026.csv".to_string()),
+        content_type: "text/csv".to_string(),
+        content_id: None,
+        data: b"item,amount\ncloud,42\n".to_vec(),
+    }];
+    store.insert_message(input2).await.unwrap();
+
+    let input3 = crate::imap::mime_fmt::parse_raw_to_new_message_input(
+        raw3,
+        vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
+        Some(1_780_315_200_000),
+        "test",
+        None,
+        None,
+        false,
+        false,
+    );
+    store.insert_message(input3).await.unwrap();
+
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    assert!(login.last().unwrap().starts_with("L1 OK"));
+    let sel = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l.contains("* 3 EXISTS")));
+
+    // 1. Complex X-GM-RAW queries
+    let r1 = send_cmd(
+        &mut reader,
+        "G1",
+        r#"UID SEARCH X-GM-RAW "from:alice has:attachment -is:unread""#,
+    )
+    .await;
+    assert!(
+        r1.iter().any(|l| l.trim() == "* SEARCH 2"),
+        "expected UID 2, got {r1:?}"
+    );
+
+    let r2 = send_cmd(
+        &mut reader,
+        "G2",
+        r#"UID SEARCH X-GM-RAW "from:alice has:attachment is:unread is:starred""#,
+    )
+    .await;
+    assert!(
+        r2.iter().any(|l| l.trim() == "* SEARCH 1"),
+        "expected UID 1, got {r2:?}"
+    );
+
+    let r3 = send_cmd(
+        &mut reader,
+        "G3",
+        r#"UID SEARCH X-GM-RAW "filename:Q4_Report.pdf""#,
+    )
+    .await;
+    assert!(
+        r3.iter().any(|l| l.trim() == "* SEARCH 1"),
+        "expected UID 1 for filename:, got {r3:?}"
+    );
+
+    let r4 = send_cmd(
+        &mut reader,
+        "G4",
+        r#"UID SEARCH X-GM-RAW "from:dave OR subject:\"Q4 Finance\"""#,
+    )
+    .await;
+    assert!(
+        r4.iter().any(|l| l.trim() == "* SEARCH 1 2 3"),
+        "expected UIDs 1 2 3 for OR query, got {r4:?}"
+    );
+
+    let r5 = send_cmd(
+        &mut reader,
+        "G5",
+        r#"UID SEARCH X-GM-RAW "before:2026/06/10""#,
+    )
+    .await;
+    assert!(
+        r5.iter().any(|l| l.trim() == "* SEARCH 3"),
+        "expected UID 3 for before:, got {r5:?}"
+    );
+
+    let r6 = send_cmd(
+        &mut reader,
+        "G6",
+        r#"UID SEARCH X-GM-RAW "after:2026/06/18 to:carol""#,
+    )
+    .await;
+    assert!(
+        r6.iter().any(|l| l.trim() == "* SEARCH 2"),
+        "expected UID 2 for after: + to:, got {r6:?}"
+    );
+
+    // 2. UID STORE +X-GM-LABELS: system label + auto-created custom label + HistoryEvent(local) + MODSEQ
+    let before_hid = store.current_history_id().await.unwrap();
+    let st_add = send_cmd(
+        &mut reader,
+        "ST1",
+        r#"UID STORE 2 +X-GM-LABELS (\Important "Work/Urgent")"#,
+    )
+    .await;
+    assert!(
+        st_add.iter().any(|l| {
+            l.contains("FETCH (")
+                && l.contains("UID 2")
+                && l.contains("X-GM-LABELS (")
+                && l.contains("\\Important")
+                && l.contains("\"Work/Urgent\"")
+                && l.contains("MODSEQ (")
+        }),
+        "expected FETCH with X-GM-LABELS and MODSEQ, got {st_add:?}"
+    );
+    assert!(st_add.last().unwrap().starts_with("ST1 OK"));
+
+    let after_hid = store.current_history_id().await.unwrap();
+    assert!(
+        after_hid > before_hid,
+        "modseq/history_id must advance after +X-GM-LABELS"
+    );
+
+    // Verify HistoryEvent with HistorySource::Local ("local") was recorded for upstream sync.
+    let hist = store
+        .list_history(&HistoryListQuery {
+            start_history_id: before_hid,
+            max_results: 50,
+            page_token: None,
+            label_id: None,
+            history_types: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        hist.entries.iter().any(|rec| {
+            rec.kind == HistoryEventKind::LabelAdded && rec.source == HISTORY_SOURCE_LOCAL
+        }),
+        "expected local LabelAdded history event, got {:?}",
+        hist.entries
+    );
+
+    // Verify SEARCH X-GM-LABELS matches both system labels and custom label names,
+    // and X-GM-RAW label: also resolves the auto-created custom label.
+    let sl1 = send_cmd(
+        &mut reader,
+        "SL1",
+        r#"UID SEARCH X-GM-LABELS "Work/Urgent""#,
+    )
+    .await;
+    assert!(
+        sl1.iter().any(|l| l.trim() == "* SEARCH 2"),
+        "expected UID 2 for X-GM-LABELS custom label, got {sl1:?}"
+    );
+    let sl2 = send_cmd(&mut reader, "SL2", r#"UID SEARCH X-GM-LABELS \Important"#).await;
+    assert!(
+        sl2.iter().any(|l| l.trim() == "* SEARCH 2"),
+        "expected UID 2 for X-GM-LABELS \\Important, got {sl2:?}"
+    );
+    let sl3 = send_cmd(
+        &mut reader,
+        "SL3",
+        r#"UID SEARCH X-GM-RAW "label:Work/Urgent""#,
+    )
+    .await;
+    assert!(
+        sl3.iter().any(|l| l.trim() == "* SEARCH 2"),
+        "expected UID 2 for X-GM-RAW label:, got {sl3:?}"
+    );
+
+    // 3. +X-GM-LABELS.SILENT suppresses untagged FETCH while persisting label
+    let st_silent = send_cmd(
+        &mut reader,
+        "ST2",
+        r#"UID STORE 2 +X-GM-LABELS.SILENT (\Starred)"#,
+    )
+    .await;
+    assert!(
+        !st_silent.iter().any(|l| l.contains("FETCH")),
+        ".SILENT must suppress untagged FETCH, got {st_silent:?}"
+    );
+    assert!(st_silent.last().unwrap().starts_with("ST2 OK"));
+    let sl_star = send_cmd(&mut reader, "SL4", r#"UID SEARCH X-GM-LABELS \Starred"#).await;
+    assert!(
+        sl_star.iter().any(|l| l.trim() == "* SEARCH 1 2"),
+        "expected UIDs 1 2 starred, got {sl_star:?}"
+    );
+
+    // 4. -X-GM-LABELS removes specified label and emits updated X-GM-LABELS + MODSEQ
+    let st_rem = send_cmd(
+        &mut reader,
+        "ST3",
+        r#"UID STORE 2 -X-GM-LABELS (\Important)"#,
+    )
+    .await;
+    assert!(
+        st_rem.iter().any(|l| {
+            l.contains("X-GM-LABELS (")
+                && !l.contains("\\Important")
+                && l.contains("\"Work/Urgent\"")
+                && l.contains("MODSEQ (")
+        }),
+        "expected FETCH without \\Important, got {st_rem:?}"
+    );
+    let sl_imp_after = send_cmd(&mut reader, "SL5", r#"UID SEARCH X-GM-LABELS \Important"#).await;
+    assert!(
+        sl_imp_after.iter().any(|l| l.trim() == "* SEARCH"),
+        "expected empty search after removing \\Important, got {sl_imp_after:?}"
+    );
+
+    // 5. X-GM-LABELS (replace) replaces Gmail labels while preserving UNREAD (\Seen state)
+    let st_rep = send_cmd(
+        &mut reader,
+        "ST4",
+        r#"UID STORE 1 X-GM-LABELS (\Inbox "ReplacedLabel")"#,
+    )
+    .await;
+    assert!(
+        st_rep.iter().any(|l| {
+            l.contains("X-GM-LABELS (")
+                && l.contains("\\Inbox")
+                && l.contains("\"ReplacedLabel\"")
+                && !l.contains("\\Starred")
+                && l.contains("MODSEQ (")
+        }),
+        "expected replaced labels on UID 1, got {st_rep:?}"
+    );
+    let unseen_chk = send_cmd(&mut reader, "SL6", "UID SEARCH UNSEEN").await;
+    assert!(
+        unseen_chk.iter().any(|l| l.trim() == "* SEARCH 1 3"),
+        "replace X-GM-LABELS must preserve UNREAD state on UID 1, got {unseen_chk:?}"
+    );
+
+    // 6. UNCHANGEDSINCE CAS protects against stale X-GM-LABELS writes
+    let stale = send_cmd(
+        &mut reader,
+        "ST5",
+        &format!(r#"UID STORE 2 (UNCHANGEDSINCE {before_hid}) +X-GM-LABELS ("StaleTag")"#),
+    )
+    .await;
+    assert!(
+        stale.last().unwrap().contains("[MODIFIED 2]"),
+        "expected [MODIFIED 2] on stale UNCHANGEDSINCE, got {stale:?}"
+    );
+
+    // 7. Unsupported Gmail system label rejected cleanly
+    let bad_sys = send_cmd(&mut reader, "ST6", r#"UID STORE 1 +X-GM-LABELS (\Bogus)"#).await;
+    assert!(bad_sys.last().unwrap().starts_with("ST6 NO"));
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_unselect_and_list_extended_list_status() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(greeting.contains("UNSELECT"));
+    assert!(greeting.contains("LIST-EXTENDED"));
+    assert!(greeting.contains("LIST-STATUS"));
+
+    let login = send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass").await;
+    assert!(login.last().unwrap().starts_with("L1 OK"));
+
+    // UNSELECT before selecting a mailbox returns NO.
+    let unsel_err = send_cmd(&mut reader, "U0", "UNSELECT").await;
+    assert!(unsel_err.last().unwrap().starts_with("U0 NO"));
+
+    // Create folder "Projects", append messages to INBOX and Projects.
+    assert!(
+        send_cmd(&mut reader, "C1", r#"CREATE "Projects""#)
+            .await
+            .last()
+            .unwrap()
+            .starts_with("C1 OK")
+    );
+    let raw1 = "From: a@example.com\r\nSubject: Msg1\r\n\r\nOne\r\n";
+    let raw2 = "From: b@example.com\r\nSubject: Msg2\r\n\r\nTwo\r\n";
+    let a1 = send_cmd(
+        &mut reader,
+        "A1",
+        &format!("APPEND INBOX {{{}+}}\r\n{raw1}", raw1.len()),
+    )
+    .await;
+    assert!(a1.last().unwrap().starts_with("A1 OK"));
+    let a2 = send_cmd(
+        &mut reader,
+        "A2",
+        &format!(
+            r#"APPEND "Projects" (\Seen) {{{}+}}{}{raw2}"#,
+            raw2.len(),
+            "\r\n"
+        ),
+    )
+    .await;
+    assert!(a2.last().unwrap().starts_with("A2 OK"));
+
+    // Select INBOX, mark UID 1 \Deleted, and UNSELECT -> must NOT expunge!
+    let _ = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    let _ = send_cmd(&mut reader, "F1", r#"UID STORE 1 +FLAGS (\Deleted)"#).await;
+    let unsel = send_cmd(&mut reader, "U1", "UNSELECT").await;
+    assert!(
+        unsel.last().unwrap().starts_with("U1 OK"),
+        "expected U1 OK, got {unsel:?}"
+    );
+
+    // Re-select INBOX and confirm message 1 is still there with \Deleted flag intact.
+    let sel2 = send_cmd(&mut reader, "S2", "SELECT INBOX").await;
+    assert!(
+        sel2.iter().any(|l| l.trim() == "* 1 EXISTS"),
+        "UNSELECT must not expunge \\Deleted message, got {sel2:?}"
+    );
+    let flags = send_cmd(&mut reader, "F2", "UID FETCH 1 (FLAGS)").await;
+    assert!(
+        flags.iter().any(|l| l.contains("\\Deleted")),
+        "\\Deleted flag must be preserved after UNSELECT, got {flags:?}"
+    );
+    // Contrast with CLOSE, which DOES expunge \Deleted.
+    let cls = send_cmd(&mut reader, "CL1", "CLOSE").await;
+    assert!(cls.last().unwrap().starts_with("CL1 OK"));
+    let sel3 = send_cmd(&mut reader, "S3", "SELECT INBOX").await;
+    assert!(
+        sel3.iter().any(|l| l.trim() == "* 0 EXISTS"),
+        "CLOSE must expunge \\Deleted message, got {sel3:?}"
+    );
+    let _ = send_cmd(&mut reader, "U2", "UNSELECT").await;
+
+    // LIST-STATUS: interleaved * LIST and * STATUS in one round-trip.
+    let ls = send_cmd(
+        &mut reader,
+        "LS1",
+        r#"LIST "" "*" RETURN (STATUS (MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN HIGHESTMODSEQ))"#,
+    )
+    .await;
+    assert!(ls.last().unwrap().starts_with("LS1 OK"));
+    // Projects has 1 message, 0 unseen (appended with \Seen).
+    let proj_list_idx = ls
+        .iter()
+        .position(|l| l.starts_with("* LIST ") && l.contains(r#""Projects""#))
+        .expect("Projects LIST line");
+    let proj_status = &ls[proj_list_idx + 1];
+    assert!(
+        proj_status.starts_with(r#"* STATUS "Projects" ("#)
+            && proj_status.contains("MESSAGES 1")
+            && proj_status.contains("RECENT 0")
+            && proj_status.contains("UIDNEXT ")
+            && proj_status.contains("UIDVALIDITY ")
+            && proj_status.contains("UNSEEN 0")
+            && proj_status.contains("HIGHESTMODSEQ "),
+        "expected interleaved STATUS after LIST for Projects, got {proj_status:?}"
+    );
+    // Virtual \Noselect "[Gmail]" container must NOT have a STATUS line (RFC 5819 §2).
+    assert!(
+        !ls.iter().any(|l| l.starts_with(r#"* STATUS "[Gmail]""#)),
+        "must not emit STATUS for \\Noselect [Gmail], got {ls:?}"
+    );
+
+    // RETURN (SPECIAL-USE) and (SPECIAL-USE) selection option.
+    let rsu = send_cmd(&mut reader, "LS2", r#"LIST "" "*" RETURN (SPECIAL-USE)"#).await;
+    assert!(rsu.last().unwrap().starts_with("LS2 OK"));
+    assert!(rsu.iter().any(|l| l.contains(r"\Sent")));
+
+    let ssu = send_cmd(&mut reader, "LS3", r#"LIST (SPECIAL-USE) "" "*""#).await;
+    assert!(ssu.last().unwrap().starts_with("LS3 OK"));
+    assert!(ssu.iter().any(|l| l.contains(r"\All")));
+    assert!(
+        !ssu.iter().any(|l| l.contains(r#""Projects""#)),
+        "SPECIAL-USE selection must filter out custom folders, got {ssu:?}"
+    );
+
+    // SUBSCRIBED selection option & RETURN (SUBSCRIBED).
+    assert!(
+        send_cmd(&mut reader, "SB1", r#"SUBSCRIBE "Projects""#)
+            .await
+            .last()
+            .unwrap()
+            .starts_with("SB1 OK")
+    );
+    let lsub_ext = send_cmd(&mut reader, "LS4", r#"LIST (SUBSCRIBED) "" "*""#).await;
+    assert!(lsub_ext.last().unwrap().starts_with("LS4 OK"));
+    let list_lines: Vec<&String> = lsub_ext
+        .iter()
+        .filter(|l| l.starts_with("* LIST "))
+        .collect();
+    assert_eq!(
+        list_lines.len(),
+        1,
+        "expected only Projects, got {lsub_ext:?}"
+    );
+    assert!(list_lines[0].contains(r#""Projects""#));
+    assert!(list_lines[0].contains(r"\Subscribed"));
+
+    // Multiple patterns + combined RETURN (SUBSCRIBED STATUS (...)).
+    let multi = send_cmd(
+        &mut reader,
+        "LS5",
+        r#"LIST "" ("INBOX" "Projects") RETURN (SUBSCRIBED STATUS (MESSAGES UNSEEN))"#,
+    )
+    .await;
+    assert!(multi.last().unwrap().starts_with("LS5 OK"));
+    assert!(multi.iter().any(|l| l.starts_with(r#"* STATUS "INBOX""#)));
+    assert!(
+        multi
+            .iter()
+            .any(|l| l.starts_with(r#"* STATUS "Projects""#))
+    );
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_sort_and_thread_rfc5256() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(greeting.contains("SORT"));
+    assert!(greeting.contains("THREAD=REFERENCES"));
+    assert!(greeting.contains("THREAD=ORDEREDSUBJECT"));
+
+    assert!(
+        send_cmd(&mut reader, "L1", "LOGIN agent@example.com secret-pass")
+            .await
+            .last()
+            .unwrap()
+            .starts_with("L1 OK")
+    );
+
+    // Append 5 messages with distinct From, Subject (with Re:/Fwd:/[blob]), Date, Size,
+    // and Message-ID/In-Reply-To/References threading hierarchy.
+    let msgs = [
+        // UID 1: Thread A root
+        (
+            "01-Jun-2026 10:00:00 +0000",
+            concat!(
+                "From: Charlie <charlie@example.com>\r\n",
+                "To: team@example.com\r\n",
+                "Date: Mon, 01 Jun 2026 10:00:00 +0000\r\n",
+                "Subject: Project Alpha\r\n",
+                "Message-ID: <a1@example.com>\r\n",
+                "\r\n",
+                "Root message\r\n"
+            )
+            .to_string(),
+        ),
+        // UID 2: Reply to UID 1
+        (
+            "01-Jun-2026 12:00:00 +0000",
+            concat!(
+                "From: \"Zoe Display\" <alice@example.com>\r\n",
+                "To: charlie@example.com\r\n",
+                "Date: Mon, 01 Jun 2026 12:00:00 +0000\r\n",
+                "Subject: Re: Project Alpha\r\n",
+                "Message-ID: <a2@example.com>\r\n",
+                "In-Reply-To: <a1@example.com>\r\n",
+                "References: <a1@example.com>\r\n",
+                "\r\n",
+                "First branch reply\r\n"
+            )
+            .to_string(),
+        ),
+        // UID 3: Reply to UID 2
+        (
+            "01-Jun-2026 14:00:00 +0000",
+            concat!(
+                "From: Bob <bob@example.com>\r\n",
+                "To: alice@example.com\r\n",
+                "Date: Mon, 01 Jun 2026 14:00:00 +0000\r\n",
+                "Subject: Re: [eng] Re: Project Alpha\r\n",
+                "Message-ID: <a3@example.com>\r\n",
+                "In-Reply-To: <a2@example.com>\r\n",
+                "References: <a1@example.com> <a2@example.com>\r\n",
+                "\r\n",
+                "Nested reply\r\n"
+            )
+            .to_string(),
+        ),
+        // UID 4: Second branch reply directly to UID 1 (earlier than UID 3)
+        (
+            "01-Jun-2026 13:00:00 +0000",
+            concat!(
+                "From: Dave <dave@example.com>\r\n",
+                "To: charlie@example.com\r\n",
+                "Date: Mon, 01 Jun 2026 13:00:00 +0000\r\n",
+                "Subject: Fwd: Project Alpha (fwd)\r\n",
+                "Message-ID: <a4@example.com>\r\n",
+                "In-Reply-To: <a1@example.com>\r\n",
+                "References: <a1@example.com>\r\n",
+                "\r\n",
+                "Second branch\r\n"
+            )
+            .to_string(),
+        ),
+        // UID 5: Standalone thread B (largest body, sorts first by SUBJECT)
+        (
+            "01-Jun-2026 11:00:00 +0000",
+            format!(
+                concat!(
+                    "From: Zoe <zoe@example.com>\r\n",
+                    "To: ops@example.com\r\n",
+                    "Date: Mon, 01 Jun 2026 11:00:00 +0000\r\n",
+                    "Subject: Beta Release\r\n",
+                    "Message-ID: <b1@example.com>\r\n",
+                    "\r\n",
+                    "{}\r\n"
+                ),
+                "payload ".repeat(100)
+            ),
+        ),
+    ];
+
+    for (idx, (date_str, raw)) in msgs.iter().enumerate() {
+        let res = send_cmd(
+            &mut reader,
+            &format!("AP{idx}"),
+            &format!("APPEND INBOX \"{date_str}\" {{{}+}}\r\n{raw}", raw.len()),
+        )
+        .await;
+        assert!(res.last().unwrap().starts_with(&format!("AP{idx} OK")));
+    }
+
+    let sel = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+    assert!(sel.iter().any(|l| l.trim() == "* 5 EXISTS"));
+
+    // SORT by FROM (addr-mailbox: alice=2, bob=3, charlie=1, dave=4, zoe=5)
+    let s_from = send_cmd(&mut reader, "SO1", "SORT (FROM) UTF-8 ALL").await;
+    assert!(
+        s_from.iter().any(|l| l.trim() == "* SORT 2 3 1 4 5"),
+        "expected * SORT 2 3 1 4 5, got {s_from:?}"
+    );
+
+    // UID SORT by REVERSE DATE (14:00=3, 13:00=4, 12:00=2, 11:00=5, 10:00=1)
+    let s_date = send_cmd(&mut reader, "SO2", "UID SORT (REVERSE DATE) UTF-8 ALL").await;
+    assert!(
+        s_date.iter().any(|l| l.trim() == "* SORT 3 4 2 5 1"),
+        "expected * SORT 3 4 2 5 1, got {s_date:?}"
+    );
+
+    // UID SORT by (SUBJECT DATE): "beta release" (5) then "project alpha" (1, 2, 4, 3)
+    let s_subj = send_cmd(&mut reader, "SO3", "UID SORT (SUBJECT DATE) US-ASCII ALL").await;
+    assert!(
+        s_subj.iter().any(|l| l.trim() == "* SORT 5 1 2 4 3"),
+        "expected * SORT 5 1 2 4 3, got {s_subj:?}"
+    );
+
+    // SORT by REVERSE SIZE: UID 5 is largest
+    let s_size = send_cmd(&mut reader, "SO4", "SORT (REVERSE SIZE) UTF-8 ALL").await;
+    let size_line = s_size
+        .iter()
+        .find(|l| l.starts_with("* SORT "))
+        .expect("SORT SIZE line");
+    assert!(
+        size_line.starts_with("* SORT 5 "),
+        "expected largest message (5) first, got {size_line:?}"
+    );
+
+    // SORT with search filter (FROM "alice")
+    let s_filt = send_cmd(
+        &mut reader,
+        "SO5",
+        r#"UID SORT (ARRIVAL) UTF-8 FROM "alice""#,
+    )
+    .await;
+    assert!(
+        s_filt.iter().any(|l| l.trim() == "* SORT 2"),
+        "expected * SORT 2, got {s_filt:?}"
+    );
+
+    // Unsupported charset rejected with BADCHARSET
+    let s_bad_cs = send_cmd(&mut reader, "SO6", "SORT (DATE) KOI8-R ALL").await;
+    assert!(
+        s_bad_cs.last().unwrap().contains("[BADCHARSET"),
+        "expected BADCHARSET, got {s_bad_cs:?}"
+    );
+
+    // THREAD REFERENCES: Thread A = (1 (2 3)(4)), Thread B = (5)
+    let t_ref = send_cmd(&mut reader, "TH1", "THREAD REFERENCES UTF-8 ALL").await;
+    assert!(
+        t_ref.iter().any(|l| l.trim() == "* THREAD (1 (2 3)(4))(5)"),
+        "expected * THREAD (1 (2 3)(4))(5), got {t_ref:?}"
+    );
+
+    // UID THREAD ORDEREDSUBJECT: Thread A = (1 2 4 3) (date order), Thread B = (5)
+    let t_os = send_cmd(&mut reader, "TH2", "UID THREAD ORDEREDSUBJECT UTF-8 ALL").await;
+    assert!(
+        t_os.iter().any(|l| l.trim() == "* THREAD (1 2 4 3)(5)"),
+        "expected * THREAD (1 2 4 3)(5), got {t_os:?}"
+    );
+
+    // Unsupported THREAD algorithm rejected with BAD
+    let t_bad = send_cmd(&mut reader, "TH3", "THREAD UNKNOWN UTF-8 ALL").await;
+    assert!(t_bad.last().unwrap().starts_with("TH3 BAD"));
+
+    // RFC 3501 §5.2 snapshot stability: delete message 1 behind the session's back;
+    // sequence numbers of remaining messages must NOT shift before NOOP/EXPUNGE!
+    let all_inbox = store.imap_list_messages("INBOX").await.unwrap();
+    store
+        .delete_message(&all_inbox[0].message_id)
+        .await
+        .unwrap();
+    let s_stable = send_cmd(&mut reader, "SO7", "SORT (ARRIVAL) UTF-8 ALL").await;
+    assert!(
+        s_stable.iter().any(|l| l.trim() == "* SORT 5 2 4 3"),
+        "sequence numbers must stay stable per RFC 3501 §5.2, got {s_stable:?}"
+    );
+
+    let _ = send_cmd(&mut reader, "BYE1", "LOGOUT").await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_imap_esearch_sasl_ir_and_literal_minus() {
+    use crate::storage::MemoryStore;
+
+    let store = Arc::new(MemoryStore::new("agent@example.com"));
+    let cfg = Config {
+        user_email: "agent@example.com".to_string(),
+        auth_tokens: vec!["xoauth2-test-token".to_string()],
+        imap_username: Some("agent@example.com".to_string()),
+        imap_password: Some("secret-pass".to_string()),
+        ..Config::default()
+    };
+    let state = AppState::with_backends(cfg, store.clone(), Arc::new(DummyResendClient));
+    let (addr, shutdown_tx) = spawn_test_imap(state).await;
+
+    // Verify single-round-trip AUTHENTICATE XOAUTH2 with SASL-IR on a dedicated connection.
+    {
+        let xo_stream = TcpStream::connect(addr).await.unwrap();
+        let mut xo_reader = BufReader::new(xo_stream);
+        let mut xo_greeting = String::new();
+        xo_reader.read_line(&mut xo_greeting).await.unwrap();
+        assert!(xo_greeting.contains("SASL-IR"));
+        assert!(xo_greeting.contains("AUTH=XOAUTH2"));
+        let xoauth2_b64 = base64::engine::general_purpose::STANDARD
+            .encode("user=agent@example.com\x01auth=Bearer xoauth2-test-token\x01\x01");
+        let xo_res = send_cmd(
+            &mut xo_reader,
+            "XO1",
+            &format!("AUTHENTICATE XOAUTH2 {xoauth2_b64}"),
+        )
+        .await;
+        assert!(
+            xo_res.last().unwrap().starts_with("XO1 OK"),
+            "expected XO1 OK for SASL-IR XOAUTH2, got {xo_res:?}"
+        );
+        let _ = send_cmd(&mut xo_reader, "XO2", "LOGOUT").await;
+    }
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(greeting.contains("ESEARCH"));
+    assert!(greeting.contains("SASL-IR"));
+    assert!(greeting.contains("LITERAL-"));
+    assert!(
+        !greeting.contains("LITERAL+"),
+        "RFC 7888 server advertising LITERAL- must not also advertise LITERAL+: {greeting}"
+    );
+
+    // 1. RFC 4959 SASL-IR empty initial response `=` on PLAIN & XOAUTH2 fails cleanly without `+ ` hang.
+    let empty_plain = send_cmd(&mut reader, "A0", "AUTHENTICATE PLAIN =").await;
+    assert!(
+        empty_plain.last().unwrap().starts_with("A0 BAD"),
+        "expected A0 BAD for empty PLAIN SASL-IR '=', got {empty_plain:?}"
+    );
+    assert!(
+        !empty_plain.iter().any(|l| l.starts_with('+')),
+        "must not send continuation prompt for SASL-IR '=', got {empty_plain:?}"
+    );
+
+    let empty_xoauth = send_cmd(&mut reader, "A1", "AUTHENTICATE XOAUTH2 =").await;
+    assert!(
+        empty_xoauth.last().unwrap().starts_with("A1 BAD"),
+        "expected A1 BAD for empty XOAUTH2 SASL-IR '=', got {empty_xoauth:?}"
+    );
+    assert!(!empty_xoauth.iter().any(|l| l.starts_with('+')));
+
+    // Valid single-round-trip SASL-IR PLAIN login.
+    let sasl = base64::engine::general_purpose::STANDARD.encode("\0agent@example.com\0secret-pass");
+    let auth_ok = send_cmd(&mut reader, "A2", &format!("AUTHENTICATE PLAIN {sasl}")).await;
+    assert!(
+        auth_ok.last().unwrap().starts_with("A2 OK"),
+        "expected A2 OK, got {auth_ok:?}"
+    );
+
+    // 2. Append 5 messages, flag 2, 3, and 5; verify RFC 4731 ESEARCH.
+    for i in 1..=5 {
+        let flags = if matches!(i, 2 | 3 | 5) {
+            "(\\Flagged)"
+        } else {
+            "()"
+        };
+        let raw = format!("From: u{i}@example.com\r\nSubject: Item {i}\r\n\r\nBody {i}\r\n");
+        let app = send_cmd(
+            &mut reader,
+            &format!("AP{i}"),
+            &format!("APPEND INBOX {flags} {{{}+}}\r\n{raw}", raw.len()),
+        )
+        .await;
+        assert!(app.last().unwrap().starts_with(&format!("AP{i} OK")));
+    }
+
+    let _ = send_cmd(&mut reader, "S1", "SELECT INBOX").await;
+
+    // Sequence-number ESEARCH
+    let es1 = send_cmd(
+        &mut reader,
+        "ES1",
+        "SEARCH RETURN (MIN MAX ALL COUNT) FLAGGED",
+    )
+    .await;
+    assert!(
+        es1.iter()
+            .any(|l| l.trim() == r#"* ESEARCH (TAG "ES1") MIN 2 MAX 5 ALL 2:3,5 COUNT 3"#),
+        "unexpected ESEARCH response: {es1:?}"
+    );
+
+    // UID ESEARCH
+    let es2 = send_cmd(
+        &mut reader,
+        "ES2",
+        "UID SEARCH RETURN (MIN MAX ALL COUNT) FLAGGED",
+    )
+    .await;
+    assert!(
+        es2.iter()
+            .any(|l| l.trim() == r#"* ESEARCH (TAG "ES2") UID MIN 2 MAX 5 ALL 2:3,5 COUNT 3"#),
+        "unexpected UID ESEARCH response: {es2:?}"
+    );
+
+    // Empty RETURN () == RETURN (ALL) per RFC 4731 §3.1
+    let es3 = send_cmd(&mut reader, "ES3", "UID SEARCH RETURN () FLAGGED").await;
+    assert!(
+        es3.iter()
+            .any(|l| l.trim() == r#"* ESEARCH (TAG "ES3") UID ALL 2:3,5"#),
+        "unexpected empty RETURN ESEARCH response: {es3:?}"
+    );
+
+    // Empty match set omits MIN/MAX/ALL and still emits COUNT 0 per RFC 4731 §3.1
+    let es4 = send_cmd(
+        &mut reader,
+        "ES4",
+        "UID SEARCH RETURN (MIN MAX ALL COUNT) DRAFT",
+    )
+    .await;
+    assert!(
+        es4.iter()
+            .any(|l| l.trim() == r#"* ESEARCH (TAG "ES4") UID COUNT 0"#),
+        "unexpected empty-match ESEARCH response: {es4:?}"
+    );
+
+    // 3. RFC 7888 LITERAL-: {4096+} accepted without continuation; synchronizing {5000} accepted;
+    //    {4097+} rejected with [TOOBIG].
+    let mut exact_4096 = "From: lit@example.com\r\nSubject: Exact4096\r\n\r\n".to_string();
+    exact_4096.push_str(&"x".repeat(4096 - exact_4096.len()));
+    assert_eq!(exact_4096.len(), 4096);
+    let lit_ok = send_cmd(
+        &mut reader,
+        "LM1",
+        &format!("APPEND INBOX {{4096+}}\r\n{exact_4096}"),
+    )
+    .await;
+    assert!(
+        lit_ok.last().unwrap().starts_with("LM1 OK [APPENDUID "),
+        "4096-byte LITERAL- must succeed, got {lit_ok:?}"
+    );
+
+    // Synchronizing literal > 4096 bytes succeeds after `+ Ready`.
+    let mut sync_5000 = "From: sync@example.com\r\nSubject: Sync5000\r\n\r\n".to_string();
+    sync_5000.push_str(&"y".repeat(5000 - sync_5000.len()));
+    assert_eq!(sync_5000.len(), 5000);
+    reader
+        .get_mut()
+        .write_all(b"LM2 APPEND INBOX {5000}\r\n")
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let mut cont = String::new();
+    reader.read_line(&mut cont).await.unwrap();
+    assert!(cont.starts_with('+'), "expected + Ready, got {cont:?}");
+    reader
+        .get_mut()
+        .write_all(format!("{sync_5000}\r\n").as_bytes())
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let mut sync_resp = String::new();
+    reader.read_line(&mut sync_resp).await.unwrap();
+    assert!(
+        sync_resp.starts_with("LM2 OK [APPENDUID "),
+        "5000-byte sync literal must succeed, got {sync_resp:?}"
+    );
+
+    // Non-synchronizing {4097+} exceeds LITERAL- 4096-byte cap -> * BAD [TOOBIG] + close.
+    reader
+        .get_mut()
+        .write_all(b"LM3 APPEND INBOX {4097+}\r\n")
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let mut err_line = String::new();
+    reader.read_line(&mut err_line).await.unwrap();
+    assert!(
+        err_line.starts_with("* BAD") && err_line.contains("[TOOBIG]"),
+        "expected * BAD [TOOBIG] for 4097-byte LITERAL-, got {err_line:?}"
+    );
+
     let _ = shutdown_tx.send(true);
 }
