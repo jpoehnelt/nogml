@@ -764,9 +764,11 @@ async fn e2e_scoped_agent_policy_overrides_enforce_draft_only_allowlist_and_max_
 #[tokio::test]
 async fn e2e_local_oauth2_auth_code_pkce_refresh_and_imap_xoauth2() {
     let mut cfg = Config::for_test();
+    cfg.auth_tokens = vec!["oauth-admin-session-tok".to_string()];
     cfg.oauth2_client_id = Some("nogml-gmail-client".to_string());
     cfg.oauth2_client_secret = Some("nogml-gmail-secret".to_string());
     cfg.oauth2_signing_secret = Some("local-hs256-signing-secret-material-42".to_string());
+    cfg.oauth2_redirect_uris = vec!["http://127.0.0.1:9999/callback".to_string()];
 
     let store = Arc::new(MemoryStore::new(&cfg.user_email));
     seed_inbox_message(&store).await;
@@ -810,11 +812,27 @@ async fn e2e_local_oauth2_auth_code_pkce_refresh_and_imap_xoauth2() {
          &scope=https%3A%2F%2Fmail.google.com%2F\
          &state=xyz123&code_challenge={challenge}&code_challenge_method=S256"
     );
+
+    // Unauthenticated /oauth2/authorize MUST be rejected with 401
+    let unauth_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&auth_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Authenticated /oauth2/authorize with allowlisted redirect_uri succeeds
     let auth_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri(&auth_url)
+                .header(header::AUTHORIZATION, "Bearer oauth-admin-session-tok")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1114,4 +1132,313 @@ async fn e2e_oauth2_endpoints_return_404_when_disabled() {
 
     let (s, _) = http_json(&app, "POST", "/oauth2/token", None, Some(json!({}))).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pruning() {
+    let mut cfg = Config::for_test();
+    cfg.user_email = "alice@example.com".to_string();
+    cfg.mailboxes = vec!["bob@example.com".to_string()];
+    cfg.oauth2_client_id = Some("public-cli-client".to_string());
+    // Intentionally unset oauth2_client_secret to test public-client hardening
+    cfg.oauth2_client_secret = None;
+    cfg.oauth2_signing_secret = Some("public-client-signing-secret-key-99".to_string());
+    cfg.oauth2_redirect_uris = vec!["http://127.0.0.1:8765/cb".to_string()];
+    cfg.scoped_tokens = vec![
+        ScopedTokenConfig {
+            token: "tok-alice-read".to_string(),
+            mailbox_id: Some("alice@example.com".to_string()),
+            scopes: vec![AuthScope::Read],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
+        ScopedTokenConfig {
+            token: "tok-alice-admin".to_string(),
+            mailbox_id: Some("alice@example.com".to_string()),
+            scopes: vec![AuthScope::Admin],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
+    ];
+
+    let store = Arc::new(MemoryStore::new(&cfg.user_email));
+    let state = AppState::with_backends(cfg, store, Arc::new(NoopResend));
+    let app = build_router(state.clone());
+
+    // 1. Discovery omits client_credentials & plain PKCE for public clients
+    let (s, meta) = http_json(
+        &app,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        meta["grant_types_supported"],
+        json!(["authorization_code", "refresh_token"])
+    );
+    assert_eq!(meta["code_challenge_methods_supported"], json!(["S256"]));
+
+    // 2. grant_type=client_credentials is forbidden when oauth2_client_secret is unset (401 invalid_client)
+    let cc_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=client_credentials&client_id=public-cli-client",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cc_resp.status(), StatusCode::UNAUTHORIZED);
+    let cc_json: Value =
+        serde_json::from_slice(&cc_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(cc_json["error"], "invalid_client");
+
+    let verifier = "pkce-verifier-with-sufficient-entropy-0123456789";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+
+    // 3. Unauthenticated /oauth2/authorize returns 401
+    let (s, _) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+             &code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // 4. Public client MUST provide PKCE S256 (missing or plain rejected with 400)
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb",
+        Some("Bearer tok-alice-read"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_request");
+
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+             &code_challenge={verifier}&code_challenge_method=plain"
+        ),
+        Some("Bearer tok-alice-read"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_request");
+
+    // 5. Open redirect & missing redirect_uri rejected with 400 when allowlist is set
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &redirect_uri=https%3A%2F%2Fevil.attacker.example%2Fsteal\
+             &code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        Some("Bearer tok-alice-read"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_request");
+
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        Some("Bearer tok-alice-read"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_request");
+
+    // 6. Scope capping: Read-only principal cannot request send or admin
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+             &scope=admin&code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        Some("Bearer tok-alice-read"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_scope");
+
+    // 7. Mailbox binding & anti-enumeration: non-Admin gets identical 403 for existing and unknown login_hint
+    for hint in ["bob@example.com", "does-not-exist@example.com"] {
+        let (s, err) = http_json(
+            &app,
+            "GET",
+            &format!(
+                "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+                 &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+                 &login_hint={hint}&code_challenge={challenge}&code_challenge_method=S256"
+            ),
+            Some("Bearer tok-alice-read"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(err["error"], "access_denied");
+    }
+
+    // 8. Omitting scope defaults to principal's own scopes ([Read]), NOT Admin!
+    let auth_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+                     &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+                     &code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .header(header::AUTHORIZATION, "Bearer tok-alice-read")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth_resp.status(), StatusCode::FOUND);
+    let loc = auth_resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let code = url::Url::parse(loc)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+
+    // Seed an already-expired JTI into used_oauth_codes to verify pruning on write
+    {
+        let mut used = state.used_oauth_codes.lock().await;
+        used.insert("expired-jti-1".to_string(), 1);
+    }
+
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", "public-cli-client")
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", "http://127.0.0.1:8765/cb")
+        .append_pair("code_verifier", verifier)
+        .finish();
+    let tok_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tok_resp.status(), StatusCode::OK);
+    let tok_json: Value =
+        serde_json::from_slice(&tok_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let jwt = tok_json["access_token"].as_str().unwrap();
+
+    // Expired JTI was pruned and only the fresh code remains
+    {
+        let used = state.used_oauth_codes.lock().await;
+        assert!(!used.contains_key("expired-jti-1"));
+        assert_eq!(used.len(), 1);
+    }
+
+    // Minted JWT has ONLY Read scope (can GET messages, cannot POST send)
+    let (s, _) = http_json(
+        &app,
+        "GET",
+        "/v1/messages",
+        Some(&format!("Bearer {jwt}")),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = http_json(
+        &app,
+        "POST",
+        "/v1/messages/send",
+        Some(&format!("Bearer {jwt}")),
+        Some(json!({ "to": ["bob@example.com"], "subject": "No", "text": "No" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // 9. Admin token CAN authorize another configured mailbox via login_hint
+    let admin_auth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+                     &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+                     &login_hint=bob@example.com&scope=read\
+                     &code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .header(header::AUTHORIZATION, "Bearer tok-alice-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_auth.status(), StatusCode::FOUND);
+
+    // 10. When oauth2_redirect_uris is empty, supplying ANY redirect_uri is rejected with 400
+    let mut cfg_no_allowlist = Config::for_test();
+    cfg_no_allowlist.auth_tokens = vec!["tok-admin".to_string()];
+    cfg_no_allowlist.oauth2_client_id = Some("cid".to_string());
+    cfg_no_allowlist.oauth2_client_secret = Some("csec".to_string());
+    cfg_no_allowlist.oauth2_signing_secret = Some("ssec-1234567890".to_string());
+    let state_no = AppState::with_backends(
+        cfg_no_allowlist,
+        Arc::new(MemoryStore::new("agent@example.com")),
+        Arc::new(NoopResend),
+    );
+    let app_no = build_router(state_no);
+    let (s, err) = http_json(
+        &app_no,
+        "GET",
+        "/oauth2/authorize?response_type=code&client_id=cid&redirect_uri=https%3A%2F%2Fevil.example%2Fcb",
+        Some("Bearer tok-admin"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"], "invalid_request");
 }

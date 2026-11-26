@@ -14,6 +14,26 @@ use crate::error::{AppError, AppResult};
 /// Placeholder emitted in `Debug` output and redacted config diagnostics for every secret field.
 pub const REDACTED: &str = "[REDACTED]";
 
+/// Redact credentials, path, query string, and fragment from a webhook or secret-bearing URL,
+/// returning `scheme://host[:port]/[REDACTED]` (or `[REDACTED]` when unparseable).
+pub fn redact_url_for_log(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let scheme = parsed.scheme();
+            match (parsed.host_str(), parsed.port()) {
+                (Some(host), Some(port)) => format!("{scheme}://{host}:{port}/{REDACTED}"),
+                (Some(host), None) => format!("{scheme}://{host}/{REDACTED}"),
+                (None, _) => REDACTED.to_string(),
+            }
+        }
+        Err(_) => REDACTED.to_string(),
+    }
+}
+
 /// Origin of a field value before `*_FILE` environment variable resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueOrigin {

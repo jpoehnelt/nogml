@@ -27,13 +27,32 @@ const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 const MAX_RAW_ERROR_SNIPPET_CHARS: usize = 512;
 
 /// Live HTTP implementation of [`ResendClient`] backed by `reqwest`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpResendClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
     max_body_bytes: usize,
     allow_private_endpoints: bool,
+}
+
+impl std::fmt::Debug for HttpResendClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResendClient")
+            .field("http", &self.http)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("allow_private_endpoints", &self.allow_private_endpoints)
+            .finish()
+    }
 }
 
 impl HttpResendClient {

@@ -35,7 +35,7 @@ const MAX_SMTP_RESPONSE_LINES: usize = 128;
 const MAX_SMTP_LINE_BYTES: usize = 64 * 1024;
 
 /// Configuration for [`SmtpTransport`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: u16,
@@ -44,6 +44,27 @@ pub struct SmtpConfig {
     pub password: Option<String>,
     pub helo_domain: String,
     pub default_from: String,
+}
+
+impl std::fmt::Debug for SmtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls_mode", &self.tls_mode)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("helo_domain", &self.helo_domain)
+            .field("default_from", &self.default_from)
+            .finish()
+    }
 }
 
 impl SmtpConfig {

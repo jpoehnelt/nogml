@@ -30,13 +30,32 @@ Classify the email and reply with ONLY a single JSON object matching: \
 Use standard Gmail labels such as IMPORTANT, CATEGORY_PROMOTIONS, CATEGORY_UPDATES, CATEGORY_SOCIAL, CATEGORY_FORUMS, or concise custom label names containing only letters, digits, underscores, or hyphens.";
 
 /// Configuration for [`LlmTriageFilter`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmTriageConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
     pub timeout: Duration,
     pub max_body_chars: usize,
+}
+
+impl std::fmt::Debug for LlmTriageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmTriageConfig")
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| crate::secrets::REDACTED),
+            )
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("max_body_chars", &self.max_body_chars)
+            .finish()
+    }
 }
 
 impl LlmTriageConfig {

@@ -24,6 +24,13 @@ fn validate_send_as_fields(send_as: &SendAs) -> AppResult<()> {
     Ok(())
 }
 
+fn redact_send_as(mut entry: SendAs) -> SendAs {
+    if let Some(ref mut msa) = entry.smtp_msa {
+        msa.password = None;
+    }
+    entry
+}
+
 /// `GET /gmail/v1/users/{userId}/settings/sendAs`
 pub async fn list_send_as(
     MailboxState(state): MailboxState,
@@ -32,7 +39,7 @@ pub async fn list_send_as(
     resolve_user_id(&user_id, &state.config)?;
     let settings = state.store.get_settings().await?;
     Ok(Json(ListSendAsResponse {
-        send_as: settings.send_as,
+        send_as: settings.send_as.into_iter().map(redact_send_as).collect(),
     }))
 }
 
@@ -49,7 +56,7 @@ pub async fn get_send_as(
         .into_iter()
         .find(|s| s.send_as_email.eq_ignore_ascii_case(&send_as_email))
         .ok_or_else(|| AppError::NotFound(format!("SendAs alias '{send_as_email}' not found")))?;
-    Ok(Json(entry))
+    Ok(Json(redact_send_as(entry)))
 }
 
 /// `POST /gmail/v1/users/{userId}/settings/sendAs`
@@ -97,7 +104,7 @@ pub async fn create_send_as(
 
     settings.send_as.push(payload.clone());
     state.store.save_settings(settings).await?;
-    Ok(Json(payload))
+    Ok(Json(redact_send_as(payload)))
 }
 
 /// `PUT /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
@@ -134,7 +141,7 @@ pub async fn update_send_as(
     let updated = entry.clone();
 
     state.store.save_settings(settings).await?;
-    Ok(Json(updated))
+    Ok(Json(redact_send_as(updated)))
 }
 
 /// `PATCH /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`
@@ -182,7 +189,7 @@ pub async fn patch_send_as(
     let updated = entry.clone();
 
     state.store.save_settings(settings).await?;
-    Ok(Json(updated))
+    Ok(Json(redact_send_as(updated)))
 }
 
 /// `DELETE /gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}`

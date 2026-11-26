@@ -301,6 +301,15 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_OAUTH2_SIGNING_SECRET", global = true)]
     oauth2_signing_secret: Option<String>,
 
+    /// Comma-separated allowlist of permitted OAuth2 `redirect_uri` values on `GET /oauth2/authorize`.
+    #[arg(
+        long,
+        env = "NOGML_OAUTH2_REDIRECT_URIS",
+        value_delimiter = ',',
+        global = true
+    )]
+    oauth2_redirect_uris: Vec<String>,
+
     /// Enable draft-only safety mode (prevent direct agent sends).
     #[arg(long, env = "NOGML_DRAFT_ONLY", default_value_t = false, global = true)]
     draft_only: bool,
@@ -1301,6 +1310,14 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "oauth2_signing_secret") {
             cfg.oauth2_signing_secret = self.oauth2_signing_secret;
+        }
+        if is_explicit(root_matches, "oauth2_redirect_uris") {
+            cfg.oauth2_redirect_uris = self
+                .oauth2_redirect_uris
+                .into_iter()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
         }
         if is_explicit(root_matches, "draft_only") {
             cfg.draft_only = self.draft_only;

@@ -39,6 +39,12 @@ impl ResendTransport {
     }
 }
 
+fn canonicalize_recipients(list: &[String]) -> AppResult<Vec<String>> {
+    list.iter()
+        .map(|addr| crate::ai::safety::canonicalize_recipient(addr))
+        .collect()
+}
+
 fn outbound_to_resend_request(
     msg: &OutboundMessage,
     default_from: &str,
@@ -47,6 +53,16 @@ fn outbound_to_resend_request(
     if msg.to.is_empty() && !msg.raw_rfc2822.is_empty() {
         let parsed = crate::mime::parse_rfc2822(&msg.raw_rfc2822)?;
         let mut req = crate::mime::parsed_to_resend_request(&parsed, default_from)?;
+        req.to = canonicalize_recipients(&req.to)?;
+        if let Some(ref cc) = req.cc {
+            req.cc = Some(canonicalize_recipients(cc)?);
+        }
+        if let Some(ref bcc) = req.bcc {
+            req.bcc = Some(canonicalize_recipients(bcc)?);
+        }
+        if let Some(ref reply_to) = req.reply_to {
+            req.reply_to = Some(canonicalize_recipients(reply_to)?);
+        }
         if req.scheduled_at.is_none() {
             req.scheduled_at = msg.scheduled_at.clone();
         }
@@ -80,6 +96,11 @@ fn outbound_to_resend_request(
             "Outbound message requires at least one To recipient".to_string(),
         ));
     }
+
+    let to = canonicalize_recipients(&msg.to)?;
+    let cc = canonicalize_recipients(&msg.cc)?;
+    let bcc = canonicalize_recipients(&msg.bcc)?;
+    let reply_to = canonicalize_recipients(&msg.reply_to)?;
 
     let attachments = if msg.attachments.is_empty() {
         None
@@ -120,11 +141,11 @@ fn outbound_to_resend_request(
 
     Ok(ResendSendEmailRequest {
         from,
-        to: msg.to.clone(),
+        to,
         subject: msg.subject.clone(),
-        cc: (!msg.cc.is_empty()).then(|| msg.cc.clone()),
-        bcc: (!msg.bcc.is_empty()).then(|| msg.bcc.clone()),
-        reply_to: (!msg.reply_to.is_empty()).then(|| msg.reply_to.clone()),
+        cc: (!cc.is_empty()).then_some(cc),
+        bcc: (!bcc.is_empty()).then_some(bcc),
+        reply_to: (!reply_to.is_empty()).then_some(reply_to),
         html: msg.html.clone(),
         text,
         headers: (!msg.headers.is_empty()).then(|| msg.headers.clone()),
@@ -234,5 +255,32 @@ mod tests {
 
         assert_eq!(outcome.provider, "resend");
         assert_eq!(outcome.provider_message_id, "resend-msg-001");
+    }
+
+    #[test]
+    fn resend_transport_rejects_multi_address_and_canonicalizes_single_recipients() {
+        let bad = OutboundMessage {
+            from: "agent@example.com".into(),
+            to: vec!["external@other.example, <alice@company.com>".into()],
+            subject: "Bad".into(),
+            text: Some("Hi".into()),
+            ..Default::default()
+        };
+        assert!(outbound_to_resend_request(&bad, "agent@example.com").is_err());
+
+        let good = OutboundMessage {
+            from: "agent@example.com".into(),
+            to: vec!["  \"Smith, Alice\"  <alice@company.com> ".into()],
+            cc: vec!["  Bob Jones <bob@company.com>  ".into()],
+            subject: "Good".into(),
+            text: Some("Hi".into()),
+            ..Default::default()
+        };
+        let req = outbound_to_resend_request(&good, "agent@example.com").unwrap();
+        assert_eq!(req.to, vec!["\"Smith, Alice\" <alice@company.com>"]);
+        assert_eq!(
+            req.cc.as_deref(),
+            Some(&["Bob Jones <bob@company.com>".to_string()][..])
+        );
     }
 }

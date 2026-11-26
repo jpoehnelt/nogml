@@ -26,7 +26,6 @@ const AUTH_EXEMPT_PATHS: &[&str] = &[
     "/webhooks/resend",
     "/webhooks/ses",
     "/oauth2/token",
-    "/oauth2/authorize",
     "/.well-known/oauth-authorization-server",
 ];
 
@@ -451,8 +450,15 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
     let trimmed = path.trim_end_matches('/');
     let normalized = if trimmed.is_empty() { "/" } else { trimmed };
 
-    if normalized == "/mcp" || normalized == "/batch/gmail/v1" {
+    if normalized == "/mcp" || normalized == "/batch/gmail/v1" || normalized == "/oauth2/authorize"
+    {
         return None;
+    }
+
+    // Human-in-the-loop approval queue inspection and decisions require `Admin`
+    // so restricted tokens cannot read held DLP-flagged payloads or self-approve.
+    if normalized == "/v1/approvals" || normalized.starts_with("/v1/approvals/") {
+        return Some(AuthScope::Admin);
     }
 
     // `POST /v1/messages/{id}/unsubscribe` enforces `Write` (for `dry_run: true`) or `Send`
@@ -492,11 +498,8 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
         return Some(AuthScope::Send);
     }
 
-    // Account settings mutations and human-in-the-loop approval decisions require `Admin`.
-    if (normalized.starts_with("/gmail/v1/users/") && normalized.contains("/settings/"))
-        || (normalized.starts_with("/v1/approvals/")
-            && (normalized.ends_with("/approve") || normalized.ends_with("/reject")))
-    {
+    // Account settings mutations require `Admin`.
+    if normalized.starts_with("/gmail/v1/users/") && normalized.contains("/settings/") {
         return Some(AuthScope::Admin);
     }
 
@@ -516,7 +519,7 @@ fn is_ai_v1_path(path: &str) -> bool {
 /// insufficient scope), and inserting the resolved [`Principal`] into request extensions.
 ///
 /// Always exempts `/healthz`, `/readyz`, `/webhooks/resend`, `/webhooks/ses`,
-/// `/oauth2/token`, `/oauth2/authorize`, and `/.well-known/oauth-authorization-server`.
+/// `/oauth2/token`, and `/.well-known/oauth-authorization-server`.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -850,7 +853,6 @@ mod tests {
             "/webhooks/resend",
             "/webhooks/ses",
             "/oauth2/token",
-            "/oauth2/authorize",
             "/.well-known/oauth-authorization-server",
         ] {
             assert!(
@@ -858,6 +860,10 @@ mod tests {
                 "path {path} should be marked auth-exempt"
             );
         }
+        assert!(
+            !is_auth_exempt_path("/oauth2/authorize"),
+            "/oauth2/authorize must require authentication"
+        );
         for path in ["/healthz", "/readyz", "/webhooks/resend", "/webhooks/ses"] {
             let res = app
                 .clone()

@@ -100,7 +100,8 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_WATCH_WEBHOOKS));
     let mut in_flight: JoinSet<()> = JoinSet::new();
     let mut rx = state.events.subscribe();
-    info!(%webhook_url, "Gmail /watch push webhook listener started");
+    let redacted_url = crate::secrets::redact_url_for_log(&webhook_url);
+    info!(webhook_url = %redacted_url, "Gmail /watch push webhook listener started");
 
     loop {
         while in_flight.try_join_next().is_some() {}
@@ -166,6 +167,7 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
 
                         let client = client.clone();
                         let webhook_url = webhook_url.clone();
+                        let redacted_url = redacted_url.clone();
                         in_flight.spawn(async move {
                             let _permit = permit;
                             match client.post(&webhook_url).json(&payload).send().await {
@@ -179,14 +181,14 @@ pub async fn run_watch_webhook_listener(state: AppState, mut shutdown: watch::Re
                                 Ok(resp) => {
                                     warn!(
                                         status = %resp.status(),
-                                        %webhook_url,
+                                        webhook_url = %redacted_url,
                                         "Gmail watch webhook returned non-2xx"
                                     );
                                 }
                                 Err(err) => {
                                     warn!(
                                         %err,
-                                        %webhook_url,
+                                        webhook_url = %redacted_url,
                                         "Failed to deliver Gmail watch push notification"
                                     );
                                 }
