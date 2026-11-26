@@ -19,7 +19,7 @@ Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME 
 - **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS. Maps Gmail labels to folders including `[Gmail]/All Mail`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-LABELS`, and pushes updates over `IDLE`.
 - **Pluggable mail transports (Resend, AWS SES, SMTP)**: Sends outbound mail via Resend (`POST /emails` with `Idempotency-Key`), AWS SESv2 raw MIME (`POST /v2/email/outbound-emails` signed with AWS SigV4), or direct SMTP (`STARTTLS`, implicit TLS, or plain TCP with `AUTH PLAIN` / `AUTH LOGIN` and RFC 5321 dot-stuffing). Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures and handles `POST /webhooks/ses` SNS notifications (inline base64 or S3 downloads) through the same inbound ingestion and filtering pipeline.
 - **Upstream Gmail sync (`SyncSource`)**: Imports existing Gmail accounts via pluggable `SyncSource` connectors (`GmailApiSyncSource` for Gmail REST API v1 with OAuth2 refresh, paginated backfill, and incremental `history.list` with automatic 404 full resync, or `GmailImapSyncSource` for Gmail IMAP with `X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`, and supports optional bidirectional label, flag, trash, and delete pushback (`NOGML_SYNC_BIDIRECTIONAL=true`).
-- **CLI (`nogml mail`)**: Runs against the local store or a remote server (`--url`). Outputs JSON automatically when stdout is not a TTY, supports `--ndjson`, `--fields`, and `--payload @-`, and returns deterministic exit codes (`0` ok, `2` validation or config error, `3` policy block, `4` auth or upstream error, `1` runtime error).
+- **CLI (`nogml mail`, `nogml crypto`)**: Runs against the local store or a remote server (`--url`). Outputs JSON automatically when stdout is not a TTY, supports `--ndjson`, `--fields`, and `--payload @-`, provides AES-256-GCM encryption at rest with `nogml crypto generate-key` and `nogml crypto rotate-key`, and returns deterministic exit codes (`0` ok, `2` validation or config error, `3` policy block, `4` auth or upstream error, `1` runtime error).
 
 ## Pluggable traits
 
@@ -289,6 +289,8 @@ Every CLI flag has a matching environment variable:
 | `NOGML_EMBEDDING_API_KEY` | `--embedding-api-key` | *(none)* | Optional Bearer API key for the embeddings endpoint |
 | `NOGML_EMBEDDING_MODEL` | `--embedding-model` | `text-embedding-3-small` | Embedding model name sent to `/embeddings` |
 | `NOGML_EMBEDDING_TIMEOUT_SECS` | `--embedding-timeout-secs` | `15` | HTTP timeout in seconds for embedding requests |
+| `NOGML_ENCRYPTION_KEY` | `--encryption-key` | *(disabled)* | Master AES-256-GCM key (`<kid>:<base64_or_hex>` or bare 32-byte key) for encrypting stored secrets at rest (`NOGML_ENCRYPTION_KEY_FILE` supported) |
+| `NOGML_ENCRYPTION_PREVIOUS_KEYS` | `--encryption-previous-keys` | *(empty)* | Comma-separated previous `<kid>:<key>` entries kept during zero-downtime key rotation (`NOGML_ENCRYPTION_PREVIOUS_KEYS_FILE` supported) |
 | `NOGML_LOG_JSON` | `--log-json` | `false` | Emit JSON logs |
 
 ## Connecting clients

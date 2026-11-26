@@ -156,6 +156,13 @@ model = "gpt-4o-mini"
 timeout_ms = 10000
 max_body_chars = 2000
 
+[security]
+# Optional AES-256-GCM encryption at rest for stored sendAs SMTP passwords and inbox rule webhook secrets.
+# Generate a key with: nogml crypto generate-key --kid k1 --output-file /run/secrets/nogml_encryption_key
+encryption_key = "file:///run/secrets/nogml_encryption_key"
+# Retain previous keys during zero-downtime rotation, then run `nogml crypto rotate-key`:
+# encryption_previous_keys = ["file:///run/secrets/nogml_encryption_key_k1"]
+
 [search]
 # Options: "store", "hybrid"
 backend = "store"
