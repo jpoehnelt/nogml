@@ -26,13 +26,16 @@ use crate::{
         Profile, SYSTEM_LABEL_IDS, SendAs, ThreadSummary, VacationSettings, is_system_label,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, DraftListPage,
-        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
-        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
+        ContactDirection, ContactInteraction, ContactPatch, ContactQuery, ContactRecord,
+        DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo,
+        ImapMessageEntry, MailStore, MessageListPage, MessageListQuery, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
         StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, parse_simple_email_address,
+        UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
+        normalize_contact_email, normalize_optional_text, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
 };
 
@@ -257,6 +260,27 @@ CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_status_created
     ON pending_approvals (mailbox_id, status, created_at_ms DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_created
     ON pending_approvals (mailbox_id, created_at_ms DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    mailbox_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    display_name TEXT,
+    domain TEXT NOT NULL,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    received_count INTEGER NOT NULL DEFAULT 0,
+    replied_by_me_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at_ms INTEGER NOT NULL,
+    last_seen_at_ms INTEGER NOT NULL,
+    last_replied_at_ms INTEGER,
+    is_vip INTEGER NOT NULL DEFAULT 0,
+    vip_override INTEGER,
+    notes TEXT,
+    PRIMARY KEY (mailbox_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_vip_activity
+    ON contacts (mailbox_id, is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC);
+CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_domain
+    ON contacts (mailbox_id, domain);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -1845,6 +1869,7 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         id: thread_id.to_string(),
         subject,
         participants,
+        sender_contact: None,
         snippet,
         labels,
         unread,
@@ -5017,6 +5042,370 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn record_contact_interaction(
+        &self,
+        interaction: &ContactInteraction,
+    ) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(&interaction.email)?;
+        let parsed_name =
+            normalize_optional_text(interaction.display_name.as_deref()).or_else(|| {
+                let parsed = parse_simple_email_address(&interaction.email);
+                normalize_optional_text(parsed.name.as_deref())
+            });
+        let is_sent = interaction.direction == ContactDirection::Sent;
+        let is_received = interaction.direction == ContactDirection::Received;
+        let is_reply = is_sent && interaction.is_reply;
+        let ts = interaction.timestamp_ms;
+
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+
+            let existing = tx
+                .query_row(
+                    "SELECT email, display_name, domain, sent_count, received_count,
+                            replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                            last_replied_at_ms, is_vip, vip_override, notes
+                     FROM contacts
+                     WHERE mailbox_id = ?1 AND email = ?2",
+                    params![mb, &email],
+                    contact_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+
+            let record = match existing {
+                Some(mut rec) => {
+                    if rec.display_name.is_none() && parsed_name.is_some() {
+                        rec.display_name = parsed_name;
+                    }
+                    if is_sent {
+                        rec.sent_count = rec.sent_count.saturating_add(1);
+                    }
+                    if is_received {
+                        rec.received_count = rec.received_count.saturating_add(1);
+                    }
+                    if is_reply {
+                        rec.replied_by_me_count = rec.replied_by_me_count.saturating_add(1);
+                        rec.last_replied_at_ms =
+                            Some(rec.last_replied_at_ms.map_or(ts, |prev| prev.max(ts)));
+                    }
+                    rec.first_seen_at_ms = rec.first_seen_at_ms.min(ts);
+                    rec.last_seen_at_ms = rec.last_seen_at_ms.max(ts);
+                    rec.is_vip = compute_contact_is_vip(rec.vip_override, rec.replied_by_me_count);
+
+                    tx.execute(
+                        "UPDATE contacts
+                         SET display_name = ?1,
+                             sent_count = ?2,
+                             received_count = ?3,
+                             replied_by_me_count = ?4,
+                             first_seen_at_ms = ?5,
+                             last_seen_at_ms = ?6,
+                             last_replied_at_ms = ?7,
+                             is_vip = ?8
+                         WHERE mailbox_id = ?9 AND email = ?10",
+                        params![
+                            &rec.display_name,
+                            rec.sent_count as i64,
+                            rec.received_count as i64,
+                            rec.replied_by_me_count as i64,
+                            rec.first_seen_at_ms,
+                            rec.last_seen_at_ms,
+                            rec.last_replied_at_ms,
+                            i64::from(rec.is_vip),
+                            mb,
+                            &rec.email,
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                    rec
+                }
+                None => {
+                    let replied = if is_reply { 1 } else { 0 };
+                    let rec = ContactRecord {
+                        email: email.clone(),
+                        display_name: parsed_name,
+                        domain,
+                        sent_count: if is_sent { 1 } else { 0 },
+                        received_count: if is_received { 1 } else { 0 },
+                        replied_by_me_count: replied,
+                        first_seen_at_ms: ts,
+                        last_seen_at_ms: ts,
+                        last_replied_at_ms: is_reply.then_some(ts),
+                        is_vip: compute_contact_is_vip(None, replied),
+                        vip_override: None,
+                        notes: None,
+                    };
+                    tx.execute(
+                        "INSERT INTO contacts (
+                            mailbox_id, email, display_name, domain,
+                            sent_count, received_count, replied_by_me_count,
+                            first_seen_at_ms, last_seen_at_ms, last_replied_at_ms,
+                            is_vip, vip_override, notes
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL)",
+                        params![
+                            mb,
+                            &rec.email,
+                            &rec.display_name,
+                            &rec.domain,
+                            rec.sent_count as i64,
+                            rec.received_count as i64,
+                            rec.replied_by_me_count as i64,
+                            rec.first_seen_at_ms,
+                            rec.last_seen_at_ms,
+                            rec.last_replied_at_ms,
+                            i64::from(rec.is_vip),
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                    rec
+                }
+            };
+
+            tx.commit().map_err(sql_err)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    async fn get_contact(&self, email: &str) -> AppResult<Option<ContactRecord>> {
+        let normalized = normalize_contact_email(email);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        self.run_blocking(move |conn, mb| {
+            conn.query_row(
+                "SELECT email, display_name, domain, sent_count, received_count,
+                        replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                        last_replied_at_ms, is_vip, vip_override, notes
+                 FROM contacts
+                 WHERE mailbox_id = ?1 AND email = ?2",
+                params![mb, &normalized],
+                contact_from_row,
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>> {
+        let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+        let q_pattern = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", escape_sql_like(&s.to_ascii_lowercase())));
+        let domain_filter = query
+            .domain
+            .as_deref()
+            .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let vip_only = query.vip_only;
+        let replied_only = query.replied_only;
+
+        self.run_blocking(move |conn, mb| {
+            let mut sql = String::from(
+                "SELECT email, display_name, domain, sent_count, received_count,
+                        replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                        last_replied_at_ms, is_vip, vip_override, notes
+                 FROM contacts
+                 WHERE mailbox_id = ?1",
+            );
+            let mut values: Vec<SqlValue> = vec![SqlValue::from(mb.to_string())];
+
+            if vip_only {
+                sql.push_str(" AND is_vip = 1");
+            }
+            if replied_only {
+                sql.push_str(" AND replied_by_me_count > 0");
+            }
+            if let Some(dom) = domain_filter {
+                values.push(SqlValue::from(dom));
+                sql.push_str(&format!(" AND domain = ?{}", values.len()));
+            }
+            if let Some(pat) = q_pattern {
+                values.push(SqlValue::from(pat));
+                let idx = values.len();
+                sql.push_str(&format!(
+                    " AND (LOWER(email) LIKE ?{idx} ESCAPE '\\' \
+                           OR LOWER(COALESCE(display_name, '')) LIKE ?{idx} ESCAPE '\\' \
+                           OR LOWER(domain) LIKE ?{idx} ESCAPE '\\' \
+                           OR LOWER(COALESCE(notes, '')) LIKE ?{idx} ESCAPE '\\')"
+                ));
+            }
+
+            values.push(SqlValue::from(limit));
+            sql.push_str(&format!(
+                " ORDER BY is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC \
+                  LIMIT ?{}",
+                values.len()
+            ));
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), contact_from_row)
+                .map_err(sql_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_err)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn patch_contact(&self, email: &str, patch: &ContactPatch) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(email)?;
+        let patch = patch.clone();
+        self.run_blocking(move |conn, mb| {
+            let now_ms = Utc::now().timestamp_millis();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+
+            let existing = tx
+                .query_row(
+                    "SELECT email, display_name, domain, sent_count, received_count,
+                            replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                            last_replied_at_ms, is_vip, vip_override, notes
+                     FROM contacts
+                     WHERE mailbox_id = ?1 AND email = ?2",
+                    params![mb, &email],
+                    contact_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+
+            let record = match existing {
+                Some(mut rec) => {
+                    if let Some(vip) = patch.is_vip {
+                        rec.vip_override = Some(vip);
+                    }
+                    rec.is_vip = compute_contact_is_vip(rec.vip_override, rec.replied_by_me_count);
+                    if let Some(ref name) = patch.display_name {
+                        rec.display_name = normalize_optional_text(Some(name.as_str()));
+                    }
+                    if let Some(ref notes) = patch.notes {
+                        rec.notes = normalize_optional_text(Some(notes.as_str()));
+                    }
+                    tx.execute(
+                        "UPDATE contacts
+                         SET display_name = ?1,
+                             is_vip = ?2,
+                             vip_override = ?3,
+                             notes = ?4
+                         WHERE mailbox_id = ?5 AND email = ?6",
+                        params![
+                            &rec.display_name,
+                            i64::from(rec.is_vip),
+                            rec.vip_override.map(i64::from),
+                            &rec.notes,
+                            mb,
+                            &rec.email,
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                    rec
+                }
+                None => {
+                    let rec = ContactRecord {
+                        email: email.clone(),
+                        display_name: patch
+                            .display_name
+                            .as_deref()
+                            .and_then(|s| normalize_optional_text(Some(s))),
+                        domain,
+                        sent_count: 0,
+                        received_count: 0,
+                        replied_by_me_count: 0,
+                        first_seen_at_ms: now_ms,
+                        last_seen_at_ms: now_ms,
+                        last_replied_at_ms: None,
+                        is_vip: compute_contact_is_vip(patch.is_vip, 0),
+                        vip_override: patch.is_vip,
+                        notes: patch
+                            .notes
+                            .as_deref()
+                            .and_then(|s| normalize_optional_text(Some(s))),
+                    };
+                    tx.execute(
+                        "INSERT INTO contacts (
+                            mailbox_id, email, display_name, domain,
+                            sent_count, received_count, replied_by_me_count,
+                            first_seen_at_ms, last_seen_at_ms, last_replied_at_ms,
+                            is_vip, vip_override, notes
+                         ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, ?5, ?6, NULL, ?7, ?8, ?9)",
+                        params![
+                            mb,
+                            &rec.email,
+                            &rec.display_name,
+                            &rec.domain,
+                            rec.first_seen_at_ms,
+                            rec.last_seen_at_ms,
+                            i64::from(rec.is_vip),
+                            rec.vip_override.map(i64::from),
+                            &rec.notes,
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                    rec
+                }
+            };
+
+            tx.commit().map_err(sql_err)?;
+            Ok(record)
+        })
+        .await
+    }
+}
+
+fn contact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRecord> {
+    let email: String = row.get(0)?;
+    let display_name: Option<String> = row.get(1)?;
+    let domain: String = row.get(2)?;
+    let sent_count: i64 = row.get(3)?;
+    let received_count: i64 = row.get(4)?;
+    let replied_by_me_count: i64 = row.get(5)?;
+    let first_seen_at_ms: i64 = row.get(6)?;
+    let last_seen_at_ms: i64 = row.get(7)?;
+    let last_replied_at_ms: Option<i64> = row.get(8)?;
+    let is_vip_int: i64 = row.get(9)?;
+    let vip_override_int: Option<i64> = row.get(10)?;
+    let notes: Option<String> = row.get(11)?;
+
+    Ok(ContactRecord {
+        email,
+        display_name,
+        domain,
+        sent_count: sent_count.max(0) as u64,
+        received_count: received_count.max(0) as u64,
+        replied_by_me_count: replied_by_me_count.max(0) as u64,
+        first_seen_at_ms,
+        last_seen_at_ms,
+        last_replied_at_ms,
+        is_vip: is_vip_int != 0,
+        vip_override: vip_override_int.map(|v| v != 0),
+        notes,
+    })
+}
+
+fn escape_sql_like(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn pending_approval_from_row(

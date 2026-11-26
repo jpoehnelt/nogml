@@ -49,9 +49,13 @@ use crate::{
     events::EventBus,
     filter::{InboundFilter, open_filter},
     gmail::upload::ResumableUploadStore,
+    models::{LABEL_DRAFT, LABEL_SENT},
     resend::{HttpResendClient, ResendClient, ResendTransport},
     search_index::{SearchIndex, StoreSearchIndex, open_search_index},
-    storage::{MailStore, StoredAttachment, StoredMessage, open_store},
+    storage::{
+        ContactDirection, ContactInteraction, MailStore, StoredAttachment, StoredMessage,
+        open_store, parse_simple_email_address, validate_and_normalize_contact_email,
+    },
     transport::{MailTransport, open_transport},
 };
 
@@ -449,6 +453,68 @@ impl AppState {
             }
         }
         self.search.index(msg).await?;
+        self.record_contacts_for_message(msg).await?;
+        Ok(())
+    }
+
+    /// Update the local per-mailbox contact graph from a newly stored message.
+    ///
+    /// - Messages carrying `DRAFT` are skipped.
+    /// - Messages carrying `SENT` record `ContactDirection::Sent` (with
+    ///   `is_reply = in_reply_to.is_some()`) for each unique recipient in `to_addrs` and
+    ///   `cc_addrs`, skipping the mailbox's own address.
+    /// - All other messages record `ContactDirection::Received` for `from_addr`, skipping the
+    ///   mailbox's own address.
+    async fn record_contacts_for_message(&self, msg: &StoredMessage) -> AppResult<()> {
+        if msg.label_ids.iter().any(|l| l == LABEL_DRAFT) {
+            return Ok(());
+        }
+
+        let self_email = self.store.mailbox_id().trim().to_ascii_lowercase();
+        let config_email = self.config.user_email.trim().to_ascii_lowercase();
+        let is_self = |addr: &str| {
+            (!self_email.is_empty() && addr == self_email)
+                || (!config_email.is_empty() && addr == config_email)
+        };
+
+        if msg.label_ids.iter().any(|l| l == LABEL_SENT) {
+            let is_reply = msg
+                .in_reply_to
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let mut seen = HashSet::new();
+            for raw in msg.to_addrs.iter().chain(msg.cc_addrs.iter()) {
+                let parsed = parse_simple_email_address(raw);
+                let Ok((email, _)) = validate_and_normalize_contact_email(&parsed.email) else {
+                    continue;
+                };
+                if is_self(&email) || !seen.insert(email.clone()) {
+                    continue;
+                }
+                let interaction = ContactInteraction {
+                    email,
+                    display_name: parsed.name,
+                    direction: ContactDirection::Sent,
+                    is_reply,
+                    timestamp_ms: msg.internal_date_ms,
+                };
+                self.store.record_contact_interaction(&interaction).await?;
+            }
+        } else {
+            let parsed = parse_simple_email_address(&msg.from_addr);
+            if let Ok((email, _)) = validate_and_normalize_contact_email(&parsed.email)
+                && !is_self(&email)
+            {
+                let interaction = ContactInteraction {
+                    email,
+                    display_name: parsed.name,
+                    direction: ContactDirection::Received,
+                    is_reply: false,
+                    timestamp_ms: msg.internal_date_ms,
+                };
+                self.store.record_contact_interaction(&interaction).await?;
+            }
+        }
         Ok(())
     }
 

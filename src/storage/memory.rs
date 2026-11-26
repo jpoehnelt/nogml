@@ -19,13 +19,16 @@ use crate::{
         ThreadSummary, is_system_label,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, DraftListPage,
-        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
-        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
+        ContactDirection, ContactInteraction, ContactPatch, ContactQuery, ContactRecord,
+        DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo,
+        ImapMessageEntry, MailStore, MessageListPage, MessageListQuery, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
         StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, parse_simple_email_address,
+        UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
+        normalize_contact_email, normalize_optional_text, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
 };
 
@@ -84,6 +87,7 @@ struct MemoryState {
     watch: Option<WatchSubscription>,
     settings: UserSettings,
     pending_approvals: HashMap<String, PendingApproval>,
+    contacts: HashMap<String, ContactRecord>,
 }
 
 impl MemoryState {
@@ -135,6 +139,7 @@ impl MemoryState {
             watch: None,
             settings: UserSettings::default_for_email(default_email),
             pending_approvals: HashMap::new(),
+            contacts: HashMap::new(),
         }
     }
 
@@ -1045,6 +1050,7 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         id: thread_id.to_string(),
         subject,
         participants,
+        sender_contact: None,
         snippet,
         labels,
         unread,
@@ -2888,6 +2894,182 @@ impl MailStore for MemoryStore {
         entry.decided_at_ms = Some(now_ms);
 
         Ok(entry.clone())
+    }
+
+    async fn record_contact_interaction(
+        &self,
+        interaction: &ContactInteraction,
+    ) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(&interaction.email)?;
+        let parsed_name =
+            normalize_optional_text(interaction.display_name.as_deref()).or_else(|| {
+                let parsed = parse_simple_email_address(&interaction.email);
+                normalize_optional_text(parsed.name.as_deref())
+            });
+        let is_sent = interaction.direction == ContactDirection::Sent;
+        let is_received = interaction.direction == ContactDirection::Received;
+        let is_reply = is_sent && interaction.is_reply;
+        let ts = interaction.timestamp_ms;
+
+        let mut state = self.write_state()?;
+        let record = match state.contacts.get_mut(&email) {
+            Some(existing) => {
+                if existing.display_name.is_none() && parsed_name.is_some() {
+                    existing.display_name = parsed_name;
+                }
+                if is_sent {
+                    existing.sent_count = existing.sent_count.saturating_add(1);
+                }
+                if is_received {
+                    existing.received_count = existing.received_count.saturating_add(1);
+                }
+                if is_reply {
+                    existing.replied_by_me_count = existing.replied_by_me_count.saturating_add(1);
+                    existing.last_replied_at_ms =
+                        Some(existing.last_replied_at_ms.map_or(ts, |prev| prev.max(ts)));
+                }
+                existing.first_seen_at_ms = existing.first_seen_at_ms.min(ts);
+                existing.last_seen_at_ms = existing.last_seen_at_ms.max(ts);
+                existing.is_vip =
+                    compute_contact_is_vip(existing.vip_override, existing.replied_by_me_count);
+                existing.clone()
+            }
+            None => {
+                let replied = if is_reply { 1 } else { 0 };
+                let created = ContactRecord {
+                    email: email.clone(),
+                    display_name: parsed_name,
+                    domain,
+                    sent_count: if is_sent { 1 } else { 0 },
+                    received_count: if is_received { 1 } else { 0 },
+                    replied_by_me_count: replied,
+                    first_seen_at_ms: ts,
+                    last_seen_at_ms: ts,
+                    last_replied_at_ms: is_reply.then_some(ts),
+                    is_vip: compute_contact_is_vip(None, replied),
+                    vip_override: None,
+                    notes: None,
+                };
+                state.contacts.insert(email, created.clone());
+                created
+            }
+        };
+        Ok(record)
+    }
+
+    async fn get_contact(&self, email: &str) -> AppResult<Option<ContactRecord>> {
+        let normalized = normalize_contact_email(email);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let state = self.read_state()?;
+        Ok(state.contacts.get(&normalized).cloned())
+    }
+
+    async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>> {
+        let limit = if query.limit == 0 { 50 } else { query.limit };
+        let q_lower = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase);
+        let domain_filter = query
+            .domain
+            .as_deref()
+            .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+
+        let state = self.read_state()?;
+        let mut items: Vec<ContactRecord> = state
+            .contacts
+            .values()
+            .filter(|c| {
+                if query.vip_only && !c.is_vip {
+                    return false;
+                }
+                if query.replied_only && c.replied_by_me_count == 0 {
+                    return false;
+                }
+                if let Some(ref dom) = domain_filter
+                    && c.domain != *dom
+                {
+                    return false;
+                }
+                if let Some(ref q) = q_lower {
+                    let matches = c.email.contains(q)
+                        || c.domain.contains(q)
+                        || c.display_name
+                            .as_deref()
+                            .is_some_and(|n| n.to_ascii_lowercase().contains(q))
+                        || c.notes
+                            .as_deref()
+                            .is_some_and(|n| n.to_ascii_lowercase().contains(q));
+                    if !matches {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        items.sort_by(|a, b| {
+            b.is_vip
+                .cmp(&a.is_vip)
+                .then_with(|| b.replied_by_me_count.cmp(&a.replied_by_me_count))
+                .then_with(|| b.last_seen_at_ms.cmp(&a.last_seen_at_ms))
+                .then_with(|| a.email.cmp(&b.email))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn patch_contact(&self, email: &str, patch: &ContactPatch) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(email)?;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.write_state()?;
+        let record = match state.contacts.get_mut(&email) {
+            Some(existing) => {
+                if let Some(vip) = patch.is_vip {
+                    existing.vip_override = Some(vip);
+                }
+                existing.is_vip =
+                    compute_contact_is_vip(existing.vip_override, existing.replied_by_me_count);
+                if let Some(ref name) = patch.display_name {
+                    existing.display_name = normalize_optional_text(Some(name.as_str()));
+                }
+                if let Some(ref notes) = patch.notes {
+                    existing.notes = normalize_optional_text(Some(notes.as_str()));
+                }
+                existing.clone()
+            }
+            None => {
+                let created = ContactRecord {
+                    email: email.clone(),
+                    display_name: patch
+                        .display_name
+                        .as_deref()
+                        .and_then(|s| normalize_optional_text(Some(s))),
+                    domain,
+                    sent_count: 0,
+                    received_count: 0,
+                    replied_by_me_count: 0,
+                    first_seen_at_ms: now_ms,
+                    last_seen_at_ms: now_ms,
+                    last_replied_at_ms: None,
+                    is_vip: compute_contact_is_vip(patch.is_vip, 0),
+                    vip_override: patch.is_vip,
+                    notes: patch
+                        .notes
+                        .as_deref()
+                        .and_then(|s| normalize_optional_text(Some(s))),
+                };
+                state.contacts.insert(email, created.clone());
+                created
+            }
+        };
+        Ok(record)
     }
 }
 

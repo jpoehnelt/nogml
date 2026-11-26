@@ -716,12 +716,30 @@ pub struct UntrustedMeta {
     pub untrusted_external_content: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactSummary {
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub domain: String,
+    pub sent_count: u64,
+    pub received_count: u64,
+    pub replied_by_me_count: u64,
+    pub is_vip: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_replied_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactMessage {
     pub id: String,
     pub thread_id: String,
     pub date: DateTime<Utc>,
     pub from: EmailAddress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_contact: Option<ContactSummary>,
     pub to: Vec<EmailAddress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cc: Vec<EmailAddress>,
@@ -757,6 +775,8 @@ pub struct ThreadSummary {
     pub id: String,
     pub subject: String,
     pub participants: Vec<EmailAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_contact: Option<ContactSummary>,
     pub snippet: String,
     pub labels: Vec<String>,
     pub unread: bool,

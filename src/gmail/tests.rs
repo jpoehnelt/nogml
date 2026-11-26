@@ -752,6 +752,62 @@ impl MailStore for MockStore {
     ) -> AppResult<crate::storage::PendingApproval> {
         unimplemented!()
     }
+    async fn record_contact_interaction(
+        &self,
+        interaction: &crate::storage::ContactInteraction,
+    ) -> AppResult<crate::storage::ContactRecord> {
+        let (email, domain) =
+            crate::storage::validate_and_normalize_contact_email(&interaction.email)?;
+        Ok(crate::storage::ContactRecord {
+            email,
+            display_name: interaction.display_name.clone(),
+            domain,
+            sent_count: u64::from(interaction.direction == crate::storage::ContactDirection::Sent),
+            received_count: u64::from(
+                interaction.direction == crate::storage::ContactDirection::Received,
+            ),
+            replied_by_me_count: u64::from(
+                interaction.direction == crate::storage::ContactDirection::Sent
+                    && interaction.is_reply,
+            ),
+            first_seen_at_ms: interaction.timestamp_ms,
+            last_seen_at_ms: interaction.timestamp_ms,
+            last_replied_at_ms: None,
+            is_vip: false,
+            vip_override: None,
+            notes: None,
+        })
+    }
+    async fn get_contact(&self, _email: &str) -> AppResult<Option<crate::storage::ContactRecord>> {
+        Ok(None)
+    }
+    async fn list_contacts(
+        &self,
+        _query: &crate::storage::ContactQuery,
+    ) -> AppResult<Vec<crate::storage::ContactRecord>> {
+        Ok(Vec::new())
+    }
+    async fn patch_contact(
+        &self,
+        email: &str,
+        patch: &crate::storage::ContactPatch,
+    ) -> AppResult<crate::storage::ContactRecord> {
+        let (email, domain) = crate::storage::validate_and_normalize_contact_email(email)?;
+        Ok(crate::storage::ContactRecord {
+            email,
+            display_name: patch.display_name.clone(),
+            domain,
+            sent_count: 0,
+            received_count: 0,
+            replied_by_me_count: 0,
+            first_seen_at_ms: 0,
+            last_seen_at_ms: 0,
+            last_replied_at_ms: None,
+            is_vip: patch.is_vip.unwrap_or(false),
+            vip_override: patch.is_vip,
+            notes: patch.notes.clone(),
+        })
+    }
 }
 
 fn test_app_with_config(cfg: Config) -> (AppState, Arc<MockResend>, Router) {
