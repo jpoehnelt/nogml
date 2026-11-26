@@ -2160,6 +2160,7 @@ impl AuthProvider for ScopedCustomAuth {
                     allowed_recipients: None,
                     max_send_recipients: Some(10),
                 }),
+                is_global_admin: false,
             }),
             _ => Err(AppError::Unauthorized(
                 "invalid custom bearer token".to_string(),
@@ -2175,6 +2176,7 @@ impl AuthProvider for ScopedCustomAuth {
                 shared_mailboxes: Vec::new(),
                 scopes: vec![AuthScope::Read, AuthScope::Write],
                 agent_policy: None,
+                is_global_admin: false,
             })
         } else {
             Err(AppError::Unauthorized(

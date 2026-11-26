@@ -1319,7 +1319,8 @@ impl McpServer {
     async fn tool_sync_gmail(&self, args: Value) -> AppResult<Value> {
         let req: SyncTriggerRequest = serde_json::from_value(args)?;
         let opts = ai::parse_sync_trigger(req)?;
-        let report = sync::run_gmail_sync(&self.state, opts).await?;
+        let report =
+            sync::run_gmail_sync_for_principal(&self.state, opts, Some(&self.principal)).await?;
         Ok(serde_json::to_value(report)?)
     }
 

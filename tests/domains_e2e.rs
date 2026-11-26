@@ -394,9 +394,10 @@ async fn domains_auth_scopes_tenant_isolation_and_validation() {
     let mut cfg = Config::for_test();
     cfg.user_email = "alice@example.com".to_string();
     cfg.mailboxes = vec!["bob@example.com".to_string()];
+    cfg.auth_tokens = vec!["tok_admin".to_string()];
     cfg.scoped_tokens = vec![
         ScopedTokenConfig {
-            token: "tok_admin".to_string(),
+            token: "tok_alice_admin".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
             shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
@@ -556,7 +557,64 @@ async fn domains_auth_scopes_tenant_isolation_and_validation() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Admin sees all domains across all mailboxes.
+    // Mailbox-scoped Admin token for Alice MUST NOT list Bob's domain, hijack/delete Bob's domain,
+    // or manually self-verify her own manual domain.
+    let (status, alice_admin_list) = http_req(
+        &app,
+        Method::GET,
+        "/v1/domains",
+        Some("tok_alice_admin"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(alice_admin_list["count"], 1);
+    assert_eq!(
+        alice_admin_list["domains"][0]["domain"],
+        "xn--mnchen-3ya.de"
+    );
+
+    let (status, _) = http_req(
+        &app,
+        Method::GET,
+        "/v1/domains?mailbox_id=bob@example.com",
+        Some("tok_alice_admin"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = http_req(
+        &app,
+        Method::PATCH,
+        "/v1/domains/bob.io",
+        Some("tok_alice_admin"),
+        Some(json!({ "catch_all_mailbox": "alice@example.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = http_req(
+        &app,
+        Method::DELETE,
+        "/v1/domains/bob.io",
+        Some("tok_alice_admin"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = http_req(
+        &app,
+        Method::PATCH,
+        "/v1/domains/xn--mnchen-3ya.de",
+        Some("tok_alice_admin"),
+        Some(json!({ "status": "verified" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Global admin sees all domains across all mailboxes.
     let (status, admin_list) =
         http_req(&app, Method::GET, "/v1/domains", Some("tok_admin"), None).await;
     assert_eq!(status, StatusCode::OK);

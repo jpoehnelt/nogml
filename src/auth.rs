@@ -136,6 +136,7 @@ impl ScopedTokenConfig {
             shared_mailboxes,
             scopes: self.scopes.clone(),
             agent_policy,
+            is_global_admin: false,
         }
     }
 }
@@ -149,6 +150,11 @@ pub struct Principal {
     pub scopes: Vec<AuthScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_policy: Option<AgentPolicyOverride>,
+    /// True only for unscoped global operator tokens (`auth.tokens`, open dev mode, or explicit
+    /// operator principals). Always `false` for mailbox-scoped tokens and OAuth2 JWTs, even when
+    /// they hold `AuthScope::Admin`.
+    #[serde(default)]
+    pub is_global_admin: bool,
 }
 
 /// Target mailbox resolved for an authenticated HTTP request (either `principal.mailbox_id`
@@ -160,7 +166,7 @@ pub struct ResolvedMailbox(pub String);
 pub const MAILBOX_HEADER: &str = "x-nogml-mailbox";
 
 impl Principal {
-    /// Construct a full-access principal for `mailbox_id`.
+    /// Construct a full-access global operator principal for `mailbox_id`.
     pub fn full_access(mailbox_id: impl Into<String>) -> Self {
         Self {
             mailbox_id: mailbox_id.into(),
@@ -172,6 +178,24 @@ impl Principal {
                 AuthScope::Admin,
             ],
             agent_policy: None,
+            is_global_admin: true,
+        }
+    }
+
+    /// Returns `true` if this principal holds global operator privilege (`is_global_admin`
+    /// and `AuthScope::Admin`).
+    pub fn is_global_admin(&self) -> bool {
+        self.is_global_admin && self.has_scope(AuthScope::Admin)
+    }
+
+    /// Return `Ok(())` if this principal holds global operator privilege, otherwise `403 Forbidden`.
+    pub fn require_global_admin(&self) -> AppResult<()> {
+        if self.is_global_admin() {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden(
+                "Global admin token is required for this operation".to_string(),
+            ))
         }
     }
 
@@ -571,6 +595,20 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
     Some(AuthScope::Write)
 }
 
+/// Determine whether an HTTP `method` + `path` mutates global cross-tenant state and therefore
+/// requires a global operator token (`Principal::is_global_admin()`).
+pub fn requires_global_admin_http(method: &Method, path: &str) -> bool {
+    if method == Method::OPTIONS || method == Method::GET || method == Method::HEAD {
+        return false;
+    }
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    normalized == "/v1/suppression"
+        || normalized.starts_with("/v1/suppression/")
+        || normalized == "/v1/deliverability"
+        || normalized.starts_with("/v1/deliverability/")
+}
+
 fn is_ai_v1_path(path: &str) -> bool {
     (path == "/v1" || path.starts_with("/v1/"))
         && path != "/v1/people"
@@ -677,6 +715,15 @@ pub async fn require_auth(
 
     if let Some(required_scope) = required_http_scope(req.method(), &path)
         && let Err(err) = principal.require_scope(required_scope)
+    {
+        if is_ai_v1_path(&path) {
+            return Ok(err.into_ai_response());
+        }
+        return Err(err);
+    }
+
+    if requires_global_admin_http(req.method(), &path)
+        && let Err(err) = principal.require_global_admin()
     {
         if is_ai_v1_path(&path) {
             return Ok(err.into_ai_response());

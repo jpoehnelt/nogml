@@ -180,6 +180,105 @@ fn parse_builder_address(raw: &str) -> Option<BuilderAddress<'static>> {
     Some(BuilderAddress::new_address(parsed.name, parsed.email))
 }
 
+/// Inspect the top-level RFC 2822 header block of `raw` directly and enforce strict single-sender
+/// `From` header invariants before any outbound dispatch:
+/// - Rejects messages containing more than one `From` header.
+/// - Rejects non-UTF-8, empty, multi-mailbox, or malformed `From` headers via
+///   [`crate::storage::parse_strict_single_mailbox`].
+/// - Returns `Ok(None)` when the raw header block contains no `From` header, or
+///   `Ok(Some((raw_header_value, parsed_email_address)))` when a single valid `From` header is present.
+pub fn validate_raw_from_header(
+    raw: &[u8],
+) -> AppResult<Option<(String, crate::models::EmailAddress)>> {
+    let mut unfolded_headers: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < raw.len() {
+        let line_end = raw[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|rel| pos + rel)
+            .unwrap_or(raw.len());
+        let mut line = &raw[pos..line_end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        pos = if line_end < raw.len() {
+            line_end + 1
+        } else {
+            raw.len()
+        };
+
+        if line.is_empty() {
+            break;
+        }
+
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            if let Some(prev) = unfolded_headers.last_mut() {
+                let trimmed = line
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .map(|idx| &line[idx..])
+                    .unwrap_or(&[]);
+                if !trimmed.is_empty() {
+                    prev.push(b' ');
+                    prev.extend_from_slice(trimmed);
+                }
+            }
+        } else {
+            unfolded_headers.push(line.to_vec());
+        }
+    }
+
+    let mut from_values: Vec<String> = Vec::new();
+    for header in unfolded_headers {
+        let Some(colon) = header.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(&header[..colon]) else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("from") {
+            continue;
+        }
+        let val = std::str::from_utf8(&header[colon + 1..]).map_err(|_| {
+            AppError::validation(
+                "Raw RFC 2822 From header contains invalid UTF-8 bytes",
+                Some("Provide a valid UTF-8/ASCII RFC 5322 From header.".to_string()),
+            )
+        })?;
+        from_values.push(val.trim().to_string());
+    }
+
+    if from_values.is_empty() {
+        return Ok(None);
+    }
+    if from_values.len() > 1 {
+        return Err(AppError::validation(
+            "Raw RFC 2822 message must not contain multiple From headers",
+            Some(
+                "Provide at most one From header with a single authorized sender address."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let raw_val = from_values.remove(0);
+    let parsed = crate::storage::parse_strict_single_mailbox(&raw_val).map_err(|reason| {
+        AppError::validation(
+            format!("Invalid raw RFC 2822 From header: {reason}"),
+            Some("Provide a single RFC 5322 mailbox in the From header.".to_string()),
+        )
+    })?;
+    let canonical = if parsed.name.is_none() {
+        parsed.email.clone()
+    } else {
+        raw_val
+    };
+
+    Ok(Some((canonical, parsed)))
+}
+
 /// Parse raw RFC 2822 message bytes into a [`ParsedEmail`].
 pub fn parse_rfc2822(raw: &[u8]) -> AppResult<ParsedEmail> {
     if raw.is_empty() {

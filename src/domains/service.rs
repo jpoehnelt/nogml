@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::{
     AppState,
     ai::safety::validate_single_recipient,
-    auth::{AuthScope, Principal},
+    auth::Principal,
     config::normalize_mailbox_id,
     domains::{
         DnsRecord, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate, NewDomainInput,
@@ -57,8 +57,8 @@ where
     Ok(Some(Option::<String>::deserialize(deserializer)?))
 }
 
-fn is_admin_principal(principal: Option<&Principal>) -> bool {
-    principal.is_none_or(|p| p.has_scope(AuthScope::Admin))
+fn is_global_admin_principal(principal: Option<&Principal>) -> bool {
+    principal.is_none_or(Principal::is_global_admin)
 }
 
 fn authorize_mailbox_access(
@@ -66,7 +66,7 @@ fn authorize_mailbox_access(
     target_mailbox: &str,
     context: &str,
 ) -> AppResult<()> {
-    if is_admin_principal(principal) {
+    if is_global_admin_principal(principal) {
         return Ok(());
     }
     if let Some(p) = principal
@@ -80,7 +80,7 @@ fn authorize_mailbox_access(
 }
 
 fn authorize_domain_access(principal: Option<&Principal>, record: &DomainRecord) -> AppResult<()> {
-    if is_admin_principal(principal) {
+    if is_global_admin_principal(principal) {
         return Ok(());
     }
     if let Some(p) = principal
@@ -155,6 +155,7 @@ pub async fn execute_create_domain(
 
     let provider = state.domain_providers.get(provider_kind)?;
     let prov_res = provider.create_domain(&domain).await?;
+    let provider_domain_id = prov_res.provider_domain_id.clone();
 
     let input = NewDomainInput {
         id: None,
@@ -172,7 +173,24 @@ pub async fn execute_create_domain(
         last_error: prov_res.last_error,
     };
 
-    let created = state.store.create_domain(input).await?;
+    let created = match state.store.create_domain(input).await {
+        Ok(created) => created,
+        Err(err) => {
+            if let Err(cleanup_err) = provider
+                .delete_domain(&domain, provider_domain_id.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    domain = %domain,
+                    provider = %provider_kind.as_str(),
+                    cleanup_error = %cleanup_err,
+                    store_error = %err,
+                    "Compensating upstream domain delete failed after store insert error"
+                );
+            }
+            return Err(err);
+        }
+    };
     state
         .record_audit(
             principal,
@@ -197,7 +215,7 @@ pub async fn execute_list_domains(
         .map(normalize_mailbox_id)
         .filter(|s| !s.is_empty());
 
-    if is_admin_principal(principal) {
+    if is_global_admin_principal(principal) {
         return state.store.list_domains(filter_mb.as_deref()).await;
     }
 
@@ -284,9 +302,9 @@ pub async fn execute_patch_domain(
                 )),
             ));
         }
-        if !is_admin_principal(principal) {
+        if !is_global_admin_principal(principal) {
             return Err(AppError::Forbidden(
-                "Admin scope is required to manually override domain verification status"
+                "Global admin token is required to manually override domain verification status"
                     .to_string(),
             ));
         }
