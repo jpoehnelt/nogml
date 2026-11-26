@@ -30,6 +30,12 @@ use crate::{
     transport::OutboundMessage,
 };
 
+pub use crate::deliverability::{
+    DeliverabilityCounts, DeliverabilityEvent, DeliverabilityEventKind, DomainDeliverabilityState,
+    NewDeliverabilityEvent, NewSuppressionInput, SuppressionEntry, SuppressionQuery,
+    SuppressionReason, SuppressionSource, normalize_deliverability_domain,
+    validate_and_normalize_suppression_email, validate_deliverability_domain,
+};
 pub use crate::domains::{
     DnsRecord, DnsRecordPurpose, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
     NewDomainInput, apply_domain_update, normalize_and_validate_domain,
@@ -1801,6 +1807,48 @@ pub trait MailStore: Send + Sync {
     async fn list_domains(&self, mailbox_id: Option<&str>) -> AppResult<Vec<DomainRecord>>;
     async fn update_domain(&self, domain: &str, update: &DomainUpdate) -> AppResult<DomainRecord>;
     async fn delete_domain(&self, domain: &str) -> AppResult<bool>;
+
+    // --- Deliverability Protection (Suppression List, Events & Circuit Breaker) ---
+    async fn upsert_suppression(&self, input: NewSuppressionInput) -> AppResult<SuppressionEntry>;
+    async fn get_suppression(
+        &self,
+        email: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<SuppressionEntry>>;
+    async fn find_suppressed_emails(
+        &self,
+        emails: &[String],
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>>;
+    async fn list_suppressions(
+        &self,
+        query: &SuppressionQuery,
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>>;
+    async fn delete_suppression(&self, email: &str) -> AppResult<bool>;
+
+    async fn record_deliverability_event(
+        &self,
+        input: NewDeliverabilityEvent,
+    ) -> AppResult<DeliverabilityEvent>;
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        since_ms: i64,
+    ) -> AppResult<DeliverabilityCounts>;
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>>;
+
+    async fn get_domain_deliverability_state(
+        &self,
+        domain: &str,
+    ) -> AppResult<Option<DomainDeliverabilityState>>;
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<DomainDeliverabilityState>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).

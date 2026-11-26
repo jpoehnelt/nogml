@@ -31,20 +31,24 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DnsRecord, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
-        DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        ContactRecord, DeliverabilityCounts, DeliverabilityEvent, DeliverabilityEventKind,
+        DnsRecord, DomainDeliverabilityState, DomainProviderKind, DomainRecord, DomainStatus,
+        DomainUpdate, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
         HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
         ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
         InboxRuleActions, InboxRulePatch, MAX_SQL_LIMIT, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewDomainInput, NewInboxRule, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
-        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription, apply_domain_update, apply_inbox_rule_patch, clamp_sql_limit,
-        compute_contact_is_vip, normalize_and_validate_domain, normalize_contact_email,
+        MessageListQuery, NewAuditLogEntry, NewDeliverabilityEvent, NewDomainInput, NewInboxRule,
+        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        NewSuppressionInput, PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread,
+        StoredAttachment, StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage,
+        StoredThreadDetail, SuppressionEntry, SuppressionQuery, SuppressionReason,
+        SuppressionSource, SyncState, ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput,
+        UpsertOutcome, UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
+        apply_inbox_rule_patch, clamp_sql_limit, compute_contact_is_vip,
+        normalize_and_validate_domain, normalize_contact_email, normalize_deliverability_domain,
         normalize_domain_lookup_key, normalize_inbox_rule_actions, normalize_optional_text,
         parse_simple_email_address, validate_and_normalize_contact_email,
+        validate_and_normalize_suppression_email, validate_deliverability_domain,
     },
 };
 
@@ -413,6 +417,42 @@ CREATE INDEX IF NOT EXISTS idx_domains_mailbox_created
     ON domains (mailbox_id, created_at_ms ASC, domain ASC);
 CREATE INDEX IF NOT EXISTS idx_domains_status
     ON domains (status, domain);
+
+CREATE TABLE IF NOT EXISTS suppression_list (
+    email TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL,
+    detail TEXT,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_suppression_list_reason_created
+    ON suppression_list (reason, created_at_ms DESC, email ASC);
+CREATE INDEX IF NOT EXISTS idx_suppression_list_expires
+    ON suppression_list (expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS deliverability_events (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    mailbox_id TEXT,
+    kind TEXT NOT NULL,
+    recipient TEXT,
+    provider TEXT,
+    detail TEXT,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deliverability_events_domain_ts
+    ON deliverability_events (domain, created_at_ms DESC, kind);
+CREATE INDEX IF NOT EXISTS idx_deliverability_events_ts
+    ON deliverability_events (created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS deliverability_domain_state (
+    domain TEXT PRIMARY KEY,
+    manually_paused INTEGER NOT NULL DEFAULT 0,
+    pause_reason TEXT,
+    resumed_at_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -7883,6 +7923,450 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn upsert_suppression(&self, input: NewSuppressionInput) -> AppResult<SuppressionEntry> {
+        let email = validate_and_normalize_suppression_email(&input.email)?;
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let entry = SuppressionEntry {
+            email,
+            reason: input.reason,
+            source: input.source,
+            detail: normalize_optional_text(input.detail.as_deref()),
+            created_at_ms,
+            expires_at_ms: input.expires_at_ms,
+        };
+        self.run_blocking(move |conn, _mb| {
+            conn.execute(
+                "INSERT INTO suppression_list (
+                     email, reason, source, detail, created_at_ms, expires_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(email) DO UPDATE SET
+                     reason = excluded.reason,
+                     source = excluded.source,
+                     detail = excluded.detail,
+                     created_at_ms = excluded.created_at_ms,
+                     expires_at_ms = excluded.expires_at_ms",
+                params![
+                    &entry.email,
+                    entry.reason.as_str(),
+                    entry.source.as_str(),
+                    &entry.detail,
+                    entry.created_at_ms,
+                    entry.expires_at_ms,
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(entry)
+        })
+        .await
+    }
+
+    async fn get_suppression(
+        &self,
+        email: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<SuppressionEntry>> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.run_blocking(move |conn, _mb| {
+            let row = conn
+                .query_row(
+                    "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+                     FROM suppression_list
+                     WHERE email = ?1
+                       AND (expires_at_ms IS NULL OR expires_at_ms > ?2)",
+                    params![&key, now_ms],
+                    suppression_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            row.transpose()
+        })
+        .await
+    }
+
+    async fn find_suppressed_emails(
+        &self,
+        emails: &[String],
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in emails {
+            let key = normalize_contact_email(raw);
+            if !key.is_empty() && seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run_blocking(move |conn, _mb| {
+            let placeholders: Vec<String> =
+                (0..keys.len()).map(|i| format!("?{}", i + 2)).collect();
+            let sql = format!(
+                "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+                 FROM suppression_list
+                 WHERE (expires_at_ms IS NULL OR expires_at_ms > ?1)
+                   AND email IN ({})
+                 ORDER BY email ASC",
+                placeholders.join(", ")
+            );
+            let mut param_values: Vec<SqlValue> = Vec::with_capacity(keys.len() + 1);
+            param_values.push(SqlValue::Integer(now_ms));
+            for k in keys {
+                param_values.push(SqlValue::Text(k));
+            }
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(param_values),
+                    suppression_from_row,
+                )
+                .map_err(sql_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_err)??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn list_suppressions(
+        &self,
+        query: &SuppressionQuery,
+        now_ms: i64,
+    ) -> AppResult<Vec<SuppressionEntry>> {
+        let limit = clamp_sql_limit(query.limit, 100, MAX_SQL_LIMIT);
+        let q = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s.to_ascii_lowercase()));
+        let reason = query.reason.map(|r| r.as_str().to_string());
+        let source = query.source.map(|s| s.as_str().to_string());
+        let include_expired = query.include_expired;
+
+        self.run_blocking(move |conn, _mb| {
+            let mut clauses: Vec<String> = Vec::new();
+            let mut param_values: Vec<SqlValue> = Vec::new();
+            if !include_expired {
+                param_values.push(SqlValue::Integer(now_ms));
+                clauses.push(format!(
+                    "(expires_at_ms IS NULL OR expires_at_ms > ?{})",
+                    param_values.len()
+                ));
+            }
+            if let Some(r) = reason {
+                param_values.push(SqlValue::Text(r));
+                clauses.push(format!("reason = ?{}", param_values.len()));
+            }
+            if let Some(s) = source {
+                param_values.push(SqlValue::Text(s));
+                clauses.push(format!("source = ?{}", param_values.len()));
+            }
+            if let Some(pattern) = q {
+                param_values.push(SqlValue::Text(pattern.clone()));
+                let p1 = param_values.len();
+                param_values.push(SqlValue::Text(pattern));
+                let p2 = param_values.len();
+                clauses.push(format!(
+                    "(LOWER(email) LIKE ?{p1} OR LOWER(COALESCE(detail, '')) LIKE ?{p2})"
+                ));
+            }
+            let where_sql = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", clauses.join(" AND "))
+            };
+            param_values.push(SqlValue::Integer(limit));
+            let limit_idx = param_values.len();
+            let sql = format!(
+                "SELECT email, reason, source, detail, created_at_ms, expires_at_ms
+                 FROM suppression_list
+                 {where_sql}
+                 ORDER BY created_at_ms DESC, email ASC
+                 LIMIT ?{limit_idx}"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(param_values),
+                    suppression_from_row,
+                )
+                .map_err(sql_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_err)??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_suppression(&self, email: &str) -> AppResult<bool> {
+        let key = normalize_contact_email(email);
+        if key.is_empty() {
+            return Ok(false);
+        }
+        self.run_blocking(move |conn, _mb| {
+            let affected = conn
+                .execute(
+                    "DELETE FROM suppression_list WHERE email = ?1",
+                    params![&key],
+                )
+                .map_err(sql_err)?;
+            Ok(affected > 0)
+        })
+        .await
+    }
+
+    async fn record_deliverability_event(
+        &self,
+        input: NewDeliverabilityEvent,
+    ) -> AppResult<DeliverabilityEvent> {
+        let domain = validate_deliverability_domain(&input.domain)?;
+        let mailbox_id = input
+            .mailbox_id
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let recipient = input
+            .recipient
+            .as_deref()
+            .map(normalize_contact_email)
+            .filter(|s| !s.is_empty());
+        let provider = normalize_optional_text(input.provider.as_deref());
+        let detail = normalize_optional_text(input.detail.as_deref());
+        let created_at_ms = input
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let event = DeliverabilityEvent {
+            id: format!("dlv_{}", new_hex_id()),
+            domain,
+            mailbox_id,
+            kind: input.kind,
+            recipient,
+            provider,
+            detail,
+            created_at_ms,
+        };
+        self.run_blocking(move |conn, _mb| {
+            conn.execute(
+                "INSERT INTO deliverability_events (
+                     id, domain, mailbox_id, kind, recipient, provider, detail, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &event.id,
+                    &event.domain,
+                    &event.mailbox_id,
+                    event.kind.as_str(),
+                    &event.recipient,
+                    &event.provider,
+                    &event.detail,
+                    event.created_at_ms,
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(event)
+        })
+        .await
+    }
+
+    async fn count_deliverability_events(
+        &self,
+        domain: &str,
+        since_ms: i64,
+    ) -> AppResult<DeliverabilityCounts> {
+        let key = normalize_deliverability_domain(domain);
+        if key.is_empty() {
+            return Ok(DeliverabilityCounts::default());
+        }
+        self.run_blocking(move |conn, _mb| {
+            let mut counts = DeliverabilityCounts {
+                domain: key.clone(),
+                ..Default::default()
+            };
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, COUNT(*)
+                     FROM deliverability_events
+                     WHERE domain = ?1 AND created_at_ms >= ?2
+                     GROUP BY kind",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![&key, since_ms], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                let (kind_raw, count_raw) = row.map_err(sql_err)?;
+                let n = count_raw.max(0) as u64;
+                if let Some(kind) = DeliverabilityEventKind::parse_str(&kind_raw) {
+                    match kind {
+                        DeliverabilityEventKind::Sent => counts.sent = n,
+                        DeliverabilityEventKind::HardBounce => counts.hard_bounce = n,
+                        DeliverabilityEventKind::SoftBounce => counts.soft_bounce = n,
+                        DeliverabilityEventKind::Complaint => counts.complaint = n,
+                    }
+                }
+            }
+            Ok(counts)
+        })
+        .await
+    }
+
+    async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+        self.run_blocking(move |conn, _mb| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT domain FROM deliverability_events
+                     UNION
+                     SELECT domain FROM deliverability_domain_state
+                     ORDER BY domain ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let d = row.map_err(sql_err)?;
+                if !d.is_empty() {
+                    out.push(d);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn get_domain_deliverability_state(
+        &self,
+        domain: &str,
+    ) -> AppResult<Option<DomainDeliverabilityState>> {
+        let key = normalize_deliverability_domain(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.run_blocking(move |conn, _mb| {
+            conn.query_row(
+                "SELECT domain, manually_paused, pause_reason, resumed_at_ms, updated_at_ms
+                 FROM deliverability_domain_state
+                 WHERE domain = ?1",
+                params![&key],
+                |row| {
+                    Ok(DomainDeliverabilityState {
+                        domain: row.get(0)?,
+                        manually_paused: row.get::<_, i64>(1)? != 0,
+                        pause_reason: row.get(2)?,
+                        resumed_at_ms: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    async fn set_domain_deliverability_paused(
+        &self,
+        domain: &str,
+        paused: bool,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> AppResult<DomainDeliverabilityState> {
+        let key = validate_deliverability_domain(domain)?;
+        let pause_reason = if paused {
+            normalize_optional_text(reason.as_deref())
+        } else {
+            None
+        };
+        self.run_blocking(move |conn, _mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing_resumed: Option<i64> = tx
+                .query_row(
+                    "SELECT resumed_at_ms FROM deliverability_domain_state WHERE domain = ?1",
+                    params![&key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .flatten();
+            let resumed_at_ms = if paused {
+                existing_resumed
+            } else {
+                Some(now_ms)
+            };
+            tx.execute(
+                "INSERT INTO deliverability_domain_state (
+                     domain, manually_paused, pause_reason, resumed_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(domain) DO UPDATE SET
+                     manually_paused = excluded.manually_paused,
+                     pause_reason = excluded.pause_reason,
+                     resumed_at_ms = excluded.resumed_at_ms,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![
+                    &key,
+                    i64::from(paused),
+                    &pause_reason,
+                    resumed_at_ms,
+                    now_ms,
+                ],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(DomainDeliverabilityState {
+                domain: key,
+                manually_paused: paused,
+                pause_reason,
+                resumed_at_ms,
+                updated_at_ms: now_ms,
+            })
+        })
+        .await
+    }
+}
+
+fn suppression_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<SuppressionEntry>> {
+    let email: String = row.get(0)?;
+    let reason_raw: String = row.get(1)?;
+    let source_raw: String = row.get(2)?;
+    let detail: Option<String> = row.get(3)?;
+    let created_at_ms: i64 = row.get(4)?;
+    let expires_at_ms: Option<i64> = row.get(5)?;
+
+    let Some(reason) = SuppressionReason::parse_str(&reason_raw) else {
+        return Ok(Err(AppError::Storage(format!(
+            "Unknown suppression reason '{reason_raw}'"
+        ))));
+    };
+    let Some(source) = SuppressionSource::parse_str(&source_raw) else {
+        return Ok(Err(AppError::Storage(format!(
+            "Unknown suppression source '{source_raw}'"
+        ))));
+    };
+
+    Ok(Ok(SuppressionEntry {
+        email,
+        reason,
+        source,
+        detail,
+        created_at_ms,
+        expires_at_ms,
+    }))
 }
 
 fn domain_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<DomainRecord>> {

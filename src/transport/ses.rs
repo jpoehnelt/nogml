@@ -536,7 +536,7 @@ impl MailTransport for SesTransport {
             supports_scheduled_send: false,
             supports_idempotency_key: false,
             supports_inbound_webhooks: true,
-            supports_delivery_webhooks: false,
+            supports_delivery_webhooks: true,
             max_message_bytes: SES_MAX_MESSAGE_BYTES,
         }
     }
@@ -727,6 +727,58 @@ struct SesNotification {
     receipt: Option<SesReceipt>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    bounce: Option<SesBounce>,
+    #[serde(default)]
+    complaint: Option<SesComplaint>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SesBounce {
+    #[serde(default)]
+    bounce_type: Option<String>,
+    #[serde(default)]
+    bounce_sub_type: Option<String>,
+    #[serde(default)]
+    bounced_recipients: Vec<SesBouncedRecipient>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    feedback_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SesBouncedRecipient {
+    #[serde(default)]
+    email_address: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    diagnostic_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SesComplaint {
+    #[serde(default)]
+    complained_recipients: Vec<SesComplainedRecipient>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    feedback_id: Option<String>,
+    #[serde(default)]
+    complaint_feedback_type: Option<String>,
+    #[serde(default)]
+    complaint_sub_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SesComplainedRecipient {
+    #[serde(default)]
+    email_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1458,6 +1510,386 @@ fn parse_timestamp_ms(candidates: &[Option<&str>]) -> Option<i64> {
     None
 }
 
+fn ses_sender_domain(mail: Option<&SesMailMetadata>, default_domain: &str) -> String {
+    let raw_from = mail
+        .and_then(|m| m.source.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            mail.and_then(|m| m.common_headers.as_ref())
+                .and_then(|c| c.from.first())
+                .map(String::as_str)
+        })
+        .unwrap_or("");
+    crate::deliverability::resolve_sender_domain(raw_from, default_domain)
+}
+
+async fn update_local_delivery_status_for_ses(
+    state: &AppState,
+    mail: Option<&SesMailMetadata>,
+    status: &str,
+    detail: Option<String>,
+) -> AppResult<Option<String>> {
+    let provider_id = mail
+        .and_then(|m| m.message_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let norm_mid = mail
+        .and_then(|m| m.common_headers.as_ref())
+        .and_then(|c| c.message_id.as_deref())
+        .and_then(crate::mime::normalize_message_id);
+
+    if provider_id.is_none() && norm_mid.is_none() {
+        return Ok(None);
+    }
+
+    for mb in state.config.known_mailboxes() {
+        let mb_state = state.for_mailbox(&mb);
+        let matched = if let Some(pid) = provider_id {
+            mb_state.store.record_delivery_status(pid, status).await?
+        } else {
+            None
+        };
+        let matched = if matched.is_some() {
+            matched
+        } else if let Some(ref mid) = norm_mid
+            && let Some(msg) = mb_state.store.find_message_by_rfc_message_id(mid).await?
+        {
+            if let Some(existing_pid) = msg.resend_id.as_deref().filter(|s| !s.is_empty()) {
+                mb_state
+                    .store
+                    .record_delivery_status(existing_pid, status)
+                    .await?
+            } else {
+                mb_state
+                    .store
+                    .record_delivery_status_by_message_id(&msg.id, status)
+                    .await?
+            }
+        } else {
+            None
+        };
+
+        if let Some(msg) = matched {
+            mb_state.events.publish(
+                crate::events::EventSource::SesInbound,
+                crate::events::MailEvent::DeliveryStatus {
+                    message_id: msg.id.clone(),
+                    resend_id: provider_id.unwrap_or_default().to_string(),
+                    status: status.to_string(),
+                    detail,
+                },
+            );
+            return Ok(Some(msg.id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn format_ses_bounce_detail(
+    bounce: Option<&SesBounce>,
+    recipient: Option<&SesBouncedRecipient>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(b) = bounce {
+        let mut kind = Vec::new();
+        if let Some(bt) = non_empty_trimmed(b.bounce_type.as_deref()) {
+            kind.push(bt);
+        }
+        if let Some(bst) = non_empty_trimmed(b.bounce_sub_type.as_deref()) {
+            kind.push(bst);
+        }
+        if !kind.is_empty() {
+            parts.push(kind.join("/"));
+        }
+    }
+    if let Some(r) = recipient {
+        if let Some(st) = non_empty_trimmed(r.status.as_deref()) {
+            parts.push(st.to_string());
+        }
+        if let Some(diag) = non_empty_trimmed(r.diagnostic_code.as_deref()) {
+            parts.push(diag.to_string());
+        }
+    }
+    if parts.is_empty() {
+        bounce
+            .and_then(|b| non_empty_trimmed(b.feedback_id.as_deref()))
+            .map(ToString::to_string)
+    } else {
+        Some(parts.join(": "))
+    }
+}
+
+async fn handle_ses_bounce(
+    state: &AppState,
+    sns: &SnsEnvelope,
+    notification: &SesNotification,
+) -> AppResult<Response> {
+    let bounce = notification.bounce.as_ref();
+    let mail = notification.mail.as_ref();
+    let bounce_type = bounce
+        .and_then(|b| non_empty_trimmed(b.bounce_type.as_deref()))
+        .unwrap_or("Permanent");
+    let is_permanent = bounce_type.eq_ignore_ascii_case("permanent");
+    let domain = ses_sender_domain(mail, &state.config.default_domain);
+    let ts_ms = parse_timestamp_ms(&[
+        bounce.and_then(|b| b.timestamp.as_deref()),
+        mail.and_then(|m| m.timestamp.as_deref()),
+        sns.timestamp.as_deref(),
+    ])
+    .unwrap_or_else(|| Utc::now().timestamp_millis());
+
+    let mut recipients: Vec<(String, Option<&SesBouncedRecipient>)> = Vec::new();
+    if let Some(b) = bounce {
+        for rec in &b.bounced_recipients {
+            let email = crate::storage::normalize_contact_email(&rec.email_address);
+            if !email.is_empty() && !recipients.iter().any(|(e, _)| e == &email) {
+                recipients.push((email, Some(rec)));
+            }
+        }
+    }
+    if recipients.is_empty()
+        && let Some(m) = mail
+    {
+        for dest in &m.destination {
+            let email = crate::storage::normalize_contact_email(dest);
+            if !email.is_empty() && !recipients.iter().any(|(e, _)| e == &email) {
+                recipients.push((email, None));
+            }
+        }
+    }
+
+    let mut suppressed: Vec<String> = Vec::new();
+    let mut events_recorded: usize = 0;
+
+    if recipients.is_empty() {
+        if !domain.is_empty() {
+            let kind = if is_permanent {
+                crate::storage::DeliverabilityEventKind::HardBounce
+            } else {
+                crate::storage::DeliverabilityEventKind::SoftBounce
+            };
+            state
+                .store
+                .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                    domain: domain.clone(),
+                    mailbox_id: None,
+                    kind,
+                    recipient: None,
+                    provider: Some("ses".to_string()),
+                    detail: format_ses_bounce_detail(bounce, None),
+                    created_at_ms: Some(ts_ms),
+                })
+                .await?;
+            if is_permanent {
+                state.metrics.inc_deliverability_hard_bounce();
+            } else {
+                state.metrics.inc_deliverability_soft_bounce();
+            }
+            events_recorded += 1;
+        }
+    } else {
+        for (email, rec_info) in recipients {
+            let detail = format_ses_bounce_detail(bounce, rec_info);
+            if is_permanent {
+                if let Ok(entry) = state
+                    .store
+                    .upsert_suppression(crate::storage::NewSuppressionInput {
+                        email: email.clone(),
+                        reason: crate::storage::SuppressionReason::HardBounce,
+                        source: crate::storage::SuppressionSource::SesSns,
+                        detail: detail.clone(),
+                        created_at_ms: Some(ts_ms),
+                        expires_at_ms: None,
+                    })
+                    .await
+                {
+                    suppressed.push(entry.email);
+                    state.metrics.inc_suppression_added();
+                }
+                if !domain.is_empty() {
+                    state
+                        .store
+                        .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                            domain: domain.clone(),
+                            mailbox_id: None,
+                            kind: crate::storage::DeliverabilityEventKind::HardBounce,
+                            recipient: Some(email),
+                            provider: Some("ses".to_string()),
+                            detail,
+                            created_at_ms: Some(ts_ms),
+                        })
+                        .await?;
+                    state.metrics.inc_deliverability_hard_bounce();
+                    events_recorded += 1;
+                }
+            } else if !domain.is_empty() {
+                state
+                    .store
+                    .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                        domain: domain.clone(),
+                        mailbox_id: None,
+                        kind: crate::storage::DeliverabilityEventKind::SoftBounce,
+                        recipient: Some(email),
+                        provider: Some("ses".to_string()),
+                        detail,
+                        created_at_ms: Some(ts_ms),
+                    })
+                    .await?;
+                state.metrics.inc_deliverability_soft_bounce();
+                events_recorded += 1;
+            }
+        }
+    }
+
+    let message_id = update_local_delivery_status_for_ses(
+        state,
+        mail,
+        "bounced",
+        format_ses_bounce_detail(bounce, None),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "recorded",
+            "notification_type": "Bounce",
+            "bounce_type": bounce_type,
+            "domain": domain,
+            "suppressed": suppressed,
+            "events_recorded": events_recorded,
+            "message_id": message_id,
+        })),
+    )
+        .into_response())
+}
+
+fn format_ses_complaint_detail(complaint: Option<&SesComplaint>) -> Option<String> {
+    let c = complaint?;
+    let mut parts = Vec::new();
+    if let Some(ft) = non_empty_trimmed(c.complaint_feedback_type.as_deref()) {
+        parts.push(ft.to_string());
+    }
+    if let Some(st) = non_empty_trimmed(c.complaint_sub_type.as_deref()) {
+        parts.push(st.to_string());
+    }
+    if parts.is_empty() {
+        non_empty_trimmed(c.feedback_id.as_deref()).map(ToString::to_string)
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+async fn handle_ses_complaint(
+    state: &AppState,
+    sns: &SnsEnvelope,
+    notification: &SesNotification,
+) -> AppResult<Response> {
+    let complaint = notification.complaint.as_ref();
+    let mail = notification.mail.as_ref();
+    let domain = ses_sender_domain(mail, &state.config.default_domain);
+    let ts_ms = parse_timestamp_ms(&[
+        complaint.and_then(|c| c.timestamp.as_deref()),
+        mail.and_then(|m| m.timestamp.as_deref()),
+        sns.timestamp.as_deref(),
+    ])
+    .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let detail = format_ses_complaint_detail(complaint);
+
+    let mut recipients: Vec<String> = Vec::new();
+    if let Some(c) = complaint {
+        for rec in &c.complained_recipients {
+            let email = crate::storage::normalize_contact_email(&rec.email_address);
+            if !email.is_empty() && !recipients.contains(&email) {
+                recipients.push(email);
+            }
+        }
+    }
+    if recipients.is_empty()
+        && let Some(m) = mail
+    {
+        for dest in &m.destination {
+            let email = crate::storage::normalize_contact_email(dest);
+            if !email.is_empty() && !recipients.contains(&email) {
+                recipients.push(email);
+            }
+        }
+    }
+
+    let mut suppressed: Vec<String> = Vec::new();
+    let mut events_recorded: usize = 0;
+
+    if recipients.is_empty() {
+        if !domain.is_empty() {
+            state
+                .store
+                .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                    domain: domain.clone(),
+                    mailbox_id: None,
+                    kind: crate::storage::DeliverabilityEventKind::Complaint,
+                    recipient: None,
+                    provider: Some("ses".to_string()),
+                    detail: detail.clone(),
+                    created_at_ms: Some(ts_ms),
+                })
+                .await?;
+            state.metrics.inc_deliverability_complaint();
+            events_recorded += 1;
+        }
+    } else {
+        for email in recipients {
+            if let Ok(entry) = state
+                .store
+                .upsert_suppression(crate::storage::NewSuppressionInput {
+                    email: email.clone(),
+                    reason: crate::storage::SuppressionReason::Complaint,
+                    source: crate::storage::SuppressionSource::SesSns,
+                    detail: detail.clone(),
+                    created_at_ms: Some(ts_ms),
+                    expires_at_ms: None,
+                })
+                .await
+            {
+                suppressed.push(entry.email);
+                state.metrics.inc_suppression_added();
+            }
+            if !domain.is_empty() {
+                state
+                    .store
+                    .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                        domain: domain.clone(),
+                        mailbox_id: None,
+                        kind: crate::storage::DeliverabilityEventKind::Complaint,
+                        recipient: Some(email),
+                        provider: Some("ses".to_string()),
+                        detail: detail.clone(),
+                        created_at_ms: Some(ts_ms),
+                    })
+                    .await?;
+                state.metrics.inc_deliverability_complaint();
+                events_recorded += 1;
+            }
+        }
+    }
+
+    let message_id =
+        update_local_delivery_status_for_ses(state, mail, "complained", detail.clone()).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "recorded",
+            "notification_type": "Complaint",
+            "domain": domain,
+            "suppressed": suppressed,
+            "events_recorded": events_recorded,
+            "message_id": message_id,
+        })),
+    )
+        .into_response())
+}
+
 /// Axum handler for `POST /webhooks/ses`.
 ///
 /// Exempt from bearer auth; fails closed (`401`) unless authenticated by:
@@ -1578,6 +2010,20 @@ pub async fn ses_webhook_handler(
         }
         None => serde_json::from_slice(&body)?,
     };
+
+    if notification
+        .notification_type
+        .eq_ignore_ascii_case("bounce")
+    {
+        return handle_ses_bounce(&state, &sns, &notification).await;
+    }
+
+    if notification
+        .notification_type
+        .eq_ignore_ascii_case("complaint")
+    {
+        return handle_ses_complaint(&state, &sns, &notification).await;
+    }
 
     if !notification
         .notification_type

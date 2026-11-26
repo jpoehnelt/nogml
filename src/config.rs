@@ -240,6 +240,22 @@ fn default_gmail_imap_archive_mailbox() -> String {
     "Archive".to_string()
 }
 
+fn default_deliverability_max_bounce_rate() -> f64 {
+    crate::deliverability::DEFAULT_MAX_BOUNCE_RATE
+}
+
+fn default_deliverability_max_complaint_rate() -> f64 {
+    crate::deliverability::DEFAULT_MAX_COMPLAINT_RATE
+}
+
+fn default_deliverability_min_samples() -> u64 {
+    crate::deliverability::DEFAULT_DELIVERABILITY_MIN_SAMPLES
+}
+
+fn default_deliverability_window_secs() -> u64 {
+    crate::deliverability::DEFAULT_DELIVERABILITY_WINDOW_SECS
+}
+
 /// Per-account upstream Gmail sync configuration entry parsed from `[[sync.accounts]]`.
 ///
 /// Implements a custom [`fmt::Debug`] that replaces all credential and token fields
@@ -602,6 +618,24 @@ pub struct Config {
     /// primary domain nor a `verified` BYOD domain owned by the sender's mailbox.
     #[serde(default)]
     pub require_verified_from_domain: bool,
+    /// Per-domain daily outbound send cap (`0` disables daily domain quota enforcement).
+    #[serde(default)]
+    pub daily_send_limit_per_domain: u64,
+    /// Rolling hard-bounce rate threshold above which a sender domain's circuit breaker opens
+    /// (default `0.05` = 5%; `0.0` disables bounce-rate circuit breaking).
+    #[serde(default = "default_deliverability_max_bounce_rate")]
+    pub deliverability_max_bounce_rate: f64,
+    /// Rolling complaint rate threshold above which a sender domain's circuit breaker opens
+    /// (default `0.001` = 0.1%; `0.0` disables complaint-rate circuit breaking).
+    #[serde(default = "default_deliverability_max_complaint_rate")]
+    pub deliverability_max_complaint_rate: f64,
+    /// Minimum rolling sample size before bounce/complaint rates can trip a domain circuit breaker
+    /// (default `20`).
+    #[serde(default = "default_deliverability_min_samples")]
+    pub deliverability_min_samples: u64,
+    /// Rolling window in seconds for bounce/complaint rate calculations (default `86400` = 24h).
+    #[serde(default = "default_deliverability_window_secs")]
+    pub deliverability_window_secs: u64,
     /// Action taken by `DlpOutboundPolicy` when secrets or sensitive PII are detected (`off`, `hold`, `deny`).
     pub dlp_action: DlpAction,
     /// Time-to-live in seconds for pending human approval requests (default 86400s / 24h).
@@ -792,6 +826,11 @@ impl Default for Config {
             require_approval: false,
             first_contact_approval: false,
             require_verified_from_domain: false,
+            daily_send_limit_per_domain: 0,
+            deliverability_max_bounce_rate: crate::deliverability::DEFAULT_MAX_BOUNCE_RATE,
+            deliverability_max_complaint_rate: crate::deliverability::DEFAULT_MAX_COMPLAINT_RATE,
+            deliverability_min_samples: crate::deliverability::DEFAULT_DELIVERABILITY_MIN_SAMPLES,
+            deliverability_window_secs: crate::deliverability::DEFAULT_DELIVERABILITY_WINDOW_SECS,
             dlp_action: DlpAction::Off,
             approval_ttl_secs: 86_400,
             approval_webhook_url: None,
@@ -1169,6 +1208,11 @@ impl Config {
             require_approval,
             first_contact_approval,
             require_verified_from_domain,
+            daily_send_limit_per_domain,
+            deliverability_max_bounce_rate,
+            deliverability_max_complaint_rate,
+            deliverability_min_samples,
+            deliverability_window_secs,
             dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
@@ -1335,6 +1379,11 @@ impl Config {
                 "require_approval": require_approval,
                 "first_contact_approval": first_contact_approval,
                 "require_verified_from_domain": require_verified_from_domain,
+                "daily_send_limit_per_domain": daily_send_limit_per_domain,
+                "deliverability_max_bounce_rate": deliverability_max_bounce_rate,
+                "deliverability_max_complaint_rate": deliverability_max_complaint_rate,
+                "deliverability_min_samples": deliverability_min_samples,
+                "deliverability_window_secs": deliverability_window_secs,
                 "dlp_action": dlp_action,
                 "approval_ttl_secs": approval_ttl_secs,
                 "approval_webhook_url": approval_webhook_url
@@ -1874,6 +1923,11 @@ impl fmt::Debug for Config {
             require_approval,
             first_contact_approval,
             require_verified_from_domain,
+            daily_send_limit_per_domain,
+            deliverability_max_bounce_rate,
+            deliverability_max_complaint_rate,
+            deliverability_min_samples,
+            deliverability_window_secs,
             dlp_action,
             approval_ttl_secs,
             approval_webhook_url,
@@ -2009,6 +2063,17 @@ impl fmt::Debug for Config {
             .field("require_approval", require_approval)
             .field("first_contact_approval", first_contact_approval)
             .field("require_verified_from_domain", require_verified_from_domain)
+            .field("daily_send_limit_per_domain", daily_send_limit_per_domain)
+            .field(
+                "deliverability_max_bounce_rate",
+                deliverability_max_bounce_rate,
+            )
+            .field(
+                "deliverability_max_complaint_rate",
+                deliverability_max_complaint_rate,
+            )
+            .field("deliverability_min_samples", deliverability_min_samples)
+            .field("deliverability_window_secs", deliverability_window_secs)
             .field("dlp_action", dlp_action)
             .field("approval_ttl_secs", approval_ttl_secs)
             .field(
@@ -2365,6 +2430,16 @@ pub struct SafetyTomlConfig {
     pub require_approval: Option<bool>,
     pub first_contact_approval: Option<bool>,
     pub require_verified_from_domain: Option<bool>,
+    #[serde(alias = "daily_send_limit")]
+    pub daily_send_limit_per_domain: Option<u64>,
+    #[serde(alias = "max_bounce_rate")]
+    pub deliverability_max_bounce_rate: Option<f64>,
+    #[serde(alias = "max_complaint_rate")]
+    pub deliverability_max_complaint_rate: Option<f64>,
+    #[serde(alias = "min_samples")]
+    pub deliverability_min_samples: Option<u64>,
+    #[serde(alias = "window_secs")]
+    pub deliverability_window_secs: Option<u64>,
     pub dlp_action: Option<DlpAction>,
     pub approval_ttl_secs: Option<u64>,
     pub approval_webhook_url: Option<String>,
@@ -2387,6 +2462,26 @@ impl std::fmt::Debug for SafetyTomlConfig {
             .field(
                 "require_verified_from_domain",
                 &self.require_verified_from_domain,
+            )
+            .field(
+                "daily_send_limit_per_domain",
+                &self.daily_send_limit_per_domain,
+            )
+            .field(
+                "deliverability_max_bounce_rate",
+                &self.deliverability_max_bounce_rate,
+            )
+            .field(
+                "deliverability_max_complaint_rate",
+                &self.deliverability_max_complaint_rate,
+            )
+            .field(
+                "deliverability_min_samples",
+                &self.deliverability_min_samples,
+            )
+            .field(
+                "deliverability_window_secs",
+                &self.deliverability_window_secs,
             )
             .field("dlp_action", &self.dlp_action)
             .field("approval_ttl_secs", &self.approval_ttl_secs)
@@ -2833,6 +2928,21 @@ impl TomlConfig {
         if let Some(v) = self.safety.require_verified_from_domain {
             cfg.require_verified_from_domain = v;
         }
+        if let Some(v) = self.safety.daily_send_limit_per_domain {
+            cfg.daily_send_limit_per_domain = v;
+        }
+        if let Some(v) = self.safety.deliverability_max_bounce_rate {
+            cfg.deliverability_max_bounce_rate = v;
+        }
+        if let Some(v) = self.safety.deliverability_max_complaint_rate {
+            cfg.deliverability_max_complaint_rate = v;
+        }
+        if let Some(v) = self.safety.deliverability_min_samples {
+            cfg.deliverability_min_samples = v;
+        }
+        if let Some(v) = self.safety.deliverability_window_secs {
+            cfg.deliverability_window_secs = v;
+        }
         if let Some(v) = self.safety.dlp_action {
             cfg.dlp_action = v;
         }
@@ -3081,6 +3191,22 @@ pub fn validate_config(
     }
     if config.approval_ttl_secs == 0 {
         errors.push("safety.approval_ttl_secs must be greater than 0".to_string());
+    }
+    if !config.deliverability_max_bounce_rate.is_finite()
+        || !(0.0..=1.0).contains(&config.deliverability_max_bounce_rate)
+    {
+        errors
+            .push("safety.deliverability_max_bounce_rate must be between 0.0 and 1.0".to_string());
+    }
+    if !config.deliverability_max_complaint_rate.is_finite()
+        || !(0.0..=1.0).contains(&config.deliverability_max_complaint_rate)
+    {
+        errors.push(
+            "safety.deliverability_max_complaint_rate must be between 0.0 and 1.0".to_string(),
+        );
+    }
+    if config.deliverability_window_secs == 0 {
+        errors.push("safety.deliverability_window_secs must be greater than 0".to_string());
     }
 
     // --- Storage ---
@@ -3504,6 +3630,11 @@ draft_only_action = "block"
 require_approval = false
 first_contact_approval = false
 require_verified_from_domain = false
+daily_send_limit_per_domain = 0
+deliverability_max_bounce_rate = 0.05
+deliverability_max_complaint_rate = 0.001
+deliverability_min_samples = 20
+deliverability_window_secs = 86400
 dlp_action = "off"
 approval_ttl_secs = 86400
 # allowed_recipients = ["@{default_domain}"]

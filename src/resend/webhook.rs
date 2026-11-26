@@ -744,6 +744,197 @@ pub async fn handle_email_received(
     }
 }
 
+async fn record_resend_deliverability(
+    state: &AppState,
+    event: &ResendWebhookEvent,
+    status: &str,
+    detail: Option<&str>,
+    matched_msg: Option<&crate::storage::StoredMessage>,
+) -> AppResult<(Vec<String>, usize, Option<String>)> {
+    if status != "bounced" && status != "complained" {
+        return Ok((Vec::new(), 0, None));
+    }
+
+    let mut recipients: Vec<String> = Vec::new();
+    for raw in &event.data.to {
+        let email = crate::storage::normalize_contact_email(raw);
+        if !email.is_empty() && !recipients.contains(&email) {
+            recipients.push(email);
+        }
+    }
+    if recipients.is_empty()
+        && let Some(msg) = matched_msg
+    {
+        for raw in &msg.to_addrs {
+            let email = crate::storage::normalize_contact_email(raw);
+            if !email.is_empty() && !recipients.contains(&email) {
+                recipients.push(email);
+            }
+        }
+    }
+
+    // If neither the webhook payload nor a local stored message provides recipients,
+    // do not synthesize deliverability records for unmatched dummy probes.
+    if recipients.is_empty() && matched_msg.is_none() {
+        return Ok((Vec::new(), 0, None));
+    }
+
+    let raw_from = event
+        .data
+        .from
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| matched_msg.map(|m| m.from_addr.as_str()))
+        .unwrap_or("");
+    let domain =
+        crate::deliverability::resolve_sender_domain(raw_from, &state.config.default_domain);
+    let ts_ms = parse_timestamp_ms(&[
+        event.data.created_at.as_deref(),
+        Some(event.created_at.as_str()),
+    ])
+    .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let detail_owned = detail.map(ToString::to_string);
+
+    let is_soft_bounce = status == "bounced"
+        && event
+            .data
+            .bounce
+            .as_ref()
+            .and_then(|b| b.bounce_type.as_deref())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("transient"));
+
+    let mut suppressed = Vec::new();
+    let mut events_recorded = 0usize;
+
+    if recipients.is_empty() {
+        if !domain.is_empty() {
+            let kind = if status == "complained" {
+                crate::storage::DeliverabilityEventKind::Complaint
+            } else if is_soft_bounce {
+                crate::storage::DeliverabilityEventKind::SoftBounce
+            } else {
+                crate::storage::DeliverabilityEventKind::HardBounce
+            };
+            state
+                .store
+                .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                    domain: domain.clone(),
+                    mailbox_id: None,
+                    kind,
+                    recipient: None,
+                    provider: Some("resend".to_string()),
+                    detail: detail_owned,
+                    created_at_ms: Some(ts_ms),
+                })
+                .await?;
+            match kind {
+                crate::storage::DeliverabilityEventKind::HardBounce => {
+                    state.metrics.inc_deliverability_hard_bounce();
+                }
+                crate::storage::DeliverabilityEventKind::SoftBounce => {
+                    state.metrics.inc_deliverability_soft_bounce();
+                }
+                crate::storage::DeliverabilityEventKind::Complaint => {
+                    state.metrics.inc_deliverability_complaint();
+                }
+                crate::storage::DeliverabilityEventKind::Sent => {}
+            }
+            events_recorded += 1;
+        }
+    } else {
+        for email in recipients {
+            if status == "complained" {
+                if let Ok(entry) = state
+                    .store
+                    .upsert_suppression(crate::storage::NewSuppressionInput {
+                        email: email.clone(),
+                        reason: crate::storage::SuppressionReason::Complaint,
+                        source: crate::storage::SuppressionSource::Resend,
+                        detail: detail_owned.clone(),
+                        created_at_ms: Some(ts_ms),
+                        expires_at_ms: None,
+                    })
+                    .await
+                {
+                    suppressed.push(entry.email);
+                    state.metrics.inc_suppression_added();
+                }
+                if !domain.is_empty() {
+                    state
+                        .store
+                        .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                            domain: domain.clone(),
+                            mailbox_id: None,
+                            kind: crate::storage::DeliverabilityEventKind::Complaint,
+                            recipient: Some(email),
+                            provider: Some("resend".to_string()),
+                            detail: detail_owned.clone(),
+                            created_at_ms: Some(ts_ms),
+                        })
+                        .await?;
+                    state.metrics.inc_deliverability_complaint();
+                    events_recorded += 1;
+                }
+            } else if is_soft_bounce {
+                if !domain.is_empty() {
+                    state
+                        .store
+                        .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                            domain: domain.clone(),
+                            mailbox_id: None,
+                            kind: crate::storage::DeliverabilityEventKind::SoftBounce,
+                            recipient: Some(email),
+                            provider: Some("resend".to_string()),
+                            detail: detail_owned.clone(),
+                            created_at_ms: Some(ts_ms),
+                        })
+                        .await?;
+                    state.metrics.inc_deliverability_soft_bounce();
+                    events_recorded += 1;
+                }
+            } else {
+                if let Ok(entry) = state
+                    .store
+                    .upsert_suppression(crate::storage::NewSuppressionInput {
+                        email: email.clone(),
+                        reason: crate::storage::SuppressionReason::HardBounce,
+                        source: crate::storage::SuppressionSource::Resend,
+                        detail: detail_owned.clone(),
+                        created_at_ms: Some(ts_ms),
+                        expires_at_ms: None,
+                    })
+                    .await
+                {
+                    suppressed.push(entry.email);
+                    state.metrics.inc_suppression_added();
+                }
+                if !domain.is_empty() {
+                    state
+                        .store
+                        .record_deliverability_event(crate::storage::NewDeliverabilityEvent {
+                            domain: domain.clone(),
+                            mailbox_id: None,
+                            kind: crate::storage::DeliverabilityEventKind::HardBounce,
+                            recipient: Some(email),
+                            provider: Some("resend".to_string()),
+                            detail: detail_owned.clone(),
+                            created_at_ms: Some(ts_ms),
+                        })
+                        .await?;
+                    state.metrics.inc_deliverability_hard_bounce();
+                    events_recorded += 1;
+                }
+            }
+        }
+    }
+
+    Ok((
+        suppressed,
+        events_recorded,
+        (!domain.is_empty()).then_some(domain),
+    ))
+}
+
 async fn handle_delivery_status(
     state: &AppState,
     event: &ResendWebhookEvent,
@@ -758,7 +949,7 @@ async fn handle_delivery_status(
         .and_then(crate::mime::normalize_message_id);
 
     let mut target_state: Option<AppState> = None;
-    let mut message_id = String::new();
+    let mut matched_msg: Option<crate::storage::StoredMessage> = None;
 
     for mb in state.config.known_mailboxes() {
         let mb_state = state.for_mailbox(&mb);
@@ -768,7 +959,7 @@ async fn handle_delivery_status(
                 .record_delivery_status(resend_id, status)
                 .await?
         {
-            message_id = msg.id;
+            matched_msg = Some(msg);
             target_state = Some(mb_state);
             break;
         }
@@ -786,13 +977,37 @@ async fn handle_delivery_status(
                     .record_delivery_status_by_message_id(&msg.id, status)
                     .await?;
             }
-            message_id = msg.id;
+            matched_msg = Some(msg);
             target_state = Some(mb_state);
             break;
         }
     }
 
+    let (suppressed, events_recorded, domain) = record_resend_deliverability(
+        state,
+        event,
+        status,
+        detail.as_deref(),
+        matched_msg.as_ref(),
+    )
+    .await?;
+
     let Some(publish_state) = target_state else {
+        if events_recorded > 0 || !suppressed.is_empty() {
+            return Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "status": "recorded",
+                    "delivery_status": status,
+                    "resend_id": resend_id,
+                    "detail": detail,
+                    "domain": domain,
+                    "suppressed": suppressed,
+                    "events_recorded": events_recorded,
+                })),
+            )
+                .into_response());
+        }
         tracing::debug!(
             resend_id = %resend_id,
             delivery_status = %status,
@@ -810,6 +1025,7 @@ async fn handle_delivery_status(
             .into_response());
     };
 
+    let message_id = matched_msg.map(|m| m.id).unwrap_or_default();
     publish_state.events.publish(
         EventSource::ResendWebhook,
         MailEvent::DeliveryStatus {
@@ -820,17 +1036,20 @@ async fn handle_delivery_status(
         },
     );
 
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "status": "recorded",
-            "delivery_status": status,
-            "resend_id": resend_id,
-            "message_id": message_id,
-            "detail": detail,
-        })),
-    )
-        .into_response())
+    let mut body = json!({
+        "status": "recorded",
+        "delivery_status": status,
+        "resend_id": resend_id,
+        "message_id": message_id,
+        "detail": detail,
+    });
+    if status == "bounced" || status == "complained" {
+        body["domain"] = json!(domain);
+        body["suppressed"] = json!(suppressed);
+        body["events_recorded"] = json!(events_recorded);
+    }
+
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 #[cfg(test)]
@@ -1491,6 +1710,98 @@ mod tests {
 
         async fn delete_domain(&self, _domain: &str) -> AppResult<bool> {
             Ok(false)
+        }
+        async fn upsert_suppression(
+            &self,
+            input: crate::storage::NewSuppressionInput,
+        ) -> AppResult<crate::storage::SuppressionEntry> {
+            let email = crate::storage::validate_and_normalize_suppression_email(&input.email)?;
+            Ok(crate::storage::SuppressionEntry {
+                email,
+                reason: input.reason,
+                source: input.source,
+                detail: input.detail,
+                created_at_ms: input
+                    .created_at_ms
+                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
+                expires_at_ms: input.expires_at_ms,
+            })
+        }
+        async fn get_suppression(
+            &self,
+            _email: &str,
+            _now_ms: i64,
+        ) -> AppResult<Option<crate::storage::SuppressionEntry>> {
+            Ok(None)
+        }
+        async fn find_suppressed_emails(
+            &self,
+            _emails: &[String],
+            _now_ms: i64,
+        ) -> AppResult<Vec<crate::storage::SuppressionEntry>> {
+            Ok(Vec::new())
+        }
+        async fn list_suppressions(
+            &self,
+            _query: &crate::storage::SuppressionQuery,
+            _now_ms: i64,
+        ) -> AppResult<Vec<crate::storage::SuppressionEntry>> {
+            Ok(Vec::new())
+        }
+        async fn delete_suppression(&self, _email: &str) -> AppResult<bool> {
+            Ok(false)
+        }
+        async fn record_deliverability_event(
+            &self,
+            input: crate::storage::NewDeliverabilityEvent,
+        ) -> AppResult<crate::storage::DeliverabilityEvent> {
+            let domain = crate::storage::validate_deliverability_domain(&input.domain)?;
+            Ok(crate::storage::DeliverabilityEvent {
+                id: "dlv_mock".to_string(),
+                domain,
+                mailbox_id: input.mailbox_id,
+                kind: input.kind,
+                recipient: input.recipient,
+                provider: input.provider,
+                detail: input.detail,
+                created_at_ms: input
+                    .created_at_ms
+                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
+            })
+        }
+        async fn count_deliverability_events(
+            &self,
+            domain: &str,
+            _since_ms: i64,
+        ) -> AppResult<crate::storage::DeliverabilityCounts> {
+            Ok(crate::storage::DeliverabilityCounts {
+                domain: domain.to_string(),
+                ..Default::default()
+            })
+        }
+        async fn list_deliverability_domains(&self) -> AppResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_domain_deliverability_state(
+            &self,
+            _domain: &str,
+        ) -> AppResult<Option<crate::storage::DomainDeliverabilityState>> {
+            Ok(None)
+        }
+        async fn set_domain_deliverability_paused(
+            &self,
+            domain: &str,
+            paused: bool,
+            reason: Option<String>,
+            now_ms: i64,
+        ) -> AppResult<crate::storage::DomainDeliverabilityState> {
+            Ok(crate::storage::DomainDeliverabilityState {
+                domain: domain.to_string(),
+                manually_paused: paused,
+                pause_reason: reason,
+                resumed_at_ms: (!paused).then_some(now_ms),
+                updated_at_ms: now_ms,
+            })
         }
     }
 

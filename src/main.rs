@@ -360,6 +360,52 @@ struct CommonConfigArgs {
     )]
     require_verified_from_domain: bool,
 
+    /// Per-domain daily outbound send cap (`0` disables daily send cap enforcement).
+    #[arg(
+        long,
+        alias = "daily-send-limit",
+        env = "NOGML_DAILY_SEND_LIMIT_PER_DOMAIN",
+        default_value_t = 0,
+        global = true
+    )]
+    daily_send_limit_per_domain: u64,
+
+    /// Rolling hard-bounce rate threshold above which a domain circuit breaker opens (default 0.05 = 5%; 0 disables).
+    #[arg(
+        long = "max-bounce-rate",
+        env = "NOGML_MAX_BOUNCE_RATE",
+        default_value_t = nogml::deliverability::DEFAULT_MAX_BOUNCE_RATE,
+        global = true
+    )]
+    deliverability_max_bounce_rate: f64,
+
+    /// Rolling complaint rate threshold above which a domain circuit breaker opens (default 0.001 = 0.1%; 0 disables).
+    #[arg(
+        long = "max-complaint-rate",
+        env = "NOGML_MAX_COMPLAINT_RATE",
+        default_value_t = nogml::deliverability::DEFAULT_MAX_COMPLAINT_RATE,
+        global = true
+    )]
+    deliverability_max_complaint_rate: f64,
+
+    /// Minimum rolling sample size before bounce/complaint rates trip a domain circuit breaker (default 20).
+    #[arg(
+        long = "deliverability-min-samples",
+        env = "NOGML_DELIVERABILITY_MIN_SAMPLES",
+        default_value_t = nogml::deliverability::DEFAULT_DELIVERABILITY_MIN_SAMPLES,
+        global = true
+    )]
+    deliverability_min_samples: u64,
+
+    /// Rolling window in seconds for bounce/complaint rate calculations (default 86400).
+    #[arg(
+        long = "deliverability-window-secs",
+        env = "NOGML_DELIVERABILITY_WINDOW_SECS",
+        default_value_t = nogml::deliverability::DEFAULT_DELIVERABILITY_WINDOW_SECS,
+        global = true
+    )]
+    deliverability_window_secs: u64,
+
     /// Outbound secret/PII DLP scanner action (`off`, `hold`, or `deny`).
     #[arg(long, env = "NOGML_DLP_ACTION", default_value = "off", global = true)]
     dlp_action: DlpAction,
@@ -1489,6 +1535,27 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "require_verified_from_domain") {
             cfg.require_verified_from_domain = self.require_verified_from_domain;
+        }
+        if is_explicit(root_matches, "daily_send_limit_per_domain") {
+            cfg.daily_send_limit_per_domain = self.daily_send_limit_per_domain;
+        } else if let Ok(raw) = std::env::var("NOGML_DAILY_SEND_LIMIT")
+            && !raw.trim().is_empty()
+        {
+            cfg.daily_send_limit_per_domain = raw.trim().parse::<u64>().map_err(|e| {
+                AppError::Config(format!("Invalid NOGML_DAILY_SEND_LIMIT '{raw}': {e}"))
+            })?;
+        }
+        if is_explicit(root_matches, "deliverability_max_bounce_rate") {
+            cfg.deliverability_max_bounce_rate = self.deliverability_max_bounce_rate;
+        }
+        if is_explicit(root_matches, "deliverability_max_complaint_rate") {
+            cfg.deliverability_max_complaint_rate = self.deliverability_max_complaint_rate;
+        }
+        if is_explicit(root_matches, "deliverability_min_samples") {
+            cfg.deliverability_min_samples = self.deliverability_min_samples;
+        }
+        if is_explicit(root_matches, "deliverability_window_secs") {
+            cfg.deliverability_window_secs = self.deliverability_window_secs;
         }
         if is_explicit(root_matches, "dlp_action") {
             cfg.dlp_action = self.dlp_action;

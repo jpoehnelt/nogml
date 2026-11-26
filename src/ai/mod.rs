@@ -287,6 +287,26 @@ pub fn ai_router() -> Router<AppState> {
                 .delete(delete_domain_handler),
         )
         .route("/v1/domains/{domain}/verify", post(verify_domain_handler))
+        .route(
+            "/v1/suppression",
+            get(list_suppressions_handler).post(add_suppression_handler),
+        )
+        .route(
+            "/v1/suppression/{email}",
+            delete(delete_suppression_handler),
+        )
+        .route(
+            "/v1/deliverability/stats",
+            get(get_deliverability_stats_handler),
+        )
+        .route(
+            "/v1/deliverability/domains/{domain}/resume",
+            post(resume_deliverability_domain_handler),
+        )
+        .route(
+            "/v1/deliverability/domains/{domain}/pause",
+            post(pause_deliverability_domain_handler),
+        )
         .route("/v1/audit", get(list_audit_handler))
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
@@ -717,7 +737,9 @@ pub async fn execute_send_email_with_context(
         .await?;
 
     state.post_store_message(&stored).await?;
-    state.metrics.inc_messages_sent();
+    state
+        .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+        .await;
 
     state.events.publish(
         source,
@@ -1270,7 +1292,9 @@ pub async fn execute_send_draft_with_context(
         .await?;
 
     state.post_store_message(&stored).await?;
-    state.metrics.inc_messages_sent();
+    state
+        .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+        .await;
 
     state.events.publish(
         source,
@@ -2348,6 +2372,35 @@ pub async fn execute_approve_approval(
         outbound.set_upstream_thread_id(up_tid);
     }
     let outbound = &outbound;
+
+    // Re-check deliverability protection (suppression list, circuit breaker, daily quota)
+    // right before dispatch in case a recipient bounced or domain paused while pending.
+    let deliv_check = OutboundCheck {
+        from: if outbound.from.trim().is_empty() {
+            state.config.user_email.clone()
+        } else {
+            outbound.from.clone()
+        },
+        to: outbound.to.clone(),
+        cc: outbound.cc.clone(),
+        bcc: outbound.bcc.clone(),
+        subject: outbound.subject.clone(),
+        text: outbound.text.clone(),
+        html: outbound.html.clone(),
+        attachment_filenames: Vec::new(),
+        thread_id: approval.thread_id.clone(),
+        mailbox_id: Some(state.mailbox_id().to_string()),
+        is_draft_send: approval.draft_id.is_some(),
+        agent_policy: None,
+    };
+    if let OutboundDecision::Deny { code, reason, hint } =
+        state.deliverability_policy.evaluate(&deliv_check).await?
+    {
+        state.metrics.inc_policy_deny();
+        state.metrics.inc_deliverability_blocked(&code);
+        let _ = state.store.release_claimed_approval(id).await;
+        return Err(policy_deny_to_error(code, reason, hint));
+    }
     let idempotency_key = format!("approval-{id}");
     let send_outcome = match state.transport.send(outbound, Some(&idempotency_key)).await {
         Ok(outcome) => outcome,
@@ -2461,7 +2514,9 @@ pub async fn execute_approve_approval(
         )
         .await?;
 
-    state.metrics.inc_messages_sent();
+    state
+        .record_outbound_sent(&stored.from_addr, &stored.to_addrs, &send_outcome.provider)
+        .await;
     state.events.publish(
         source,
         MailEvent::MessageSent {
@@ -3327,11 +3382,17 @@ pub(crate) fn policy_deny_to_error(code: String, reason: String, hint: Option<St
             hint: hint.unwrap_or(reason),
         }
     } else {
+        let details = if code == "recipient_suppressed" {
+            let suppressed = crate::deliverability::extract_suppressed_from_reason(&reason);
+            (!suppressed.is_empty()).then(|| json!({ "suppressed": suppressed }))
+        } else {
+            None
+        };
         AppError::PolicyDenied {
             code,
             message: reason,
             hint,
-            details: None,
+            details,
         }
     }
 }
@@ -3714,6 +3775,12 @@ async fn get_capabilities(
             "PATCH /v1/domains/{domain}",
             "DELETE /v1/domains/{domain}",
             "POST /v1/domains/{domain}/verify",
+            "GET /v1/suppression",
+            "POST /v1/suppression",
+            "DELETE /v1/suppression/{email}",
+            "GET /v1/deliverability/stats",
+            "POST /v1/deliverability/domains/{domain}/resume",
+            "POST /v1/deliverability/domains/{domain}/pause",
             "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",
@@ -3727,6 +3794,12 @@ async fn get_capabilities(
             "require_approval": cfg.require_approval,
             "first_contact_approval": cfg.first_contact_approval,
             "require_verified_from_domain": cfg.require_verified_from_domain,
+            "suppression_list_enabled": true,
+            "daily_send_limit_per_domain": cfg.daily_send_limit_per_domain,
+            "max_bounce_rate": cfg.deliverability_max_bounce_rate,
+            "max_complaint_rate": cfg.deliverability_max_complaint_rate,
+            "deliverability_min_samples": cfg.deliverability_min_samples,
+            "deliverability_window_secs": cfg.deliverability_window_secs,
             "dlp_action": cfg.dlp_action,
             "approval_ttl_secs": cfg.approval_ttl_secs,
             "approval_webhook_enabled": cfg.approval_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty()),
@@ -5071,5 +5144,346 @@ async fn delete_domain_handler(
         "/v1",
     )
     .await?;
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListSuppressionsParams {
+    q: Option<String>,
+    reason: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    include_expired: bool,
+    #[serde(default)]
+    limit: usize,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AddSuppressionRequest {
+    email: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeliverabilityStatsParams {
+    domain: Option<String>,
+    window_secs: Option<u64>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PauseDeliverabilityRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn list_suppressions_handler(
+    MailboxState(state): MailboxState,
+    Query(params): Query<ListSuppressionsParams>,
+) -> Result<Json<Value>, AiError> {
+    let reason = match params
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(
+            crate::storage::SuppressionReason::parse_str(raw).ok_or_else(|| {
+                AppError::validation(
+                    format!("Invalid suppression reason '{raw}'"),
+                    Some("Use one of: hard_bounce, complaint, unsubscribe, manual.".to_string()),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let source = match params
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(
+            crate::storage::SuppressionSource::parse_str(raw).ok_or_else(|| {
+                AppError::validation(
+                    format!("Invalid suppression source '{raw}'"),
+                    Some("Use one of: ses_sns, resend, manual.".to_string()),
+                )
+            })?,
+        ),
+        None => None,
+    };
+
+    let limit = if params.limit == 0 {
+        100
+    } else {
+        params.limit.min(1000)
+    };
+    let query = crate::storage::SuppressionQuery {
+        q: params.q,
+        reason,
+        source,
+        include_expired: params.include_expired,
+        limit,
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    let suppressions = state.store.list_suppressions(&query, now_ms).await?;
+    let body = json!({
+        "suppressions": suppressions,
+        "count": suppressions.len(),
+    });
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn add_suppression_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<AddSuppressionRequest>,
+) -> Result<(StatusCode, Json<Value>), AiError> {
+    let reason = match req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => crate::storage::SuppressionReason::parse_str(raw).ok_or_else(|| {
+            AppError::validation(
+                format!("Invalid suppression reason '{raw}'"),
+                Some("Use one of: hard_bounce, complaint, unsubscribe, manual.".to_string()),
+            )
+        })?,
+        None => crate::storage::SuppressionReason::Manual,
+    };
+    let source = match req
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => crate::storage::SuppressionSource::parse_str(raw).ok_or_else(|| {
+            AppError::validation(
+                format!("Invalid suppression source '{raw}'"),
+                Some("Use one of: ses_sns, resend, manual.".to_string()),
+            )
+        })?,
+        None => crate::storage::SuppressionSource::Manual,
+    };
+
+    let expires_at_ms = match (req.expires_at_ms, req.expires_at.as_deref()) {
+        (Some(ms), _) => Some(ms),
+        (None, Some(raw)) => parse_since_ms(Some(raw))?,
+        (None, None) => None,
+    };
+
+    let entry = state
+        .store
+        .upsert_suppression(crate::storage::NewSuppressionInput {
+            email: req.email,
+            reason,
+            source,
+            detail: req.detail,
+            created_at_ms: None,
+            expires_at_ms,
+        })
+        .await?;
+    state.metrics.inc_suppression_added();
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "suppression.add",
+            vec![entry.email.clone()],
+            "ok",
+            Some(format!("reason={} source={}", entry.reason, entry.source)),
+        )
+        .await;
+
+    let body = json!({ "suppression": entry });
+    Ok((
+        StatusCode::CREATED,
+        Json(project_fields(body, query.fields.as_deref())?),
+    ))
+}
+
+async fn delete_suppression_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(email): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let normalized = crate::storage::validate_and_normalize_suppression_email(&email)?;
+    let deleted = state.store.delete_suppression(&normalized).await?;
+    if !deleted {
+        return Err(
+            AppError::NotFound(format!("Suppression entry '{normalized}' not found")).into(),
+        );
+    }
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "suppression.remove",
+            vec![normalized.clone()],
+            "ok",
+            None,
+        )
+        .await;
+    let body = json!({
+        "deleted": true,
+        "email": normalized,
+    });
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn get_deliverability_stats_handler(
+    MailboxState(state): MailboxState,
+    Query(params): Query<DeliverabilityStatsParams>,
+) -> Result<Json<Value>, AiError> {
+    let mut thresholds =
+        crate::deliverability::DeliverabilityThresholds::from_config(&state.config);
+    if let Some(ws) = params.window_secs {
+        if ws == 0 {
+            return Err(AppError::validation(
+                "window_secs must be greater than 0",
+                Some("Provide a positive number of seconds (e.g. 86400).".to_string()),
+            )
+            .into());
+        }
+        thresholds.window_secs = ws;
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let domain_names: Vec<String> = if let Some(ref raw_domain) = params.domain {
+        vec![crate::storage::validate_deliverability_domain(raw_domain)?]
+    } else {
+        state.store.list_deliverability_domains().await?
+    };
+
+    let mut domains = Vec::with_capacity(domain_names.len());
+    for d in domain_names {
+        let stats = crate::deliverability::compute_domain_stats(
+            state.store.as_ref(),
+            &d,
+            thresholds,
+            now_ms,
+        )
+        .await?;
+        domains.push(stats);
+    }
+
+    let active_suppressions = state
+        .store
+        .list_suppressions(
+            &crate::storage::SuppressionQuery {
+                limit: crate::storage::MAX_SQL_LIMIT,
+                ..Default::default()
+            },
+            now_ms,
+        )
+        .await?;
+
+    let resp = crate::deliverability::DeliverabilityStatsResponse {
+        config: thresholds,
+        suppression_count: active_suppressions.len(),
+        domains,
+    };
+    let body = serde_json::to_value(resp).map_err(AppError::from)?;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn resume_deliverability_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let norm = crate::storage::validate_deliverability_domain(&domain)?;
+    let now_ms = Utc::now().timestamp_millis();
+    state
+        .store
+        .set_domain_deliverability_paused(&norm, false, None, now_ms)
+        .await?;
+    let thresholds = crate::deliverability::DeliverabilityThresholds::from_config(&state.config);
+    let stats = crate::deliverability::compute_domain_stats(
+        state.store.as_ref(),
+        &norm,
+        thresholds,
+        now_ms,
+    )
+    .await?;
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "deliverability.resume",
+            vec![norm.clone()],
+            "ok",
+            None,
+        )
+        .await;
+
+    let body = json!({
+        "domain": norm,
+        "resumed": true,
+        "stats": stats,
+    });
+    Ok(Json(project_fields(body, query.fields.as_deref())?))
+}
+
+async fn pause_deliverability_domain_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(domain): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    body_bytes: Bytes,
+) -> Result<Json<Value>, AiError> {
+    let norm = crate::storage::validate_deliverability_domain(&domain)?;
+    let req: PauseDeliverabilityRequest = if body_bytes.is_empty() {
+        PauseDeliverabilityRequest::default()
+    } else {
+        serde_json::from_slice(&body_bytes).map_err(AppError::from)?
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    state
+        .store
+        .set_domain_deliverability_paused(&norm, true, req.reason.clone(), now_ms)
+        .await?;
+    let thresholds = crate::deliverability::DeliverabilityThresholds::from_config(&state.config);
+    let stats = crate::deliverability::compute_domain_stats(
+        state.store.as_ref(),
+        &norm,
+        thresholds,
+        now_ms,
+    )
+    .await?;
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "deliverability.pause",
+            vec![norm.clone()],
+            "ok",
+            req.reason,
+        )
+        .await;
+
+    let body = json!({
+        "domain": norm,
+        "paused": true,
+        "stats": stats,
+    });
     Ok(Json(project_fields(body, query.fields.as_deref())?))
 }

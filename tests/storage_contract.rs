@@ -2710,11 +2710,208 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_snooze_and_scheduled_sends(base_store.clone(), &mb_sched_a, &mb_sched_b).await;
     contract_inbox_rules_crud(base_store.for_mailbox(&mb_rules)).await;
     contract_domains_crud_and_isolation(base_store.clone(), &mb_alice, &mb_bob, &suffix).await;
+    contract_deliverability_suppression_events_and_circuit_state(base_store.clone(), &suffix).await;
     contract_storage_perf_and_parity(
         base_store.for_mailbox(&format!("{prefix}-parity-{suffix}@contract.test")),
     )
     .await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
+}
+
+async fn contract_deliverability_suppression_events_and_circuit_state(
+    store: Arc<dyn MailStore>,
+    suffix: &str,
+) {
+    use nogml::storage::{
+        DeliverabilityEventKind, NewDeliverabilityEvent, NewSuppressionInput, SuppressionQuery,
+        SuppressionReason, SuppressionSource,
+    };
+
+    let now_ms = Utc::now().timestamp_millis();
+    let bounced_email = format!("Bounced-{suffix}@Example.COM");
+    let bounced_norm = format!("bounced-{suffix}@example.com");
+    let expired_email = format!("expired-{suffix}@example.com");
+    let domain = format!("dlv-{suffix}.example.com");
+
+    // 1. Upsert suppression normalizes lowercase email and supports re-upsert updates.
+    let created = store
+        .upsert_suppression(NewSuppressionInput {
+            email: bounced_email.clone(),
+            reason: SuppressionReason::HardBounce,
+            source: SuppressionSource::SesSns,
+            detail: Some("550 5.1.1 user unknown".to_string()),
+            created_at_ms: Some(now_ms),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.email, bounced_norm);
+    assert_eq!(created.reason, SuppressionReason::HardBounce);
+    assert_eq!(created.source, SuppressionSource::SesSns);
+
+    // Re-upserting with a different reason updates the existing row in place.
+    let updated = store
+        .upsert_suppression(NewSuppressionInput {
+            email: bounced_norm.clone(),
+            reason: SuppressionReason::Complaint,
+            source: SuppressionSource::Resend,
+            detail: Some("abuse report".to_string()),
+            created_at_ms: Some(now_ms + 100),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.reason, SuppressionReason::Complaint);
+    assert_eq!(updated.source, SuppressionSource::Resend);
+
+    // Expired suppression entry is ignored by get/find/default list, visible with include_expired.
+    store
+        .upsert_suppression(NewSuppressionInput {
+            email: expired_email.clone(),
+            reason: SuppressionReason::Manual,
+            source: SuppressionSource::Manual,
+            detail: Some("temp block".to_string()),
+            created_at_ms: Some(now_ms - 5_000),
+            expires_at_ms: Some(now_ms - 1_000),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .get_suppression(&bounced_email, now_ms)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_suppression(&expired_email, now_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let found = store
+        .find_suppressed_emails(
+            &[
+                bounced_email.clone(),
+                expired_email.clone(),
+                format!("clean-{suffix}@example.com"),
+            ],
+            now_ms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].email, bounced_norm);
+
+    let filtered = store
+        .list_suppressions(
+            &SuppressionQuery {
+                q: Some(suffix.to_string()),
+                reason: Some(SuppressionReason::Complaint),
+                source: Some(SuppressionSource::Resend),
+                include_expired: false,
+                limit: 50,
+            },
+            now_ms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].email, bounced_norm);
+
+    let with_expired = store
+        .list_suppressions(
+            &SuppressionQuery {
+                q: Some(suffix.to_string()),
+                reason: None,
+                source: None,
+                include_expired: true,
+                limit: 50,
+            },
+            now_ms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_expired.len(), 2);
+
+    // Delete suppression returns true once, then false.
+    assert!(store.delete_suppression(&bounced_email).await.unwrap());
+    assert!(!store.delete_suppression(&bounced_email).await.unwrap());
+    assert!(store.delete_suppression(&expired_email).await.unwrap());
+
+    // 2. Deliverability events & windowed counts.
+    for (kind, offset_ms) in [
+        (DeliverabilityEventKind::Sent, -10_000),
+        (DeliverabilityEventKind::Sent, -500),
+        (DeliverabilityEventKind::Sent, 0),
+        (DeliverabilityEventKind::HardBounce, -200),
+        (DeliverabilityEventKind::SoftBounce, -100),
+        (DeliverabilityEventKind::Complaint, 50),
+    ] {
+        store
+            .record_deliverability_event(NewDeliverabilityEvent {
+                domain: domain.clone(),
+                mailbox_id: Some(format!("sender-{suffix}@contract.test")),
+                kind,
+                recipient: Some(format!("rcpt-{suffix}@example.com")),
+                provider: Some("ses".to_string()),
+                detail: None,
+                created_at_ms: Some(now_ms + offset_ms),
+            })
+            .await
+            .unwrap();
+    }
+
+    let recent_counts = store
+        .count_deliverability_events(&domain, now_ms - 1_000)
+        .await
+        .unwrap();
+    assert_eq!(recent_counts.sent, 2);
+    assert_eq!(recent_counts.hard_bounce, 1);
+    assert_eq!(recent_counts.soft_bounce, 1);
+    assert_eq!(recent_counts.complaint, 1);
+
+    let domains = store.list_deliverability_domains().await.unwrap();
+    assert!(domains.contains(&domain));
+
+    // 3. Manual pause / resume circuit breaker state persistence.
+    assert!(
+        store
+            .get_domain_deliverability_state(&domain)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let paused = store
+        .set_domain_deliverability_paused(
+            &domain,
+            true,
+            Some("high bounce spike".to_string()),
+            now_ms + 1_000,
+        )
+        .await
+        .unwrap();
+    assert!(paused.manually_paused);
+    assert_eq!(paused.pause_reason.as_deref(), Some("high bounce spike"));
+    assert!(paused.resumed_at_ms.is_none());
+
+    let resumed = store
+        .set_domain_deliverability_paused(&domain, false, None, now_ms + 2_000)
+        .await
+        .unwrap();
+    assert!(!resumed.manually_paused);
+    assert!(resumed.pause_reason.is_none());
+    assert_eq!(resumed.resumed_at_ms, Some(now_ms + 2_000));
+
+    let reloaded = store
+        .get_domain_deliverability_state(&domain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded, resumed);
 }
 
 async fn contract_domains_crud_and_isolation(
