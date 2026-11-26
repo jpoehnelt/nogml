@@ -20,7 +20,7 @@ use crate::{
         read_secret_file, resolve_secret_tokens, resolve_secret_value, split_token_list,
         system_env_lookup,
     },
-    transport::{SesConfig, SmtpConfig},
+    transport::{GmailTransportConfig, SesConfig, SmtpConfig},
 };
 
 /// Normalize a mailbox identifier (email address) by trimming whitespace and lowercasing ASCII.
@@ -161,6 +161,7 @@ pub enum TransportBackend {
     Resend,
     Ses,
     Smtp,
+    Gmail,
 }
 
 /// TLS mode for `SmtpTransport`.
@@ -586,6 +587,8 @@ pub struct Config {
     pub smtp_tls_mode: SmtpTlsMode,
     pub smtp_username: Option<String>,
     pub smtp_password: Option<String>,
+    #[serde(default)]
+    pub smtp_oauth_token: Option<String>,
     pub smtp_helo_domain: Option<String>,
 
     // --- AI-first safety guardrails ---
@@ -781,6 +784,7 @@ impl Default for Config {
             smtp_tls_mode: SmtpTlsMode::Starttls,
             smtp_username: None,
             smtp_password: None,
+            smtp_oauth_token: None,
             smtp_helo_domain: None,
 
             draft_only: false,
@@ -1158,6 +1162,7 @@ impl Config {
             smtp_tls_mode,
             smtp_username,
             smtp_password,
+            smtp_oauth_token,
             smtp_helo_domain,
             draft_only,
             draft_only_action,
@@ -1321,6 +1326,7 @@ impl Config {
                 "tls_mode": smtp_tls_mode,
                 "username": smtp_username,
                 "password": redact_opt(smtp_password),
+                "oauth_token": redact_opt(smtp_oauth_token),
                 "helo_domain": smtp_helo_domain,
             },
             "safety": {
@@ -1538,6 +1544,13 @@ impl Config {
             self.smtp_password
         );
         load_opt_env_file!(
+            "smtp_oauth_token",
+            "smtp.oauth_token",
+            "NOGML_SMTP_OAUTH_TOKEN",
+            "NOGML_SMTP_OAUTH_TOKEN_FILE",
+            self.smtp_oauth_token
+        );
+        load_opt_env_file!(
             "imap_password",
             "imap.password",
             "NOGML_IMAP_PASSWORD",
@@ -1723,6 +1736,7 @@ impl Config {
         resolve_opt_uri!("ses.session_token", self.ses_session_token);
         resolve_opt_uri!("ses.webhook_secret", self.ses_webhook_secret);
         resolve_opt_uri!("smtp.password", self.smtp_password);
+        resolve_opt_uri!("smtp.oauth_token", self.smtp_oauth_token);
         resolve_opt_uri!("imap.password", self.imap_password);
         resolve_opt_uri!("sync.gmail_client_secret", self.gmail_client_secret);
         resolve_opt_uri!("sync.gmail_refresh_token", self.gmail_refresh_token);
@@ -1853,6 +1867,7 @@ impl fmt::Debug for Config {
             smtp_tls_mode,
             smtp_username,
             smtp_password,
+            smtp_oauth_token,
             smtp_helo_domain,
             draft_only,
             draft_only_action,
@@ -1987,6 +2002,7 @@ impl fmt::Debug for Config {
             .field("smtp_tls_mode", smtp_tls_mode)
             .field("smtp_username", smtp_username)
             .field("smtp_password", &redacted_opt(smtp_password))
+            .field("smtp_oauth_token", &redacted_opt(smtp_oauth_token))
             .field("smtp_helo_domain", smtp_helo_domain)
             .field("draft_only", draft_only)
             .field("draft_only_action", draft_only_action)
@@ -2234,10 +2250,34 @@ impl std::fmt::Debug for OAuth2TomlConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct TransportTomlConfig {
     pub backend: Option<TransportBackend>,
+}
+
+impl<'de> Deserialize<'de> for TransportTomlConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum TransportTomlRepr {
+            Shorthand(TransportBackend),
+            Table(TransportTable),
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct TransportTable {
+            backend: Option<TransportBackend>,
+        }
+
+        match TransportTomlRepr::deserialize(deserializer)? {
+            TransportTomlRepr::Shorthand(b) => Ok(Self { backend: Some(b) }),
+            TransportTomlRepr::Table(t) => Ok(Self { backend: t.backend }),
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -2299,6 +2339,7 @@ pub struct SmtpTomlConfig {
     pub tls_mode: Option<SmtpTlsMode>,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub oauth_token: Option<String>,
     pub helo_domain: Option<String>,
 }
 
@@ -2310,6 +2351,7 @@ impl std::fmt::Debug for SmtpTomlConfig {
             .field("tls_mode", &self.tls_mode)
             .field("username", &self.username)
             .field("password", &redacted_opt_debug(&self.password))
+            .field("oauth_token", &redacted_opt_debug(&self.oauth_token))
             .field("helo_domain", &self.helo_domain)
             .finish()
     }
@@ -2768,6 +2810,9 @@ impl TomlConfig {
         if let Some(ref v) = self.smtp.password {
             cfg.smtp_password = Some(v.clone());
         }
+        if let Some(ref v) = self.smtp.oauth_token {
+            cfg.smtp_oauth_token = Some(v.clone());
+        }
         if let Some(ref v) = self.smtp.helo_domain {
             cfg.smtp_helo_domain = Some(v.clone());
         }
@@ -3146,25 +3191,40 @@ pub fn validate_config(
                 );
             }
         }
-        TransportBackend::Smtp => {
-            if let Err(err) = SmtpConfig::from_config(config) {
+        TransportBackend::Smtp => match SmtpConfig::from_config(config) {
+            Ok(smtp_cfg) => {
+                let has_user = config
+                    .smtp_username
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_pass = config
+                    .smtp_password
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty());
+                if smtp_cfg.oauth2.is_none() && has_user != has_pass {
+                    warnings.push(
+                            "Only one of smtp.username and smtp.password is set; SMTP AUTH requires both (or configure smtp.oauth_token / Gmail OAuth2 for XOAUTH2)"
+                                .to_string(),
+                        );
+                }
+            }
+            Err(err) => {
                 errors.push(err.to_string());
             }
-            let has_user = config
-                .smtp_username
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
-            let has_pass = config
-                .smtp_password
-                .as_deref()
-                .is_some_and(|s| !s.is_empty());
-            if has_user != has_pass {
-                warnings.push(
-                    "Only one of smtp.username and smtp.password is set; SMTP AUTH requires both"
-                        .to_string(),
-                );
+        },
+        TransportBackend::Gmail => match GmailTransportConfig::from_config(config) {
+            Ok(gmail_cfg) => {
+                if !gmail_cfg.has_credentials() {
+                    warnings.push(
+                        "Gmail OAuth2 credentials are not set; outbound Gmail API sends require GMAIL_ACCESS_TOKEN or (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN)"
+                            .to_string(),
+                    );
+                }
             }
-        }
+            Err(err) => {
+                errors.push(err.to_string());
+            }
+        },
     }
 
     // --- Auth & OAuth2 ---

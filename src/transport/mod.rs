@@ -5,6 +5,7 @@
 //! can drop in behind `Arc<dyn MailTransport>` without leaking provider types into `gmail`,
 //! `ai`, `mcp`, `imap`, or `storage`.
 
+pub mod gmail;
 pub mod ses;
 pub mod smtp;
 
@@ -24,10 +25,17 @@ use crate::{
     storage::{MailStore, NewAttachmentInput, NewMessageInput, StoredMessage},
 };
 
+pub use gmail::{GmailApiTransport, GmailTransportConfig};
 pub use ses::{
     SesConfig, SesTransport, SigV4Headers, ses_router, ses_webhook_handler, sign_aws_v4,
 };
-pub use smtp::{SmtpConfig, SmtpTransport, dot_stuff_rfc5321};
+pub use smtp::{
+    SmtpConfig, SmtpOAuth2Config, SmtpTransport, build_xoauth2_sasl_payload, dot_stuff_rfc5321,
+};
+
+/// Internal `OutboundMessage::tags` key carrying an upstream Gmail `threadId` when replying
+/// to a synced Gmail thread. Filtered out by non-Gmail transports such as Resend.
+pub const TAG_GMAIL_THREAD_ID: &str = "_nogml_gmail_thread_id";
 
 /// Construct the active [`MailTransport`] selected by [`Config::transport`].
 pub fn open_transport(
@@ -41,6 +49,7 @@ pub fn open_transport(
         ))),
         TransportBackend::Ses => Ok(Arc::new(SesTransport::from_config(config)?)),
         TransportBackend::Smtp => Ok(Arc::new(SmtpTransport::from_config(config)?)),
+        TransportBackend::Gmail => Ok(Arc::new(GmailApiTransport::from_config(config)?)),
     }
 }
 
@@ -213,6 +222,72 @@ pub struct OutboundMessage {
     pub scheduled_at: Option<String>,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+}
+
+impl OutboundMessage {
+    /// Attach an upstream Gmail `threadId` so [`GmailApiTransport`] threads replies cleanly.
+    pub fn set_upstream_thread_id(&mut self, thread_id: impl Into<String>) {
+        let tid = thread_id.into();
+        let trimmed = tid.trim();
+        if !trimmed.is_empty() {
+            self.tags
+                .insert(TAG_GMAIL_THREAD_ID.to_string(), trimmed.to_string());
+        }
+    }
+
+    /// Read any attached upstream Gmail `threadId`.
+    pub fn upstream_thread_id(&self) -> Option<&str> {
+        self.tags
+            .get(TAG_GMAIL_THREAD_ID)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Resolve an upstream Gmail `threadId` from a local `thread_id` or `In-Reply-To`/`References` headers.
+pub async fn resolve_outbound_upstream_thread_id(
+    store: &dyn MailStore,
+    thread_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> Option<String> {
+    if let Some(tid) = thread_id.map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(Some(detail)) = store.get_thread(tid).await
+    {
+        for m in detail.messages {
+            if let Some(utid) = m.upstream_thread_id
+                && !utid.trim().is_empty()
+            {
+                return Some(utid);
+            }
+        }
+    }
+    for candidate in extract_parent_message_ids(in_reply_to, references) {
+        if let Ok(Some(parent)) = store.find_message_by_rfc_message_id(&candidate).await
+            && let Some(utid) = parent.upstream_thread_id
+            && !utid.trim().is_empty()
+        {
+            return Some(utid);
+        }
+    }
+    None
+}
+
+/// Derive `(upstream_gmail_id, upstream_thread_id)` for a locally persisted Sent message after
+/// [`MailTransport::send`] completes.
+pub fn upstream_gmail_ids_from_send(
+    outcome: &SendOutcome,
+    upstream_thread_id: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if outcome.provider == "gmail" && !outcome.provider_message_id.trim().is_empty() {
+        (
+            Some(outcome.provider_message_id.clone()),
+            upstream_thread_id.filter(|s| !s.trim().is_empty()),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 /// Result returned by [`MailTransport::send`].

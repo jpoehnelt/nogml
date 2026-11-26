@@ -1191,10 +1191,10 @@ mod tests {
             unreachable!()
         }
         async fn get_settings(&self) -> AppResult<UserSettings> {
-            unreachable!()
+            Ok(UserSettings::default_for_email(self.mailbox_id()))
         }
-        async fn save_settings(&self, _settings: UserSettings) -> AppResult<UserSettings> {
-            unreachable!()
+        async fn save_settings(&self, settings: UserSettings) -> AppResult<UserSettings> {
+            Ok(settings)
         }
         async fn create_pending_approval(
             &self,

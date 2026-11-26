@@ -90,6 +90,7 @@ struct MemoryState {
     drafts: HashMap<String, MemDraft>,
     history_events: Vec<MemHistoryEvent>,
     sync_states: HashMap<String, SyncState>,
+    sync_metadata: HashMap<String, String>,
     watch: Option<WatchSubscription>,
     settings: UserSettings,
     pending_approvals: HashMap<String, PendingApproval>,
@@ -148,6 +149,7 @@ impl MemoryState {
             drafts: HashMap::new(),
             history_events: Vec::new(),
             sync_states: HashMap::new(),
+            sync_metadata: HashMap::new(),
             watch: None,
             settings: UserSettings::default_for_email(default_email),
             pending_approvals: HashMap::new(),
@@ -3077,6 +3079,50 @@ impl MailStore for MemoryStore {
         let mut list: Vec<SyncState> = state.sync_states.values().cloned().collect();
         list.sort_by(|a, b| a.account_key.cmp(&b.account_key));
         Ok(list)
+    }
+
+    async fn set_message_upstream_ids(
+        &self,
+        id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<Option<StoredMessage>> {
+        let mut state = self.write_state()?;
+        let Some(msg) = state.messages.get_mut(id) else {
+            return Ok(None);
+        };
+        msg.upstream_gmail_id = Some(upstream_gmail_id.to_string());
+        if let Some(tid) = upstream_thread_id.filter(|s| !s.trim().is_empty()) {
+            msg.upstream_thread_id = Some(tid.to_string());
+        }
+        Ok(Some(msg.clone()))
+    }
+
+    async fn set_label_upstream_id(
+        &self,
+        id: &str,
+        upstream_label_id: &str,
+    ) -> AppResult<Option<StoredLabel>> {
+        let mut state = self.write_state()?;
+        let Some(lbl) = state.labels.get_mut(id) else {
+            return Ok(None);
+        };
+        lbl.upstream_label_id = Some(upstream_label_id.to_string());
+        let cloned = lbl.clone();
+        Ok(Some(state.build_stored_label(&cloned)))
+    }
+
+    async fn get_sync_metadata(&self, key: &str) -> AppResult<Option<String>> {
+        let state = self.read_state()?;
+        Ok(state.sync_metadata.get(key).cloned())
+    }
+
+    async fn put_sync_metadata(&self, key: &str, value_json: &str) -> AppResult<()> {
+        let mut state = self.write_state()?;
+        state
+            .sync_metadata
+            .insert(key.to_string(), value_json.to_string());
+        Ok(())
     }
 
     async fn set_watch(&self, watch: WatchSubscription) -> AppResult<WatchSubscription> {

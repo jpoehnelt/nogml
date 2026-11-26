@@ -201,6 +201,38 @@ pub(crate) fn gmail_api_routes() -> Router<AppState> {
                 .delete(settings::delete_send_as),
         )
         .route(
+            "/gmail/v1/users/{userId}/settings/sendAs/{sendAsEmail}/verify",
+            post(settings::verify_send_as),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/filters",
+            get(settings::list_filters).post(settings::create_filter),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/filters/{id}",
+            get(settings::get_filter).delete(settings::delete_filter),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/forwardingAddresses",
+            get(settings::list_forwarding_addresses).post(settings::create_forwarding_address),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/forwardingAddresses/{forwardingEmail}",
+            get(settings::get_forwarding_address).delete(settings::delete_forwarding_address),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/delegates",
+            get(settings::list_delegates).post(settings::create_delegate),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/delegates/{delegateEmail}",
+            get(settings::get_delegate).delete(settings::delete_delegate),
+        )
+        .route(
+            "/gmail/v1/users/{userId}/settings/language",
+            get(settings::get_language).put(settings::update_language),
+        )
+        .route(
             "/gmail/v1/users/{userId}/settings/vacation",
             get(settings::get_vacation).put(settings::update_vacation),
         )
@@ -638,7 +670,20 @@ async fn execute_gmail_send(
         }
     }
 
+    let resolved_upstream_tid = crate::transport::resolve_outbound_upstream_thread_id(
+        state.store.as_ref(),
+        thread_id.as_deref(),
+        parsed.in_reply_to.as_deref(),
+        parsed.references_header.as_deref(),
+    )
+    .await;
+    if let Some(ref up_tid) = resolved_upstream_tid {
+        outbound.set_upstream_thread_id(up_tid);
+    }
+
     let send_outcome = state.transport.send(&outbound, idempotency_key).await?;
+    let (upstream_gmail_id, upstream_thread_id) =
+        crate::transport::upstream_gmail_ids_from_send(&send_outcome, resolved_upstream_tid);
 
     let mut labels = vec![LABEL_SENT.to_string()];
     for l in extra_labels {
@@ -649,7 +694,7 @@ async fn execute_gmail_send(
     }
     let labels = dedup_labels(labels);
 
-    let input = build_new_message_input(
+    let mut input = build_new_message_input(
         &parsed,
         raw_bytes,
         thread_id,
@@ -659,6 +704,8 @@ async fn execute_gmail_send(
         false,
         "local",
     );
+    input.upstream_gmail_id = upstream_gmail_id;
+    input.upstream_thread_id = upstream_thread_id;
     let stored = state.store.insert_message(input).await?;
     state.post_store_message(&stored).await?;
     state.metrics.inc_messages_sent();
@@ -999,9 +1046,19 @@ async fn complete_import_message(
         internal_date_ms,
         None,
         deleted,
-        "local",
+        "gmail_import",
     );
     let stored = state.store.insert_message(input).await?;
+    let webhook_policy = crate::ai::rules::RuleWebhookPolicy::from_config(&state.config);
+    let stored = crate::ai::rules::evaluate_inbox_rules_with_cipher(
+        state.store.as_ref(),
+        &state.events,
+        &stored,
+        state.config.untrusted_content_guard,
+        &webhook_policy,
+        state.cipher.as_ref(),
+    )
+    .await;
     state.post_store_message(&stored).await?;
     state.metrics.inc_messages_received();
 

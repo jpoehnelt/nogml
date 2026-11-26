@@ -117,6 +117,13 @@ pub trait SyncSource: Send + Sync {
         opts: &SyncRunOptions,
     ) -> AppResult<PullReport>;
 
+    /// Returns `true` when this connector handles additional bidirectional push work
+    /// (such as drafts, locally created Sent/imported messages, or custom labels)
+    /// even when message-level `LocalMutation`s are empty.
+    fn supports_full_bidirectional_push(&self) -> bool {
+        false
+    }
+
     /// Replay local label, flag, trash, and delete mutations back to the upstream account.
     ///
     /// One-way connectors can rely on this default no-op implementation.
@@ -357,12 +364,15 @@ async fn run_sync_source_inner(
     state.store.save_sync_state(sync_state.clone()).await?;
 
     // 1. Capture pre-pull local history checkpoint and collect genuinely local mutations.
+    let skip_draft_mutations = source.supports_full_bidirectional_push();
     let pre_pull_hid = state.store.current_history_id().await?;
     let pending_mutations = if bidirectional
         && let Some(last_pushed_hid) = sync_state.last_pushed_history_id
         && pre_pull_hid > last_pushed_hid
     {
-        match collect_local_mutations(state, last_pushed_hid, pre_pull_hid).await {
+        match collect_local_mutations(state, last_pushed_hid, pre_pull_hid, skip_draft_mutations)
+            .await
+        {
             Ok(m) => m,
             Err(err) => {
                 sync_state.status = "error".to_string();
@@ -388,9 +398,12 @@ async fn run_sync_source_inner(
 
     let post_pull_hid = state.store.current_history_id().await?;
 
-    // 3. Resolve conflicts with pull-generated history events and push remaining local mutations.
-    let push_report = if bidirectional && !pending_mutations.is_empty() {
-        let resolved_mutations =
+    // 3. Resolve conflicts with pull-generated history events and push remaining local mutations
+    // (including label, draft, and locally created Sent/imported message pushback).
+    let push_report = if bidirectional {
+        let resolved_mutations = if pending_mutations.is_empty() {
+            Vec::new()
+        } else {
             match resolve_pull_conflicts(state, pre_pull_hid, post_pull_hid, pending_mutations)
                 .await
             {
@@ -401,9 +414,10 @@ async fn run_sync_source_inner(
                     let _ = state.store.save_sync_state(sync_state).await;
                     return Err(err);
                 }
-            };
+            }
+        };
 
-        if resolved_mutations.is_empty() {
+        if resolved_mutations.is_empty() && !source.supports_full_bidirectional_push() {
             PushReport::default()
         } else {
             match source.push_changes(state, &resolved_mutations).await {
@@ -424,7 +438,8 @@ async fn run_sync_source_inner(
     // without skipping any concurrent local (`source = "local"`) mutations created while `pull()`
     // was executing.
     let next_pushed_hid = if bidirectional {
-        compute_next_pushed_history_id(state, pre_pull_hid, post_pull_hid).await?
+        compute_next_pushed_history_id(state, pre_pull_hid, post_pull_hid, skip_draft_mutations)
+            .await?
     } else {
         post_pull_hid
     };
@@ -478,6 +493,7 @@ async fn collect_local_mutations(
     state: &AppState,
     after_hid: u64,
     through_hid: u64,
+    skip_draft_mutations: bool,
 ) -> AppResult<Vec<LocalMutation>> {
     if through_hid <= after_hid {
         return Ok(Vec::new());
@@ -494,6 +510,10 @@ async fn collect_local_mutations(
     for entry in entries {
         if entry.source == HISTORY_SOURCE_SYNC {
             // Skip upstream-originated sync writes so retries never echo pulled rows back upstream.
+            continue;
+        }
+        if skip_draft_mutations && entry.label_ids.iter().any(|l| l == LABEL_DRAFT) {
+            // Gmail API draft lifecycle mutations are synchronized via `users.drafts.*`, not `users.messages.*`.
             continue;
         }
         let acc = by_msg.entry(entry.message_id.clone()).or_insert_with(|| {
@@ -715,6 +735,7 @@ async fn compute_next_pushed_history_id(
     state: &AppState,
     pre_pull_hid: u64,
     post_pull_hid: u64,
+    skip_draft_mutations: bool,
 ) -> AppResult<u64> {
     if post_pull_hid <= pre_pull_hid {
         return Ok(post_pull_hid);
@@ -722,7 +743,10 @@ async fn compute_next_pushed_history_id(
     let range_events = load_mutation_history_range(state, pre_pull_hid, post_pull_hid).await?;
     if let Some(first_local_hid) = range_events
         .iter()
-        .filter(|e| e.source != HISTORY_SOURCE_SYNC)
+        .filter(|e| {
+            e.source != HISTORY_SOURCE_SYNC
+                && !(skip_draft_mutations && e.label_ids.iter().any(|l| l == LABEL_DRAFT))
+        })
         .map(|e| e.history_id)
         .min()
     {

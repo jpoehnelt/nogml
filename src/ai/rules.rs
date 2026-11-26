@@ -17,7 +17,7 @@ use crate::{
     crypto::SecretCipher,
     error::{AppError, AppResult},
     events::{EventBus, EventSource, MailEvent},
-    models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_UNREAD},
+    models::{GmailFilter, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_UNREAD},
     net_guard::{
         UrlGuardOptions, build_pinned_http_client, validate_and_pin_url, validate_url_static,
     },
@@ -480,6 +480,123 @@ fn rule_matches_query(rule: &InboxRule, msg: &StoredMessage) -> bool {
     matches_message(&query, msg)
 }
 
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn matches_filter_text_expr(haystack: &str, expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.split(" OR ").any(|branch| {
+        let cleaned = branch.trim().trim_matches('"').trim();
+        !cleaned.is_empty() && contains_ci(haystack, cleaned)
+    })
+}
+
+/// Evaluate whether a Gmail `users.settings.filters` entry matches a [`StoredMessage`].
+pub fn gmail_filter_matches(filter: &GmailFilter, msg: &StoredMessage) -> bool {
+    let Some(ref criteria) = filter.criteria else {
+        return false;
+    };
+    let mut has_any = false;
+
+    if let Some(ref from) = criteria.from
+        && !from.trim().is_empty()
+    {
+        has_any = true;
+        if !matches_filter_text_expr(&msg.from_addr, from) {
+            return false;
+        }
+    }
+
+    if let Some(ref to) = criteria.to
+        && !to.trim().is_empty()
+    {
+        has_any = true;
+        let matched_recipient = msg
+            .to_addrs
+            .iter()
+            .chain(msg.cc_addrs.iter())
+            .chain(msg.bcc_addrs.iter())
+            .any(|addr| matches_filter_text_expr(addr, to));
+        if !matched_recipient {
+            return false;
+        }
+    }
+
+    if let Some(ref subject) = criteria.subject
+        && !subject.trim().is_empty()
+    {
+        has_any = true;
+        if !matches_filter_text_expr(&msg.subject, subject) {
+            return false;
+        }
+    }
+
+    if let Some(ref query) = criteria.query
+        && !query.trim().is_empty()
+    {
+        has_any = true;
+        let parsed = parse_query(query.trim());
+        if !matches_message(&parsed, msg) {
+            return false;
+        }
+    }
+
+    if let Some(ref neg) = criteria.negated_query
+        && !neg.trim().is_empty()
+    {
+        has_any = true;
+        let parsed = parse_query(neg.trim());
+        if !parsed.terms.is_empty() && matches_message(&parsed, msg) {
+            return false;
+        }
+    }
+
+    if criteria.has_attachment == Some(true) {
+        has_any = true;
+        if !msg.has_attachments {
+            return false;
+        }
+    }
+
+    if criteria.exclude_chats == Some(true)
+        && msg.label_ids.iter().any(|l| l.eq_ignore_ascii_case("CHAT"))
+    {
+        return false;
+    }
+
+    if let Some(size) = criteria.size {
+        has_any = true;
+        let msg_size = if msg.size_estimate > 0 {
+            i64::from(msg.size_estimate)
+        } else {
+            msg.raw_rfc2822.len() as i64
+        };
+        let cmp = criteria
+            .size_comparison
+            .as_deref()
+            .unwrap_or("larger")
+            .to_ascii_lowercase();
+        let matched = match cmp.as_str() {
+            "smaller" => msg_size < size,
+            _ => msg_size > size,
+        };
+        if !matched {
+            return false;
+        }
+    }
+
+    has_any
+}
+
 async fn ensure_labels_exist(store: &dyn MailStore, labels: &[String]) {
     if labels.is_empty() {
         return;
@@ -580,12 +697,20 @@ pub async fn evaluate_inbox_rules_with_cipher(
         Ok(r) => r,
         Err(err) => {
             warn!(%err, message_id = %msg.id, "Failed to load inbox rules; skipping rule evaluation");
-            return msg.clone();
+            Vec::new()
+        }
+    };
+
+    let gmail_filters = match store.get_settings().await {
+        Ok(s) => s.filters,
+        Err(err) => {
+            warn!(%err, message_id = %msg.id, "Failed to load Gmail settings filters; skipping filter evaluation");
+            Vec::new()
         }
     };
 
     let enabled_rules: Vec<InboxRule> = rules.into_iter().filter(|r| r.enabled).collect();
-    if enabled_rules.is_empty() {
+    if enabled_rules.is_empty() && gmail_filters.is_empty() {
         return msg.clone();
     }
 
@@ -612,11 +737,16 @@ pub async fn evaluate_inbox_rules_with_cipher(
         }
     }
 
-    if matched_rules.is_empty() {
+    let matched_gmail_filters: Vec<GmailFilter> = gmail_filters
+        .into_iter()
+        .filter(|f| gmail_filter_matches(f, msg))
+        .collect();
+
+    if matched_rules.is_empty() && matched_gmail_filters.is_empty() {
         return msg.clone();
     }
 
-    // Aggregate label mutations in rule creation order.
+    // Aggregate label mutations in creation order (inbox rules, then Gmail settings filters).
     let mut add_labels: Vec<String> = Vec::new();
     let mut remove_labels: Vec<String> = Vec::new();
 
@@ -654,6 +784,38 @@ pub async fn evaluate_inbox_rules_with_cipher(
             add_labels.retain(|a| a != LABEL_UNREAD);
             if !remove_labels.iter().any(|r| r == LABEL_UNREAD) {
                 remove_labels.push(LABEL_UNREAD.to_string());
+            }
+        }
+    }
+
+    for filter in &matched_gmail_filters {
+        if let Some(ref action) = filter.action {
+            if let Some(ref adds) = action.add_label_ids {
+                for lbl in adds {
+                    let trimmed = lbl.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    remove_labels.retain(|r| !r.eq_ignore_ascii_case(trimmed));
+                    if !add_labels.iter().any(|a| a.eq_ignore_ascii_case(trimmed)) {
+                        add_labels.push(trimmed.to_string());
+                    }
+                }
+            }
+            if let Some(ref rems) = action.remove_label_ids {
+                for lbl in rems {
+                    let trimmed = lbl.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    add_labels.retain(|a| !a.eq_ignore_ascii_case(trimmed));
+                    if !remove_labels
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(trimmed))
+                    {
+                        remove_labels.push(trimmed.to_string());
+                    }
+                }
             }
         }
     }

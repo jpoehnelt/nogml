@@ -1368,6 +1368,7 @@ mod pluggable_seam_tests {
             (TransportBackend::Resend, "resend"),
             (TransportBackend::Ses, "ses"),
             (TransportBackend::Smtp, "smtp"),
+            (TransportBackend::Gmail, "gmail"),
         ] {
             let mut cfg = Config::for_test();
             cfg.transport = backend;

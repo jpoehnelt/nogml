@@ -21,7 +21,7 @@ use crate::{
     imap::build_tls_acceptor,
     secrets::{SecretResolutionReport, check_secret_file_permissions},
     storage::{SqliteStore, open_store_async},
-    transport::{SesConfig, SmtpConfig},
+    transport::{GmailTransportConfig, SesConfig, SmtpConfig},
 };
 
 /// Non-mutating probe key used to verify `BlobStore` reachability.
@@ -541,13 +541,16 @@ fn check_transport(config: &Config) -> DoctorCheck {
             }
         }
         TransportBackend::Smtp => {
-            if let Err(err) = SmtpConfig::from_config(config) {
-                return DoctorCheck {
-                    name: "transport".to_string(),
-                    status: DoctorStatus::Fail,
-                    detail: err.to_string(),
-                };
-            }
+            let smtp_cfg = match SmtpConfig::from_config(config) {
+                Ok(c) => c,
+                Err(err) => {
+                    return DoctorCheck {
+                        name: "transport".to_string(),
+                        status: DoctorStatus::Fail,
+                        detail: err.to_string(),
+                    };
+                }
+            };
             let has_user = config
                 .smtp_username
                 .as_deref()
@@ -556,7 +559,7 @@ fn check_transport(config: &Config) -> DoctorCheck {
                 .smtp_password
                 .as_deref()
                 .is_some_and(|s| !s.is_empty());
-            if has_user != has_pass {
+            if smtp_cfg.oauth2.is_none() && has_user != has_pass {
                 return DoctorCheck {
                     name: "transport".to_string(),
                     status: DoctorStatus::Warn,
@@ -564,13 +567,49 @@ fn check_transport(config: &Config) -> DoctorCheck {
                         .to_string(),
                 };
             }
+            let auth_desc = if smtp_cfg.oauth2.is_some() {
+                ", auth=XOAUTH2"
+            } else if has_user {
+                ", auth=PLAIN/LOGIN"
+            } else {
+                ""
+            };
             DoctorCheck {
                 name: "transport".to_string(),
                 status: DoctorStatus::Pass,
                 detail: format!(
-                    "smtp transport configured ({}:{}, tls={:?})",
+                    "smtp transport configured ({}:{}, tls={:?}{auth_desc})",
                     config.smtp_host, config.smtp_port, config.smtp_tls_mode
                 ),
+            }
+        }
+        TransportBackend::Gmail => {
+            let gmail_cfg = match GmailTransportConfig::from_config(config) {
+                Ok(c) => c,
+                Err(err) => {
+                    return DoctorCheck {
+                        name: "transport".to_string(),
+                        status: DoctorStatus::Fail,
+                        detail: err.to_string(),
+                    };
+                }
+            };
+            if gmail_cfg.has_credentials() {
+                DoctorCheck {
+                    name: "transport".to_string(),
+                    status: DoctorStatus::Pass,
+                    detail: format!(
+                        "gmail transport configured (user_id={}, OAuth2 credentials present)",
+                        gmail_cfg.user_id
+                    ),
+                }
+            } else {
+                DoctorCheck {
+                    name: "transport".to_string(),
+                    status: DoctorStatus::Warn,
+                    detail: "gmail transport active, but Gmail OAuth2 credentials are not set"
+                        .to_string(),
+                }
             }
         }
     }

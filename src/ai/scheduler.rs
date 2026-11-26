@@ -568,6 +568,29 @@ pub async fn process_due_scheduler_items(
             }
         }
 
+        let mut outbound_owned = outbound.clone();
+        let irt_lookup = outbound_owned
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("in-reply-to"))
+            .map(|(_, v)| v.clone());
+        let refs_lookup = outbound_owned
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("references"))
+            .map(|(_, v)| v.clone());
+        let resolved_upstream_tid = crate::transport::resolve_outbound_upstream_thread_id(
+            mb_state.store.as_ref(),
+            current.thread_id.as_deref(),
+            irt_lookup.as_deref(),
+            refs_lookup.as_deref(),
+        )
+        .await;
+        if let Some(ref up_tid) = resolved_upstream_tid {
+            outbound_owned.set_upstream_thread_id(up_tid);
+        }
+        let outbound = &outbound_owned;
+
         let transport_idem_key = format!("scheduled-{}", current.id);
         let send_outcome = match mb_state
             .transport
@@ -601,6 +624,8 @@ pub async fn process_due_scheduler_items(
                 continue;
             }
         };
+        let (upstream_gmail_id, upstream_thread_id) =
+            crate::transport::upstream_gmail_ids_from_send(&send_outcome, resolved_upstream_tid);
 
         let raw_rfc2822 =
             match crate::transport::ensure_raw_rfc2822(outbound, &mb_state.config.user_email) {
@@ -679,8 +704,8 @@ pub async fn process_due_scheduler_items(
                 in_reply_to,
                 references_header,
                 resend_id: Some(send_outcome.provider_message_id.clone()),
-                upstream_gmail_id: None,
-                upstream_thread_id: None,
+                upstream_gmail_id,
+                upstream_thread_id,
                 source: "local".to_string(),
                 is_answered: false,
                 is_deleted: false,

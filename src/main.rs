@@ -173,7 +173,7 @@ struct CommonConfigArgs {
     )]
     default_domain: String,
 
-    /// Outbound mail transport backend (`resend`, `ses`, or `smtp`).
+    /// Outbound mail transport backend (`resend`, `ses`, `smtp`, or `gmail`).
     #[arg(long, env = "NOGML_TRANSPORT", default_value = "resend", global = true)]
     transport: TransportBackend,
 
@@ -277,6 +277,10 @@ struct CommonConfigArgs {
     /// Optional SMTP AUTH password.
     #[arg(long, env = "NOGML_SMTP_PASSWORD", global = true)]
     smtp_password: Option<String>,
+
+    /// Optional SMTP `XOAUTH2` OAuth2 access token.
+    #[arg(long, env = "NOGML_SMTP_OAUTH_TOKEN", global = true)]
+    smtp_oauth_token: Option<String>,
 
     /// Optional `EHLO` domain name (defaults to `--default-domain`).
     #[arg(long, env = "NOGML_SMTP_HELO_DOMAIN", global = true)]
@@ -1441,6 +1445,9 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "smtp_password") {
             cfg.smtp_password = self.smtp_password;
+        }
+        if is_explicit(root_matches, "smtp_oauth_token") {
+            cfg.smtp_oauth_token = self.smtp_oauth_token;
         }
         if is_explicit(root_matches, "smtp_helo_domain") {
             cfg.smtp_helo_domain = self.smtp_helo_domain;
