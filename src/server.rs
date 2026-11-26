@@ -96,7 +96,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 /// - `POST /webhooks/resend` (Svix-verified, exempt from bearer auth)
 /// - `POST /webhooks/ses` (SNS/SES inbound webhook, optional shared secret, exempt from bearer auth)
 /// - `GET /.well-known/oauth-authorization-server`, `GET /oauth2/authorize`, `POST /oauth2/token` (optional local OAuth2, exempt from bearer auth)
-/// - `/gmail/v1/...`, `/upload/gmail/v1/...`, `/batch/gmail/v1` (bearer-protected)
+/// - `/gmail/v1/...`, `/upload/gmail/v1/...`, `/batch/gmail/v1`, `/oauth2/v2/userinfo`, `/oauth2/v3/userinfo`, `/v1/people/me` (bearer-protected)
 /// - `/v1/...` AI-first REST + SSE (bearer-protected)
 /// - `/mcp` Streamable HTTP MCP (bearer-protected)
 ///

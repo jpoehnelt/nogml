@@ -420,7 +420,12 @@ pub fn parse_oauth2_scopes(raw: Option<&str>) -> Result<Vec<AuthScope>, String> 
                 push_unique(AuthScope::Send);
                 push_unique(AuthScope::Admin);
             }
-            "openid" | "email" | "profile" | "offline_access" => {}
+            "openid"
+            | "email"
+            | "profile"
+            | "offline_access"
+            | "https://www.googleapis.com/auth/userinfo.email"
+            | "https://www.googleapis.com/auth/userinfo.profile" => {}
             other => {
                 return Err(format!("Unsupported OAuth2 scope '{other}'"));
             }
@@ -520,6 +525,7 @@ async fn well_known_metadata(State(state): State<AppState>, headers: HeaderMap) 
             "issuer": origin,
             "authorization_endpoint": format!("{origin}/oauth2/authorize"),
             "token_endpoint": format!("{origin}/oauth2/token"),
+            "userinfo_endpoint": format!("{origin}/oauth2/v3/userinfo"),
             "response_types_supported": ["code"],
             "grant_types_supported": [
                 "authorization_code",

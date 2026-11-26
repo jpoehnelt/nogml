@@ -482,6 +482,12 @@ pub fn required_http_scope(method: &Method, path: &str) -> Option<AuthScope> {
     Some(AuthScope::Write)
 }
 
+fn is_ai_v1_path(path: &str) -> bool {
+    (path == "/v1" || path.starts_with("/v1/"))
+        && path != "/v1/people"
+        && !path.starts_with("/v1/people/")
+}
+
 /// Axum middleware authenticating requests via `state.auth` (`Authorization: Bearer <token>`,
 /// `X-API-Key`, or `?access_token=`), enforcing [`required_http_scope`] (`403 Forbidden` on
 /// insufficient scope), and inserting the resolved [`Principal`] into request extensions.
@@ -507,7 +513,7 @@ pub async fn require_auth(
         match state.auth.authenticate_bearer(token.as_deref()).await {
             Ok(p) => p,
             Err(err) => {
-                if path == "/v1" || path.starts_with("/v1/") {
+                if is_ai_v1_path(&path) {
                     return Ok(err.into_ai_response());
                 }
                 return Err(err);
@@ -518,7 +524,7 @@ pub async fn require_auth(
     if let Some(required_scope) = required_http_scope(req.method(), &path)
         && let Err(err) = principal.require_scope(required_scope)
     {
-        if path == "/v1" || path.starts_with("/v1/") {
+        if is_ai_v1_path(&path) {
             return Ok(err.into_ai_response());
         }
         return Err(err);
