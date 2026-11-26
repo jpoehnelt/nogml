@@ -1180,6 +1180,20 @@ pub trait MailStore: Send + Sync {
         resend_id: &str,
         status: &str,
     ) -> AppResult<Option<StoredMessage>>;
+    /// Record delivery status directly by local message ID (used when matching a delivery
+    /// webhook via `rfc822_message_id` fallback even if `resend_id` is unset or differs).
+    async fn record_delivery_status_by_message_id(
+        &self,
+        message_id: &str,
+        status: &str,
+    ) -> AppResult<Option<StoredMessage>> {
+        if let Some(msg) = self.get_message(message_id).await?
+            && let Some(rid) = msg.resend_id.as_deref()
+        {
+            return self.record_delivery_status(rid, status).await;
+        }
+        Ok(None)
+    }
 
     // --- IMAP Operations (per-mailbox monotonic UIDs) ---
     async fn imap_list_mailboxes(&self) -> AppResult<Vec<ImapMailboxInfo>>;

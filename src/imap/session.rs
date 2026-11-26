@@ -1521,11 +1521,14 @@ impl ImapSession {
                         labels: stored.label_ids.clone(),
                     },
                 );
-                let stored = crate::ai::rules::evaluate_inbox_rules(
+                let webhook_policy =
+                    crate::ai::rules::RuleWebhookPolicy::from_config(&self.state.config);
+                let stored = crate::ai::rules::evaluate_inbox_rules_with_policy(
                     self.state.store.as_ref(),
                     &self.state.events,
                     &stored,
                     self.state.config.untrusted_content_guard,
+                    &webhook_policy,
                 )
                 .await;
                 let _ = self.state.post_store_message(&stored).await;

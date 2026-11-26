@@ -2,13 +2,17 @@
 //! request signing and an inbound SNS/SES webhook handler (`POST /webhooks/ses`) supporting
 //! inline base64 payloads and SigV4-authenticated S3 `.eml` fetches.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Mutex as StdMutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{RawQuery, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -28,9 +32,13 @@ use crate::{
     error::{AppError, AppResult},
     filter::FilterDecision,
     models::{LABEL_INBOX, LABEL_UNREAD},
+    net_guard::{
+        MAX_SNS_CERT_BYTES, UrlGuardOptions, build_pinned_http_client, read_bounded_bytes,
+        same_origin, ssrf_error, validate_and_pin_url, validate_url_static,
+    },
     transport::{
         InboundEnvelope, IngestOutcome, MailTransport, OutboundMessage, SendOutcome,
-        TransportCapabilities, ensure_raw_rfc2822, ingest_inbound_rfc2822,
+        TransportCapabilities, ensure_raw_rfc2822, ingest_inbound_rfc2822_with_config,
     },
 };
 
@@ -40,6 +48,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const SES_MAX_MESSAGE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_ERROR_SNIPPET_CHARS: usize = 512;
+const SNS_CERT_CACHE_TTL: Duration = Duration::from_secs(3600);
+const SNS_CERT_CACHE_MAX_ENTRIES: usize = 64;
 
 /// Configuration for [`SesTransport`] and S3 inbound fetches.
 #[derive(Debug, Clone)]
@@ -50,6 +60,7 @@ pub struct SesConfig {
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
     pub s3_endpoint: String,
+    pub s3_endpoint_custom: bool,
     pub webhook_secret: Option<String>,
     pub default_from: String,
 }
@@ -71,15 +82,16 @@ impl SesConfig {
             None => format!("https://email.{region}.amazonaws.com"),
         };
 
-        let s3_endpoint = match non_empty_trimmed(config.ses_s3_endpoint.as_deref()) {
-            Some(ep) => {
-                Url::parse(ep).map_err(|e| {
-                    AppError::Config(format!("Invalid NOGML_SES_S3_ENDPOINT '{ep}': {e}"))
-                })?;
-                ep.trim_end_matches('/').to_string()
-            }
-            None => format!("https://s3.{region}.amazonaws.com"),
-        };
+        let (s3_endpoint, s3_endpoint_custom) =
+            match non_empty_trimmed(config.ses_s3_endpoint.as_deref()) {
+                Some(ep) => {
+                    Url::parse(ep).map_err(|e| {
+                        AppError::Config(format!("Invalid NOGML_SES_S3_ENDPOINT '{ep}': {e}"))
+                    })?;
+                    (ep.trim_end_matches('/').to_string(), true)
+                }
+                None => (format!("https://s3.{region}.amazonaws.com"), false),
+            };
 
         Ok(Self {
             region,
@@ -91,6 +103,7 @@ impl SesConfig {
             session_token: non_empty_trimmed(config.ses_session_token.as_deref())
                 .map(ToString::to_string),
             s3_endpoint,
+            s3_endpoint_custom,
             webhook_secret: non_empty_trimmed(config.ses_webhook_secret.as_deref())
                 .map(ToString::to_string),
             default_from: config.user_email.clone(),
@@ -372,6 +385,8 @@ pub fn sign_aws_v4(
 fn build_http_client() -> reqwest::Client {
     crate::ensure_crypto_provider();
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
         .user_agent(concat!("nogml/", env!("CARGO_PKG_VERSION")))
@@ -616,12 +631,22 @@ struct SnsEnvelope {
     message_id: Option<String>,
     #[serde(rename = "TopicArn")]
     topic_arn: Option<String>,
+    #[serde(rename = "Subject")]
+    subject: Option<String>,
     #[serde(rename = "Message")]
     message: Option<String>,
     #[serde(rename = "SubscribeURL")]
     subscribe_url: Option<String>,
+    #[serde(rename = "Token")]
+    token: Option<String>,
     #[serde(rename = "Timestamp")]
     timestamp: Option<String>,
+    #[serde(rename = "SignatureVersion")]
+    signature_version: Option<String>,
+    #[serde(rename = "Signature")]
+    signature: Option<String>,
+    #[serde(rename = "SigningCertURL")]
+    signing_cert_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,6 +698,8 @@ struct SesReceipt {
     #[serde(default)]
     timestamp: Option<String>,
     #[serde(default)]
+    recipients: Vec<String>,
+    #[serde(default)]
     spf_verdict: Option<SesVerdict>,
     #[serde(default)]
     dkim_verdict: Option<SesVerdict>,
@@ -704,11 +731,7 @@ struct SesReceiptAction {
     encoding: Option<String>,
 }
 
-fn verify_ses_webhook_secret(
-    headers: &HeaderMap,
-    raw_query: Option<&str>,
-    expected_secret: &str,
-) -> AppResult<()> {
+fn verify_ses_webhook_secret(headers: &HeaderMap, expected_secret: &str) -> AppResult<()> {
     let allowed = [expected_secret.to_string()];
 
     for header_name in [
@@ -723,11 +746,13 @@ fn verify_ses_webhook_secret(
         }
     }
 
-    if let Some(query) = raw_query {
-        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
-            if (k == "secret" || k == "token") && constant_time_token_matches(v.trim(), &allowed) {
-                return Ok(());
-            }
+    if let Some(auth_val) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let trimmed = auth_val.trim();
+        if trimmed.len() > 7
+            && trimmed[..7].eq_ignore_ascii_case("bearer ")
+            && constant_time_token_matches(trimmed[7..].trim(), &allowed)
+        {
+            return Ok(());
         }
     }
 
@@ -736,7 +761,484 @@ fn verify_ses_webhook_secret(
     ))
 }
 
+/// Validate an AWS SNS `SigningCertURL`, pinning it strictly to
+/// `https://sns.<region>.amazonaws.com/<path>.pem` (or `.amazonaws.com.cn`) with
+/// SSRF protection (no userinfo, no custom port, no path traversal, globally routable).
+pub fn validate_sns_signing_cert_url(raw_url: &str) -> AppResult<Url> {
+    let parsed = validate_url_static(
+        raw_url,
+        UrlGuardOptions {
+            allow_private_endpoints: false,
+            allow_http: false,
+            allowed_hosts: &[],
+            context: "SNS SigningCertURL",
+        },
+    )?;
+
+    if parsed.port().is_some_and(|p| p != 443) {
+        return Err(ssrf_error(
+            "SNS SigningCertURL must use standard HTTPS port 443",
+            "Only official AWS SNS signing certificate URLs are permitted.",
+        ));
+    }
+
+    let host = parsed
+        .host_str()
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let region = host
+        .strip_prefix("sns.")
+        .and_then(|rest| {
+            rest.strip_suffix(".amazonaws.com")
+                .or_else(|| rest.strip_suffix(".amazonaws.com.cn"))
+        })
+        .ok_or_else(|| {
+            ssrf_error(
+                format!(
+                    "SNS SigningCertURL host '{host}' is not an official AWS SNS domain (expected sns.<region>.amazonaws.com)"
+                ),
+                "SigningCertURL must be hosted on https://sns.<region>.amazonaws.com/...",
+            )
+        })?;
+
+    let valid_region = !region.is_empty()
+        && region.len() <= 32
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && region.as_bytes()[0].is_ascii_alphanumeric()
+        && region.as_bytes()[region.len() - 1].is_ascii_alphanumeric();
+    if !valid_region {
+        return Err(ssrf_error(
+            format!("SNS SigningCertURL contains invalid AWS region '{region}'"),
+            "SigningCertURL must be hosted on https://sns.<region>.amazonaws.com/...",
+        ));
+    }
+
+    let path = parsed.path();
+    let lower_raw = raw_url.to_ascii_lowercase();
+    if !path.ends_with(".pem")
+        || path.contains("..")
+        || raw_url.contains("..")
+        || lower_raw.contains("%2e")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ssrf_error(
+            "SNS SigningCertURL path must reference a .pem certificate without path traversal, query, or fragment",
+            "Only official AWS SNS .pem certificate URLs are permitted.",
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn build_sns_string_to_sign(sns: &SnsEnvelope) -> AppResult<String> {
+    let msg_type = non_empty_trimmed(sns.envelope_type.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'Type' field".to_string())
+    })?;
+    let message = sns.message.as_deref().ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'Message' field".to_string())
+    })?;
+    let message_id = non_empty_trimmed(sns.message_id.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'MessageId' field".to_string())
+    })?;
+    let timestamp = non_empty_trimmed(sns.timestamp.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'Timestamp' field".to_string())
+    })?;
+    let topic_arn = non_empty_trimmed(sns.topic_arn.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'TopicArn' field".to_string())
+    })?;
+
+    let mut out = String::new();
+    match msg_type {
+        "Notification" => {
+            out.push_str("Message\n");
+            out.push_str(message);
+            out.push('\n');
+            out.push_str("MessageId\n");
+            out.push_str(message_id);
+            out.push('\n');
+            if let Some(subject) = sns.subject.as_deref() {
+                out.push_str("Subject\n");
+                out.push_str(subject);
+                out.push('\n');
+            }
+            out.push_str("Timestamp\n");
+            out.push_str(timestamp);
+            out.push('\n');
+            out.push_str("TopicArn\n");
+            out.push_str(topic_arn);
+            out.push('\n');
+            out.push_str("Type\n");
+            out.push_str(msg_type);
+            out.push('\n');
+        }
+        "SubscriptionConfirmation" | "UnsubscribeConfirmation" => {
+            let subscribe_url =
+                non_empty_trimmed(sns.subscribe_url.as_deref()).ok_or_else(|| {
+                    AppError::Unauthorized(
+                        "SNS confirmation envelope missing required 'SubscribeURL' field"
+                            .to_string(),
+                    )
+                })?;
+            let token = non_empty_trimmed(sns.token.as_deref()).ok_or_else(|| {
+                AppError::Unauthorized(
+                    "SNS confirmation envelope missing required 'Token' field".to_string(),
+                )
+            })?;
+            out.push_str("Message\n");
+            out.push_str(message);
+            out.push('\n');
+            out.push_str("MessageId\n");
+            out.push_str(message_id);
+            out.push('\n');
+            out.push_str("SubscribeURL\n");
+            out.push_str(subscribe_url);
+            out.push('\n');
+            out.push_str("Timestamp\n");
+            out.push_str(timestamp);
+            out.push('\n');
+            out.push_str("Token\n");
+            out.push_str(token);
+            out.push('\n');
+            out.push_str("TopicArn\n");
+            out.push_str(topic_arn);
+            out.push('\n');
+            out.push_str("Type\n");
+            out.push_str(msg_type);
+            out.push('\n');
+        }
+        other => {
+            return Err(AppError::Unauthorized(format!(
+                "Unsupported SNS envelope Type '{other}' for signature verification"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn read_der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let &tag = input.first()?;
+    let &len_byte = input.get(1)?;
+    let (len, header_len) = if len_byte < 0x80 {
+        (len_byte as usize, 2usize)
+    } else {
+        let num_bytes = (len_byte & 0x7f) as usize;
+        if num_bytes == 0 || num_bytes > 4 || input.len() < 2 + num_bytes {
+            return None;
+        }
+        let mut len = 0usize;
+        for &b in &input[2..2 + num_bytes] {
+            len = (len << 8) | (b as usize);
+        }
+        (len, 2 + num_bytes)
+    };
+    let end = header_len.checked_add(len)?;
+    if end > input.len() {
+        return None;
+    }
+    Some((tag, &input[header_len..end], &input[end..]))
+}
+
+fn extract_rsa_pubkey_der_from_x509(cert_der: &[u8]) -> Option<&[u8]> {
+    let (cert_tag, cert_body, _) = read_der_tlv(cert_der)?;
+    if cert_tag != 0x30 {
+        return None;
+    }
+    let (tbs_tag, mut tbs, _) = read_der_tlv(cert_body)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
+    // Optional [0] EXPLICIT version
+    if tbs.first() == Some(&0xA0) {
+        let (_, _, rest) = read_der_tlv(tbs)?;
+        tbs = rest;
+    }
+    // serialNumber (INTEGER 0x02)
+    let (tag, _, rest) = read_der_tlv(tbs)?;
+    if tag != 0x02 {
+        return None;
+    }
+    tbs = rest;
+    // signature, issuer, validity, subject (4 SEQUENCEs)
+    for _ in 0..4 {
+        let (seq_tag, _, rest) = read_der_tlv(tbs)?;
+        if seq_tag != 0x30 {
+            return None;
+        }
+        tbs = rest;
+    }
+    // subjectPublicKeyInfo (SEQUENCE)
+    let (spki_tag, spki, _) = read_der_tlv(tbs)?;
+    if spki_tag != 0x30 {
+        return None;
+    }
+    // algorithm (SEQUENCE)
+    let (alg_tag, _, spki_rest) = read_der_tlv(spki)?;
+    if alg_tag != 0x30 {
+        return None;
+    }
+    // subjectPublicKey (BIT STRING 0x03)
+    let (bit_tag, bit_val, _) = read_der_tlv(spki_rest)?;
+    if bit_tag != 0x03 || bit_val.len() < 2 || bit_val[0] != 0 {
+        return None;
+    }
+    Some(&bit_val[1..])
+}
+
+fn decode_pem_certificate_der(cert_pem: &str) -> AppResult<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let start = cert_pem.find(BEGIN).ok_or_else(|| {
+        AppError::Unauthorized("SNS signing certificate missing PEM BEGIN marker".to_string())
+    })? + BEGIN.len();
+    let rest = &cert_pem[start..];
+    let end = rest.find(END).ok_or_else(|| {
+        AppError::Unauthorized("SNS signing certificate missing PEM END marker".to_string())
+    })?;
+    let b64: String = rest[..end]
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| {
+            AppError::Unauthorized(format!(
+                "Invalid base64 in SNS signing certificate PEM: {e}"
+            ))
+        })
+}
+
+/// Cryptographically verify an AWS SNS RSA-SHA1 (`SignatureVersion == "1"`) or
+/// RSA-SHA256 (`SignatureVersion == "2"`) signature against a PEM-encoded X.509 certificate.
+pub fn verify_sns_rsa_signature(
+    cert_pem: &str,
+    signature_version: &str,
+    signature_b64: &str,
+    string_to_sign: &[u8],
+) -> AppResult<()> {
+    let cert_der = decode_pem_certificate_der(cert_pem)?;
+    let rsa_pub_der = extract_rsa_pubkey_der_from_x509(&cert_der).ok_or_else(|| {
+        AppError::Unauthorized(
+            "Failed to parse RSA SubjectPublicKeyInfo from SNS X.509 certificate".to_string(),
+        )
+    })?;
+
+    let cleaned_sig: String = signature_b64
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let sig_bytes = general_purpose::STANDARD
+        .decode(cleaned_sig.as_bytes())
+        .map_err(|e| AppError::Unauthorized(format!("Invalid base64 SNS Signature: {e}")))?;
+
+    let alg: &'static dyn ring::signature::VerificationAlgorithm = match signature_version.trim() {
+        "1" => &ring::signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
+        "2" => &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+        other => {
+            return Err(AppError::Unauthorized(format!(
+                "Unsupported SNS SignatureVersion '{other}' (expected '1' or '2')"
+            )));
+        }
+    };
+
+    ring::signature::UnparsedPublicKey::new(alg, rsa_pub_der)
+        .verify(string_to_sign, &sig_bytes)
+        .map_err(|_| AppError::Unauthorized("SNS RSA signature verification failed".to_string()))
+}
+
+fn sns_cert_cache() -> &'static StdMutex<HashMap<String, (Instant, String)>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+async fn fetch_sns_signing_cert_pem(cert_url: &str) -> AppResult<String> {
+    let validated = validate_sns_signing_cert_url(cert_url)?;
+    let canonical_url = validated.as_str().to_string();
+
+    {
+        let mut cache = sns_cert_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some((expires_at, pem)) = cache.get(&canonical_url)
+            && *expires_at > now
+        {
+            return Ok(pem.clone());
+        }
+        cache.retain(|_, (exp, _)| *exp > now);
+    }
+
+    let pinned = validate_and_pin_url(
+        &canonical_url,
+        UrlGuardOptions {
+            allow_private_endpoints: false,
+            allow_http: false,
+            allowed_hosts: &[],
+            context: "SNS SigningCertURL",
+        },
+    )
+    .await?;
+
+    let client = build_pinned_http_client(
+        &pinned,
+        Duration::from_secs(10),
+        Some(Duration::from_secs(5)),
+    )?;
+    let resp = client.get(pinned.url.as_str()).send().await.map_err(|e| {
+        AppError::Unauthorized(format!("Failed to fetch SNS signing certificate: {e}"))
+    })?;
+    let status = resp.status();
+    if status.is_redirection() {
+        return Err(ssrf_error(
+            format!(
+                "SNS SigningCertURL returned HTTP {} redirect; redirects are disabled",
+                status.as_u16()
+            ),
+            "AWS SNS signing certificate URLs must respond directly without redirecting.",
+        ));
+    }
+    if !status.is_success() {
+        return Err(AppError::Unauthorized(format!(
+            "Failed to fetch SNS signing certificate: HTTP {}",
+            status.as_u16()
+        )));
+    }
+
+    let bytes = read_bounded_bytes(resp, MAX_SNS_CERT_BYTES, "SNS SigningCertURL").await?;
+    let pem = String::from_utf8(bytes).map_err(|_| {
+        AppError::Unauthorized(
+            "SNS signing certificate response is not valid UTF-8 PEM".to_string(),
+        )
+    })?;
+
+    {
+        let mut cache = sns_cert_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        cache.retain(|_, (exp, _)| *exp > now);
+        if cache.len() >= SNS_CERT_CACHE_MAX_ENTRIES
+            && let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, (exp, _))| *exp)
+                .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+        cache.insert(canonical_url, (now + SNS_CERT_CACHE_TTL, pem.clone()));
+    }
+
+    Ok(pem)
+}
+
+async fn verify_sns_envelope_signature(sns: &SnsEnvelope) -> AppResult<()> {
+    let cert_url = non_empty_trimmed(sns.signing_cert_url.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'SigningCertURL' field".to_string())
+    })?;
+    let signature = non_empty_trimmed(sns.signature.as_deref()).ok_or_else(|| {
+        AppError::Unauthorized("SNS envelope missing required 'Signature' field".to_string())
+    })?;
+    let signature_version =
+        non_empty_trimmed(sns.signature_version.as_deref()).ok_or_else(|| {
+            AppError::Unauthorized(
+                "SNS envelope missing required 'SignatureVersion' field".to_string(),
+            )
+        })?;
+
+    validate_sns_signing_cert_url(cert_url)?;
+    let string_to_sign = build_sns_string_to_sign(sns)?;
+    let cert_pem = fetch_sns_signing_cert_pem(cert_url).await?;
+    verify_sns_rsa_signature(
+        &cert_pem,
+        signature_version,
+        signature,
+        string_to_sign.as_bytes(),
+    )
+}
+
+/// Validate S3 `bucketName` and `objectKey` against bucket allowlists and path traversal
+/// (rejecting raw or percent-encoded `.` / `..` segments, backslashes, and control characters).
+pub fn validate_s3_bucket_and_key(
+    bucket: &str,
+    object_key: &str,
+    allowed_buckets: &[String],
+) -> AppResult<()> {
+    let clean_bucket = bucket.trim();
+    if clean_bucket.is_empty()
+        || clean_bucket.len() > 63
+        || clean_bucket == "."
+        || clean_bucket == ".."
+        || clean_bucket.contains("..")
+        || clean_bucket.starts_with('.')
+        || clean_bucket.ends_with('.')
+        || clean_bucket.chars().any(char::is_control)
+        || !clean_bucket
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return Err(AppError::BadRequest(format!(
+            "Invalid S3 bucket name '{bucket}'"
+        )));
+    }
+
+    let non_empty_allowed: Vec<&str> = allowed_buckets
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !non_empty_allowed.is_empty() && !non_empty_allowed.contains(&clean_bucket) {
+        return Err(AppError::Forbidden(format!(
+            "S3 bucket '{clean_bucket}' is not in the configured SES S3 bucket allowlist"
+        )));
+    }
+
+    let clean_key = object_key.trim();
+    if clean_key.is_empty() || clean_key.contains('\\') || clean_key.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "Invalid S3 objectKey: must be non-empty and free of backslashes or control characters"
+                .to_string(),
+        ));
+    }
+
+    // Check every path segment both raw and after iterative percent-decoding (up to 3 rounds)
+    // so raw `..`, `%2e%2e`, `%2E%2E`, `%252e%252e`, or encoded slashes cannot traverse buckets/prefixes.
+    for raw_seg in clean_key.split('/') {
+        if raw_seg == "." || raw_seg == ".." {
+            return Err(AppError::BadRequest(
+                "S3 objectKey contains disallowed path traversal segment".to_string(),
+            ));
+        }
+
+        let mut decoded = raw_seg.to_string();
+        for _ in 0..3 {
+            let next_bytes = percent_decode_bytes(&decoded);
+            if next_bytes.contains(&0) {
+                return Err(AppError::BadRequest(
+                    "S3 objectKey contains disallowed NUL byte".to_string(),
+                ));
+            }
+            let next = String::from_utf8_lossy(&next_bytes).into_owned();
+            if next == "."
+                || next == ".."
+                || next.contains('/')
+                || next.contains('\\')
+                || next.chars().any(char::is_control)
+            {
+                return Err(AppError::BadRequest(
+                    "S3 objectKey contains disallowed path traversal segment".to_string(),
+                ));
+            }
+            if next == decoded {
+                break;
+            }
+            decoded = next;
+        }
+    }
+
+    Ok(())
+}
+
 fn build_s3_object_url(s3_endpoint: &str, bucket: &str, object_key: &str) -> AppResult<Url> {
+    validate_s3_bucket_and_key(bucket, object_key, &[])?;
     let encoded_bucket = aws_uri_encode(bucket.trim(), true);
     let trimmed_key = object_key.trim_start_matches('/');
     let encoded_key = trimmed_key
@@ -759,12 +1261,29 @@ async fn fetch_s3_object_bytes(
     ses_cfg: &SesConfig,
     bucket: &str,
     object_key: &str,
+    allow_private_endpoints: bool,
+    allowed_buckets: &[String],
 ) -> AppResult<Vec<u8>> {
+    validate_s3_bucket_and_key(bucket, object_key, allowed_buckets)?;
     let creds = ses_cfg.credentials()?;
     let url = build_s3_object_url(&ses_cfg.s3_endpoint, bucket, object_key)?;
+
+    let allow_private = allow_private_endpoints
+        || (ses_cfg.s3_endpoint_custom && same_origin(&url, &ses_cfg.s3_endpoint));
+    let pinned = validate_and_pin_url(
+        url.as_str(),
+        UrlGuardOptions {
+            allow_private_endpoints: allow_private,
+            allow_http: allow_private,
+            allowed_hosts: &[],
+            context: "SES S3 object URL",
+        },
+    )
+    .await?;
+
     let sig = sign_aws_v4(
         "GET",
-        &url,
+        &pinned.url,
         &[],
         b"",
         creds.access_key_id,
@@ -775,9 +1294,13 @@ async fn fetch_s3_object_bytes(
         Utc::now(),
     )?;
 
-    let http = build_http_client();
+    let http = build_pinned_http_client(
+        &pinned,
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        Some(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)),
+    )?;
     let mut req = http
-        .get(url)
+        .get(pinned.url.as_str())
         .header("authorization", sig.authorization)
         .header("x-amz-date", sig.amz_date)
         .header("x-amz-content-sha256", sig.payload_hash);
@@ -787,31 +1310,53 @@ async fn fetch_s3_object_bytes(
 
     let resp = req.send().await?;
     let status = resp.status();
+    if status.is_redirection() {
+        return Err(ssrf_error(
+            format!(
+                "SES S3 fetch returned HTTP {} redirect; redirects are disabled",
+                status.as_u16()
+            ),
+            "S3 object fetches must respond directly without redirecting.",
+        ));
+    }
+
+    let body = read_bounded_bytes(resp, SES_MAX_MESSAGE_BYTES, "SES S3 object").await?;
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let snippet = String::from_utf8_lossy(&body);
         return Err(AppError::Upstream {
             status: status.as_u16(),
             message: format!(
                 "Failed to fetch S3 object s3://{bucket}/{object_key}: {}",
-                truncate_snippet(&body)
+                truncate_snippet(&snippet)
             ),
         });
     }
 
-    Ok(resp.bytes().await?.to_vec())
+    Ok(body)
 }
 
 fn decode_inline_ses_content(content: &str, encoding: Option<&str>) -> AppResult<Vec<u8>> {
     if encoding.is_some_and(|e| e.eq_ignore_ascii_case("utf8") || e.eq_ignore_ascii_case("utf-8")) {
+        if content.len() > SES_MAX_MESSAGE_BYTES {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Inline SES content exceeds maximum allowed size ({SES_MAX_MESSAGE_BYTES} bytes)"
+            )));
+        }
         return Ok(content.as_bytes().to_vec());
     }
     let cleaned: String = content
         .chars()
         .filter(|c| !c.is_ascii_whitespace())
         .collect();
-    general_purpose::STANDARD
+    let decoded = general_purpose::STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SES content payload: {e}")))
+        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SES content payload: {e}")))?;
+    if decoded.len() > SES_MAX_MESSAGE_BYTES {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Decoded inline SES content exceeds maximum allowed size ({SES_MAX_MESSAGE_BYTES} bytes)"
+        )));
+    }
+    Ok(decoded)
 }
 
 fn format_ses_auth_results(receipt: &SesReceipt) -> Option<String> {
@@ -848,26 +1393,73 @@ fn parse_timestamp_ms(candidates: &[Option<&str>]) -> Option<i64> {
 
 /// Axum handler for `POST /webhooks/ses`.
 ///
-/// Exempt from bearer auth; enforces optional shared secret verification via
-/// `NOGML_SES_WEBHOOK_SECRET` (header `X-Nogml-Webhook-Secret` / `X-SES-Webhook-Secret` /
-/// `X-Webhook-Secret`, or `?secret=` / `?token=`). Handles SNS `SubscriptionConfirmation`
-/// and `Notification` payloads carrying SES `Received` events (both inline base64 `content`
-/// and S3 action downloads signed with SigV4).
+/// Exempt from bearer auth; fails closed (`401`) unless authenticated by:
+/// - `NOGML_SES_WEBHOOK_SECRET` via headers ONLY (`X-Nogml-Webhook-Secret`,
+///   `X-SES-Webhook-Secret`, `X-Webhook-Secret`, or `Authorization: Bearer`), OR
+/// - Verified AWS SNS X.509 RSA signature (`SigningCertURL` pinned to
+///   `https://sns.<region>.amazonaws.com/...`) combined with a configured
+///   `NOGML_SES_ALLOWED_TOPIC_ARNS` allowlist, OR
+/// - Explicit local dev bypass (`NOGML_ALLOW_INSECURE_WEBHOOKS=true`).
+///
+/// Handles SNS `SubscriptionConfirmation` and `Notification` payloads carrying SES
+/// `Received` events (both inline base64 `content` and SigV4-authenticated S3 fetches).
 pub async fn ses_webhook_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> AppResult<Response> {
-    if let Some(secret) = non_empty_trimmed(state.config.ses_webhook_secret.as_deref()) {
-        verify_ses_webhook_secret(&headers, raw_query.as_deref(), secret)?;
-    } else {
-        tracing::warn!(
-            "SES webhook secret is not configured; accepting webhook without shared-secret check (dev mode)"
-        );
+    let configured_secret = non_empty_trimmed(state.config.ses_webhook_secret.as_deref());
+    if let Some(secret) = configured_secret {
+        verify_ses_webhook_secret(&headers, secret)?;
     }
 
     let sns: SnsEnvelope = serde_json::from_slice(&body)?;
+    let has_sns_signature_fields = non_empty_trimmed(sns.signature.as_deref()).is_some()
+        || non_empty_trimmed(sns.signing_cert_url.as_deref()).is_some();
+
+    let allowed_topics: Vec<&str> = state
+        .config
+        .ses_allowed_topic_arns
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if configured_secret.is_none() {
+        if has_sns_signature_fields && !allowed_topics.is_empty() {
+            // Will authenticate via SNS X.509 RSA signature + TopicArn allowlist below.
+        } else if state.config.allow_insecure_webhooks {
+            tracing::warn!(
+                "SES webhook secret is not configured; accepting webhook because allow_insecure_webhooks=true (dev mode)"
+            );
+        } else {
+            return Err(AppError::Unauthorized(
+                "SES webhook authentication is not configured; set NOGML_SES_WEBHOOK_SECRET, configure NOGML_SES_ALLOWED_TOPIC_ARNS with signed SNS notifications, or enable NOGML_ALLOW_INSECURE_WEBHOOKS=true for local development"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Whenever SNS signature metadata is present, always verify SigningCertURL pinning and RSA signature.
+    if has_sns_signature_fields {
+        verify_sns_envelope_signature(&sns).await?;
+    }
+
+    // Enforce optional SNS TopicArn allowlist.
+    if !allowed_topics.is_empty() {
+        let topic = non_empty_trimmed(sns.topic_arn.as_deref()).ok_or_else(|| {
+            AppError::Forbidden(
+                "SES webhook payload is missing TopicArn required by NOGML_SES_ALLOWED_TOPIC_ARNS"
+                    .to_string(),
+            )
+        })?;
+        if !allowed_topics.contains(&topic) {
+            return Err(AppError::Forbidden(format!(
+                "SNS TopicArn '{topic}' is not in the configured SES TopicArn allowlist"
+            )));
+        }
+    }
+
     let notification: SesNotification = match sns.envelope_type.as_deref() {
         Some("SubscriptionConfirmation") => {
             tracing::info!(
@@ -943,6 +1535,46 @@ pub async fn ses_webhook_handler(
         .as_ref()
         .and_then(|r| r.action.as_ref());
 
+    // Validate S3 bucket allowlist and path traversal before resolving or fetching.
+    if notification
+        .content
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+        && let Some(act) = action
+        && let (Some(bucket), Some(key)) = (
+            non_empty_trimmed(act.bucket_name.as_deref()),
+            non_empty_trimmed(act.object_key.as_deref()),
+        )
+    {
+        validate_s3_bucket_and_key(bucket, key, &state.config.ses_allowed_s3_buckets)?;
+    }
+
+    // Strict envelope-only multi-mailbox routing: use ONLY SES envelope recipients
+    // (`receipt.recipients` and `mail.destination`), NEVER sender-controlled MIME headers.
+    let mail = notification.mail.as_ref();
+    let mut recipient_candidates: Vec<String> = Vec::new();
+    if let Some(r) = notification.receipt.as_ref() {
+        recipient_candidates.extend(r.recipients.iter().cloned());
+    }
+    if let Some(m) = mail {
+        recipient_candidates.extend(m.destination.iter().cloned());
+    }
+
+    let target_mailboxes = state
+        .config
+        .resolve_inbound_mailboxes(&recipient_candidates);
+    if target_mailboxes.is_empty() {
+        tracing::info!("Ignoring SES inbound email with no matching local mailbox");
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": "no_matching_local_mailbox",
+            })),
+        )
+            .into_response());
+    }
+
     let (raw_rfc2822, source) = if let Some(inline) = notification
         .content
         .as_deref()
@@ -959,7 +1591,14 @@ pub async fn ses_webhook_handler(
     {
         let _action_type = act.action_type.as_deref().unwrap_or("S3");
         let ses_cfg = SesConfig::from_config(&state.config)?;
-        let bytes = fetch_s3_object_bytes(&ses_cfg, bucket, key).await?;
+        let bytes = fetch_s3_object_bytes(
+            &ses_cfg,
+            bucket,
+            key,
+            state.config.allow_private_endpoints,
+            &state.config.ses_allowed_s3_buckets,
+        )
+        .await?;
         (bytes, "ses_s3".to_string())
     } else {
         return Err(AppError::BadRequest(
@@ -968,7 +1607,6 @@ pub async fn ses_webhook_handler(
         ));
     };
 
-    let mail = notification.mail.as_ref();
     let common = mail.and_then(|m| m.common_headers.as_ref());
     let received_at_ms = parse_timestamp_ms(&[
         notification
@@ -998,43 +1636,6 @@ pub async fn ses_webhook_handler(
         .as_ref()
         .and_then(format_ses_auth_results);
 
-    let mut recipient_candidates: Vec<String> = Vec::new();
-    if let Some(m) = mail {
-        recipient_candidates.extend(m.destination.iter().cloned());
-    }
-    if let Some(c) = common {
-        recipient_candidates.extend(c.to.iter().cloned());
-        recipient_candidates.extend(c.cc.iter().cloned());
-    }
-    if let Ok(parsed) = crate::mime::parse_rfc2822(&raw_rfc2822) {
-        recipient_candidates.extend(parsed.to);
-        recipient_candidates.extend(parsed.cc);
-        recipient_candidates.extend(parsed.bcc);
-        for hdr in parsed.headers {
-            if matches!(
-                hdr.name.to_ascii_lowercase().as_str(),
-                "delivered-to" | "x-original-to" | "envelope-to"
-            ) {
-                recipient_candidates.push(hdr.value);
-            }
-        }
-    }
-
-    let target_mailboxes = state
-        .config
-        .resolve_inbound_mailboxes(&recipient_candidates);
-    if target_mailboxes.is_empty() {
-        tracing::info!("Ignoring SES inbound email with no matching local mailbox");
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "status": "ignored",
-                "reason": "no_matching_local_mailbox",
-            })),
-        )
-            .into_response());
-    }
-
     let base_envelope = InboundEnvelope {
         raw_rfc2822,
         source,
@@ -1059,11 +1660,12 @@ pub async fn ses_webhook_handler(
     if target_mailboxes.len() == 1 {
         let mb = &target_mailboxes[0];
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822(
+        let outcome = ingest_inbound_rfc2822_with_config(
             mb_state.store.as_ref(),
             &mb_state.events,
             mb_state.filter.as_ref(),
             base_envelope,
+            &mb_state.config,
         )
         .await?;
 
@@ -1124,11 +1726,12 @@ pub async fn ses_webhook_handler(
 
     for mb in &target_mailboxes {
         let mb_state = state.for_mailbox(mb);
-        let outcome = ingest_inbound_rfc2822(
+        let outcome = ingest_inbound_rfc2822_with_config(
             mb_state.store.as_ref(),
             &mb_state.events,
             mb_state.filter.as_ref(),
             base_envelope.clone(),
+            &mb_state.config,
         )
         .await?;
 
@@ -1574,12 +2177,29 @@ mod tests {
             "Message": ses_inline_msg.to_string()
         });
 
+        // 3a. Query-param ?secret= MUST be rejected (headers only)
         let res = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/webhooks/ses?secret=ses-shared-secret")
+                    .header("content-type", "text/plain; charset=UTF-8")
+                    .body(Body::from(sns_inline.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 3b. Inline base64 SES Notification (with Authorization: Bearer header) -> stored + blob mirrored + event published
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/ses")
+                    .header("authorization", "Bearer ses-shared-secret")
                     .header("content-type", "text/plain; charset=UTF-8")
                     .body(Body::from(sns_inline.to_string()))
                     .unwrap(),
@@ -1615,7 +2235,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/webhooks/ses?secret=ses-shared-secret")
+                    .uri("/webhooks/ses")
+                    .header("x-nogml-webhook-secret", "ses-shared-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(sns_inline.to_string()))
                     .unwrap(),

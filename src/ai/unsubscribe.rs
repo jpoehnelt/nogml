@@ -1,16 +1,14 @@
 //! Safe RFC 8058 one-click HTTP POST and RFC 2369 `mailto:` unsubscribe execution
 //! with strict SSRF protection, `dry_run` preview, and [`OutboundPolicy`] enforcement.
 
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use url::{Host, Url};
+use url::Url;
 use uuid::Uuid;
 
+pub use crate::net_guard::is_globally_routable_ip;
 use crate::{
     AppState,
     ai::{
@@ -28,14 +26,15 @@ use crate::{
     events::{EventSource, MailEvent},
     mime::{RFC8058_ONE_CLICK_BODY, generate_snippet, parse_unsubscribe_from_raw},
     models::{LABEL_DRAFT, LABEL_SENT, PolicyCheckResult, UnsubscribeInfo},
+    net_guard::{
+        PinnedUrl, UrlGuardOptions, build_pinned_http_client, ssrf_error, validate_and_pin_url,
+        validate_url_static,
+    },
     storage::NewMessageInput,
 };
 
 /// Hard timeout enforced on RFC 8058 one-click HTTP POST requests.
 const UNSUBSCRIBE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Hard timeout enforced on DNS resolution during SSRF validation.
-const UNSUBSCRIBE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Validated RFC 8058 HTTPS target with pre-resolved global IP addresses.
 #[derive(Debug, Clone)]
@@ -59,140 +58,6 @@ enum SelectedMethod {
     Mailto(String),
 }
 
-fn ssrf_error(message: impl Into<String>, hint: impl Into<String>) -> AppError {
-    AppError::PolicyDenied {
-        code: "ssrf_blocked".to_string(),
-        message: message.into(),
-        hint: Some(hint.into()),
-        details: None,
-    }
-}
-
-/// Return `true` only if `ip` is a globally routable unicast address.
-///
-/// Rejects loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`),
-/// link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`), CGNAT (`100.64.0.0/10`),
-/// ULA (`fc00::/7`), unspecified (`0.0.0.0/8`, `::`), multicast, broadcast, documentation,
-/// benchmarking, reserved ranges, IPv4-mapped IPv6 (`::ffff:0:0/96`), IPv4-compatible IPv6
-/// (`::/96`), NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), Teredo, and 6to4 private targets.
-pub fn is_globally_routable_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_globally_routable_ipv4(v4),
-        IpAddr::V6(v6) => is_globally_routable_ipv6(v6),
-    }
-}
-
-fn is_globally_routable_ipv4(v4: Ipv4Addr) -> bool {
-    let octets = v4.octets();
-    // 0.0.0.0/8 ("This network", including 0.0.0.0 unspecified)
-    if octets[0] == 0 {
-        return false;
-    }
-    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC 1918 private)
-    if v4.is_private() {
-        return false;
-    }
-    // 100.64.0.0/10 (RFC 6598 CGNAT / shared address space)
-    if octets[0] == 100 && (octets[1] & 0b1100_0000) == 64 {
-        return false;
-    }
-    // 127.0.0.0/8 (loopback)
-    if v4.is_loopback() {
-        return false;
-    }
-    // 169.254.0.0/16 (link-local & cloud metadata 169.254.169.254)
-    if v4.is_link_local() {
-        return false;
-    }
-    // 192.0.0.0/24 (IETF protocol assignments)
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return false;
-    }
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (documentation)
-    if v4.is_documentation() {
-        return false;
-    }
-    // 198.18.0.0/15 (benchmarking)
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return false;
-    }
-    // 224.0.0.0/4 (multicast)
-    if v4.is_multicast() {
-        return false;
-    }
-    // 240.0.0.0/4 (reserved / future use + 255.255.255.255 broadcast)
-    if octets[0] >= 240 || v4.is_broadcast() {
-        return false;
-    }
-    true
-}
-
-fn is_globally_routable_ipv6(v6: Ipv6Addr) -> bool {
-    if let Some(mapped_v4) = v6.to_ipv4_mapped() {
-        return is_globally_routable_ipv4(mapped_v4);
-    }
-
-    let segs = v6.segments();
-
-    // ::/96 covers unspecified (::), loopback (::1), and deprecated IPv4-compatible (::a.b.c.d).
-    if segs[0..6] == [0, 0, 0, 0, 0, 0] {
-        return false;
-    }
-    if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
-        return false;
-    }
-    // Unique Local Addresses (ULA): fc00::/7
-    if (segs[0] & 0xfe00) == 0xfc00 {
-        return false;
-    }
-    // Link-local unicast: fe80::/10
-    if (segs[0] & 0xffc0) == 0xfe80 {
-        return false;
-    }
-    // Deprecated site-local: fec0::/10
-    if (segs[0] & 0xffc0) == 0xfec0 {
-        return false;
-    }
-    // Discard-only: 100::/64
-    if segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 {
-        return false;
-    }
-    // Documentation: 2001:db8::/32
-    if segs[0] == 0x2001 && segs[1] == 0x0db8 {
-        return false;
-    }
-    // Teredo tunneling: 2001::/32
-    if segs[0] == 0x2001 && segs[1] == 0x0000 {
-        return false;
-    }
-    // NAT64 well-known prefix: 64:ff9b::/96 (check embedded IPv4)
-    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6] == [0, 0, 0, 0] {
-        let embedded = Ipv4Addr::new(
-            (segs[6] >> 8) as u8,
-            (segs[6] & 0xff) as u8,
-            (segs[7] >> 8) as u8,
-            (segs[7] & 0xff) as u8,
-        );
-        return is_globally_routable_ipv4(embedded);
-    }
-    // NAT64 local-use prefix: 64:ff9b:1::/48
-    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
-        return false;
-    }
-    // 6to4: 2002::/16 (check embedded IPv4)
-    if segs[0] == 0x2002 {
-        let embedded = Ipv4Addr::new(
-            (segs[1] >> 8) as u8,
-            (segs[1] & 0xff) as u8,
-            (segs[2] >> 8) as u8,
-            (segs[2] & 0xff) as u8,
-        );
-        return is_globally_routable_ipv4(embedded);
-    }
-
-    true
-}
-
 /// Perform zero-network static SSRF validation on an unsubscribe URL.
 ///
 /// Rejects non-`https://` schemes, embedded credentials, local hostnames, and
@@ -201,94 +66,15 @@ pub fn validate_unsubscribe_https_url_static(
     raw_url: &str,
     allow_private_for_tests: bool,
 ) -> AppResult<Url> {
-    let trimmed = raw_url.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
-        return Err(AppError::validation(
-            "Unsubscribe URL must be non-empty and free of control characters",
-            None,
-        ));
-    }
-
-    let parsed = Url::parse(trimmed).map_err(|err| {
-        AppError::validation(
-            format!("Invalid unsubscribe URL: {err}"),
-            Some("Provide a valid RFC 8058 https:// URL.".to_string()),
-        )
-    })?;
-
-    if !parsed.scheme().eq_ignore_ascii_case("https") {
-        return Err(ssrf_error(
-            format!(
-                "Unsubscribe URL scheme '{}' is forbidden; strictly https:// is required",
-                parsed.scheme()
-            ),
-            "Only https:// URLs are permitted for RFC 8058 one-click unsubscribe.",
-        ));
-    }
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(ssrf_error(
-            "Unsubscribe URL must not contain embedded username or password credentials",
-            "Remove userinfo credentials from the unsubscribe URL.",
-        ));
-    }
-
-    let Some(host) = parsed.host() else {
-        return Err(AppError::validation(
-            "Unsubscribe URL is missing a host",
-            None,
-        ));
-    };
-
-    match host {
-        Host::Ipv4(v4) => {
-            if !allow_private_for_tests && !is_globally_routable_ip(IpAddr::V4(v4)) {
-                return Err(ssrf_error(
-                    format!("Unsubscribe target IP {v4} is not a globally routable address"),
-                    "Private, loopback, link-local, CGNAT, and metadata IP ranges are blocked.",
-                ));
-            }
-        }
-        Host::Ipv6(v6) => {
-            if !allow_private_for_tests && !is_globally_routable_ip(IpAddr::V6(v6)) {
-                return Err(ssrf_error(
-                    format!("Unsubscribe target IP [{v6}] is not a globally routable address"),
-                    "Private, loopback, link-local, ULA, and IPv4-mapped internal IP ranges are blocked.",
-                ));
-            }
-        }
-        Host::Domain(domain) => {
-            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
-            if normalized.is_empty() {
-                return Err(AppError::validation(
-                    "Unsubscribe URL host must not be empty",
-                    None,
-                ));
-            }
-            if !allow_private_for_tests {
-                if normalized == "localhost"
-                    || normalized.ends_with(".localhost")
-                    || normalized.ends_with(".local")
-                    || normalized.ends_with(".internal")
-                {
-                    return Err(ssrf_error(
-                        format!("Unsubscribe host '{domain}' targets a local or internal domain"),
-                        "Local and internal domains are blocked by SSRF policy.",
-                    ));
-                }
-                if let Ok(ip) = normalized.parse::<IpAddr>()
-                    && !is_globally_routable_ip(ip)
-                {
-                    return Err(ssrf_error(
-                        format!("Unsubscribe target IP {ip} is not a globally routable address"),
-                        "Private, loopback, link-local, CGNAT, and metadata IP ranges are blocked.",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(parsed)
+    validate_url_static(
+        raw_url,
+        UrlGuardOptions {
+            allow_private_endpoints: allow_private_for_tests,
+            allow_http: false,
+            allowed_hosts: &[],
+            context: "Unsubscribe URL",
+        },
+    )
 }
 
 /// Validate an RFC 8058 unsubscribe HTTPS URL including DNS resolution via
@@ -297,71 +83,21 @@ pub async fn validate_unsubscribe_https_url(
     raw_url: &str,
     allow_private_for_tests: bool,
 ) -> AppResult<ValidatedUnsubscribeUrl> {
-    let parsed = validate_unsubscribe_https_url_static(raw_url, allow_private_for_tests)?;
-    let port = parsed.port_or_known_default().unwrap_or(443);
-
-    match parsed.host() {
-        Some(Host::Ipv4(v4)) => Ok(ValidatedUnsubscribeUrl {
-            resolved_addrs: vec![SocketAddr::new(IpAddr::V4(v4), port)],
-            domain: None,
-            url: parsed,
-        }),
-        Some(Host::Ipv6(v6)) => Ok(ValidatedUnsubscribeUrl {
-            resolved_addrs: vec![SocketAddr::new(IpAddr::V6(v6), port)],
-            domain: None,
-            url: parsed,
-        }),
-        Some(Host::Domain(domain)) => {
-            let domain_owned = domain.to_string();
-            let lookup_res = tokio::time::timeout(
-                UNSUBSCRIBE_DNS_TIMEOUT,
-                tokio::net::lookup_host((domain_owned.as_str(), port)),
-            )
-            .await
-            .map_err(|_| AppError::Upstream {
-                status: 504,
-                message: format!("DNS lookup timed out for unsubscribe host '{domain_owned}'"),
-            })?
-            .map_err(|err| AppError::Upstream {
-                status: 502,
-                message: format!("DNS lookup failed for unsubscribe host '{domain_owned}': {err}"),
-            })?;
-
-            let resolved_addrs: Vec<SocketAddr> = lookup_res.collect();
-            if resolved_addrs.is_empty() {
-                return Err(AppError::Upstream {
-                    status: 502,
-                    message: format!(
-                        "DNS lookup returned no addresses for unsubscribe host '{domain_owned}'"
-                    ),
-                });
-            }
-
-            if !allow_private_for_tests {
-                for addr in &resolved_addrs {
-                    if !is_globally_routable_ip(addr.ip()) {
-                        return Err(ssrf_error(
-                            format!(
-                                "Unsubscribe host '{domain_owned}' resolved to non-global IP {}",
-                                addr.ip()
-                            ),
-                            "Private, loopback, link-local, CGNAT, ULA, and metadata IP ranges are blocked.",
-                        ));
-                    }
-                }
-            }
-
-            Ok(ValidatedUnsubscribeUrl {
-                url: parsed,
-                domain: Some(domain_owned),
-                resolved_addrs,
-            })
-        }
-        None => Err(AppError::validation(
-            "Unsubscribe URL is missing a host",
-            None,
-        )),
-    }
+    let pinned = validate_and_pin_url(
+        raw_url,
+        UrlGuardOptions {
+            allow_private_endpoints: allow_private_for_tests,
+            allow_http: false,
+            allowed_hosts: &[],
+            context: "Unsubscribe URL",
+        },
+    )
+    .await?;
+    Ok(ValidatedUnsubscribeUrl {
+        url: pinned.url,
+        domain: pinned.domain,
+        resolved_addrs: pinned.resolved_addrs,
+    })
 }
 
 /// Parse an RFC 6068 `mailto:` URI into recipient address(es), subject, and text body.
@@ -802,19 +538,12 @@ async fn execute_one_click_post(
 }
 
 async fn send_one_click_post_request(target: &ValidatedUnsubscribeUrl) -> AppResult<u16> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(UNSUBSCRIBE_HTTP_TIMEOUT);
-
-    if let Some(ref domain) = target.domain {
-        builder = builder.resolve_to_addrs(domain, &target.resolved_addrs);
-    }
-
-    let client = builder.build().map_err(|err| {
-        AppError::Internal(format!(
-            "Failed to construct unsubscribe HTTP client: {err}"
-        ))
-    })?;
+    let pinned = PinnedUrl {
+        url: target.url.clone(),
+        domain: target.domain.clone(),
+        resolved_addrs: target.resolved_addrs.clone(),
+    };
+    let client = build_pinned_http_client(&pinned, UNSUBSCRIBE_HTTP_TIMEOUT, None)?;
 
     let response = client
         .post(target.url.as_str())
@@ -1157,6 +886,8 @@ async fn execute_mailto_unsubscribe(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
     use axum::http::StatusCode;
 

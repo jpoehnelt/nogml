@@ -249,7 +249,8 @@ fn make_sqlite_config(dir: &Path, imap_addr: Option<SocketAddr>) -> Config {
 async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
     let dir = TempDir::new().unwrap();
     let imap_addr = pick_ephemeral_addr().await;
-    let cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    let mut cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    cfg.allow_insecure_webhooks = true;
     let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
     let state = AppState::with_backends(cfg, store.clone(), Arc::new(StubResendClient::noop()));
 
@@ -618,7 +619,8 @@ async fn e2e_imap_full_lifecycle_async_imap_and_raw_tcp() {
 async fn e2e_imap_cross_protocol_live_idle_gmail_insert_and_resend_ingest() {
     let dir = TempDir::new().unwrap();
     let imap_addr = pick_ephemeral_addr().await;
-    let cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    let mut cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    cfg.allow_insecure_webhooks = true;
     let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
     let state = AppState::with_backends(cfg, store, Arc::new(StubResendClient::noop()));
     let app = build_router(state.clone());
@@ -854,6 +856,7 @@ async fn e2e_gmail_api_sync_backfill_incremental_404_fallback_and_resend_dedup()
         .await;
 
     let mut cfg = make_sqlite_config(dir.path(), None);
+    cfg.allow_insecure_webhooks = true;
     cfg.sync_mode = SyncMode::Api;
     cfg.gmail_api_base_url = mock.uri();
     cfg.gmail_oauth_token_url = format!("{}/oauth/token", mock.uri());
@@ -1653,6 +1656,7 @@ async fn e2e_inbound_filter_chain_across_all_four_ingest_paths() {
     let mock = MockServer::start().await;
 
     let mut cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    cfg.allow_insecure_webhooks = true;
     cfg.sync_mode = SyncMode::Api;
     cfg.gmail_api_base_url = mock.uri();
     cfg.gmail_access_token = Some("filter-sync-tok".to_string());
@@ -2216,7 +2220,8 @@ impl SearchIndex for TrackingSearchIndex {
 async fn e2e_custom_auth_provider_mail_transport_and_search_index_seams() {
     let dir = TempDir::new().unwrap();
     let imap_addr = pick_ephemeral_addr().await;
-    let cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    let mut cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    cfg.allow_insecure_webhooks = true;
     let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
 
     let bearer_calls = Arc::new(AtomicUsize::new(0));
@@ -2608,7 +2613,8 @@ async fn e2e_imap_implicit_tls_and_starttls_with_async_imap() {
 async fn e2e_imap_condstore_and_qresync_delta_sync_sqlite() {
     let dir = TempDir::new().unwrap();
     let imap_addr = pick_ephemeral_addr().await;
-    let cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    let mut cfg = make_sqlite_config(dir.path(), Some(imap_addr));
+    cfg.allow_insecure_webhooks = true;
     let store = Arc::new(SqliteStore::open(&cfg.db_path, &cfg.user_email).unwrap());
     let state = AppState::with_backends(cfg, store.clone(), Arc::new(StubResendClient::noop()));
 

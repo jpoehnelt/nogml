@@ -366,6 +366,47 @@ pub async fn ingest_inbound_rfc2822(
     filter: &dyn InboundFilter,
     envelope: InboundEnvelope,
 ) -> AppResult<IngestOutcome> {
+    ingest_inbound_rfc2822_inner(
+        store,
+        events,
+        filter,
+        envelope,
+        true,
+        &crate::ai::rules::RuleWebhookPolicy::default(),
+    )
+    .await
+}
+
+/// Variant of [`ingest_inbound_rfc2822`] that propagates [`Config`] settings (such as
+/// `untrusted_content_guard`, `allow_private_endpoints`, and `webhook_allowed_hosts`)
+/// to per-mailbox inbox rule evaluation.
+pub async fn ingest_inbound_rfc2822_with_config(
+    store: &dyn MailStore,
+    events: &EventBus,
+    filter: &dyn InboundFilter,
+    envelope: InboundEnvelope,
+    config: &Config,
+) -> AppResult<IngestOutcome> {
+    let policy = crate::ai::rules::RuleWebhookPolicy::from_config(config);
+    ingest_inbound_rfc2822_inner(
+        store,
+        events,
+        filter,
+        envelope,
+        config.untrusted_content_guard,
+        &policy,
+    )
+    .await
+}
+
+async fn ingest_inbound_rfc2822_inner(
+    store: &dyn MailStore,
+    events: &EventBus,
+    filter: &dyn InboundFilter,
+    envelope: InboundEnvelope,
+    untrusted_content_guard: bool,
+    webhook_policy: &crate::ai::rules::RuleWebhookPolicy,
+) -> AppResult<IngestOutcome> {
     let parsed = match crate::mime::parse_rfc2822(&envelope.raw_rfc2822) {
         Ok(p) => Some(p),
         Err(err) => {
@@ -609,7 +650,14 @@ pub async fn ingest_inbound_rfc2822(
     );
 
     // 6. Evaluate per-mailbox inbox rules (label mutations + async signed webhooks).
-    let stored = crate::ai::rules::evaluate_inbox_rules(store, events, &stored, true).await;
+    let stored = crate::ai::rules::evaluate_inbox_rules_with_policy(
+        store,
+        events,
+        &stored,
+        untrusted_content_guard,
+        webhook_policy,
+    )
+    .await;
 
     Ok(IngestOutcome::Stored {
         message: stored,

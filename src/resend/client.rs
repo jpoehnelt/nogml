@@ -13,11 +13,16 @@ use crate::{
         ResendErrorResponse, ResendReceivedAttachment, ResendReceivedAttachmentsResponse,
         ResendReceivedEmail, ResendSendEmailRequest, ResendSendEmailResponse,
     },
+    net_guard::{
+        UrlGuardOptions, build_pinned_http_client, read_bounded_bytes, same_origin, ssrf_error,
+        validate_and_pin_url,
+    },
     resend::ResendClient,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_MAX_DOWNLOAD_BYTES: usize = 40 * 1024 * 1024;
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 const MAX_RAW_ERROR_SNIPPET_CHARS: usize = 512;
 
@@ -27,18 +32,24 @@ pub struct HttpResendClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    max_body_bytes: usize,
+    allow_private_endpoints: bool,
 }
 
 impl HttpResendClient {
     /// Construct a client from application [`Config`].
     pub fn from_config(config: &Config) -> Self {
         Self::new(&config.resend_base_url, config.resend_api_key.clone())
+            .with_max_body_bytes(config.max_body_bytes)
+            .with_allow_private_endpoints(config.allow_private_endpoints)
     }
 
     /// Construct a client targeting `base_url` with an optional Resend API key.
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         crate::ensure_crypto_provider();
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .user_agent(concat!("nogml/", env!("CARGO_PKG_VERSION")))
@@ -59,7 +70,21 @@ impl HttpResendClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
+            max_body_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            allow_private_endpoints: false,
         }
+    }
+
+    /// Override the maximum response size permitted by [`ResendClient::download_bytes`].
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes.max(1);
+        self
+    }
+
+    /// Allow private/loopback/HTTP download endpoints (for local dev/tests only).
+    pub fn with_allow_private_endpoints(mut self, allow: bool) -> Self {
+        self.allow_private_endpoints = allow;
+        self
     }
 
     /// Return the configured base URL (without trailing slash).
@@ -119,17 +144,6 @@ fn validate_email_id(email_id: &str) -> AppResult<&str> {
         )));
     }
     Ok(trimmed)
-}
-
-fn validate_download_url(raw_url: &str) -> AppResult<Url> {
-    let parsed = Url::parse(raw_url.trim())
-        .map_err(|err| AppError::BadRequest(format!("Invalid download URL: {err}")))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(parsed),
-        scheme => Err(AppError::BadRequest(format!(
-            "Unsupported download URL scheme '{scheme}'; expected http or https"
-        ))),
-    }
 }
 
 /// Map a non-2xx Resend HTTP response into a typed [`AppError`].
@@ -308,17 +322,48 @@ impl ResendClient for HttpResendClient {
     }
 
     async fn download_bytes(&self, url: &str) -> AppResult<Vec<u8>> {
-        let validated = validate_download_url(url)?;
+        let parsed = Url::parse(url.trim())
+            .map_err(|err| AppError::BadRequest(format!("Invalid download URL: {err}")))?;
+        let allow_private =
+            self.allow_private_endpoints || same_origin(&parsed, self.base_url.as_str());
+
+        let pinned = validate_and_pin_url(
+            url,
+            UrlGuardOptions {
+                allow_private_endpoints: allow_private,
+                allow_http: allow_private,
+                allowed_hosts: &[],
+                context: "Resend download URL",
+            },
+        )
+        .await?;
+
+        let client = build_pinned_http_client(
+            &pinned,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            Some(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)),
+        )?;
+
         // Presigned download URLs (S3/R2) reject extra Authorization headers; do not attach bearer auth.
-        let resp = self.http.get(validated).send().await?;
+        let resp = client.get(pinned.url.as_str()).send().await?;
         let status = resp.status();
-        let body = resp.bytes().await?;
+        if status.is_redirection() {
+            return Err(ssrf_error(
+                format!(
+                    "Resend download URL returned HTTP {} redirect; redirects are disabled for SSRF protection",
+                    status.as_u16()
+                ),
+                "Presigned download URLs must respond directly without redirecting.",
+            ));
+        }
+
+        let body = read_bounded_bytes(resp, self.max_body_bytes, "Resend download").await?;
 
         if !status.is_success() {
             return Err(map_resend_error(status, &body));
         }
 
-        Ok(body.to_vec())
+        Ok(body)
     }
 }
 

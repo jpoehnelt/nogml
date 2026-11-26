@@ -4071,18 +4071,30 @@ async fn get_attachment_handler(
     let content_type = HeaderValue::from_str(&att.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
 
-    if let Some(filename) = &att.filename {
-        let safe_name: String = filename
-            .chars()
-            .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n' | '\0'))
-            .collect();
-        if let Ok(disposition) =
-            HeaderValue::from_str(&format!("attachment; filename=\"{safe_name}\""))
-        {
-            headers.insert(header::CONTENT_DISPOSITION, disposition);
-        }
-    }
+    let disposition = att
+        .filename
+        .as_deref()
+        .map(|filename| {
+            filename
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n' | '\0'))
+                .collect::<String>()
+        })
+        .filter(|safe| !safe.is_empty())
+        .and_then(|safe_name| {
+            HeaderValue::from_str(&format!("attachment; filename=\"{safe_name}\"")).ok()
+        })
+        .unwrap_or_else(|| HeaderValue::from_static("attachment"));
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
 
     let data = state.load_attachment_bytes(&att).await?;
     state

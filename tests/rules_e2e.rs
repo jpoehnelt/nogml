@@ -47,7 +47,7 @@ use nogml::{
     sync::{PullReport, ingest_synced_message},
     transport::{
         InboundEnvelope, IngestOutcome, MailTransport, OutboundMessage, SendOutcome,
-        TransportCapabilities, ingest_inbound_rfc2822,
+        TransportCapabilities, ingest_inbound_rfc2822_with_config,
     },
 };
 
@@ -135,6 +135,7 @@ async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock
 
 fn build_state(mut cfg: Config) -> (AppState, Router) {
     cfg.user_email = "agent@example.com".to_string();
+    cfg.allow_private_endpoints = true;
     let store = Arc::new(SqliteStore::open_in_memory(&cfg.user_email).unwrap());
     let resend = Arc::new(HttpResendClient::from_config(&cfg));
     let state = AppState::with_backends(cfg, store, resend)
@@ -218,7 +219,7 @@ async fn stripe_dispute_rule_mutates_labels_and_posts_signed_compact_webhook() {
     })
     .unwrap();
 
-    let outcome = ingest_inbound_rfc2822(
+    let outcome = ingest_inbound_rfc2822_with_config(
         state.store.as_ref(),
         &state.events,
         state.filter.as_ref(),
@@ -227,6 +228,7 @@ async fn stripe_dispute_rule_mutates_labels_and_posts_signed_compact_webhook() {
             source: "resend_inbound".to_string(),
             ..Default::default()
         },
+        &state.config,
     )
     .await
     .unwrap();
@@ -281,7 +283,7 @@ async fn stripe_dispute_rule_mutates_labels_and_posts_signed_compact_webhook() {
         ..Default::default()
     })
     .unwrap();
-    let other_outcome = ingest_inbound_rfc2822(
+    let other_outcome = ingest_inbound_rfc2822_with_config(
         state.store.as_ref(),
         &state.events,
         state.filter.as_ref(),
@@ -290,6 +292,7 @@ async fn stripe_dispute_rule_mutates_labels_and_posts_signed_compact_webhook() {
             source: "resend_inbound".to_string(),
             ..Default::default()
         },
+        &state.config,
     )
     .await
     .unwrap();
@@ -511,7 +514,7 @@ async fn vip_only_rule_fires_only_for_vip_senders() {
         ..Default::default()
     })
     .unwrap();
-    let non_vip_res = ingest_inbound_rfc2822(
+    let non_vip_res = ingest_inbound_rfc2822_with_config(
         state.store.as_ref(),
         &state.events,
         state.filter.as_ref(),
@@ -520,6 +523,7 @@ async fn vip_only_rule_fires_only_for_vip_senders() {
             source: "resend_inbound".to_string(),
             ..Default::default()
         },
+        &state.config,
     )
     .await
     .unwrap();
@@ -551,7 +555,7 @@ async fn vip_only_rule_fires_only_for_vip_senders() {
         ..Default::default()
     })
     .unwrap();
-    let vip_res = ingest_inbound_rfc2822(
+    let vip_res = ingest_inbound_rfc2822_with_config(
         state.store.as_ref(),
         &state.events,
         state.filter.as_ref(),
@@ -560,6 +564,7 @@ async fn vip_only_rule_fires_only_for_vip_senders() {
             source: "resend_inbound".to_string(),
             ..Default::default()
         },
+        &state.config,
     )
     .await
     .unwrap();
@@ -640,7 +645,7 @@ async fn failing_and_unreachable_webhooks_never_fail_message_storage() {
     .unwrap();
 
     // Storage succeeds immediately even though both webhooks fail.
-    let outcome = ingest_inbound_rfc2822(
+    let outcome = ingest_inbound_rfc2822_with_config(
         state.store.as_ref(),
         &state.events,
         state.filter.as_ref(),
@@ -649,6 +654,7 @@ async fn failing_and_unreachable_webhooks_never_fail_message_storage() {
             source: "resend_inbound".to_string(),
             ..Default::default()
         },
+        &state.config,
     )
     .await
     .unwrap();
@@ -950,6 +956,14 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
             allowed_recipients: None,
             max_send_recipients: None,
         },
+        ScopedTokenConfig {
+            token: "tok_admin".to_string(),
+            mailbox_id: Some("agent@example.com".to_string()),
+            scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Admin],
+            draft_only: None,
+            allowed_recipients: None,
+            max_send_recipients: None,
+        },
     ];
     let (state, app) = build_state(cfg);
 
@@ -1044,11 +1058,27 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // Write-only token cannot set webhook_url (requires Admin scope).
     let (status, _) = send_json(
         &app,
         Method::POST,
         "/v1/rules",
         Some("tok_write"),
+        Some(json!({
+            "name": "Write Webhook Denied",
+            "match_query": "from:@stripe.com",
+            "actions": { "webhook_url": format!("{}/never-called", hook_server.uri()) }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admin token gets SSRF policy rejection on unsupported scheme.
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/rules",
+        Some("tok_admin"),
         Some(json!({
             "name": "Bad Scheme",
             "match_query": "from:@stripe.com",
@@ -1056,7 +1086,7 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Read-only token cannot create rule
     let (status, _) = send_json(
@@ -1073,12 +1103,12 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Write token creates rule
+    // Admin token creates rule with webhook_url
     let (status, created) = send_json(
         &app,
         Method::POST,
         "/v1/rules",
-        Some("tok_write"),
+        Some("tok_admin"),
         Some(json!({
             "name": "Dry Run Stripe",
             "match_query": "from:@stripe.com subject:dispute",
@@ -1122,12 +1152,23 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(hook_server.received_requests().await.unwrap().is_empty());
 
-    // PATCH rule updates name/enabled and preserves secret (still redacted).
-    let (status, patched) = send_json(
+    // Write-only token cannot toggle enabled or match_query on an existing webhook rule.
+    let (status, _) = send_json(
         &app,
         Method::PATCH,
         &format!("/v1/rules/{rule_id}"),
         Some("tok_write"),
+        Some(json!({ "name": "Hijack Attempt", "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admin PATCH rule updates name/enabled and preserves secret (still redacted).
+    let (status, patched) = send_json(
+        &app,
+        Method::PATCH,
+        &format!("/v1/rules/{rule_id}"),
+        Some("tok_admin"),
         Some(json!({ "name": "Renamed Stripe", "enabled": false })),
     )
     .await;
@@ -1137,12 +1178,35 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
     assert_eq!(patched["actions"]["has_webhook_secret"], true);
     assert!(!patched.to_string().contains("keep_me_hidden"));
 
-    // MCP create_rule / list_rules / delete_rule
-    let (status, mcp_create) = send_json(
+    // MCP create_rule with webhook_url requires Admin scope (Write-only token is forbidden).
+    let (status, _) = send_json(
         &app,
         Method::POST,
         "/mcp",
         Some("tok_write"),
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "create_rule",
+                "arguments": {
+                    "name": "MCP Write Denied",
+                    "match_query": "from:@billing.test",
+                    "webhook_url": "https://hooks.example.com/mcp"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // MCP create_rule / list_rules / delete_rule (Admin token can set webhook_url)
+    let (status, mcp_create) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        Some("tok_admin"),
         Some(json!({
             "jsonrpc": "2.0",
             "id": 1,

@@ -218,9 +218,28 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_SES_S3_ENDPOINT", global = true)]
     ses_s3_endpoint: Option<String>,
 
-    /// Optional shared secret required by `POST /webhooks/ses` (header or query param).
+    /// Shared secret required by `POST /webhooks/ses` (via headers only:
+    /// `X-Nogml-Webhook-Secret`, `X-SES-Webhook-Secret`, `X-Webhook-Secret`, or `Authorization: Bearer`).
     #[arg(long, env = "NOGML_SES_WEBHOOK_SECRET", global = true)]
     ses_webhook_secret: Option<String>,
+
+    /// Comma-separated AWS SNS TopicArn allowlist for `POST /webhooks/ses`.
+    #[arg(
+        long,
+        env = "NOGML_SES_ALLOWED_TOPIC_ARNS",
+        value_delimiter = ',',
+        global = true
+    )]
+    ses_allowed_topic_arns: Vec<String>,
+
+    /// Comma-separated S3 bucket name allowlist for SES S3 inbound receipt actions.
+    #[arg(
+        long,
+        env = "NOGML_SES_ALLOWED_S3_BUCKETS",
+        value_delimiter = ',',
+        global = true
+    )]
+    ses_allowed_s3_buckets: Vec<String>,
 
     // --- SMTP outbound submission ---
     /// Upstream SMTP relay host.
@@ -365,6 +384,33 @@ struct CommonConfigArgs {
         global = true
     )]
     untrusted_content_guard: bool,
+
+    /// Comma-separated host allowlist for outbound inbox rule webhooks (exact host or `*.domain`).
+    #[arg(
+        long,
+        env = "NOGML_WEBHOOK_ALLOWED_HOSTS",
+        value_delimiter = ',',
+        global = true
+    )]
+    webhook_allowed_hosts: Vec<String>,
+
+    /// Allow private/loopback/HTTP webhook and download endpoints (dev/test only; NEVER enable in production).
+    #[arg(
+        long,
+        env = "NOGML_ALLOW_PRIVATE_ENDPOINTS",
+        default_value_t = false,
+        global = true
+    )]
+    allow_private_endpoints: bool,
+
+    /// Allow unsigned `/webhooks/resend` and `/webhooks/ses` requests when webhook secrets are unset (dev/test only).
+    #[arg(
+        long,
+        env = "NOGML_ALLOW_INSECURE_WEBHOOKS",
+        default_value_t = false,
+        global = true
+    )]
+    allow_insecure_webhooks: bool,
 
     // --- Upstream Gmail Sync ---
     #[arg(long, env = "NOGML_SYNC_MODE", default_value = "api", global = true)]
@@ -1217,6 +1263,12 @@ impl CommonConfigArgs {
         if is_explicit(root_matches, "ses_webhook_secret") {
             cfg.ses_webhook_secret = self.ses_webhook_secret;
         }
+        if is_explicit(root_matches, "ses_allowed_topic_arns") {
+            cfg.ses_allowed_topic_arns = self.ses_allowed_topic_arns;
+        }
+        if is_explicit(root_matches, "ses_allowed_s3_buckets") {
+            cfg.ses_allowed_s3_buckets = self.ses_allowed_s3_buckets;
+        }
         if is_explicit(root_matches, "smtp_host") {
             cfg.smtp_host = self.smtp_host;
         }
@@ -1282,6 +1334,15 @@ impl CommonConfigArgs {
         }
         if is_explicit(root_matches, "untrusted_content_guard") {
             cfg.untrusted_content_guard = self.untrusted_content_guard;
+        }
+        if is_explicit(root_matches, "webhook_allowed_hosts") {
+            cfg.webhook_allowed_hosts = self.webhook_allowed_hosts;
+        }
+        if is_explicit(root_matches, "allow_private_endpoints") {
+            cfg.allow_private_endpoints = self.allow_private_endpoints;
+        }
+        if is_explicit(root_matches, "allow_insecure_webhooks") {
+            cfg.allow_insecure_webhooks = self.allow_insecure_webhooks;
         }
         if is_explicit(root_matches, "sync_mode") {
             cfg.sync_mode = self.sync_mode;

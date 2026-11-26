@@ -252,6 +252,12 @@ pub struct Config {
     pub ses_session_token: Option<String>,
     pub ses_s3_endpoint: Option<String>,
     pub ses_webhook_secret: Option<String>,
+    /// Optional AWS SNS TopicArn allowlist for `POST /webhooks/ses`.
+    #[serde(default)]
+    pub ses_allowed_topic_arns: Vec<String>,
+    /// Optional S3 bucket name allowlist for SES S3 inbound receipt actions.
+    #[serde(default)]
+    pub ses_allowed_s3_buckets: Vec<String>,
 
     // --- SMTP outbound submission ---
     pub smtp_host: String,
@@ -279,6 +285,17 @@ pub struct Config {
     pub max_send_recipients: usize,
     pub default_max_body_chars: usize,
     pub untrusted_content_guard: bool,
+    /// Optional host allowlist for outbound inbox rule webhooks (exact host or `*.domain`).
+    #[serde(default)]
+    pub webhook_allowed_hosts: Vec<String>,
+    /// Explicit dev/test opt-in allowing private/loopback/HTTP webhook & download endpoints.
+    /// Must remain `false` in production.
+    #[serde(default)]
+    pub allow_private_endpoints: bool,
+    /// Explicit dev/test opt-in allowing unsigned `/webhooks/resend` and `/webhooks/ses`
+    /// requests when webhook secrets are unset. Must remain `false` in production.
+    #[serde(default)]
+    pub allow_insecure_webhooks: bool,
 
     // --- Embedded IMAP4rev1 server ---
     pub imap_bind: Option<SocketAddr>,
@@ -403,6 +420,8 @@ impl Default for Config {
             ses_session_token: None,
             ses_s3_endpoint: None,
             ses_webhook_secret: None,
+            ses_allowed_topic_arns: Vec::new(),
+            ses_allowed_s3_buckets: Vec::new(),
 
             smtp_host: "127.0.0.1".to_string(),
             smtp_port: 587,
@@ -422,6 +441,9 @@ impl Default for Config {
             max_send_recipients: 50,
             default_max_body_chars: 4000,
             untrusted_content_guard: true,
+            webhook_allowed_hosts: Vec::new(),
+            allow_private_endpoints: false,
+            allow_insecure_webhooks: false,
 
             imap_bind: None,
             imap_tls_bind: None,
@@ -641,6 +663,8 @@ impl Config {
             ses_session_token,
             ses_s3_endpoint,
             ses_webhook_secret,
+            ses_allowed_topic_arns,
+            ses_allowed_s3_buckets,
             smtp_host,
             smtp_port,
             smtp_tls_mode,
@@ -658,6 +682,9 @@ impl Config {
             max_send_recipients,
             default_max_body_chars,
             untrusted_content_guard,
+            webhook_allowed_hosts,
+            allow_private_endpoints,
+            allow_insecure_webhooks,
             imap_bind,
             imap_tls_bind,
             imap_tls_cert,
@@ -779,6 +806,8 @@ impl Config {
                 "session_token": redact_opt(ses_session_token),
                 "s3_endpoint": ses_s3_endpoint,
                 "webhook_secret": redact_opt(ses_webhook_secret),
+                "allowed_topic_arns": ses_allowed_topic_arns,
+                "allowed_s3_buckets": ses_allowed_s3_buckets,
             },
             "smtp": {
                 "host": smtp_host,
@@ -800,6 +829,9 @@ impl Config {
                 "max_send_recipients": max_send_recipients,
                 "default_max_body_chars": default_max_body_chars,
                 "untrusted_content_guard": untrusted_content_guard,
+                "webhook_allowed_hosts": webhook_allowed_hosts,
+                "allow_private_endpoints": allow_private_endpoints,
+                "allow_insecure_webhooks": allow_insecure_webhooks,
             },
             "imap": {
                 "bind": imap_bind.map(|a| a.to_string()),
@@ -1218,6 +1250,8 @@ impl fmt::Debug for Config {
             ses_session_token,
             ses_s3_endpoint,
             ses_webhook_secret,
+            ses_allowed_topic_arns,
+            ses_allowed_s3_buckets,
             smtp_host,
             smtp_port,
             smtp_tls_mode,
@@ -1235,6 +1269,9 @@ impl fmt::Debug for Config {
             max_send_recipients,
             default_max_body_chars,
             untrusted_content_guard,
+            webhook_allowed_hosts,
+            allow_private_endpoints,
+            allow_insecure_webhooks,
             imap_bind,
             imap_tls_bind,
             imap_tls_cert,
@@ -1336,6 +1373,8 @@ impl fmt::Debug for Config {
             .field("ses_session_token", &redacted_opt(ses_session_token))
             .field("ses_s3_endpoint", ses_s3_endpoint)
             .field("ses_webhook_secret", &redacted_opt(ses_webhook_secret))
+            .field("ses_allowed_topic_arns", ses_allowed_topic_arns)
+            .field("ses_allowed_s3_buckets", ses_allowed_s3_buckets)
             .field("smtp_host", smtp_host)
             .field("smtp_port", smtp_port)
             .field("smtp_tls_mode", smtp_tls_mode)
@@ -1353,6 +1392,9 @@ impl fmt::Debug for Config {
             .field("max_send_recipients", max_send_recipients)
             .field("default_max_body_chars", default_max_body_chars)
             .field("untrusted_content_guard", untrusted_content_guard)
+            .field("webhook_allowed_hosts", webhook_allowed_hosts)
+            .field("allow_private_endpoints", allow_private_endpoints)
+            .field("allow_insecure_webhooks", allow_insecure_webhooks)
             .field("imap_bind", imap_bind)
             .field("imap_tls_bind", imap_tls_bind)
             .field("imap_tls_cert", imap_tls_cert)
@@ -1506,6 +1548,8 @@ pub struct SesTomlConfig {
     pub session_token: Option<String>,
     pub s3_endpoint: Option<String>,
     pub webhook_secret: Option<String>,
+    pub allowed_topic_arns: Option<Vec<String>>,
+    pub allowed_s3_buckets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1533,6 +1577,9 @@ pub struct SafetyTomlConfig {
     pub max_send_recipients: Option<usize>,
     pub default_max_body_chars: Option<usize>,
     pub untrusted_content_guard: Option<bool>,
+    pub webhook_allowed_hosts: Option<Vec<String>>,
+    pub allow_private_endpoints: Option<bool>,
+    pub allow_insecure_webhooks: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1776,6 +1823,12 @@ impl TomlConfig {
         if let Some(ref v) = self.ses.webhook_secret {
             cfg.ses_webhook_secret = Some(v.clone());
         }
+        if let Some(ref v) = self.ses.allowed_topic_arns {
+            cfg.ses_allowed_topic_arns = v.clone();
+        }
+        if let Some(ref v) = self.ses.allowed_s3_buckets {
+            cfg.ses_allowed_s3_buckets = v.clone();
+        }
 
         // [smtp]
         if let Some(ref v) = self.smtp.host {
@@ -1830,6 +1883,15 @@ impl TomlConfig {
         }
         if let Some(v) = self.safety.untrusted_content_guard {
             cfg.untrusted_content_guard = v;
+        }
+        if let Some(ref v) = self.safety.webhook_allowed_hosts {
+            cfg.webhook_allowed_hosts = v.clone();
+        }
+        if let Some(v) = self.safety.allow_private_endpoints {
+            cfg.allow_private_endpoints = v;
+        }
+        if let Some(v) = self.safety.allow_insecure_webhooks {
+            cfg.allow_insecure_webhooks = v;
         }
 
         // [imap]
@@ -2061,6 +2123,19 @@ pub fn validate_config(
         && let Err(err) = S3BlobConfig::from_config(config)
     {
         errors.push(err.to_string());
+    }
+
+    if config.allow_insecure_webhooks {
+        warnings.push(
+            "safety.allow_insecure_webhooks is enabled; unsigned webhooks on /webhooks/resend and /webhooks/ses will be accepted without verification"
+                .to_string(),
+        );
+    }
+    if config.allow_private_endpoints {
+        warnings.push(
+            "safety.allow_private_endpoints is enabled; SSRF private IP protections are relaxed"
+                .to_string(),
+        );
     }
 
     // --- Outbound transport ---

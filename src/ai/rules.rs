@@ -12,11 +12,14 @@ use tracing::warn;
 use crate::{
     AppState,
     ai::{channel_for_source, sanitize_untrusted_text, to_compact_message, validate_resource_id},
-    auth::Principal,
+    auth::{AuthScope, Principal},
     config::Config,
     error::{AppError, AppResult},
     events::{EventBus, EventSource, MailEvent},
     models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_UNREAD},
+    net_guard::{
+        UrlGuardOptions, build_pinned_http_client, validate_and_pin_url, validate_url_static,
+    },
     search::{SearchQuery, matches_message, parse_query, try_parse_query},
     storage::{
         InboxRule, InboxRuleActions, InboxRulePatch, InboxRuleView, MailStore, MessageListQuery,
@@ -335,8 +338,34 @@ pub fn validate_match_query(raw: &str, vip_only: bool) -> AppResult<SearchQuery>
     Ok(parsed)
 }
 
-/// Validate a rule webhook URL: must be an absolute `http://` or `https://` URL with a host.
+/// Runtime SSRF and host-allowlist policy applied to inbox rule webhooks.
+#[derive(Debug, Clone, Default)]
+pub struct RuleWebhookPolicy {
+    pub allow_private_endpoints: bool,
+    pub allowed_hosts: Vec<String>,
+}
+
+impl RuleWebhookPolicy {
+    /// Build a [`RuleWebhookPolicy`] from application [`Config`].
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            allow_private_endpoints: config.allow_private_endpoints,
+            allowed_hosts: config.webhook_allowed_hosts.clone(),
+        }
+    }
+}
+
+/// Validate a rule webhook URL with strict production SSRF rules (HTTPS-only,
+/// globally routable host, no embedded credentials).
 pub fn validate_webhook_url(raw: &str) -> AppResult<String> {
+    validate_webhook_url_with_policy(raw, &RuleWebhookPolicy::default())
+}
+
+/// Validate a rule webhook URL under the given [`RuleWebhookPolicy`].
+pub fn validate_webhook_url_with_policy(
+    raw: &str,
+    policy: &RuleWebhookPolicy,
+) -> AppResult<String> {
     if has_control_chars(raw) {
         return Err(AppError::validation(
             "webhook_url contains disallowed control characters",
@@ -344,37 +373,15 @@ pub fn validate_webhook_url(raw: &str) -> AppResult<String> {
         ));
     }
     let trimmed = raw.trim();
-    let parsed = url::Url::parse(trimmed).map_err(|err| {
-        AppError::validation(
-            format!("Invalid webhook_url '{trimmed}': {err}"),
-            Some("Provide a valid http:// or https:// URL.".to_string()),
-        )
-    })?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(AppError::validation(
-            format!(
-                "Unsupported webhook_url scheme '{}': only http:// and https:// are allowed",
-                parsed.scheme()
-            ),
-            Some("Use an http:// or https:// webhook endpoint URL.".to_string()),
-        ));
-    }
-    if parsed.host_str().map(str::trim).unwrap_or("").is_empty() {
-        return Err(AppError::validation(
-            "webhook_url must include a host",
-            Some("Provide a complete URL such as https://hooks.example.com/nogml.".to_string()),
-        ));
-    }
-    let after_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or("");
-    if after_scheme.is_empty() || after_scheme.starts_with('/') {
-        return Err(AppError::validation(
-            format!("Invalid webhook_url '{trimmed}': missing host"),
-            Some("Provide a complete URL such as https://hooks.example.com/nogml.".to_string()),
-        ));
-    }
+    validate_url_static(
+        trimmed,
+        UrlGuardOptions {
+            allow_private_endpoints: policy.allow_private_endpoints,
+            allow_http: policy.allow_private_endpoints,
+            allowed_hosts: &policy.allowed_hosts,
+            context: "webhook_url",
+        },
+    )?;
     Ok(trimmed.to_string())
 }
 
@@ -394,8 +401,16 @@ fn validate_label_token(label: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Validate and normalize [`InboxRuleActions`].
+/// Validate and normalize [`InboxRuleActions`] using strict production SSRF defaults.
 pub fn validate_rule_actions(actions: &InboxRuleActions) -> AppResult<InboxRuleActions> {
+    validate_rule_actions_with_policy(actions, &RuleWebhookPolicy::default())
+}
+
+/// Validate and normalize [`InboxRuleActions`] under the given [`RuleWebhookPolicy`].
+pub fn validate_rule_actions_with_policy(
+    actions: &InboxRuleActions,
+    policy: &RuleWebhookPolicy,
+) -> AppResult<InboxRuleActions> {
     let normalized = normalize_inbox_rule_actions(actions);
     for lbl in normalized
         .add_labels
@@ -405,7 +420,7 @@ pub fn validate_rule_actions(actions: &InboxRuleActions) -> AppResult<InboxRuleA
         validate_label_token(lbl)?;
     }
     if let Some(ref url) = normalized.webhook_url {
-        validate_webhook_url(url)?;
+        validate_webhook_url_with_policy(url, policy)?;
     }
     if let Some(ref secret) = normalized.webhook_secret
         && has_control_chars(secret)
@@ -418,11 +433,19 @@ pub fn validate_rule_actions(actions: &InboxRuleActions) -> AppResult<InboxRuleA
     Ok(normalized)
 }
 
-/// Validate a [`NewInboxRule`] input before storing it.
+/// Validate a [`NewInboxRule`] input before storing it using strict production SSRF defaults.
 pub fn validate_new_inbox_rule(input: &NewInboxRule) -> AppResult<NewInboxRule> {
+    validate_new_inbox_rule_with_policy(input, &RuleWebhookPolicy::default())
+}
+
+/// Validate a [`NewInboxRule`] input under the given [`RuleWebhookPolicy`].
+pub fn validate_new_inbox_rule_with_policy(
+    input: &NewInboxRule,
+    policy: &RuleWebhookPolicy,
+) -> AppResult<NewInboxRule> {
     let name = validate_rule_name(&input.name)?;
     validate_match_query(&input.match_query, input.vip_only)?;
-    let actions = validate_rule_actions(&input.actions)?;
+    let actions = validate_rule_actions_with_policy(&input.actions, policy)?;
     Ok(NewInboxRule {
         name,
         enabled: input.enabled,
@@ -501,6 +524,25 @@ pub async fn evaluate_inbox_rules(
     events: &EventBus,
     msg: &StoredMessage,
     untrusted_content_guard: bool,
+) -> StoredMessage {
+    evaluate_inbox_rules_with_policy(
+        store,
+        events,
+        msg,
+        untrusted_content_guard,
+        &RuleWebhookPolicy::default(),
+    )
+    .await
+}
+
+/// Evaluate all enabled per-mailbox inbox rules for a newly ingested inbound message
+/// using an explicit [`RuleWebhookPolicy`].
+pub async fn evaluate_inbox_rules_with_policy(
+    store: &dyn MailStore,
+    events: &EventBus,
+    msg: &StoredMessage,
+    untrusted_content_guard: bool,
+    webhook_policy: &RuleWebhookPolicy,
 ) -> StoredMessage {
     // Never fire inbox rules on outbound SENT or DRAFT messages.
     if msg
@@ -700,6 +742,7 @@ pub async fn evaluate_inbox_rules(
             webhook_url,
             body_bytes,
             signature,
+            webhook_policy.clone(),
         );
     }
 
@@ -713,9 +756,38 @@ fn spawn_rule_webhook(
     webhook_url: String,
     body_bytes: Vec<u8>,
     signature: Option<String>,
+    webhook_policy: RuleWebhookPolicy,
 ) {
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
+        let pinned = match validate_and_pin_url(
+            &webhook_url,
+            UrlGuardOptions {
+                allow_private_endpoints: webhook_policy.allow_private_endpoints,
+                allow_http: webhook_policy.allow_private_endpoints,
+                allowed_hosts: &webhook_policy.allowed_hosts,
+                context: "inbox rule webhook",
+            },
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(
+                    %err,
+                    %rule_id,
+                    %rule_name,
+                    %mailbox_id,
+                    "Blocked inbox rule webhook delivery by SSRF/allowlist policy"
+                );
+                return;
+            }
+        };
+
+        let client = match build_pinned_http_client(
+            &pinned,
+            WEBHOOK_TIMEOUT,
+            Some(Duration::from_secs(5)),
+        ) {
             Ok(c) => c,
             Err(err) => {
                 warn!(%err, %rule_id, %rule_name, %mailbox_id, "Failed to build HTTP client for inbox rule webhook");
@@ -726,7 +798,7 @@ fn spawn_rule_webhook(
         let total_attempts = 1 + WEBHOOK_RETRY_BACKOFF_MS.len();
         for attempt in 0..total_attempts {
             let mut req = client
-                .post(&webhook_url)
+                .post(pinned.url.as_str())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(WEBHOOK_EVENT_HEADER, RULE_MATCHED_EVENT)
                 .body(body_bytes.clone());
@@ -737,6 +809,16 @@ fn spawn_rule_webhook(
 
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) if resp.status().is_redirection() => {
+                    warn!(
+                        status = %resp.status(),
+                        %rule_id,
+                        %rule_name,
+                        %mailbox_id,
+                        "Inbox rule webhook returned redirect; refusing to follow for SSRF protection"
+                    );
+                    return;
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let retryable = status.is_server_error()
@@ -749,7 +831,6 @@ fn spawn_rule_webhook(
                             %rule_id,
                             %rule_name,
                             %mailbox_id,
-                            %webhook_url,
                             "Inbox rule webhook delivery failed with non-success status"
                         );
                         return;
@@ -758,7 +839,6 @@ fn spawn_rule_webhook(
                         status = %status,
                         attempt = attempt + 1,
                         %rule_id,
-                        %webhook_url,
                         "Inbox rule webhook returned retryable status; retrying"
                     );
                 }
@@ -770,7 +850,6 @@ fn spawn_rule_webhook(
                             %rule_id,
                             %rule_name,
                             %mailbox_id,
-                            %webhook_url,
                             "Inbox rule webhook delivery failed after retries"
                         );
                         return;
@@ -779,7 +858,6 @@ fn spawn_rule_webhook(
                         %err,
                         attempt = attempt + 1,
                         %rule_id,
-                        %webhook_url,
                         "Inbox rule webhook request failed; retrying"
                     );
                 }
@@ -819,7 +897,22 @@ pub async fn execute_create_rule_with_context(
     principal: Option<Principal>,
     source: EventSource,
 ) -> AppResult<Value> {
-    let validated = validate_new_inbox_rule(&input)?;
+    let sets_webhook = input
+        .actions
+        .webhook_url
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || input
+            .actions
+            .webhook_secret
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+    if sets_webhook && let Some(ref p) = principal {
+        p.require_scope(AuthScope::Admin)?;
+    }
+
+    let policy = RuleWebhookPolicy::from_config(&state.config);
+    let validated = validate_new_inbox_rule_with_policy(&input, &policy)?;
     let created = state.store.create_inbox_rule(&validated).await?;
     state
         .record_audit(
@@ -849,6 +942,19 @@ pub async fn execute_patch_rule_with_context(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Inbox rule '{id}' not found")))?;
 
+    let touches_webhook = patch.actions.as_ref().is_some_and(|actions| {
+        let normalized = normalize_inbox_rule_actions(actions);
+        normalized.webhook_url != existing.actions.webhook_url
+            || normalized.webhook_secret != existing.actions.webhook_secret
+    });
+    let modifies_webhook_rule_trigger = existing.actions.webhook_url.is_some()
+        && (patch.match_query.is_some() || patch.vip_only.is_some() || patch.enabled.is_some());
+    if (touches_webhook || modifies_webhook_rule_trigger)
+        && let Some(ref p) = principal
+    {
+        p.require_scope(AuthScope::Admin)?;
+    }
+
     if let Some(ref name) = patch.name {
         patch.name = Some(validate_rule_name(name)?);
     }
@@ -863,8 +969,9 @@ pub async fn execute_patch_rule_with_context(
         patch.match_query = Some(q.trim().to_string());
     }
 
+    let policy = RuleWebhookPolicy::from_config(&state.config);
     if let Some(ref actions) = patch.actions {
-        patch.actions = Some(validate_rule_actions(actions)?);
+        patch.actions = Some(validate_rule_actions_with_policy(actions, &policy)?);
     }
 
     let updated = state.store.patch_inbox_rule(id, &patch).await?;
@@ -1035,13 +1142,40 @@ mod tests {
     }
 
     #[test]
-    fn webhook_url_validation_allows_http_and_https_only() {
+    fn webhook_url_validation_enforces_https_and_ssrf_guards() {
         assert!(validate_webhook_url("https://hooks.example.com/nogml").is_ok());
-        assert!(validate_webhook_url("http://127.0.0.1:8080/hook").is_ok());
+        assert!(validate_webhook_url("http://127.0.0.1:8080/hook").is_err());
+        assert!(validate_webhook_url("https://127.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("https://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_webhook_url("https://10.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("https://[::1]/hook").is_err());
+        assert!(validate_webhook_url("https://user:pass@hooks.example.com/hook").is_err());
+        assert!(validate_webhook_url("http://hooks.example.com/hook").is_err());
         assert!(validate_webhook_url("ftp://example.com/hook").is_err());
         assert!(validate_webhook_url("javascript:alert(1)").is_err());
         assert!(validate_webhook_url("/relative/path").is_err());
         assert!(validate_webhook_url("https:///missing-host").is_err());
+
+        // Dev/test policy allows local HTTP mock endpoints while respecting host allowlist.
+        let dev_policy = RuleWebhookPolicy {
+            allow_private_endpoints: true,
+            allowed_hosts: vec![],
+        };
+        assert!(
+            validate_webhook_url_with_policy("http://127.0.0.1:8080/hook", &dev_policy).is_ok()
+        );
+
+        let allowlist_policy = RuleWebhookPolicy {
+            allow_private_endpoints: false,
+            allowed_hosts: vec!["*.trusted.example".to_string()],
+        };
+        assert!(
+            validate_webhook_url_with_policy("https://hooks.trusted.example/in", &allowlist_policy)
+                .is_ok()
+        );
+        assert!(
+            validate_webhook_url_with_policy("https://evil.example/in", &allowlist_policy).is_err()
+        );
     }
 
     #[test]
