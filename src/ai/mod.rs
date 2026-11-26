@@ -5,6 +5,7 @@
 //! Owned by the `ai-mcp` worker.
 
 pub mod briefing;
+pub mod openapi;
 pub mod reply_context;
 pub mod rules;
 pub mod safety;
@@ -76,6 +77,7 @@ pub use briefing::{
     ApprovalBriefingItem, BriefingCounts, BriefingParams, BriefingResponse, FollowUpCandidate,
     build_briefing, execute_briefing, parse_briefing_since,
 };
+pub use openapi::{V1_OPENAPI_OPERATIONS, openapi_spec};
 pub use reply_context::{
     ReplyContextOptions, ReplyContextResponse, clean_subject, execute_get_reply_context,
 };
@@ -213,6 +215,7 @@ pub fn router() -> Router<AppState> {
 pub fn ai_router() -> Router<AppState> {
     Router::new()
         .route("/v1/capabilities", get(get_capabilities))
+        .route("/v1/openapi.json", get(get_openapi_spec))
         .route("/v1/briefing", get(briefing_handler))
         .route("/v1/threads", get(list_threads))
         .route("/v1/threads/batch_triage", post(batch_triage_handler))
@@ -3584,6 +3587,10 @@ struct EventsParams {
     since_id: Option<u64>,
 }
 
+async fn get_openapi_spec() -> Json<Value> {
+    Json(openapi_spec())
+}
+
 async fn get_capabilities(
     MailboxState(state): MailboxState,
     Query(query): Query<FieldsQuery>,
@@ -3602,6 +3609,7 @@ async fn get_capabilities(
         "mcp_endpoint": "/mcp",
         "endpoints": [
             "GET /v1/capabilities",
+            "GET /v1/openapi.json",
             "GET /v1/briefing",
             "GET /v1/threads",
             "POST /v1/threads/batch_triage",

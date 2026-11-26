@@ -71,6 +71,9 @@ nogml config init --output nogml.toml --token-file ./auth_token
 # Validate syntax, secret sources, and TLS certificates (secrets are always redacted)
 nogml config check --config nogml.toml
 
+# Run live operational diagnostics (config, secret permissions, storage, blobs, IMAP TLS expiry, transport, security posture)
+nogml doctor --config nogml.toml
+
 # Start the server using nogml.toml (CLI flags and env vars override file settings)
 nogml serve --config nogml.toml
 ```
@@ -101,12 +104,13 @@ nogml serve \
   --allowed-recipients @example.com,partner@acme.org
 ```
 
-Check health, readiness, capabilities, and Prometheus metrics:
+Check health, readiness, capabilities, OpenAPI 3.1 schema, and Prometheus metrics:
 
 ```bash
 curl -s http://127.0.0.1:8080/healthz
 curl -s http://127.0.0.1:8080/readyz
 curl -s http://127.0.0.1:8080/v1/capabilities | jq .
+curl -s http://127.0.0.1:8080/v1/openapi.json | jq .
 curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8080/metrics
 ```
 
@@ -137,6 +141,8 @@ nogml mail --url http://127.0.0.1:8080 triage <thread_id> --archive true --mark-
 nogml mail --url http://127.0.0.1:8080 batch-triage --query "newsletter" --archive true --mark-read true --dry-run
 nogml mail --url http://127.0.0.1:8080 watch
 nogml schema --command send
+nogml schema --openapi
+nogml completions zsh
 ```
 
 ### 4. Sync a Gmail account (`nogml auth gmail`, `nogml sync gmail`)
