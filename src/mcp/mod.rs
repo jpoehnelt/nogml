@@ -26,8 +26,8 @@ use crate::{
     models::{
         AiBatchTriageRequest, AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest,
         AiSendEmailRequest, AiTriageRequest, LABEL_INBOX, PatchThreadAnnotationRequest,
-        SyncTriggerRequest, ThreadAnnotationPatch, UpsertThreadAnnotationRequest,
-        default_extracted_object,
+        SnoozeThreadRequest, SyncTriggerRequest, ThreadAnnotationPatch,
+        UpsertThreadAnnotationRequest, default_extracted_object,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord,
@@ -233,9 +233,16 @@ impl McpServer {
             | "list_labels"
             | "lookup_contact"
             | "list_vips"
+            | "list_scheduled_sends"
             | "sync_status" => AuthScope::Read,
-            "create_draft" | "triage_thread" | "batch_triage" | "annotate_thread"
-            | "modify_labels" | "sync_gmail" => AuthScope::Write,
+            "create_draft"
+            | "triage_thread"
+            | "batch_triage"
+            | "snooze_thread"
+            | "cancel_scheduled_send"
+            | "annotate_thread"
+            | "modify_labels"
+            | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
             "unsubscribe" => {
                 let is_dry_run = arguments
@@ -265,6 +272,8 @@ impl McpServer {
                     "create_draft" => "draft",
                     "triage_thread" => "triage",
                     "batch_triage" => "batch_triage",
+                    "snooze_thread" => "snooze",
+                    "cancel_scheduled_send" => "cancel_scheduled_send",
                     "modify_labels" => "modify",
                     "unsubscribe" => "unsubscribe",
                     _ => "read",
@@ -292,6 +301,9 @@ impl McpServer {
                     "send_draft" => self.tool_send_draft(arguments).await,
                     "triage_thread" => self.tool_triage_thread(arguments).await,
                     "batch_triage" => self.tool_batch_triage(arguments).await,
+                    "snooze_thread" => self.tool_snooze_thread(arguments).await,
+                    "list_scheduled_sends" => self.tool_list_scheduled_sends(arguments).await,
+                    "cancel_scheduled_send" => self.tool_cancel_scheduled_send(arguments).await,
                     "annotate_thread" => self.tool_annotate_thread(arguments).await,
                     "get_thread_annotations" => self.tool_get_thread_annotations(arguments).await,
                     "modify_labels" => self.tool_modify_labels(arguments).await,
@@ -865,6 +877,56 @@ impl McpServer {
         ai::execute_batch_triage_with_context(
             &self.state,
             req,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
+    }
+
+    async fn tool_snooze_thread(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            thread_id: String,
+            until: DateTime<Utc>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        ai::execute_snooze_thread_with_context(
+            &self.state,
+            &parsed.thread_id,
+            SnoozeThreadRequest {
+                until: parsed.until,
+            },
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
+    }
+
+    async fn tool_list_scheduled_sends(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Default, Deserialize)]
+        struct Args {
+            #[serde(default)]
+            status: Option<String>,
+            limit: Option<usize>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        ai::execute_list_scheduled_sends(&self.state, parsed.status.as_deref(), limit).await
+    }
+
+    async fn tool_cancel_scheduled_send(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            #[serde(alias = "id")]
+            scheduled_id: String,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        ai::execute_cancel_scheduled_send_with_context(
+            &self.state,
+            &parsed.scheduled_id,
             Some(self.principal.clone()),
             EventSource::Mcp,
         )
@@ -1563,7 +1625,8 @@ fn tool_catalog() -> Value {
                     "html": { "type": "string" },
                     "reply_to_message_id": { "type": "string" },
                     "dry_run": { "type": "boolean", "default": false },
-                    "idempotency_key": { "type": "string", "description": "Optional deduplication key preventing duplicate sends on agent retries (cached 24h per mailbox)" }
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key preventing duplicate sends on agent retries (cached 24h per mailbox)" },
+                    "send_at": { "type": "string", "format": "date-time", "description": "Optional future RFC 3339 timestamp to schedule outbound delivery instead of sending immediately" }
                 }
             },
             "annotations": {
@@ -1705,6 +1768,58 @@ fn tool_catalog() -> Value {
                 "readOnlyHint": false,
                 "destructiveHint": false,
                 "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "snooze_thread",
+            "description": "Snooze a conversation thread until a future RFC 3339 timestamp (removes INBOX, adds SNOOZED; restores INBOX and UNREAD automatically when due).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id", "until"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "until": { "type": "string", "format": "date-time", "description": "Future RFC 3339 timestamp when the thread returns to INBOX" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_scheduled_sends",
+            "description": "List scheduled outbound emails for the active mailbox, optionally filtered by status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["pending", "sent", "canceled", "failed", "all"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "cancel_scheduled_send",
+            "description": "Cancel a pending scheduled outbound email before dispatch.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["scheduled_id"],
+                "properties": {
+                    "scheduled_id": { "type": "string", "description": "Scheduled send ID to cancel" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },
@@ -1953,7 +2068,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 19 tools
+        // tools/list advertises all 22 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1976,6 +2091,9 @@ mod tests {
             "send_draft",
             "triage_thread",
             "batch_triage",
+            "snooze_thread",
+            "list_scheduled_sends",
+            "cancel_scheduled_send",
             "annotate_thread",
             "get_thread_annotations",
             "modify_labels",
@@ -1988,7 +2106,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 22);
     }
 
     #[tokio::test]

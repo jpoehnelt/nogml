@@ -25,12 +25,12 @@ use crate::{
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
         IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
         MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
-        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
-        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
-        normalize_contact_email, normalize_optional_text, parse_simple_email_address,
-        validate_and_normalize_contact_email,
+        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
+        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
+        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
+        WatchSubscription, compute_contact_is_vip, normalize_contact_email,
+        normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -93,6 +93,8 @@ struct MemoryState {
     thread_annotations: HashMap<String, ThreadAnnotation>,
     idempotency_keys: HashMap<(String, String), IdempotencyRecord>,
     audit_log: Vec<AuditLogEntry>,
+    snoozed_threads: HashMap<String, SnoozedThread>,
+    scheduled_sends: HashMap<String, ScheduledSend>,
 }
 
 impl MemoryState {
@@ -148,6 +150,8 @@ impl MemoryState {
             thread_annotations: HashMap::new(),
             idempotency_keys: HashMap::new(),
             audit_log: Vec::new(),
+            snoozed_threads: HashMap::new(),
+            scheduled_sends: HashMap::new(),
         }
     }
 
@@ -1581,6 +1585,7 @@ impl MailStore for MemoryStore {
             state.delete_message_inner(&mid);
         }
         state.thread_annotations.remove(thread_id);
+        state.snoozed_threads.remove(thread_id);
         Ok(true)
     }
 
@@ -3252,6 +3257,217 @@ impl MailStore for MemoryStore {
             .take(limit)
             .map(|(_, e)| e.clone())
             .collect())
+    }
+
+    async fn snooze_thread(&self, thread_id: &str, until_ms: i64) -> AppResult<SnoozedThread> {
+        let mut state = self.write_state()?;
+        let record = SnoozedThread {
+            thread_id: thread_id.to_string(),
+            mailbox_id: self.mailbox_id.clone(),
+            snooze_until_ms: until_ms,
+            created_at_ms: Utc::now().timestamp_millis(),
+        };
+        state
+            .snoozed_threads
+            .insert(thread_id.to_string(), record.clone());
+        Ok(record)
+    }
+
+    async fn unsnooze_thread(&self, thread_id: &str) -> AppResult<bool> {
+        let mut state = self.write_state()?;
+        Ok(state.snoozed_threads.remove(thread_id).is_some())
+    }
+
+    async fn list_snoozed_threads(
+        &self,
+        due_before_ms: Option<i64>,
+    ) -> AppResult<Vec<SnoozedThread>> {
+        let state = self.read_state()?;
+        let mut items: Vec<SnoozedThread> = state
+            .snoozed_threads
+            .values()
+            .filter(|s| due_before_ms.is_none_or(|cutoff| s.snooze_until_ms <= cutoff))
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            a.snooze_until_ms
+                .cmp(&b.snooze_until_ms)
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+        Ok(items)
+    }
+
+    async fn list_all_due_snoozes(&self, now_ms: i64) -> AppResult<Vec<SnoozedThread>> {
+        let states: Vec<Arc<RwLock<MemoryState>>> = {
+            let map = self.mailboxes.read().map_err(|_| {
+                AppError::Storage("MemoryStore mailboxes lock poisoned".to_string())
+            })?;
+            map.values().cloned().collect()
+        };
+        let mut items = Vec::new();
+        for mb_state in states {
+            let guard = mb_state
+                .read()
+                .map_err(|_| AppError::Storage("MemoryStore lock poisoned".to_string()))?;
+            for snooze in guard.snoozed_threads.values() {
+                if snooze.snooze_until_ms <= now_ms {
+                    items.push(snooze.clone());
+                }
+            }
+        }
+        items.sort_by(|a, b| {
+            a.snooze_until_ms
+                .cmp(&b.snooze_until_ms)
+                .then_with(|| a.mailbox_id.cmp(&b.mailbox_id))
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+        Ok(items)
+    }
+
+    async fn create_scheduled_send(&self, input: &NewScheduledSend) -> AppResult<ScheduledSend> {
+        let mut state = self.write_state()?;
+        let id = input
+            .id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("sch_{}", Uuid::new_v4().simple()));
+        if state.scheduled_sends.contains_key(&id) {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' already exists"
+            )));
+        }
+        let item = ScheduledSend {
+            id: id.clone(),
+            mailbox_id: self.mailbox_id.clone(),
+            status: ScheduledSendStatus::Pending,
+            send_at_ms: input.send_at_ms,
+            outbound_message: input.outbound_message.clone(),
+            reply_to_message_id: input.reply_to_message_id.clone(),
+            thread_id: input.thread_id.clone(),
+            sent_message_id: None,
+            provider_message_id: None,
+            last_error: None,
+            created_at_ms: input.created_at_ms,
+            updated_at_ms: input.created_at_ms,
+        };
+        state.scheduled_sends.insert(id, item.clone());
+        Ok(item)
+    }
+
+    async fn get_scheduled_send(&self, id: &str) -> AppResult<Option<ScheduledSend>> {
+        let state = self.read_state()?;
+        Ok(state.scheduled_sends.get(id).cloned())
+    }
+
+    async fn list_scheduled_sends(
+        &self,
+        status: Option<ScheduledSendStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduledSend>> {
+        let limit = if limit == 0 { 20 } else { limit };
+        let state = self.read_state()?;
+        let mut items: Vec<ScheduledSend> = state
+            .scheduled_sends
+            .values()
+            .filter(|item| status.is_none_or(|st| item.status == st))
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            a.send_at_ms
+                .cmp(&b.send_at_ms)
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn cancel_scheduled_send(&self, id: &str) -> AppResult<ScheduledSend> {
+        let mut state = self.write_state()?;
+        let entry = state
+            .scheduled_sends
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        if entry.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                entry.status
+            )));
+        }
+        entry.status = ScheduledSendStatus::Canceled;
+        entry.updated_at_ms = Utc::now().timestamp_millis();
+        Ok(entry.clone())
+    }
+
+    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>> {
+        let states: Vec<Arc<RwLock<MemoryState>>> = {
+            let map = self.mailboxes.read().map_err(|_| {
+                AppError::Storage("MemoryStore mailboxes lock poisoned".to_string())
+            })?;
+            map.values().cloned().collect()
+        };
+        let mut items = Vec::new();
+        for mb_state in states {
+            let guard = mb_state
+                .read()
+                .map_err(|_| AppError::Storage("MemoryStore lock poisoned".to_string()))?;
+            for item in guard.scheduled_sends.values() {
+                if item.status == ScheduledSendStatus::Pending && item.send_at_ms <= now_ms {
+                    items.push(item.clone());
+                }
+            }
+        }
+        items.sort_by(|a, b| {
+            a.send_at_ms
+                .cmp(&b.send_at_ms)
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+                .then_with(|| a.mailbox_id.cmp(&b.mailbox_id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(items)
+    }
+
+    async fn complete_scheduled_send(
+        &self,
+        id: &str,
+        sent_message_id: &str,
+        provider_message_id: &str,
+    ) -> AppResult<ScheduledSend> {
+        let mut state = self.write_state()?;
+        let entry = state
+            .scheduled_sends
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        if entry.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                entry.status
+            )));
+        }
+        entry.status = ScheduledSendStatus::Sent;
+        entry.sent_message_id = Some(sent_message_id.to_string());
+        entry.provider_message_id = Some(provider_message_id.to_string());
+        entry.last_error = None;
+        entry.updated_at_ms = Utc::now().timestamp_millis();
+        Ok(entry.clone())
+    }
+
+    async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend> {
+        let mut state = self.write_state()?;
+        let entry = state
+            .scheduled_sends
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("Scheduled send '{id}' not found")))?;
+        if entry.status != ScheduledSendStatus::Pending {
+            return Err(AppError::Conflict(format!(
+                "Scheduled send '{id}' is already {}",
+                entry.status
+            )));
+        }
+        entry.status = ScheduledSendStatus::Failed;
+        entry.last_error = Some(error.to_string());
+        entry.updated_at_ms = Utc::now().timestamp_millis();
+        Ok(entry.clone())
     }
 }
 

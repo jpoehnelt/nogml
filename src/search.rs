@@ -8,8 +8,8 @@ use mail_parser::MessageParser;
 use crate::{
     mime::normalize_message_id,
     models::{
-        LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
-        LABEL_TRASH, LABEL_UNREAD,
+        LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SNOOZED, LABEL_SPAM,
+        LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD,
     },
     storage::StoredMessage,
 };
@@ -523,6 +523,7 @@ fn matches_label_name(msg: &StoredMessage, wanted: &str) -> bool {
         "unread" => LABEL_UNREAD,
         "starred" => LABEL_STARRED,
         "important" => LABEL_IMPORTANT,
+        "snoozed" => LABEL_SNOOZED,
         _ => wanted,
     };
 
@@ -584,6 +585,7 @@ fn eval_term(term: &SearchTerm, msg: &StoredMessage) -> bool {
             "spam" => has_label_exact(msg, LABEL_SPAM),
             "starred" => has_label_exact(msg, LABEL_STARRED),
             "important" => has_label_exact(msg, LABEL_IMPORTANT),
+            "snoozed" => has_label_exact(msg, LABEL_SNOOZED),
             "unread" => has_label_exact(msg, LABEL_UNREAD),
             "read" => !has_label_exact(msg, LABEL_UNREAD),
             other => matches_label_name(msg, other),

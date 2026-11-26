@@ -5,6 +5,7 @@
 //! Owned by the `ai-mcp` worker.
 
 pub mod safety;
+pub mod scheduler;
 pub mod schema;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -54,15 +55,16 @@ use crate::{
         BatchTriageApplyResponse, BatchTriageDryRunResponse, BatchTriagePreviewItem,
         BatchTriageThreadError, BatchTriageThreadResult, CompactMessage, ContactSummary,
         EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH,
-        LABEL_UNREAD, PatchThreadAnnotationRequest, SyncTriggerRequest, ThreadAnnotation,
-        ThreadDetail, ThreadSummary, UnsubscribeInfo, UpsertThreadAnnotationRequest, WaitingOn,
-        truncate_to_millis,
+        LABEL_UNREAD, PatchThreadAnnotationRequest, SnoozeThreadRequest, SyncTriggerRequest,
+        ThreadAnnotation, ThreadDetail, ThreadSummary, UnsubscribeInfo,
+        UpsertThreadAnnotationRequest, WaitingOn, truncate_to_millis,
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactPatch, ContactQuery,
         ContactRecord, MessageListQuery, NewAttachmentInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredLabel, StoredMessage, StoredThreadDetail,
-        TriagePatch, parse_simple_email_address, validate_and_normalize_contact_email,
+        NewPendingApprovalInput, NewScheduledSend, PendingApproval, StoredLabel, StoredMessage,
+        StoredThreadDetail, TriagePatch, parse_simple_email_address,
+        validate_and_normalize_contact_email,
     },
     sync::{self, SyncRunOptions},
     transport::{OutboundAttachment, OutboundMessage},
@@ -74,6 +76,13 @@ pub use safety::{
     clamp_max_body_chars, evaluate_send_dry_run, open_outbound_policy, sanitize_untrusted_text,
     scan_dlp_findings, scan_dlp_text, untrusted_meta, validate_email_header, validate_resource_id,
 };
+pub use scheduler::{
+    DEFAULT_SCHEDULER_INTERVAL_SECS, SchedulerTickReport, execute_cancel_scheduled_send,
+    execute_cancel_scheduled_send_with_context, execute_list_scheduled_sends,
+    execute_snooze_thread, execute_snooze_thread_with_context, execute_unsnooze_thread,
+    execute_unsnooze_thread_with_context, parse_scheduled_send_status_filter,
+    process_due_scheduler_items, run_background_scheduler,
+};
 pub use schema::runtime_schema;
 pub use unsubscribe::{
     ParsedMailto, ValidatedUnsubscribeUrl, execute_unsubscribe, execute_unsubscribe_with_source,
@@ -82,7 +91,7 @@ pub use unsubscribe::{
 };
 
 const DEFAULT_LIST_LIMIT: usize = 20;
-const MAX_LIST_LIMIT: usize = 100;
+pub(crate) const MAX_LIST_LIMIT: usize = 100;
 const DEFAULT_CONTACTS_LIMIT: usize = 50;
 const MAX_CONTACTS_LIMIT: usize = 200;
 const DEFAULT_AUDIT_LIMIT: usize = 50;
@@ -140,7 +149,13 @@ fn normalize_idempotency_key(raw: Option<&str>) -> AppResult<Option<String>> {
 
 fn extract_cached_target_ids(val: &Value) -> Vec<String> {
     let mut ids = Vec::new();
-    for field in ["approval_id", "draft_id", "message_id", "thread_id"] {
+    for field in [
+        "approval_id",
+        "scheduled_id",
+        "draft_id",
+        "message_id",
+        "thread_id",
+    ] {
         if let Some(s) = val.get(field).and_then(Value::as_str)
             && !s.is_empty()
             && !ids.iter().any(|existing| existing == s)
@@ -192,12 +207,18 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/triage", post(triage_thread_handler))
         .route(
+            "/v1/threads/{id}/snooze",
+            post(snooze_thread_handler).delete(unsnooze_thread_handler),
+        )
+        .route(
             "/v1/threads/{id}/annotations",
             get(get_thread_annotations_handler)
                 .put(put_thread_annotations_handler)
                 .patch(patch_thread_annotations_handler)
                 .delete(delete_thread_annotations_handler),
         )
+        .route("/v1/scheduled", get(list_scheduled_sends_handler))
+        .route("/v1/scheduled/{id}", delete(cancel_scheduled_send_handler))
         .route("/v1/messages", get(list_messages))
         .route("/v1/messages/send", post(send_message_handler))
         .route("/v1/messages/modify", post(modify_messages_handler))
@@ -539,6 +560,71 @@ pub async fn execute_send_email_with_context(
             return Ok(resp);
         }
         OutboundDecision::Allow => {}
+    }
+
+    if let Some(send_at) = req.send_at {
+        let send_at = truncate_to_millis(send_at);
+        let send_at_ms = send_at.timestamp_millis();
+        if send_at_ms > now_ms {
+            let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
+            outbound_msg.idempotency_key = idempotency_key.clone();
+            let scheduled = state
+                .store
+                .create_scheduled_send(&NewScheduledSend {
+                    id: None,
+                    send_at_ms,
+                    outbound_message: outbound_msg,
+                    reply_to_message_id: req.reply_to_message_id.clone(),
+                    thread_id: resolved.thread_id.clone(),
+                    created_at_ms: now_ms,
+                })
+                .await?;
+            let scheduled_at =
+                DateTime::from_timestamp_millis(scheduled.send_at_ms).unwrap_or(send_at);
+            let resp = json!({
+                "status": "scheduled",
+                "scheduled_id": scheduled.id,
+                "send_at": scheduled_at,
+                "send_at_ms": scheduled.send_at_ms,
+                "thread_id": scheduled.thread_id,
+                "preview": {
+                    "from": scheduled.outbound_message.from,
+                    "to": scheduled.outbound_message.to,
+                    "cc": scheduled.outbound_message.cc,
+                    "bcc": scheduled.outbound_message.bcc,
+                    "subject": scheduled.outbound_message.subject,
+                    "snippet": snippet,
+                    "estimated_bytes": scheduled.outbound_message.raw_rfc2822.len(),
+                },
+            });
+            if let Some(ref key) = idempotency_key {
+                let encoded = serde_json::to_string(&resp)?;
+                state
+                    .store
+                    .put_idempotency_key(
+                        IDEMPOTENCY_SCOPE_SEND,
+                        key,
+                        &encoded,
+                        DEFAULT_IDEMPOTENCY_TTL_SECS,
+                    )
+                    .await?;
+            }
+            state
+                .record_audit(
+                    principal.as_ref(),
+                    channel,
+                    "schedule_send",
+                    vec![scheduled.id.clone()],
+                    "scheduled",
+                    Some(format!(
+                        "send_at={} to={}",
+                        scheduled_at.to_rfc3339(),
+                        scheduled.outbound_message.to.join(",")
+                    )),
+                )
+                .await;
+            return Ok(resp);
+        }
     }
 
     let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
@@ -3352,6 +3438,13 @@ struct ListApprovalsParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ListScheduledParams {
+    status: Option<String>,
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ListContactsParams {
     q: Option<String>,
     #[serde(default)]
@@ -3402,10 +3495,14 @@ async fn get_capabilities(
             "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
+            "POST /v1/threads/{id}/snooze",
+            "DELETE /v1/threads/{id}/snooze",
             "GET /v1/threads/{id}/annotations",
             "PUT /v1/threads/{id}/annotations",
             "PATCH /v1/threads/{id}/annotations",
             "DELETE /v1/threads/{id}/annotations",
+            "GET /v1/scheduled",
+            "DELETE /v1/scheduled/{id}",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",
@@ -3589,6 +3686,68 @@ async fn triage_thread_handler(
         &state,
         &id,
         req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn snooze_thread_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(req): Json<SnoozeThreadRequest>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_snooze_thread_with_context(
+        &state,
+        &id,
+        req,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn unsnooze_thread_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_unsnooze_thread_with_context(
+        &state,
+        &id,
+        principal.map(|Extension(p)| p),
+        EventSource::Api,
+    )
+    .await?;
+    Ok(Json(project_fields(res, query.fields.as_deref())?))
+}
+
+async fn list_scheduled_sends_handler(
+    MailboxState(state): MailboxState,
+    Query(params): Query<ListScheduledParams>,
+) -> Result<Json<Value>, AiError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let body = execute_list_scheduled_sends(&state, params.status.as_deref(), limit).await?;
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn cancel_scheduled_send_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let res = execute_cancel_scheduled_send_with_context(
+        &state,
+        &id,
         principal.map(|Extension(p)| p),
         EventSource::Api,
     )
@@ -3784,10 +3943,9 @@ async fn unsubscribe_message_handler(
         EventSource::Api,
     )
     .await?;
-    let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
+    let status = match res.get("status").and_then(Value::as_str) {
+        Some("pending_approval") | Some("scheduled") => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())
@@ -3888,10 +4046,9 @@ async fn send_message_handler(
         EventSource::Api,
     )
     .await?;
-    let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
+    let status = match res.get("status").and_then(Value::as_str) {
+        Some("pending_approval") | Some("scheduled") => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())
@@ -4015,10 +4172,9 @@ async fn send_draft_handler(
         EventSource::Api,
     )
     .await?;
-    let status = if res.get("status").and_then(Value::as_str) == Some("pending_approval") {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
+    let status = match res.get("status").and_then(Value::as_str) {
+        Some("pending_approval") | Some("scheduled") => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
     };
     let projected = project_fields(res, query.fields.as_deref())?;
     Ok((status, Json(projected)).into_response())

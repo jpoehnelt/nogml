@@ -1054,6 +1054,64 @@ impl MailStore for TestMailStore {
     ) -> AppResult<Vec<crate::storage::AuditLogEntry>> {
         Ok(Vec::new())
     }
+    async fn snooze_thread(&self, _: &str, _: i64) -> AppResult<crate::storage::SnoozedThread> {
+        unimplemented!()
+    }
+    async fn unsnooze_thread(&self, _: &str) -> AppResult<bool> {
+        Ok(false)
+    }
+    async fn list_snoozed_threads(
+        &self,
+        _: Option<i64>,
+    ) -> AppResult<Vec<crate::storage::SnoozedThread>> {
+        Ok(Vec::new())
+    }
+    async fn list_all_due_snoozes(&self, _: i64) -> AppResult<Vec<crate::storage::SnoozedThread>> {
+        Ok(Vec::new())
+    }
+    async fn create_scheduled_send(
+        &self,
+        _: &crate::storage::NewScheduledSend,
+    ) -> AppResult<crate::storage::ScheduledSend> {
+        unimplemented!()
+    }
+    async fn get_scheduled_send(
+        &self,
+        _: &str,
+    ) -> AppResult<Option<crate::storage::ScheduledSend>> {
+        Ok(None)
+    }
+    async fn list_scheduled_sends(
+        &self,
+        _: Option<crate::storage::ScheduledSendStatus>,
+        _: usize,
+    ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
+        Ok(Vec::new())
+    }
+    async fn cancel_scheduled_send(&self, _: &str) -> AppResult<crate::storage::ScheduledSend> {
+        unimplemented!()
+    }
+    async fn claim_due_scheduled_sends(
+        &self,
+        _: i64,
+    ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
+        Ok(Vec::new())
+    }
+    async fn complete_scheduled_send(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> AppResult<crate::storage::ScheduledSend> {
+        unimplemented!()
+    }
+    async fn fail_scheduled_send(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AppResult<crate::storage::ScheduledSend> {
+        unimplemented!()
+    }
 }
 
 pub(crate) fn test_app_state(mut config: Config) -> AppState {

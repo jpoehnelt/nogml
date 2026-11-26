@@ -116,7 +116,34 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                     "html": { "type": "string" },
                     "reply_to_message_id": { "type": "string" },
                     "dry_run": { "type": "boolean", "default": false },
-                    "idempotency_key": { "type": "string", "description": "Optional deduplication key (or Idempotency-Key HTTP header) cached for 24h per mailbox" }
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key (or Idempotency-Key HTTP header) cached for 24h per mailbox" },
+                    "send_at": { "type": "string", "format": "date-time", "description": "Optional future RFC 3339 timestamp to schedule outbound delivery" }
+                }
+            }
+        },
+        "mail.snooze": {
+            "endpoint": "POST /v1/threads/{id}/snooze | DELETE /v1/threads/{id}/snooze",
+            "mcp_tool": "snooze_thread",
+            "description": "Snooze a thread until a future RFC 3339 timestamp or unsnooze it immediately.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id", "until"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "until": { "type": "string", "format": "date-time" }
+                }
+            }
+        },
+        "mail.scheduled": {
+            "endpoint": "GET /v1/scheduled | DELETE /v1/scheduled/{id}",
+            "mcp_tool": "list_scheduled_sends | cancel_scheduled_send",
+            "description": "List or cancel scheduled outbound emails before dispatch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scheduled_id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "sent", "canceled", "failed", "all"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         },
@@ -357,6 +384,8 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "send_draft" => "mail.send_draft",
             "triage" | "triage_thread" => "mail.triage",
             "batch_triage" | "batch-triage" => "mail.batch_triage",
+            "snooze" | "snooze_thread" => "mail.snooze",
+            "scheduled" | "list_scheduled_sends" | "cancel_scheduled_send" => "mail.scheduled",
             "annotations" | "annotate_thread" | "get_thread_annotations" => "mail.annotations",
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
@@ -394,10 +423,14 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
             "POST /v1/threads/{id}/triage",
+            "POST /v1/threads/{id}/snooze",
+            "DELETE /v1/threads/{id}/snooze",
             "GET /v1/threads/{id}/annotations",
             "PUT /v1/threads/{id}/annotations",
             "PATCH /v1/threads/{id}/annotations",
             "DELETE /v1/threads/{id}/annotations",
+            "GET /v1/scheduled",
+            "DELETE /v1/scheduled/{id}",
             "GET /v1/messages",
             "GET /v1/messages/{id}",
             "POST /v1/messages/{id}/unsubscribe",

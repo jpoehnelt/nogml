@@ -698,6 +698,89 @@ pub struct AuditLogQuery {
     #[serde(default)]
     pub limit: usize,
 }
+
+// ============================================================================
+// Thread Snooze & Scheduled Outbound Send Types
+// ============================================================================
+
+/// Persisted snooze record for a conversation thread scoped to `(mailbox_id, thread_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnoozedThread {
+    pub thread_id: String,
+    pub mailbox_id: String,
+    pub snooze_until_ms: i64,
+    pub created_at_ms: i64,
+}
+
+/// Lifecycle status of a scheduled outbound email (`send_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledSendStatus {
+    Pending,
+    Sent,
+    Canceled,
+    Failed,
+}
+
+impl ScheduledSendStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sent => "sent",
+            Self::Canceled => "canceled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "sent" => Some(Self::Sent),
+            "canceled" | "cancelled" => Some(Self::Canceled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ScheduledSendStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Persistent record for an outbound email scheduled for future delivery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledSend {
+    pub id: String,
+    pub mailbox_id: String,
+    pub status: ScheduledSendStatus,
+    pub send_at_ms: i64,
+    pub outbound_message: OutboundMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Input used to enqueue a new scheduled outbound email.
+#[derive(Debug, Clone)]
+pub struct NewScheduledSend {
+    pub id: Option<String>,
+    pub send_at_ms: i64,
+    pub outbound_message: OutboundMessage,
+    pub reply_to_message_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub created_at_ms: i64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -998,6 +1081,39 @@ pub trait MailStore: Send + Sync {
     // --- Immutable Audit Log (append-only; no update/delete API) ---
     async fn append_audit_log(&self, entry: &NewAuditLogEntry) -> AppResult<AuditLogEntry>;
     async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>>;
+
+    // --- Thread Snooze ---
+    async fn snooze_thread(&self, thread_id: &str, until_ms: i64) -> AppResult<SnoozedThread>;
+    async fn unsnooze_thread(&self, thread_id: &str) -> AppResult<bool>;
+    async fn list_snoozed_threads(
+        &self,
+        due_before_ms: Option<i64>,
+    ) -> AppResult<Vec<SnoozedThread>>;
+    /// Scan all mailboxes for snoozed threads due at or before `now_ms`.
+    async fn list_all_due_snoozes(&self, now_ms: i64) -> AppResult<Vec<SnoozedThread>>;
+
+    // --- Scheduled Outbound Sends ---
+    async fn create_scheduled_send(&self, input: &NewScheduledSend) -> AppResult<ScheduledSend>;
+    async fn get_scheduled_send(&self, id: &str) -> AppResult<Option<ScheduledSend>>;
+    async fn list_scheduled_sends(
+        &self,
+        status: Option<ScheduledSendStatus>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduledSend>>;
+    /// Atomically transition a `Pending` scheduled send to `Canceled`.
+    /// Returns `AppError::NotFound` if missing, or `AppError::Conflict` if already sent/canceled/failed.
+    async fn cancel_scheduled_send(&self, id: &str) -> AppResult<ScheduledSend>;
+    /// List due `Pending` scheduled sends (`send_at_ms <= now_ms`) across all mailboxes.
+    async fn claim_due_scheduled_sends(&self, now_ms: i64) -> AppResult<Vec<ScheduledSend>>;
+    /// Atomically transition a `Pending` scheduled send to `Sent`.
+    async fn complete_scheduled_send(
+        &self,
+        id: &str,
+        sent_message_id: &str,
+        provider_message_id: &str,
+    ) -> AppResult<ScheduledSend>;
+    /// Atomically transition a `Pending` scheduled send to `Failed`.
+    async fn fail_scheduled_send(&self, id: &str, error: &str) -> AppResult<ScheduledSend>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).

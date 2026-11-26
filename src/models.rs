@@ -16,6 +16,7 @@ pub const LABEL_SPAM: &str = "SPAM";
 pub const LABEL_UNREAD: &str = "UNREAD";
 pub const LABEL_STARRED: &str = "STARRED";
 pub const LABEL_IMPORTANT: &str = "IMPORTANT";
+pub const LABEL_SNOOZED: &str = "SNOOZED";
 pub const LABEL_CATEGORY_PERSONAL: &str = "CATEGORY_PERSONAL";
 pub const LABEL_CATEGORY_SOCIAL: &str = "CATEGORY_SOCIAL";
 pub const LABEL_CATEGORY_PROMOTIONS: &str = "CATEGORY_PROMOTIONS";
@@ -31,6 +32,7 @@ pub const SYSTEM_LABEL_IDS: &[&str] = &[
     LABEL_UNREAD,
     LABEL_STARRED,
     LABEL_IMPORTANT,
+    LABEL_SNOOZED,
     LABEL_CATEGORY_PERSONAL,
     LABEL_CATEGORY_SOCIAL,
     LABEL_CATEGORY_PROMOTIONS,
@@ -1035,6 +1037,13 @@ pub struct AiSendEmailRequest {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnoozeThreadRequest {
+    pub until: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
