@@ -28,11 +28,12 @@ use crate::{
         is_system_label, truncate_to_millis,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
-        ContactDirection, ContactInteraction, ContactPatch, ContactQuery, ContactRecord,
-        DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo,
-        ImapMessageEntry, MailStore, MessageListPage, MessageListQuery, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
+        AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
+        ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
+        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
+        MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
         StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
@@ -299,6 +300,39 @@ CREATE TABLE IF NOT EXISTS thread_annotations (
 );
 CREATE INDEX IF NOT EXISTS idx_thread_annotations_mailbox_triage
     ON thread_annotations (mailbox_id, needs_reply, waiting_on);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    mailbox_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, scope, key)
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires
+    ON idempotency_keys (mailbox_id, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL,
+    mailbox_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_ids_json TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT,
+    UNIQUE (mailbox_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_ts_seq
+    ON audit_log (mailbox_id, timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_action_ts
+    ON audit_log (mailbox_id, action, timestamp_ms DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_mailbox_actor_ts
+    ON audit_log (mailbox_id, actor, timestamp_ms DESC, seq DESC);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -5631,6 +5665,173 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn get_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<IdempotencyRecord>> {
+        let scope = scope.to_string();
+        let key = key.to_string();
+        self.run_blocking(move |conn, mb| {
+            let row = conn
+                .query_row(
+                    "SELECT scope, key, response_json, created_at_ms, expires_at_ms
+                     FROM idempotency_keys
+                     WHERE mailbox_id = ?1 AND scope = ?2 AND key = ?3 AND expires_at_ms > ?4",
+                    params![mb, scope, key, now_ms],
+                    |r| {
+                        Ok(IdempotencyRecord {
+                            scope: r.get(0)?,
+                            key: r.get(1)?,
+                            response_json: r.get(2)?,
+                            created_at_ms: r.get(3)?,
+                            expires_at_ms: r.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(sql_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    async fn put_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        response_json: &str,
+        ttl_secs: i64,
+    ) -> AppResult<()> {
+        let scope = scope.to_string();
+        let key = key.to_string();
+        let response_json = response_json.to_string();
+        self.run_blocking(move |conn, mb| {
+            let created_at_ms = Utc::now().timestamp_millis();
+            let expires_at_ms = created_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
+            conn.execute(
+                "INSERT INTO idempotency_keys (
+                    mailbox_id, scope, key, response_json, created_at_ms, expires_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (mailbox_id, scope, key) DO UPDATE SET
+                    response_json = excluded.response_json,
+                    created_at_ms = excluded.created_at_ms,
+                    expires_at_ms = excluded.expires_at_ms",
+                params![mb, scope, key, response_json, created_at_ms, expires_at_ms],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn append_audit_log(&self, entry: &NewAuditLogEntry) -> AppResult<AuditLogEntry> {
+        let entry = entry.clone();
+        self.run_blocking(move |conn, mb| {
+            let id = format!("aud_{}", Uuid::new_v4().simple());
+            let timestamp_ms = entry
+                .timestamp_ms
+                .unwrap_or_else(|| Utc::now().timestamp_millis());
+            let scopes_json = serde_json::to_string(&entry.scopes)?;
+            let target_ids_json = serde_json::to_string(&entry.target_ids)?;
+
+            conn.execute(
+                "INSERT INTO audit_log (
+                    id, mailbox_id, timestamp_ms, actor, scopes_json, channel,
+                    action, target_ids_json, outcome, detail
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    mb,
+                    timestamp_ms,
+                    entry.actor,
+                    scopes_json,
+                    entry.channel,
+                    entry.action,
+                    target_ids_json,
+                    entry.outcome,
+                    entry.detail,
+                ],
+            )
+            .map_err(sql_err)?;
+
+            Ok(AuditLogEntry {
+                id,
+                mailbox_id: mb.to_string(),
+                timestamp_ms,
+                actor: entry.actor,
+                scopes: entry.scopes,
+                channel: entry.channel,
+                action: entry.action,
+                target_ids: entry.target_ids,
+                outcome: entry.outcome,
+                detail: entry.detail,
+            })
+        })
+        .await
+    }
+
+    async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>> {
+        let query = query.clone();
+        self.run_blocking(move |conn, mb| {
+            let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+            let mut sql = String::from(
+                "SELECT id, mailbox_id, timestamp_ms, actor, scopes_json, channel,
+                        action, target_ids_json, outcome, detail
+                 FROM audit_log
+                 WHERE mailbox_id = ?1",
+            );
+            let mut values: Vec<SqlValue> = vec![SqlValue::Text(mb.to_string())];
+            let mut next_idx = 2usize;
+
+            if let Some(action) = query
+                .action
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                sql.push_str(&format!(" AND LOWER(action) = LOWER(?{next_idx})"));
+                values.push(SqlValue::Text(action.to_string()));
+                next_idx += 1;
+            }
+            if let Some(actor) = query
+                .actor
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                sql.push_str(&format!(" AND LOWER(actor) = LOWER(?{next_idx})"));
+                values.push(SqlValue::Text(actor.to_string()));
+                next_idx += 1;
+            }
+            if let Some(since_ms) = query.since_ms {
+                sql.push_str(&format!(" AND timestamp_ms >= ?{next_idx}"));
+                values.push(SqlValue::Integer(since_ms));
+                next_idx += 1;
+            }
+
+            sql.push_str(&format!(
+                " ORDER BY timestamp_ms DESC, seq DESC LIMIT ?{next_idx}"
+            ));
+            values.push(SqlValue::Integer(limit));
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(values.iter()),
+                    audit_log_from_row,
+                )
+                .map_err(sql_err)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(sql_err)??);
+            }
+            Ok(results)
+        })
+        .await
+    }
 }
 
 fn contact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRecord> {
@@ -5675,6 +5876,39 @@ fn escape_sql_like(raw: &str) -> String {
         }
     }
     out
+}
+
+fn audit_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<AuditLogEntry>> {
+    let id: String = row.get(0)?;
+    let mailbox_id: String = row.get(1)?;
+    let timestamp_ms: i64 = row.get(2)?;
+    let actor: String = row.get(3)?;
+    let scopes_json: String = row.get(4)?;
+    let channel: String = row.get(5)?;
+    let action: String = row.get(6)?;
+    let target_ids_json: String = row.get(7)?;
+    let outcome: String = row.get(8)?;
+    let detail: Option<String> = row.get(9)?;
+
+    let parsed = (|| -> AppResult<AuditLogEntry> {
+        let scopes: Vec<String> = serde_json::from_str(&scopes_json)
+            .map_err(|e| AppError::Storage(format!("Corrupt scopes_json: {e}")))?;
+        let target_ids: Vec<String> = serde_json::from_str(&target_ids_json)
+            .map_err(|e| AppError::Storage(format!("Corrupt target_ids_json: {e}")))?;
+        Ok(AuditLogEntry {
+            id,
+            mailbox_id,
+            timestamp_ms,
+            actor,
+            scopes,
+            channel,
+            action,
+            target_ids,
+            outcome,
+            detail,
+        })
+    })();
+    Ok(parsed)
 }
 
 fn pending_approval_from_row(

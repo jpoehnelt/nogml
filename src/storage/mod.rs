@@ -639,6 +639,65 @@ pub fn validate_and_normalize_contact_email(raw: &str) -> AppResult<(String, Str
     Ok((email.clone(), domain.to_string()))
 }
 
+// ============================================================================
+// Idempotency Keys & Immutable Audit Log Types
+// ============================================================================
+
+/// Persisted JSON response cached under `(mailbox_id, scope, key)` until `expires_at_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub scope: String,
+    pub response_json: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+/// Immutable append-only audit log entry recording an agent or API operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: String,
+    pub mailbox_id: String,
+    pub timestamp_ms: i64,
+    pub actor: String,
+    pub scopes: Vec<String>,
+    pub channel: String,
+    pub action: String,
+    pub target_ids: Vec<String>,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Input used to append a new immutable audit log entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewAuditLogEntry {
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+    pub actor: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub channel: String,
+    pub action: String,
+    #[serde(default)]
+    pub target_ids: Vec<String>,
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// Filter parameters for querying the append-only audit log (newest-first).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogQuery {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    #[serde(default)]
+    pub limit: usize,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -917,6 +976,28 @@ pub trait MailStore: Send + Sync {
     async fn get_contact(&self, email: &str) -> AppResult<Option<ContactRecord>>;
     async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>>;
     async fn patch_contact(&self, email: &str, patch: &ContactPatch) -> AppResult<ContactRecord>;
+
+    // --- Idempotency Keys ---
+    /// Look up a non-expired idempotency record scoped to `(self.mailbox_id(), scope, key)`.
+    /// Entries with `expires_at_ms <= now_ms` are ignored and return `Ok(None)`.
+    async fn get_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<IdempotencyRecord>>;
+    /// Persist (or overwrite) an idempotency record scoped to `(self.mailbox_id(), scope, key)` with TTL in seconds.
+    async fn put_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        response_json: &str,
+        ttl_secs: i64,
+    ) -> AppResult<()>;
+
+    // --- Immutable Audit Log (append-only; no update/delete API) ---
+    async fn append_audit_log(&self, entry: &NewAuditLogEntry) -> AppResult<AuditLogEntry>;
+    async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).

@@ -258,6 +258,25 @@ impl McpServer {
 
         let outcome: AppResult<Value> =
             if let Err(err) = self.principal.require_scope(required_scope) {
+                let denied_action = match name {
+                    "search_emails" => "search",
+                    "send_email" | "send_draft" => "send",
+                    "create_draft" => "draft",
+                    "triage_thread" => "triage",
+                    "modify_labels" => "modify",
+                    "unsubscribe" => "unsubscribe",
+                    _ => "read",
+                };
+                self.state
+                    .record_audit(
+                        Some(&self.principal),
+                        "/mcp",
+                        denied_action,
+                        Vec::new(),
+                        "denied",
+                        Some(format!("tool={name}: {err}")),
+                    )
+                    .await;
                 Err(err)
             } else {
                 match name {
@@ -303,6 +322,16 @@ impl McpServer {
         };
 
         let payload = self.read_resource_uri(uri).await?;
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                vec![uri.to_string()],
+                "ok",
+                Some("resource".to_string()),
+            )
+            .await;
         let text = serde_json::to_string(&payload)
             .map_err(|e| RpcError::new(-32603, format!("Serialization failed: {e}"), None))?;
 
@@ -510,7 +539,7 @@ impl McpServer {
             .state
             .search
             .search(&AiSearchQuery {
-                q: parsed.query,
+                q: parsed.query.clone(),
                 labels: parsed.labels,
                 unread: parsed.unread,
                 from: parsed.from,
@@ -522,6 +551,18 @@ impl McpServer {
                 ..Default::default()
             })
             .await?;
+
+        let target_ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "search",
+                target_ids,
+                "ok",
+                parsed.query,
+            )
+            .await;
 
         let messages: Vec<_> = page
             .messages
@@ -575,7 +616,7 @@ impl McpServer {
             .state
             .store
             .list_thread_summaries(&AiThreadQuery {
-                q: parsed.query,
+                q: parsed.query.clone(),
                 label: parsed.label,
                 unread_only: parsed.unread_only,
                 needs_reply: parsed.needs_reply,
@@ -587,6 +628,17 @@ impl McpServer {
             .await?;
 
         ai::enrich_thread_summaries_with_contacts(&self.state, &mut page.threads).await?;
+        let target_ids: Vec<String> = page.threads.iter().map(|t| t.id.clone()).collect();
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                target_ids,
+                "ok",
+                parsed.query.map(|q| format!("threads q={q}")),
+            )
+            .await;
 
         Ok(json!({
             "threads": page.threads,
@@ -631,6 +683,17 @@ impl McpServer {
             include_attachments_meta,
         )
         .await?;
+
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                vec![parsed.thread_id],
+                "ok",
+                Some("thread".to_string()),
+            )
+            .await;
 
         Ok(serde_json::to_value(projected)?)
     }
@@ -685,6 +748,17 @@ impl McpServer {
             .await?;
         }
 
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                vec![parsed.message_id],
+                "ok",
+                Some("message".to_string()),
+            )
+            .await;
+
         Ok(serde_json::to_value(compact)?)
     }
 
@@ -705,6 +779,17 @@ impl McpServer {
         )
         .await?;
 
+        self.state
+            .record_audit(
+                Some(&self.principal),
+                "/mcp",
+                "read",
+                vec![parsed.message_id, parsed.attachment_id],
+                "ok",
+                Some("attachment_text".to_string()),
+            )
+            .await;
+
         Ok(serde_json::to_value(extracted)?)
     }
 
@@ -721,7 +806,13 @@ impl McpServer {
 
     async fn tool_create_draft(&self, args: Value) -> AppResult<Value> {
         let req: AiCreateDraftRequest = serde_json::from_value(args)?;
-        ai::execute_create_draft_with_source(&self.state, req, EventSource::Mcp).await
+        ai::execute_create_draft_with_context(
+            &self.state,
+            req,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
     }
 
     async fn tool_send_draft(&self, args: Value) -> AppResult<Value> {
@@ -754,10 +845,11 @@ impl McpServer {
         }
 
         let parsed: Args = serde_json::from_value(args)?;
-        ai::execute_triage_thread_with_source(
+        ai::execute_triage_thread_with_context(
             &self.state,
             &parsed.thread_id,
             parsed.req,
+            Some(self.principal.clone()),
             EventSource::Mcp,
         )
         .await
@@ -839,7 +931,13 @@ impl McpServer {
 
     async fn tool_modify_labels(&self, args: Value) -> AppResult<Value> {
         let req: AiModifyLabelsRequest = serde_json::from_value(args)?;
-        ai::execute_modify_labels_with_source(&self.state, req, EventSource::Mcp).await
+        ai::execute_modify_labels_with_context(
+            &self.state,
+            req,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
     }
 
     async fn tool_unsubscribe(&self, args: Value) -> AppResult<Value> {
@@ -1448,7 +1546,8 @@ fn tool_catalog() -> Value {
                     "text": { "type": "string" },
                     "html": { "type": "string" },
                     "reply_to_message_id": { "type": "string" },
-                    "dry_run": { "type": "boolean", "default": false }
+                    "dry_run": { "type": "boolean", "default": false },
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key preventing duplicate sends on agent retries (cached 24h per mailbox)" }
                 }
             },
             "annotations": {
@@ -1470,7 +1569,8 @@ fn tool_catalog() -> Value {
                     "subject": { "type": "string" },
                     "text": { "type": "string" },
                     "html": { "type": "string" },
-                    "reply_to_message_id": { "type": "string" }
+                    "reply_to_message_id": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key preventing duplicate drafts on retries (cached 24h per mailbox)" }
                 }
             },
             "annotations": {

@@ -20,11 +20,12 @@ use crate::{
         is_system_label, truncate_to_millis,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
-        ContactDirection, ContactInteraction, ContactPatch, ContactQuery, ContactRecord,
-        DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo,
-        ImapMessageEntry, MailStore, MessageListPage, MessageListQuery, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
+        AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
+        ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
+        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
+        MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
         StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, WatchSubscription, compute_contact_is_vip,
@@ -90,6 +91,8 @@ struct MemoryState {
     pending_approvals: HashMap<String, PendingApproval>,
     contacts: HashMap<String, ContactRecord>,
     thread_annotations: HashMap<String, ThreadAnnotation>,
+    idempotency_keys: HashMap<(String, String), IdempotencyRecord>,
+    audit_log: Vec<AuditLogEntry>,
 }
 
 impl MemoryState {
@@ -143,6 +146,8 @@ impl MemoryState {
             pending_approvals: HashMap::new(),
             contacts: HashMap::new(),
             thread_annotations: HashMap::new(),
+            idempotency_keys: HashMap::new(),
+            audit_log: Vec::new(),
         }
     }
 
@@ -3133,6 +3138,120 @@ impl MailStore for MemoryStore {
             }
         };
         Ok(record)
+    }
+
+    async fn get_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        now_ms: i64,
+    ) -> AppResult<Option<IdempotencyRecord>> {
+        let state = self.read_state()?;
+        let Some(rec) = state
+            .idempotency_keys
+            .get(&(scope.to_string(), key.to_string()))
+        else {
+            return Ok(None);
+        };
+        if rec.expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+        Ok(Some(rec.clone()))
+    }
+
+    async fn put_idempotency_key(
+        &self,
+        scope: &str,
+        key: &str,
+        response_json: &str,
+        ttl_secs: i64,
+    ) -> AppResult<()> {
+        let mut state = self.write_state()?;
+        let created_at_ms = Utc::now().timestamp_millis();
+        let expires_at_ms = created_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
+        state.idempotency_keys.insert(
+            (scope.to_string(), key.to_string()),
+            IdempotencyRecord {
+                key: key.to_string(),
+                scope: scope.to_string(),
+                response_json: response_json.to_string(),
+                created_at_ms,
+                expires_at_ms,
+            },
+        );
+        Ok(())
+    }
+
+    async fn append_audit_log(&self, entry: &NewAuditLogEntry) -> AppResult<AuditLogEntry> {
+        let mut state = self.write_state()?;
+        let timestamp_ms = entry
+            .timestamp_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let record = AuditLogEntry {
+            id: format!("aud_{}", Uuid::new_v4().simple()),
+            mailbox_id: self.mailbox_id.clone(),
+            timestamp_ms,
+            actor: entry.actor.clone(),
+            scopes: entry.scopes.clone(),
+            channel: entry.channel.clone(),
+            action: entry.action.clone(),
+            target_ids: entry.target_ids.clone(),
+            outcome: entry.outcome.clone(),
+            detail: entry.detail.clone(),
+        };
+        state.audit_log.push(record.clone());
+        Ok(record)
+    }
+
+    async fn list_audit_log(&self, query: &AuditLogQuery) -> AppResult<Vec<AuditLogEntry>> {
+        let state = self.read_state()?;
+        let limit = if query.limit == 0 { 50 } else { query.limit };
+        let action_filter = query
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let actor_filter = query
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let mut matched: Vec<(usize, &AuditLogEntry)> = state
+            .audit_log
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if let Some(action) = action_filter
+                    && !e.action.eq_ignore_ascii_case(action)
+                {
+                    return false;
+                }
+                if let Some(actor) = actor_filter
+                    && !e.actor.eq_ignore_ascii_case(actor)
+                {
+                    return false;
+                }
+                if let Some(since_ms) = query.since_ms
+                    && e.timestamp_ms < since_ms
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        matched.sort_by(|a, b| {
+            b.1.timestamp_ms
+                .cmp(&a.1.timestamp_ms)
+                .then_with(|| b.0.cmp(&a.0))
+        });
+
+        Ok(matched
+            .into_iter()
+            .take(limit)
+            .map(|(_, e)| e.clone())
+            .collect())
     }
 }
 

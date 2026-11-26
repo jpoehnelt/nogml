@@ -908,6 +908,9 @@ enum MailAction {
         reply_to: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Optional idempotency key to deduplicate retries for 24h.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Create a draft email.
     Draft {
@@ -927,6 +930,9 @@ enum MailAction {
         html: Option<String>,
         #[arg(long)]
         reply_to: Option<String>,
+        /// Optional idempotency key to deduplicate retries for 24h.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Triage a thread (archive, mark read, star, trash, or modify labels).
     Triage {
@@ -954,6 +960,21 @@ enum MailAction {
     Approvals {
         #[command(subcommand)]
         action: ApprovalsAction,
+    },
+    /// Query the immutable agent and API audit log (newest-first).
+    Audit {
+        /// Filter by action (`read`, `search`, `send`, `draft`, `triage`, `approve`, `reject`, `unsubscribe`, `modify`, `delete`).
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter by actor identity.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Filter entries at or after this Unix epoch ms or RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of audit log entries to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Stream real-time mail events as NDJSON.
     Watch,
@@ -1661,6 +1682,7 @@ async fn run_remote_mail(
             html,
             reply_to,
             dry_run,
+            idempotency_key,
         } => {
             let mut req: AiSendEmailRequest = match payload {
                 Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
@@ -1673,10 +1695,14 @@ async fn run_remote_mail(
                     html,
                     reply_to_message_id: reply_to,
                     dry_run,
+                    idempotency_key: idempotency_key.clone(),
                 },
             };
             if dry_run {
                 req.dry_run = true;
+            }
+            if req.idempotency_key.is_none() && idempotency_key.is_some() {
+                req.idempotency_key = idempotency_key;
             }
             let resp = with_optional_bearer(
                 client.post(format!("{base}/v1/messages/send")).json(&req),
@@ -1696,8 +1722,9 @@ async fn run_remote_mail(
             text,
             html,
             reply_to,
+            idempotency_key,
         } => {
-            let req: AiCreateDraftRequest = match payload {
+            let mut req: AiCreateDraftRequest = match payload {
                 Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                 None => AiCreateDraftRequest {
                     to,
@@ -1707,8 +1734,12 @@ async fn run_remote_mail(
                     text,
                     html,
                     reply_to_message_id: reply_to,
+                    idempotency_key: idempotency_key.clone(),
                 },
             };
+            if req.idempotency_key.is_none() && idempotency_key.is_some() {
+                req.idempotency_key = idempotency_key;
+            }
             let resp = with_optional_bearer(
                 client.post(format!("{base}/v1/drafts")).json(&req),
                 bearer_token,
@@ -1829,6 +1860,38 @@ async fn run_remote_mail(
                 emit_output(val, fields, json_flag)
             }
         },
+        MailAction::Audit {
+            action,
+            actor,
+            since,
+            limit,
+        } => {
+            let mut params: Vec<(String, String)> = vec![("limit".to_string(), limit.to_string())];
+            if let Some(action) = action {
+                params.push(("action".to_string(), action));
+            }
+            if let Some(actor) = actor {
+                params.push(("actor".to_string(), actor));
+            }
+            if let Some(since) = since {
+                params.push(("since".to_string(), since));
+            }
+            let resp = with_optional_bearer(
+                client.get(format!("{base}/v1/audit")).query(&params),
+                bearer_token,
+            )
+            .send()
+            .await?;
+            let val = parse_remote_json(resp).await?;
+            if ndjson && let Some(items) = val.get("entries").and_then(Value::as_array) {
+                for item in items {
+                    emit_output(item.clone(), fields, true)?;
+                }
+                Ok(())
+            } else {
+                emit_output(val, fields, json_flag)
+            }
+        }
         MailAction::Watch => {
             // Stream `/v1/events` SSE frames and emit each `data:` payload as NDJSON.
             let stream_client = reqwest::Client::builder()
@@ -2535,6 +2598,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     html,
                     reply_to,
                     dry_run,
+                    idempotency_key,
                 } => {
                     let mut req: AiSendEmailRequest = match payload {
                         Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
@@ -2547,10 +2611,14 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                             html,
                             reply_to_message_id: reply_to,
                             dry_run,
+                            idempotency_key: idempotency_key.clone(),
                         },
                     };
                     if dry_run {
                         req.dry_run = true;
+                    }
+                    if req.idempotency_key.is_none() && idempotency_key.is_some() {
+                        req.idempotency_key = idempotency_key;
                     }
                     let res = ai::execute_send_email(&state, req).await?;
                     emit_output(res, fields.as_deref(), json_flag)?;
@@ -2564,8 +2632,9 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     text,
                     html,
                     reply_to,
+                    idempotency_key,
                 } => {
-                    let req: AiCreateDraftRequest = match payload {
+                    let mut req: AiCreateDraftRequest = match payload {
                         Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                         None => AiCreateDraftRequest {
                             to,
@@ -2575,8 +2644,12 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                             text,
                             html,
                             reply_to_message_id: reply_to,
+                            idempotency_key: idempotency_key.clone(),
                         },
                     };
+                    if req.idempotency_key.is_none() && idempotency_key.is_some() {
+                        req.idempotency_key = idempotency_key;
+                    }
                     let res = ai::execute_create_draft(&state, req).await?;
                     emit_output(res, fields.as_deref(), json_flag)?;
                 }
@@ -2660,6 +2733,28 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                         emit_output(val, fields.as_deref(), json_flag)?;
                     }
                 },
+                MailAction::Audit {
+                    action,
+                    actor,
+                    since,
+                    limit,
+                } => {
+                    let val = ai::execute_list_audit_log(
+                        &state,
+                        action.as_deref(),
+                        actor.as_deref(),
+                        since.as_deref(),
+                        limit,
+                    )
+                    .await?;
+                    if ndjson && let Some(items) = val.get("entries").and_then(Value::as_array) {
+                        for item in items {
+                            emit_output(item.clone(), fields.as_deref(), true)?;
+                        }
+                    } else {
+                        emit_output(val, fields.as_deref(), json_flag)?;
+                    }
+                }
                 MailAction::Watch => {
                     let mut rx = state.events.subscribe();
                     while let Ok(env) = rx.recv().await {

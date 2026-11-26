@@ -115,7 +115,8 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                     "text": { "type": "string" },
                     "html": { "type": "string" },
                     "reply_to_message_id": { "type": "string" },
-                    "dry_run": { "type": "boolean", "default": false }
+                    "dry_run": { "type": "boolean", "default": false },
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key (or Idempotency-Key HTTP header) cached for 24h per mailbox" }
                 }
             }
         },
@@ -132,7 +133,8 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                     "subject": { "type": "string" },
                     "text": { "type": "string" },
                     "html": { "type": "string" },
-                    "reply_to_message_id": { "type": "string" }
+                    "reply_to_message_id": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Optional deduplication key (or Idempotency-Key HTTP header) cached for 24h per mailbox" }
                 }
             }
         },
@@ -241,6 +243,20 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                 }
             }
         },
+        "mail.audit": {
+            "endpoint": "GET /v1/audit",
+            "description": "Query the immutable append-only agent and API audit log (newest-first, scoped by mailbox).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "Filter by action (read, search, send, draft, triage, approve, reject, unsubscribe, modify, delete)" },
+                    "actor": { "type": "string", "description": "Filter by actor identity" },
+                    "since": { "type": "string", "description": "Unix epoch milliseconds or RFC 3339 timestamp" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
+                    "fields": { "type": "string" }
+                }
+            }
+        },
         "mail.watch": {
             "endpoint": "GET /v1/events",
             "description": "Stream real-time mail events via SSE (HTTP) or NDJSON (CLI).",
@@ -294,6 +310,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "labels" | "list_labels" => "mail.labels",
             "contacts" | "lookup_contact" | "list_vips" | "vips" => "mail.contacts",
             "approvals" | "approve" | "reject" => "mail.approvals",
+            "audit" | "audit_log" => "mail.audit",
             "watch" | "events" => "mail.watch",
             "sync" | "sync_gmail" => "sync.gmail",
             "sync_status" | "status" => "sync.status",
@@ -345,6 +362,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "GET /v1/contacts",
             "GET /v1/contacts/{email}",
             "PATCH /v1/contacts/{email}",
+            "GET /v1/audit",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",

@@ -14,11 +14,11 @@ use nogml::{
         LabelColor, SYSTEM_LABEL_IDS, ThreadAnnotation, ThreadAnnotationPatch, WaitingOn,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactDirection, ContactInteraction,
-        ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery, MailStore, MemoryStore,
-        MessageListQuery, NewAttachmentInput, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, SqliteStore, SyncState, TriagePatch, UpdateLabelInput,
-        UpsertOutcomeKind, WatchSubscription, open_store,
+        AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactDirection,
+        ContactInteraction, ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery,
+        MailStore, MemoryStore, MessageListQuery, NewAttachmentInput, NewAuditLogEntry,
+        NewLabelInput, NewMessageInput, NewPendingApprovalInput, SqliteStore, SyncState,
+        TriagePatch, UpdateLabelInput, UpsertOutcomeKind, WatchSubscription, open_store,
     },
     transport::OutboundMessage,
 };
@@ -1195,6 +1195,179 @@ async fn contract_thread_annotations(store: Arc<dyn MailStore>) {
     );
 }
 
+async fn contract_idempotency_keys_and_audit_log(store: Arc<dyn MailStore>) {
+    let mb = store.mailbox_id().to_string();
+    let now_ms = Utc::now().timestamp_millis();
+
+    // 1. Missing key returns None
+    assert!(
+        store
+            .get_idempotency_key("send_email", "key-missing", now_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 2. Store key with 60s TTL; visible before expiration, isolated by scope
+    store
+        .put_idempotency_key("send_email", "idem-1", r#"{"message_id":"m1"}"#, 60)
+        .await
+        .unwrap();
+    let rec = store
+        .get_idempotency_key("send_email", "idem-1", now_ms)
+        .await
+        .unwrap()
+        .expect("idempotency record should exist");
+    assert_eq!(rec.key, "idem-1");
+    assert_eq!(rec.scope, "send_email");
+    assert_eq!(rec.response_json, r#"{"message_id":"m1"}"#);
+    assert!(rec.expires_at_ms > now_ms);
+
+    // Different scope with same key must NOT collide
+    assert!(
+        store
+            .get_idempotency_key("create_draft", "idem-1", now_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Expired lookup returns None (at or after expires_at_ms)
+    assert!(
+        store
+            .get_idempotency_key("send_email", "idem-1", rec.expires_at_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_idempotency_key("send_email", "idem-1", rec.expires_at_ms + 5_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Overwriting an expired/existing key succeeds with fresh TTL and new payload
+    store
+        .put_idempotency_key("send_email", "idem-1", r#"{"message_id":"m2"}"#, 120)
+        .await
+        .unwrap();
+    let updated = store
+        .get_idempotency_key("send_email", "idem-1", now_ms)
+        .await
+        .unwrap()
+        .expect("overwritten idempotency record should exist");
+    assert_eq!(updated.response_json, r#"{"message_id":"m2"}"#);
+
+    // 3. Immutable append-only audit log: newest-first ordering (including same-ms tie breaking) & filters
+    let e1 = store
+        .append_audit_log(&NewAuditLogEntry {
+            timestamp_ms: Some(1_700_000_001_000),
+            actor: "agent-a@example.com".to_string(),
+            scopes: vec!["read".to_string()],
+            channel: "/v1".to_string(),
+            action: "read".to_string(),
+            target_ids: vec!["msg_1".to_string()],
+            outcome: "ok".to_string(),
+            detail: Some("first".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(e1.mailbox_id, mb);
+    assert!(!e1.id.is_empty());
+
+    let e2 = store
+        .append_audit_log(&NewAuditLogEntry {
+            timestamp_ms: Some(1_700_000_002_000),
+            actor: "agent-a@example.com".to_string(),
+            scopes: vec!["read".to_string(), "send".to_string()],
+            channel: "/mcp".to_string(),
+            action: "send".to_string(),
+            target_ids: vec!["msg_2".to_string(), "thr_2".to_string()],
+            outcome: "ok".to_string(),
+            detail: Some("second".to_string()),
+        })
+        .await
+        .unwrap();
+
+    // Same timestamp as e2: must appear BEFORE e2 in newest-first order
+    let e3 = store
+        .append_audit_log(&NewAuditLogEntry {
+            timestamp_ms: Some(1_700_000_002_000),
+            actor: "agent-b@example.com".to_string(),
+            scopes: vec!["write".to_string()],
+            channel: "/gmail/v1".to_string(),
+            action: "modify".to_string(),
+            target_ids: vec!["msg_2".to_string()],
+            outcome: "ok".to_string(),
+            detail: None,
+        })
+        .await
+        .unwrap();
+
+    let all = store
+        .list_audit_log(&AuditLogQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].id, e3.id);
+    assert_eq!(all[1].id, e2.id);
+    assert_eq!(all[2].id, e1.id);
+    assert_eq!(all[1].scopes, vec!["read", "send"]);
+    assert_eq!(all[1].target_ids, vec!["msg_2", "thr_2"]);
+
+    // Filter by action
+    let sends = store
+        .list_audit_log(&AuditLogQuery {
+            action: Some("send".to_string()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].id, e2.id);
+
+    // Filter by actor
+    let by_b = store
+        .list_audit_log(&AuditLogQuery {
+            actor: Some("agent-b@example.com".to_string()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_b.len(), 1);
+    assert_eq!(by_b[0].id, e3.id);
+
+    // Filter by since_ms (inclusive) and limit
+    let since_e2 = store
+        .list_audit_log(&AuditLogQuery {
+            since_ms: Some(1_700_000_002_000),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(since_e2.len(), 2);
+    assert_eq!(since_e2[0].id, e3.id);
+    assert_eq!(since_e2[1].id, e2.id);
+
+    let limited = store
+        .list_audit_log(&AuditLogQuery {
+            limit: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].id, e3.id);
+}
+
 async fn contract_multi_mailbox_isolation(
     base_store: Arc<dyn MailStore>,
     alice_mb: &str,
@@ -1257,9 +1430,38 @@ async fn contract_multi_mailbox_isolation(
         })
         .await
         .unwrap();
+    alice
+        .put_idempotency_key("send_email", "shared-idem", r#"{"owner":"alice"}"#, 3600)
+        .await
+        .unwrap();
+    alice
+        .append_audit_log(&NewAuditLogEntry {
+            timestamp_ms: Some(now_ms),
+            actor: alice_mb.to_string(),
+            scopes: vec!["send".to_string()],
+            channel: "/v1".to_string(),
+            action: "send".to_string(),
+            target_ids: vec![a_stored.id.clone()],
+            outcome: "ok".to_string(),
+            detail: Some("alice secret audit".to_string()),
+        })
+        .await
+        .unwrap();
 
     // Bob sees NONE of Alice's data and starts with independent history_id, UIDs, and settings
     assert!(bob.get_message(&a_stored.id).await.unwrap().is_none());
+    assert!(
+        bob.get_idempotency_key("send_email", "shared-idem", now_ms)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        bob.list_audit_log(&AuditLogQuery::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         bob.list_messages(&MessageListQuery::default())
             .await
@@ -1638,6 +1840,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     let mb_apr = format!("{prefix}-apr-{suffix}@contract.test");
     let mb_contacts = format!("{prefix}-contacts-{suffix}@contract.test");
     let mb_ann = format!("{prefix}-ann-{suffix}@contract.test");
+    let mb_idem = format!("{prefix}-idem-{suffix}@contract.test");
     let mb_alice = format!("{prefix}-alice-{suffix}@contract.test");
     let mb_bob = format!("{prefix}-bob-{suffix}@contract.test");
 
@@ -1648,6 +1851,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_pending_approvals_atomic_transitions(base_store.for_mailbox(&mb_apr)).await;
     contract_contacts_stats_vip_filtering_and_patch(base_store.for_mailbox(&mb_contacts)).await;
     contract_thread_annotations(base_store.for_mailbox(&mb_ann)).await;
+    contract_idempotency_keys_and_audit_log(base_store.for_mailbox(&mb_idem)).await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
 }
 

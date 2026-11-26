@@ -1024,6 +1024,8 @@ pub struct AiSendEmailRequest {
     pub reply_to_message_id: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1042,6 +1044,8 @@ pub struct AiCreateDraftRequest {
     pub html: Option<String>,
     #[serde(default)]
     pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -832,6 +832,48 @@ impl MailStore for MockStore {
     async fn delete_thread_annotation(&self, _thread_id: &str) -> AppResult<()> {
         Ok(())
     }
+    async fn get_idempotency_key(
+        &self,
+        _scope: &str,
+        _key: &str,
+        _now_ms: i64,
+    ) -> AppResult<Option<crate::storage::IdempotencyRecord>> {
+        Ok(None)
+    }
+    async fn put_idempotency_key(
+        &self,
+        _scope: &str,
+        _key: &str,
+        _response_json: &str,
+        _ttl_secs: i64,
+    ) -> AppResult<()> {
+        Ok(())
+    }
+    async fn append_audit_log(
+        &self,
+        entry: &crate::storage::NewAuditLogEntry,
+    ) -> AppResult<crate::storage::AuditLogEntry> {
+        Ok(crate::storage::AuditLogEntry {
+            id: format!("aud_{}", uuid::Uuid::new_v4().simple()),
+            mailbox_id: self.mailbox_id.clone(),
+            timestamp_ms: entry
+                .timestamp_ms
+                .unwrap_or_else(|| Utc::now().timestamp_millis()),
+            actor: entry.actor.clone(),
+            scopes: entry.scopes.clone(),
+            channel: entry.channel.clone(),
+            action: entry.action.clone(),
+            target_ids: entry.target_ids.clone(),
+            outcome: entry.outcome.clone(),
+            detail: entry.detail.clone(),
+        })
+    }
+    async fn list_audit_log(
+        &self,
+        _query: &crate::storage::AuditLogQuery,
+    ) -> AppResult<Vec<crate::storage::AuditLogEntry>> {
+        Ok(Vec::new())
+    }
 }
 
 fn test_app_with_config(cfg: Config) -> (AppState, Arc<MockResend>, Router) {

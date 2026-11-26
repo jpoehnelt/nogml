@@ -536,8 +536,9 @@ pub async fn execute_unsubscribe_with_source(
 
     let (method, mut warnings) = select_method(&info, prefer_mailto)?;
     let agent_policy = principal.as_ref().and_then(|p| p.agent_policy.clone());
+    let audit_principal = principal.clone();
 
-    match method {
+    let result = match method {
         SelectedMethod::OneClickPost(url) => {
             execute_one_click_post(
                 state,
@@ -565,7 +566,56 @@ pub async fn execute_unsubscribe_with_source(
             )
             .await
         }
+    };
+
+    let channel = crate::ai::channel_for_source(source);
+    match &result {
+        Ok(val) => {
+            let outcome = if dry_run {
+                "dry_run"
+            } else {
+                match val.get("status").and_then(Value::as_str) {
+                    Some("pending_approval") => "pending_approval",
+                    Some("draft_created") => "downgraded_to_draft",
+                    _ => "ok",
+                }
+            };
+            let detail = val
+                .get("method")
+                .and_then(Value::as_str)
+                .map(|m| format!("method={m}"));
+            state
+                .record_audit(
+                    audit_principal.as_ref(),
+                    channel,
+                    "unsubscribe",
+                    vec![msg.id.clone()],
+                    outcome,
+                    detail,
+                )
+                .await;
+        }
+        Err(err) => {
+            let outcome = match err {
+                AppError::PolicyDenied { .. }
+                | AppError::DraftOnlyBlocked { .. }
+                | AppError::Forbidden(_) => "denied",
+                _ => "error",
+            };
+            state
+                .record_audit(
+                    audit_principal.as_ref(),
+                    channel,
+                    "unsubscribe",
+                    vec![msg.id.clone()],
+                    outcome,
+                    Some(err.to_string()),
+                )
+                .await;
+        }
     }
+
+    result
 }
 
 fn select_method(
