@@ -10,13 +10,23 @@ pub mod session;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+
+/// Default maximum number of concurrent IMAP connections per listener.
+pub const IMAP_MAX_CONCURRENT_CONNECTIONS: usize = 512;
+/// Maximum duration allowed for an implicit TLS handshake before dropping the connection.
+const IMAP_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     AppState, ensure_crypto_provider,
@@ -117,25 +127,55 @@ pub async fn serve_imap(state: AppState, shutdown: watch::Receiver<bool>) -> App
 }
 
 /// Accept plain TCP IMAP connections (supporting `STARTTLS` if `tls_acceptor` is provided)
-/// on an already-bound [`TcpListener`].
+/// on an already-bound [`TcpListener`], capped at [`IMAP_MAX_CONCURRENT_CONNECTIONS`].
 pub async fn serve_plain_listener(
     listener: TcpListener,
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> AppResult<()> {
-    let mut handles = Vec::new();
+    serve_plain_listener_with_limit(
+        listener,
+        state,
+        tls_acceptor,
+        shutdown,
+        IMAP_MAX_CONCURRENT_CONNECTIONS,
+    )
+    .await
+}
+
+/// Accept plain TCP IMAP connections with an explicit concurrent connection limit.
+pub async fn serve_plain_listener_with_limit(
+    listener: TcpListener,
+    state: AppState,
+    tls_acceptor: Option<TlsAcceptor>,
+    mut shutdown: watch::Receiver<bool>,
+    max_connections: usize,
+) -> AppResult<()> {
+    let semaphore = Arc::new(Semaphore::new(max_connections.max(1)));
+    let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             accepted = listener.accept() => {
+                while tasks.try_join_next().is_some() {}
                 match accepted {
-                    Ok((tcp, _peer)) => {
+                    Ok((mut tcp, _peer)) => {
+                        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                            warn!("IMAP max concurrent connections ({max_connections}) reached; rejecting client");
+                            let _ = tcp
+                                .write_all(b"* BYE Server busy; too many concurrent connections\r\n")
+                                .await;
+                            let _ = tcp.shutdown().await;
+                            continue;
+                        };
                         let st = state.clone();
                         let acc = tls_acceptor.clone();
                         let rx = shutdown.clone();
-                        handles.push(tokio::spawn(async move {
+                        tasks.spawn(async move {
+                            let _permit = permit;
                             handle_connection(ImapStream::Plain(tcp), st, acc, rx).await;
-                        }));
+                        });
                     }
                     Err(err) => {
                         warn!(%err, "IMAP TCP accept error");
@@ -149,31 +189,57 @@ pub async fn serve_plain_listener(
             }
         }
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }
 
-/// Accept implicit-TLS IMAP connections on an already-bound [`TcpListener`].
+/// Accept implicit-TLS IMAP connections on an already-bound [`TcpListener`],
+/// capped at [`IMAP_MAX_CONCURRENT_CONNECTIONS`].
 pub async fn serve_tls_listener(
     listener: TcpListener,
     state: AppState,
     tls_acceptor: TlsAcceptor,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> AppResult<()> {
-    let mut handles = Vec::new();
+    serve_tls_listener_with_limit(
+        listener,
+        state,
+        tls_acceptor,
+        shutdown,
+        IMAP_MAX_CONCURRENT_CONNECTIONS,
+    )
+    .await
+}
+
+/// Accept implicit-TLS IMAP connections with an explicit concurrent connection limit.
+pub async fn serve_tls_listener_with_limit(
+    listener: TcpListener,
+    state: AppState,
+    tls_acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+    max_connections: usize,
+) -> AppResult<()> {
+    let semaphore = Arc::new(Semaphore::new(max_connections.max(1)));
+    let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             accepted = listener.accept() => {
+                while tasks.try_join_next().is_some() {}
                 match accepted {
-                    Ok((tcp, _peer)) => {
+                    Ok((mut tcp, _peer)) => {
+                        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                            warn!("IMAP TLS max concurrent connections ({max_connections}) reached; rejecting client");
+                            let _ = tcp.shutdown().await;
+                            continue;
+                        };
                         let st = state.clone();
                         let acc = tls_acceptor.clone();
                         let rx = shutdown.clone();
-                        handles.push(tokio::spawn(async move {
-                            match acc.accept(tcp).await {
-                                Ok(tls_stream) => {
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            match tokio::time::timeout(IMAP_TLS_HANDSHAKE_TIMEOUT, acc.accept(tcp)).await {
+                                Ok(Ok(tls_stream)) => {
                                     handle_connection(
                                         ImapStream::Tls(Box::new(tls_stream)),
                                         st,
@@ -181,11 +247,14 @@ pub async fn serve_tls_listener(
                                         rx,
                                     ).await;
                                 }
-                                Err(err) => {
+                                Ok(Err(err)) => {
                                     warn!(%err, "IMAP implicit TLS handshake failed");
                                 }
+                                Err(_) => {
+                                    warn!("IMAP implicit TLS handshake timed out");
+                                }
                             }
-                        }));
+                        });
                     }
                     Err(err) => {
                         warn!(%err, "IMAP TLS accept error");
@@ -199,8 +268,6 @@ pub async fn serve_tls_listener(
             }
         }
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }

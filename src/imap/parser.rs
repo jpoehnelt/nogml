@@ -9,7 +9,46 @@ use crate::error::{AppError, AppResult};
 /// Maximum length of a single command line segment (excluding literal payloads).
 const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Maximum parenthesized list nesting depth in IMAP commands.
-const MAX_IMAP_LIST_DEPTH: usize = 32;
+pub const MAX_IMAP_LIST_DEPTH: usize = 32;
+/// Pre-authentication maximum size of a single IMAP literal (16 KiB).
+pub const PRE_AUTH_MAX_LITERAL_BYTES: usize = 16 * 1024;
+/// Pre-authentication cumulative command byte cap (32 KiB).
+pub const PRE_AUTH_MAX_COMMAND_BYTES: usize = 32 * 1024;
+/// Maximum number of literals allowed in a single IMAP command.
+pub const MAX_COMMAND_LITERALS: usize = 16;
+/// Extra framing headroom above `max_body_bytes` for authenticated commands (64 KiB).
+pub const POST_AUTH_COMMAND_OVERHEAD_BYTES: usize = 64 * 1024;
+
+/// Resource limits enforced while reading a single IMAP command frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadCommandLimits {
+    /// Maximum byte length of any single `{N}` or `{N+}` literal.
+    pub max_literal_bytes: usize,
+    /// Maximum number of literals allowed in one command.
+    pub max_literals: usize,
+    /// Maximum cumulative bytes across all lines and literal payloads in one command.
+    pub max_command_bytes: usize,
+}
+
+impl ReadCommandLimits {
+    /// Tight pre-authentication limits to prevent unauthenticated OOM DoS.
+    pub fn pre_auth(config_max_body_bytes: usize) -> Self {
+        Self {
+            max_literal_bytes: config_max_body_bytes.min(PRE_AUTH_MAX_LITERAL_BYTES),
+            max_literals: MAX_COMMAND_LITERALS,
+            max_command_bytes: PRE_AUTH_MAX_COMMAND_BYTES,
+        }
+    }
+
+    /// Authenticated limits bounded by `max_body_bytes + 64 KiB`.
+    pub fn authenticated(max_body_bytes: usize) -> Self {
+        Self {
+            max_literal_bytes: max_body_bytes,
+            max_literals: MAX_COMMAND_LITERALS,
+            max_command_bytes: max_body_bytes.saturating_add(POST_AUTH_COMMAND_OVERHEAD_BYTES),
+        }
+    }
+}
 
 /// A piece of a raw IMAP command before tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,13 +128,34 @@ pub async fn read_command<S>(
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
 {
+    read_command_with_limits(stream, ReadCommandLimits::authenticated(max_literal_bytes)).await
+}
+
+/// Read one complete IMAP command enforcing per-literal, literal-count, and cumulative byte limits.
+pub async fn read_command_with_limits<S>(
+    stream: &mut S,
+    limits: ReadCommandLimits,
+) -> AppResult<ReadCommandOutcome>
+where
+    S: AsyncBufRead + AsyncWrite + Unpin,
+{
     let mut chunks: Vec<RawChunk> = Vec::new();
     let mut first_tag: Option<String> = None;
+    let mut literal_count = 0usize;
+    let mut total_bytes = 0usize;
 
     loop {
-        let line = match read_crlf_line(stream, MAX_LINE_BYTES).await? {
-            Some(l) => l,
-            None => {
+        let remaining_budget = limits.max_command_bytes.saturating_sub(total_bytes);
+        if remaining_budget == 0 {
+            return Err(AppError::PayloadTooLarge(format!(
+                "IMAP command exceeds cumulative limit of {} bytes",
+                limits.max_command_bytes
+            )));
+        }
+        let line_cap = MAX_LINE_BYTES.min(remaining_budget);
+        let line = match read_crlf_line(stream, line_cap).await {
+            Ok(Some(l)) => l,
+            Ok(None) => {
                 if chunks.is_empty() {
                     return Ok(ReadCommandOutcome::Eof);
                 }
@@ -103,10 +163,23 @@ where
                     "Unexpected EOF while reading IMAP command".to_string(),
                 ));
             }
+            Err(AppError::BadRequest(msg)) if remaining_budget < MAX_LINE_BYTES => {
+                return Err(AppError::PayloadTooLarge(msg));
+            }
+            Err(err) => return Err(err),
         };
 
         if chunks.is_empty() && line.trim().is_empty() {
             return Ok(ReadCommandOutcome::Empty);
+        }
+
+        // Count text line plus its CRLF terminator against the cumulative command budget.
+        total_bytes = total_bytes.saturating_add(line.len().saturating_add(2));
+        if total_bytes > limits.max_command_bytes {
+            return Err(AppError::PayloadTooLarge(format!(
+                "IMAP command exceeds cumulative limit of {} bytes",
+                limits.max_command_bytes
+            )));
         }
 
         if first_tag.is_none() {
@@ -117,12 +190,12 @@ where
             if !prefix.is_empty() {
                 chunks.push(RawChunk::Text(prefix.to_string()));
             }
-            if lit_len > max_literal_bytes {
-                // For synchronizing literals we haven't sent continuation, so client won't send payload.
-                // For non-sync literals, abort connection since stream framing would desync.
+            literal_count += 1;
+            if literal_count > limits.max_literals {
                 if non_sync {
                     return Err(AppError::PayloadTooLarge(format!(
-                        "IMAP literal size {lit_len} exceeds limit {max_literal_bytes}"
+                        "IMAP command exceeds maximum literal count of {}",
+                        limits.max_literals
                     )));
                 }
                 return Ok(ReadCommandOutcome::LiteralTooLarge {
@@ -130,6 +203,22 @@ where
                     size: lit_len,
                 });
             }
+            if lit_len > limits.max_literal_bytes
+                || total_bytes.saturating_add(lit_len) > limits.max_command_bytes
+            {
+                // For synchronizing literals we haven't sent continuation, so client won't send payload.
+                // For non-sync literals, abort connection since stream framing would desync.
+                if non_sync {
+                    return Err(AppError::PayloadTooLarge(format!(
+                        "IMAP literal size {lit_len} exceeds limit"
+                    )));
+                }
+                return Ok(ReadCommandOutcome::LiteralTooLarge {
+                    tag: first_tag,
+                    size: lit_len,
+                });
+            }
+            total_bytes = total_bytes.saturating_add(lit_len);
             if !non_sync {
                 stream
                     .write_all(b"+ Ready\r\n")
@@ -164,7 +253,25 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
     max_bytes: usize,
 ) -> AppResult<Option<String>> {
     let mut buf = Vec::new();
-    let mut total = 0usize;
+    read_crlf_line_into(reader, &mut buf, max_bytes).await
+}
+
+/// Cancel-safe variant of [`read_crlf_line`] that accumulates partial line bytes in caller-owned
+/// `buf`. If the returned future is dropped inside `tokio::select!` before `\n` arrives, already
+/// consumed bytes remain in `buf` and are preserved on the next call.
+pub async fn read_crlf_line_into<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> AppResult<Option<String>> {
+    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let mut raw: Vec<u8> = buf.drain(..=pos).collect();
+        while matches!(raw.last(), Some(b'\n' | b'\r')) {
+            raw.pop();
+        }
+        return Ok(Some(String::from_utf8_lossy(&raw).into_owned()));
+    }
+
     loop {
         let available = reader
             .fill_buf()
@@ -178,8 +285,8 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             let take = pos + 1;
-            total += take;
-            if total > max_bytes {
+            if buf.len().saturating_add(take) > max_bytes {
+                buf.clear();
                 return Err(AppError::BadRequest(
                     "IMAP command line too long".to_string(),
                 ));
@@ -189,8 +296,8 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
             break;
         } else {
             let len = available.len();
-            total += len;
-            if total > max_bytes {
+            if buf.len().saturating_add(len) > max_bytes {
+                buf.clear();
                 return Err(AppError::BadRequest(
                     "IMAP command line too long".to_string(),
                 ));
@@ -200,10 +307,11 @@ pub async fn read_crlf_line<R: AsyncBufRead + Unpin>(
         }
     }
 
-    while matches!(buf.last(), Some(b'\n' | b'\r')) {
-        buf.pop();
+    let mut raw = std::mem::take(buf);
+    while matches!(raw.last(), Some(b'\n' | b'\r')) {
+        raw.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
 }
 
 /// Check if a line ends with `{N}` or `{N+}`.
@@ -358,6 +466,11 @@ pub fn tokenize_chunks(chunks: &[RawChunk]) -> AppResult<Vec<ImapArg>> {
                                 in_quote = true;
                             } else if c == b'[' {
                                 bracket_depth += 1;
+                                if bracket_depth > MAX_IMAP_LIST_DEPTH {
+                                    return Err(AppError::BadRequest(format!(
+                                        "IMAP command exceeds maximum bracket nesting depth of {MAX_IMAP_LIST_DEPTH}"
+                                    )));
+                                }
                             } else if c == b']' {
                                 bracket_depth -= 1;
                             }
@@ -479,46 +592,43 @@ pub fn format_sequence_set(nums: &[u32]) -> String {
 /// `*` matches zero or more characters including `delim`.
 /// `%` matches zero or more characters excluding `delim`.
 /// `INBOX` is matched case-insensitively per RFC 3501.
+///
+/// Runs in O(n*m) time and O(n) space via dynamic programming (immune to wildcard backtracking ReDoS).
 pub fn imap_wildcard_match(pattern: &str, name: &str, delim: char) -> bool {
     if pattern.eq_ignore_ascii_case("INBOX") && name.eq_ignore_ascii_case("INBOX") {
         return true;
     }
-    let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = name.chars().collect();
-    wildcard_match_rec(&p, &s, delim)
-}
+    let n = s.len();
+    let mut prev = vec![false; n + 1];
+    let mut curr = vec![false; n + 1];
+    prev[0] = true;
 
-fn wildcard_match_rec(p: &[char], s: &[char], delim: char) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
+    for pch in pattern.chars() {
+        curr.fill(false);
+        match pch {
+            '*' => {
+                curr[0] = prev[0];
+                for j in 1..=n {
+                    curr[j] = prev[j] || curr[j - 1];
+                }
+            }
+            '%' => {
+                curr[0] = prev[0];
+                for j in 1..=n {
+                    curr[j] = prev[j] || (curr[j - 1] && s[j - 1] != delim);
+                }
+            }
+            c => {
+                for j in 1..=n {
+                    curr[j] = prev[j - 1] && s[j - 1] == c;
+                }
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
     }
-    match p[0] {
-        '*' => {
-            if wildcard_match_rec(&p[1..], s, delim) {
-                return true;
-            }
-            if !s.is_empty() {
-                return wildcard_match_rec(p, &s[1..], delim);
-            }
-            false
-        }
-        '%' => {
-            if wildcard_match_rec(&p[1..], s, delim) {
-                return true;
-            }
-            if !s.is_empty() && s[0] != delim {
-                return wildcard_match_rec(p, &s[1..], delim);
-            }
-            false
-        }
-        c => {
-            if !s.is_empty() && s[0] == c {
-                wildcard_match_rec(&p[1..], &s[1..], delim)
-            } else {
-                false
-            }
-        }
-    }
+
+    prev[n]
 }
 
 /// Format an IMAP quoted string (escaping `\` and `"`), or a literal `{N}\r\n...` if it contains
@@ -548,12 +658,22 @@ pub fn imap_quote(s: &str) -> String {
         if ch == '\\' || ch == '"' {
             out.push('\\');
         }
-        if ch != '\r' && ch != '\n' {
+        if ch != '\r' && ch != '\n' && ch != '\0' {
             out.push(ch);
         }
     }
     out.push('"');
     out
+}
+
+/// Sanitize arbitrary human-readable text for an IMAP single-line response (stripping CR/LF/NUL).
+pub fn sanitize_imap_text(s: &str) -> String {
+    s.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\0' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 /// Format an optional string as IMAP `nstring` (`NIL` or quoted/literal string).
@@ -639,5 +759,127 @@ mod tests {
         let deep = format!("A1 SEARCH {}", "(".repeat(3_000));
         let err = parse_command_line(&deep).expect_err("deep nesting must fail");
         assert!(matches!(err, AppError::BadRequest(_)));
+
+        // Exactly MAX_IMAP_LIST_DEPTH (32) nested lists succeeds; 33 fails.
+        let ok_line = format!("A1 SEARCH {}ALL{}", "(".repeat(32), ")".repeat(32));
+        assert!(parse_command_line(&ok_line).is_ok());
+        let too_deep = format!("A1 SEARCH {}ALL{}", "(".repeat(33), ")".repeat(33));
+        assert!(matches!(
+            parse_command_line(&too_deep),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn imap_wildcard_match_dp_avoids_exponential_backtracking() {
+        // Pathological pattern that triggers O(2^n) backtracking in recursive matchers.
+        let pattern = format!("{}b", "a*".repeat(40));
+        let input = "a".repeat(80);
+        assert!(!imap_wildcard_match(&pattern, &input, '/'));
+
+        let match_pattern = format!("{}x", "*".repeat(30));
+        let match_input = format!("{}x", "y".repeat(60));
+        assert!(imap_wildcard_match(&match_pattern, &match_input, '/'));
+
+        // Percent wildcard must not cross hierarchy delimiter.
+        assert!(imap_wildcard_match("Work/%", "Work/Alpha", '/'));
+        assert!(!imap_wildcard_match("Work/%", "Work/Alpha/Beta", '/'));
+        assert!(imap_wildcard_match("Work/%/%", "Work/Alpha/Beta", '/'));
+        assert!(imap_wildcard_match("inbox", "INBOX", '/'));
+    }
+
+    #[tokio::test]
+    async fn read_command_with_limits_enforces_pre_auth_and_cumulative_caps() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        // 1. Pre-auth sync literal > 16 KiB returns LiteralTooLarge without "+ Ready".
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut reader = BufReader::new(server);
+        client.write_all(b"A1 LOGIN {20000}\r\n").await.unwrap();
+        let outcome =
+            read_command_with_limits(&mut reader, ReadCommandLimits::pre_auth(40_000_000))
+                .await
+                .unwrap();
+        assert!(matches!(
+            outcome,
+            ReadCommandOutcome::LiteralTooLarge {
+                tag: Some(ref t),
+                size: 20000
+            } if t == "A1"
+        ));
+
+        // 2. Pre-auth LITERAL+ > 16 KiB returns PayloadTooLarge so framing aborts.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut reader = BufReader::new(server);
+        client.write_all(b"A2 LOGIN {20000+}\r\n").await.unwrap();
+        let err = read_command_with_limits(&mut reader, ReadCommandLimits::pre_auth(40_000_000))
+            .await
+            .expect_err("oversized LITERAL+ must fail");
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+
+        // 3. Cumulative command byte cap across multiple literals.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = BufReader::new(server);
+        let limits = ReadCommandLimits {
+            max_literal_bytes: 16 * 1024,
+            max_literals: 16,
+            max_command_bytes: 20 * 1024,
+        };
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(
+                    format!("A3 CMD {{12000+}}\r\n{} {{12000+}}\r\n", "x".repeat(12000)).as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let err = read_command_with_limits(&mut reader, limits)
+            .await
+            .expect_err("cumulative cap must reject second literal");
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+        let _ = writer.await;
+
+        // 4. Max literal count cap (> 16 literals).
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = BufReader::new(server);
+        let mut payload = String::from("A4 CMD ");
+        for _ in 0..17 {
+            payload.push_str("{1+}\r\na ");
+        }
+        payload.push_str("\r\n");
+        let writer = tokio::spawn(async move {
+            client.write_all(payload.as_bytes()).await.unwrap();
+        });
+        let err = read_command_with_limits(&mut reader, ReadCommandLimits::pre_auth(40_000_000))
+            .await
+            .expect_err("excessive literal count must fail");
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn read_crlf_line_into_is_cancel_safe() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let (mut client, server) = tokio::io::duplex(256);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+
+        client.write_all(b"DO").await.unwrap();
+        // Cancel mid-line after consuming "DO".
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            read_crlf_line_into(&mut reader, &mut buf, 1024),
+        )
+        .await;
+        assert!(timed.is_err(), "partial line should time out cleanly");
+        assert_eq!(buf, b"DO");
+
+        client.write_all(b"NE\r\n").await.unwrap();
+        let line = read_crlf_line_into(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap();
+        assert_eq!(line.as_deref(), Some("DONE"));
+        assert!(buf.is_empty());
     }
 }

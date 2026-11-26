@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use base64::Engine as _;
@@ -27,21 +28,38 @@ use crate::{
     imap::{
         mime_fmt::{
             extract_body_section, format_bodystructure, format_envelope, parse_body_section,
-            parse_raw_to_new_message_input,
+            parse_raw_to_new_message_input, split_raw_header_and_body,
         },
         parser::{
-            ImapArg, ImapCommand, ReadCommandOutcome, append_literal, format_internal_date,
-            format_sequence_set, imap_quote, imap_wildcard_match, normalize_mailbox_name,
-            parse_imap_date_time, parse_imap_search_date, parse_sequence_set, read_command,
-            read_crlf_line, seq_set_contains,
+            ImapArg, ImapCommand, ReadCommandLimits, ReadCommandOutcome, append_literal,
+            format_internal_date, format_sequence_set, imap_quote, imap_string,
+            imap_wildcard_match, normalize_mailbox_name, parse_imap_date_time,
+            parse_imap_search_date, parse_sequence_set, read_command_with_limits, read_crlf_line,
+            read_crlf_line_into, sanitize_imap_text, seq_set_contains,
         },
     },
     models::{
         LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
         LABEL_TRASH, LABEL_UNREAD,
     },
-    storage::{ImapMessageEntry, NewLabelInput, StoredMessage, UpdateLabelInput},
+    storage::{
+        ImapFlagAction, ImapFlagSet, ImapMessageEntry, ImapStoreFlagsOutcome, NewLabelInput,
+        StoredMessage, UpdateLabelInput,
+    },
 };
+
+/// Maximum consecutive authentication failures permitted before closing the connection.
+const MAX_FAILED_AUTH_ATTEMPTS: u32 = 5;
+/// Maximum recursion depth for `SEARCH` criteria (`List`, `NOT`, `OR`).
+const MAX_SEARCH_DEPTH: usize = 32;
+/// Pre-authentication command read timeout (60s).
+const IMAP_PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Post-authentication command idle timeout (30 min, RFC 3501 §5.4).
+const IMAP_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Maximum duration of a single `IDLE` command without activity (30 min, RFC 2177).
+const IMAP_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Maximum duration allowed for `STARTTLS` handshake negotiation.
+const IMAP_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Underlying transport stream for an IMAP client connection (plain TCP or TLS).
 pub enum ImapStream {
@@ -120,6 +138,8 @@ struct ImapSession {
     condstore_enabled: bool,
     /// RFC 7162 `QRESYNC` enabled for this connection (via `ENABLE QRESYNC`).
     qresync_enabled: bool,
+    /// Consecutive failed authentication attempts on this connection.
+    failed_auth_attempts: u32,
 }
 
 /// Drive one client IMAP4rev1 connection to completion or shutdown.
@@ -140,6 +160,7 @@ pub async fn handle_connection(
         tls_acceptor,
         condstore_enabled: false,
         qresync_enabled: false,
+        failed_auth_attempts: 0,
     };
 
     let greeting = format!(
@@ -150,11 +171,32 @@ pub async fn handle_connection(
         return;
     }
 
-    let max_lit = session.state.config.max_body_bytes;
-
     loop {
+        let cmd_limits = if session.is_authenticated() {
+            ReadCommandLimits::authenticated(session.state.config.max_body_bytes)
+        } else {
+            ReadCommandLimits::pre_auth(session.state.config.max_body_bytes)
+        };
+        let read_timeout = if session.is_authenticated() {
+            IMAP_AUTH_READ_TIMEOUT
+        } else {
+            IMAP_PRE_AUTH_READ_TIMEOUT
+        };
+
         let cmd_outcome = tokio::select! {
-            res = read_command(&mut reader, max_lit) => res,
+            res = tokio::time::timeout(read_timeout, read_command_with_limits(&mut reader, cmd_limits)) => {
+                match res {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        let _ = write_flush(
+                            &mut reader,
+                            b"* BYE Autologout; idle for too long\r\n",
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
                     let _ = write_flush(&mut reader, b"* BYE nogml IMAP server shutting down\r\n").await;
@@ -169,7 +211,9 @@ pub async fn handle_connection(
             Ok(ReadCommandOutcome::Empty) => continue,
             Ok(ReadCommandOutcome::Eof) => break,
             Ok(ReadCommandOutcome::LiteralTooLarge { tag, size }) => {
-                let t = tag.unwrap_or_else(|| "*".to_string());
+                let t = tag
+                    .map(|s| sanitize_imap_text(&s))
+                    .unwrap_or_else(|| "*".to_string());
                 let resp = format!("{t} NO [TOOBIG] Literal size {size} exceeds limit\r\n");
                 if write_flush(&mut reader, resp.as_bytes()).await.is_err() {
                     break;
@@ -178,7 +222,8 @@ pub async fn handle_connection(
             }
             Err(err) => {
                 debug!(%err, "IMAP command read/parse error");
-                let resp = format!("* BAD {err}\r\n");
+                let safe_err = sanitize_imap_text(&err.to_string());
+                let resp = format!("* BAD {safe_err}\r\n");
                 let _ = write_flush(&mut reader, resp.as_bytes()).await;
                 if matches!(err, AppError::PayloadTooLarge(_) | AppError::Internal(_)) {
                     break;
@@ -231,8 +276,8 @@ pub async fn handle_connection(
                 ImapStream::Plain(tcp) => tcp,
                 ImapStream::Tls(_) => break,
             };
-            match acceptor.accept(tcp).await {
-                Ok(tls_stream) => {
+            match tokio::time::timeout(IMAP_TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                Ok(Ok(tls_stream)) => {
                     reader = BufReader::new(ImapStream::Tls(Box::new(tls_stream)));
                     session.state = session.base_state.clone();
                     session.auth = AuthState::NotAuthenticated;
@@ -240,8 +285,12 @@ pub async fn handle_connection(
                     session.condstore_enabled = false;
                     session.qresync_enabled = false;
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     warn!(%err, "IMAP STARTTLS handshake failed");
+                    break;
+                }
+                Err(_) => {
+                    warn!("IMAP STARTTLS handshake timed out");
                     break;
                 }
             }
@@ -300,9 +349,11 @@ impl ImapSession {
             AuthState::NotAuthenticated => {
                 if !is_tls && self.tls_acceptor.is_some() {
                     caps.push("STARTTLS");
+                    caps.push("LOGINDISABLED");
+                } else {
+                    caps.push("AUTH=PLAIN");
+                    caps.push("AUTH=XOAUTH2");
                 }
-                caps.push("AUTH=PLAIN");
-                caps.push("AUTH=XOAUTH2");
             }
             AuthState::Authenticated | AuthState::Selected(_) => {
                 caps.extend_from_slice(&["ENABLE", "CONDSTORE", "QRESYNC"]);
@@ -356,14 +407,8 @@ impl ImapSession {
                 write_flush(stream, resp.as_bytes()).await?;
                 Ok(true)
             }
-            "LOGIN" => {
-                self.handle_login(&tag, &cmd.args, stream).await?;
-                Ok(true)
-            }
-            "AUTHENTICATE" => {
-                self.handle_authenticate(&tag, &cmd.args, stream).await?;
-                Ok(true)
-            }
+            "LOGIN" => self.handle_login(&tag, &cmd.args, stream).await,
+            "AUTHENTICATE" => self.handle_authenticate(&tag, &cmd.args, stream).await,
             "ENABLE" => {
                 self.handle_enable(&tag, &cmd.args, stream).await?;
                 Ok(true)
@@ -482,9 +527,10 @@ impl ImapSession {
                 Ok(true)
             }
             _ => {
+                let safe_name = sanitize_imap_text(name);
                 write_flush(
                     stream,
-                    format!("{tag} BAD Unknown or unsupported command {name}\r\n").as_bytes(),
+                    format!("{tag} BAD Unknown or unsupported command {safe_name}\r\n").as_bytes(),
                 )
                 .await?;
                 Ok(true)
@@ -525,24 +571,68 @@ impl ImapSession {
         Ok(false)
     }
 
+    /// Record a failed authentication attempt; returns `Ok(false)` when the connection must close.
+    async fn record_auth_failure(
+        &mut self,
+        tag: &str,
+        code: &str,
+        message: &str,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<bool> {
+        self.failed_auth_attempts = self.failed_auth_attempts.saturating_add(1);
+        if self.failed_auth_attempts >= MAX_FAILED_AUTH_ATTEMPTS {
+            write_flush(
+                stream,
+                format!("{tag} NO [{code}] {message}\r\n* BYE Too many failed login attempts\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(false);
+        }
+        write_flush(
+            stream,
+            format!("{tag} NO [{code}] {message}\r\n").as_bytes(),
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn handle_login(
         &mut self,
         tag: &str,
         args: &[ImapArg],
         stream: &mut BufReader<ImapStream>,
-    ) -> AppResult<()> {
+    ) -> AppResult<bool> {
+        if self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} BAD Already authenticated\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(true);
+        }
+        if !stream.get_ref().is_tls() && self.tls_acceptor.is_some() {
+            write_flush(
+                stream,
+                format!("{tag} NO [PRIVACYREQUIRED] STARTTLS required before authentication\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(true);
+        }
         if args.len() < 2 {
             write_flush(
                 stream,
                 format!("{tag} BAD LOGIN requires username and password\r\n").as_bytes(),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
         let user = args[0].as_str_lossy().unwrap_or_default();
         let pass = args[1].as_str_lossy().unwrap_or_default();
         match self.base_state.auth.authenticate_imap(&user, &pass).await {
             Ok(principal) => {
+                self.failed_auth_attempts = 0;
                 self.state = self.base_state.for_mailbox(&principal.mailbox_id);
                 self.principal = Some(principal);
                 self.auth = AuthState::Authenticated;
@@ -552,16 +642,13 @@ impl ImapSession {
                     format!("{tag} OK [CAPABILITY {cap}] LOGIN completed\r\n").as_bytes(),
                 )
                 .await?;
+                Ok(true)
             }
             Err(_) => {
-                write_flush(
-                    stream,
-                    format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
-                )
-                .await?;
+                self.record_auth_failure(tag, "AUTHENTICATIONFAILED", "Invalid credentials", stream)
+                    .await
             }
         }
-        Ok(())
     }
 
     async fn handle_authenticate(
@@ -569,24 +656,42 @@ impl ImapSession {
         tag: &str,
         args: &[ImapArg],
         stream: &mut BufReader<ImapStream>,
-    ) -> AppResult<()> {
+    ) -> AppResult<bool> {
+        if self.is_authenticated() {
+            write_flush(
+                stream,
+                format!("{tag} BAD Already authenticated\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(true);
+        }
+        if !stream.get_ref().is_tls() && self.tls_acceptor.is_some() {
+            write_flush(
+                stream,
+                format!("{tag} NO [PRIVACYREQUIRED] STARTTLS required before authentication\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+            return Ok(true);
+        }
         let Some(mech) = args.first().and_then(ImapArg::as_str_lossy) else {
             write_flush(
                 stream,
                 format!("{tag} BAD AUTHENTICATE requires mechanism\r\n").as_bytes(),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         };
         let is_plain = mech.eq_ignore_ascii_case("PLAIN");
         let is_xoauth2 = mech.eq_ignore_ascii_case("XOAUTH2");
         if !is_plain && !is_xoauth2 {
+            let safe_mech = sanitize_imap_text(&mech);
             write_flush(
                 stream,
-                format!("{tag} NO Unsupported SASL mechanism {mech}\r\n").as_bytes(),
+                format!("{tag} NO Unsupported SASL mechanism {safe_mech}\r\n").as_bytes(),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
 
         let b64_payload = if let Some(initial) = args.get(1).and_then(ImapArg::as_str_lossy) {
@@ -597,14 +702,26 @@ impl ImapSession {
             }
         } else {
             write_flush(stream, b"+ \r\n").await?;
-            match read_crlf_line(stream, 8192).await? {
+            let line_opt = match tokio::time::timeout(
+                IMAP_PRE_AUTH_READ_TIMEOUT,
+                read_crlf_line(stream, 8192),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    let _ = write_flush(stream, b"* BYE Autologout; idle for too long\r\n").await;
+                    return Ok(false);
+                }
+            };
+            match line_opt {
                 Some(line) if line.trim() == "*" => {
                     write_flush(
                         stream,
                         format!("{tag} BAD AUTHENTICATE cancelled\r\n").as_bytes(),
                     )
                     .await?;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Some(line) => line.trim().to_string(),
                 None => return Err(AppError::BadRequest("EOF during AUTHENTICATE".to_string())),
@@ -621,23 +738,26 @@ impl ImapSession {
                     format!("{tag} BAD Invalid base64 in AUTHENTICATE {mech_label}\r\n").as_bytes(),
                 )
                 .await?;
-                return Ok(());
+                return Ok(true);
             }
         };
 
-        let auth_result = if is_xoauth2 {
+        let (auth_result, plain_authzid_check) = if is_xoauth2 {
             let Some((user, token)) = parse_xoauth2_payload(&decoded) else {
                 write_flush(
                     stream,
                     format!("{tag} BAD Malformed XOAUTH2 SASL payload\r\n").as_bytes(),
                 )
                 .await?;
-                return Ok(());
+                return Ok(true);
             };
-            self.base_state
-                .auth
-                .authenticate_xoauth2(&user, &token)
-                .await
+            (
+                self.base_state
+                    .auth
+                    .authenticate_xoauth2(&user, &token)
+                    .await,
+                None,
+            )
         } else {
             // Format: [authzid]\0authcid\0passwd
             let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
@@ -647,18 +767,36 @@ impl ImapSession {
                     format!("{tag} BAD Malformed PLAIN SASL payload\r\n").as_bytes(),
                 )
                 .await?;
-                return Ok(());
+                return Ok(true);
             }
-            let authcid = String::from_utf8_lossy(parts[1]);
+            let authzid = String::from_utf8_lossy(parts[0]).trim().to_string();
+            let authcid = String::from_utf8_lossy(parts[1]).trim().to_string();
             let passwd = String::from_utf8_lossy(parts[2]);
-            self.base_state
+            let res = self
+                .base_state
                 .auth
                 .authenticate_imap(&authcid, &passwd)
-                .await
+                .await;
+            (res, Some((authzid, authcid)))
         };
 
         match auth_result {
             Ok(principal) => {
+                if let Some((authzid, authcid)) = plain_authzid_check
+                    && !authzid.is_empty()
+                    && !authzid.eq_ignore_ascii_case(&authcid)
+                    && !principal.has_scope(AuthScope::Admin)
+                {
+                    return self
+                        .record_auth_failure(
+                            tag,
+                            "AUTHORIZATIONFAILED",
+                            "Authorization identity does not match authentication identity",
+                            stream,
+                        )
+                        .await;
+                }
+                self.failed_auth_attempts = 0;
                 self.state = self.base_state.for_mailbox(&principal.mailbox_id);
                 self.principal = Some(principal);
                 self.auth = AuthState::Authenticated;
@@ -668,16 +806,13 @@ impl ImapSession {
                     format!("{tag} OK [CAPABILITY {cap}] AUTHENTICATE completed\r\n").as_bytes(),
                 )
                 .await?;
+                Ok(true)
             }
             Err(_) => {
-                write_flush(
-                    stream,
-                    format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n").as_bytes(),
-                )
-                .await?;
+                self.record_auth_failure(tag, "AUTHENTICATIONFAILED", "Invalid credentials", stream)
+                    .await
             }
         }
-        Ok(())
     }
 
     async fn handle_enable(
@@ -835,7 +970,7 @@ impl ImapSession {
             out.push_str(&format!(
                 "* {cmd_word} ({}) \"/\" {}\r\n",
                 attrs.join(" "),
-                imap_quote(&mbx.name)
+                imap_string(&mbx.name)
             ));
         }
         out.push_str(&format!("{tag} OK {cmd_word} completed\r\n"));
@@ -884,7 +1019,11 @@ impl ImapSession {
         let Some(info) = self.state.store.imap_mailbox_info(&mailbox).await? else {
             write_flush(
                 stream,
-                format!("{tag} NO Mailbox does not exist: {mailbox}\r\n").as_bytes(),
+                format!(
+                    "{tag} NO Mailbox does not exist: {}\r\n",
+                    imap_quote(&mailbox)
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
@@ -918,7 +1057,7 @@ impl ImapSession {
         }
         let resp = format!(
             "* STATUS {} ({})\r\n{tag} OK STATUS completed\r\n",
-            imap_quote(&info.name),
+            imap_string(&info.name),
             pairs.join(" ")
         );
         write_flush(stream, resp.as_bytes()).await?;
@@ -1011,7 +1150,8 @@ impl ImapSession {
                                 req_condstore = true;
                             }
                             Err(err) => {
-                                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes())
+                                let safe_err = sanitize_imap_text(&err.to_string());
+                                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes())
                                     .await?;
                                 return Ok(());
                             }
@@ -1019,10 +1159,13 @@ impl ImapSession {
                         i += 2;
                     }
                     other => {
+                        let safe_other = sanitize_imap_text(other);
                         write_flush(
                             stream,
-                            format!("{tag} BAD Unsupported SELECT/EXAMINE parameter {other}\r\n")
-                                .as_bytes(),
+                            format!(
+                                "{tag} BAD Unsupported SELECT/EXAMINE parameter {safe_other}\r\n"
+                            )
+                            .as_bytes(),
                         )
                         .await?;
                         return Ok(());
@@ -1031,20 +1174,28 @@ impl ImapSession {
             }
         }
 
+        // RFC 3501 Section 6.3.1 / 6.3.2: SELECT/EXAMINE always deselects any currently selected
+        // mailbox before attempting the new selection, even if the new selection fails.
+        let was_selected = self.is_selected();
+        self.auth = AuthState::Authenticated;
+
         let mailbox = normalize_mailbox_name(&raw_mbx);
         let Some(info) = self.state.store.imap_mailbox_info(&mailbox).await? else {
-            write_flush(
-                stream,
-                format!("{tag} NO [TRYCREATE] Mailbox does not exist: {mailbox}\r\n").as_bytes(),
-            )
-            .await?;
+            let mut resp = String::new();
+            if was_selected && self.qresync_enabled {
+                resp.push_str("* OK [CLOSED] Previous mailbox closed\r\n");
+            }
+            resp.push_str(&format!(
+                "{tag} NO [TRYCREATE] Mailbox does not exist: {}\r\n",
+                imap_quote(&mailbox)
+            ));
+            write_flush(stream, resp.as_bytes()).await?;
             return Ok(());
         };
         if req_condstore {
             self.condstore_enabled = true;
         }
 
-        let was_selected = self.is_selected();
         let entries = self.state.store.imap_list_messages(&info.name).await?;
         let highest_modseq = self.state.store.current_history_id().await?.max(1);
         let first_unseen = entries
@@ -1170,10 +1321,22 @@ impl ImapSession {
             .await?;
             return Ok(());
         };
+        if !is_valid_mailbox_name(&name) {
+            write_flush(
+                stream,
+                format!("{tag} BAD Invalid mailbox name\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
         if is_reserved_mailbox(&name) {
             write_flush(
                 stream,
-                format!("{tag} NO Cannot create reserved system mailbox {name}\r\n").as_bytes(),
+                format!(
+                    "{tag} NO Cannot create reserved system mailbox {}\r\n",
+                    imap_quote(&name)
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
@@ -1191,7 +1354,8 @@ impl ImapSession {
                 write_flush(stream, format!("{tag} OK CREATE completed\r\n").as_bytes()).await?;
             }
             Err(err) => {
-                write_flush(stream, format!("{tag} NO {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} NO {safe_err}\r\n").as_bytes()).await?;
             }
         }
         Ok(())
@@ -1228,7 +1392,11 @@ impl ImapSession {
         if is_reserved_mailbox(&name) {
             write_flush(
                 stream,
-                format!("{tag} NO Cannot delete system mailbox {name}\r\n").as_bytes(),
+                format!(
+                    "{tag} NO Cannot delete system mailbox {}\r\n",
+                    imap_quote(&name)
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
@@ -1240,7 +1408,7 @@ impl ImapSession {
         else {
             write_flush(
                 stream,
-                format!("{tag} NO Mailbox does not exist: {name}\r\n").as_bytes(),
+                format!("{tag} NO Mailbox does not exist: {}\r\n", imap_quote(&name)).as_bytes(),
             )
             .await?;
             return Ok(());
@@ -1251,7 +1419,8 @@ impl ImapSession {
                 write_flush(stream, format!("{tag} OK DELETE completed\r\n").as_bytes()).await?;
             }
             Err(err) => {
-                write_flush(stream, format!("{tag} NO {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} NO {safe_err}\r\n").as_bytes()).await?;
             }
         }
         Ok(())
@@ -1287,6 +1456,14 @@ impl ImapSession {
         }
         let old_name = args[0].as_str_lossy().unwrap_or_default();
         let new_name = args[1].as_str_lossy().unwrap_or_default();
+        if !is_valid_mailbox_name(&new_name) {
+            write_flush(
+                stream,
+                format!("{tag} BAD Invalid mailbox name\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
         if is_reserved_mailbox(&old_name) || is_reserved_mailbox(&new_name) {
             write_flush(
                 stream,
@@ -1302,7 +1479,11 @@ impl ImapSession {
         else {
             write_flush(
                 stream,
-                format!("{tag} NO Mailbox does not exist: {old_name}\r\n").as_bytes(),
+                format!(
+                    "{tag} NO Mailbox does not exist: {}\r\n",
+                    imap_quote(&old_name)
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
@@ -1327,7 +1508,8 @@ impl ImapSession {
                 write_flush(stream, format!("{tag} OK RENAME completed\r\n").as_bytes()).await?;
             }
             Err(err) => {
-                write_flush(stream, format!("{tag} NO {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} NO {safe_err}\r\n").as_bytes()).await?;
             }
         }
         Ok(())
@@ -1487,9 +1669,10 @@ impl ImapSession {
         self.state.metrics.record_filter_decision(&decision);
         match decision {
             FilterDecision::Reject { reason } => {
+                let safe_reason = sanitize_imap_text(&reason);
                 write_flush(
                     stream,
-                    format!("{tag} NO [REJECTED] {reason}\r\n").as_bytes(),
+                    format!("{tag} NO [REJECTED] {safe_reason}\r\n").as_bytes(),
                 )
                 .await?;
                 return Ok(());
@@ -1540,10 +1723,16 @@ impl ImapSession {
                 .await?;
             }
             Err(AppError::NotFound(msg)) => {
-                write_flush(stream, format!("{tag} NO [TRYCREATE] {msg}\r\n").as_bytes()).await?;
+                let safe_msg = sanitize_imap_text(&msg);
+                write_flush(
+                    stream,
+                    format!("{tag} NO [TRYCREATE] {safe_msg}\r\n").as_bytes(),
+                )
+                .await?;
             }
             Err(err) => {
-                write_flush(stream, format!("{tag} NO {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} NO {safe_err}\r\n").as_bytes()).await?;
             }
         }
         Ok(())
@@ -1566,7 +1755,27 @@ impl ImapSession {
             }
         };
         if !sel.read_only && self.has_scope(AuthScope::Write) {
-            let _ = self.state.store.imap_expunge(&sel.mailbox).await?;
+            let expunged = self
+                .state
+                .store
+                .imap_expunge_uids(&sel.mailbox, None)
+                .await?;
+            for entry in &expunged {
+                if entry.permanently_deleted {
+                    let _ = self
+                        .state
+                        .post_delete_message(&entry.message_id, &entry.attachment_ids)
+                        .await;
+                }
+                self.state.events.publish(
+                    EventSource::Imap,
+                    MailEvent::MessageDeleted {
+                        message_id: entry.message_id.clone(),
+                        thread_id: entry.thread_id.clone(),
+                        labels: entry.label_ids.clone(),
+                    },
+                );
+            }
         }
         self.auth = AuthState::Authenticated;
         write_flush(stream, format!("{tag} OK CLOSE completed\r\n").as_bytes()).await?;
@@ -1576,6 +1785,58 @@ impl ImapSession {
     async fn handle_expunge(
         &mut self,
         tag: &str,
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        self.handle_expunge_inner(tag, None, stream).await
+    }
+
+    async fn handle_uid_expunge(
+        &mut self,
+        tag: &str,
+        args: &[ImapArg],
+        stream: &mut BufReader<ImapStream>,
+    ) -> AppResult<()> {
+        let sel = match &self.auth {
+            AuthState::Selected(s) => s.clone(),
+            _ => {
+                write_flush(
+                    stream,
+                    format!("{tag} NO No mailbox selected\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let Some(uid_spec) = args.first().and_then(ImapArg::as_str_lossy) else {
+            write_flush(
+                stream,
+                format!("{tag} BAD UID EXPUNGE requires a UID sequence set\r\n").as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let snap_max_uid = sel.snapshot.last().map(|e| e.uid).unwrap_or(0);
+        // If the client gave explicit UIDs without `*`, parse them even if snapshot was empty.
+        let parse_max = if uid_spec.contains('*') {
+            snap_max_uid
+        } else {
+            snap_max_uid.max(1)
+        };
+        let ranges = match parse_sequence_set(&uid_spec, parse_max) {
+            Ok(r) => r,
+            Err(err) => {
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        self.handle_expunge_inner(tag, Some(&ranges), stream).await
+    }
+
+    async fn handle_expunge_inner(
+        &mut self,
+        tag: &str,
+        uid_ranges: Option<&[(u32, u32)]>,
         stream: &mut BufReader<ImapStream>,
     ) -> AppResult<()> {
         let sel = match &self.auth {
@@ -1603,40 +1864,64 @@ impl ImapSession {
             .await?;
             return Ok(());
         }
-        let mut expunged_seqs = self.state.store.imap_expunge(&sel.mailbox).await?;
-        expunged_seqs.sort_unstable();
 
-        // Refresh snapshot & emit events for removed messages.
+        let expunged = self
+            .state
+            .store
+            .imap_expunge_uids(&sel.mailbox, uid_ranges)
+            .await?;
+        for entry in &expunged {
+            if entry.permanently_deleted {
+                let _ = self
+                    .state
+                    .post_delete_message(&entry.message_id, &entry.attachment_ids)
+                    .await;
+            }
+            self.state.events.publish(
+                EventSource::Imap,
+                MailEvent::MessageDeleted {
+                    message_id: entry.message_id.clone(),
+                    thread_id: entry.thread_id.clone(),
+                    labels: entry.label_ids.clone(),
+                },
+            );
+        }
+
+        // Diff `sel.snapshot` against the fresh mailbox listing so every removed message
+        // (including concurrent deletions) is reported in strict RFC 3501 sequence order.
         let new_entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
         let remaining_ids: HashSet<&str> =
             new_entries.iter().map(|e| e.message_id.as_str()).collect();
-        let mut expunged_uids: Vec<u32> = Vec::new();
-        for old in &sel.snapshot {
-            if !remaining_ids.contains(old.message_id.as_str()) {
-                expunged_uids.push(old.uid);
-                self.state.events.publish(
-                    EventSource::Imap,
-                    MailEvent::MessageDeleted {
-                        message_id: old.message_id.clone(),
-                        thread_id: old.thread_id.clone(),
-                        labels: old.label_ids.clone(),
-                    },
-                );
-            }
-        }
+        let mut removed_seqs: Vec<u32> = sel
+            .snapshot
+            .iter()
+            .filter(|old| !remaining_ids.contains(old.message_id.as_str()))
+            .map(|old| old.seq)
+            .collect();
+        let removed_uids: Vec<u32> = sel
+            .snapshot
+            .iter()
+            .filter(|old| !remaining_ids.contains(old.message_id.as_str()))
+            .map(|old| old.uid)
+            .collect();
+        removed_seqs.sort_unstable();
 
         let mut out = String::new();
         if self.qresync_enabled {
             // RFC 7162 Section 3.2.10: emit VANISHED instead of EXPUNGE when QRESYNC is enabled.
-            if !expunged_uids.is_empty() {
-                let uid_set = format_sequence_set(&expunged_uids);
+            if !removed_uids.is_empty() {
+                let uid_set = format_sequence_set(&removed_uids);
                 out.push_str(&format!("* VANISHED {uid_set}\r\n"));
             }
         } else {
-            for (removed_so_far, pre_seq) in expunged_seqs.iter().enumerate() {
+            for (removed_so_far, pre_seq) in removed_seqs.iter().enumerate() {
                 let adjusted = pre_seq.saturating_sub(removed_so_far as u32).max(1);
                 out.push_str(&format!("* {adjusted} EXPUNGE\r\n"));
             }
+        }
+        let after_expunge_count = sel.snapshot.len().saturating_sub(removed_seqs.len());
+        if new_entries.len() > after_expunge_count {
+            out.push_str(&format!("* {} EXISTS\r\n", new_entries.len()));
         }
         if let AuthState::Selected(ref mut s) = self.auth {
             s.snapshot = new_entries;
@@ -1674,11 +1959,12 @@ impl ImapSession {
                 self.handle_copy_or_move(tag, rest, true, true, stream)
                     .await
             }
-            "EXPUNGE" => self.handle_expunge(tag, stream).await,
+            "EXPUNGE" => self.handle_uid_expunge(tag, rest, stream).await,
             other => {
+                let safe_other = sanitize_imap_text(other);
                 write_flush(
                     stream,
-                    format!("{tag} BAD Unsupported UID subcommand {other}\r\n").as_bytes(),
+                    format!("{tag} BAD Unsupported UID subcommand {safe_other}\r\n").as_bytes(),
                 )
                 .await
             }
@@ -1703,10 +1989,6 @@ impl ImapSession {
                 return Ok(());
             }
         };
-        let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
-        if let AuthState::Selected(ref mut s) = self.auth {
-            s.snapshot = entries.clone();
-        }
 
         // Skip optional CHARSET <charset>.
         let mut slice = args;
@@ -1718,12 +2000,15 @@ impl ImapSession {
             slice = &slice[2..];
         }
 
-        let max_seq = entries.len() as u32;
-        let max_uid = entries.last().map(|e| e.uid).unwrap_or(0);
+        // RFC 3501 §5.2: resolve sequence numbers strictly against `sel.snapshot` without
+        // overwriting the snapshot or shifting sequence numbers of concurrently deleted messages.
+        let max_seq = sel.snapshot.len() as u32;
+        let max_uid = sel.snapshot.last().map(|e| e.uid).unwrap_or(0);
         let criteria = match parse_search_criteria(slice, max_seq, max_uid) {
             Ok(c) => c,
             Err(err) => {
-                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                 return Ok(());
             }
         };
@@ -1733,18 +2018,45 @@ impl ImapSession {
             self.condstore_enabled = true;
         }
         let needs_full_msg = criteria_needs_full_message(&criteria);
+        let needs_raw = criteria_needs_raw_rfc2822(&criteria);
+
+        // Look up live message state by message_id so flags/modseq are fresh and
+        // concurrently deleted messages are skipped rather than shifting sequence numbers.
+        let live_by_id: HashMap<String, ImapMessageEntry> = self
+            .state
+            .store
+            .imap_list_messages(&sel.mailbox)
+            .await?
+            .into_iter()
+            .map(|e| (e.message_id.clone(), e))
+            .collect();
+
         let mut matched_ids = Vec::new();
         let mut max_matched_modseq: u64 = 0;
 
-        for entry in &entries {
+        for snap_entry in &sel.snapshot {
+            let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
+                continue;
+            };
+            let mut effective = live_entry.clone();
+            effective.seq = snap_entry.seq;
+            effective.uid = snap_entry.uid;
+
             let full_msg = if needs_full_msg {
-                self.state.store.get_message(&entry.message_id).await?
+                let mut loaded = self.state.store.get_message(&snap_entry.message_id).await?;
+                if needs_raw
+                    && is_external_blob_store(self.state.blobs.as_ref())
+                    && let Some(ref mut msg) = loaded
+                {
+                    msg.raw_rfc2822 = self.state.load_raw_rfc2822(msg).await?;
+                }
+                loaded
             } else {
                 None
             };
-            if eval_search_criteria(&criteria, entry, full_msg.as_ref()) {
-                matched_ids.push(if is_uid { entry.uid } else { entry.seq });
-                max_matched_modseq = max_matched_modseq.max(entry.modseq());
+            if eval_search_criteria(&criteria, &effective, full_msg.as_ref()) {
+                matched_ids.push(if is_uid { effective.uid } else { effective.seq });
+                max_matched_modseq = max_matched_modseq.max(effective.modseq());
             }
         }
 
@@ -1798,7 +2110,8 @@ impl ImapSession {
             match parse_fetch_modifiers(mod_arg, is_uid, self.qresync_enabled) {
                 Ok(m) => m,
                 Err(err) => {
-                    write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                    let safe_err = sanitize_imap_text(&err.to_string());
+                    write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                     return Ok(());
                 }
             }
@@ -1806,21 +2119,18 @@ impl ImapSession {
             FetchModifiers::default()
         };
 
-        let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
-        if let AuthState::Selected(ref mut s) = self.auth {
-            s.snapshot = entries.clone();
-        }
-
+        // RFC 3501 §5.2: resolve client sequence numbers strictly against `sel.snapshot`.
         let seq_spec = args[0].as_str_lossy().unwrap_or_default();
         let max_val = if is_uid {
-            entries.last().map(|e| e.uid).unwrap_or(0)
+            sel.snapshot.last().map(|e| e.uid).unwrap_or(0)
         } else {
-            entries.len() as u32
+            sel.snapshot.len() as u32
         };
         let ranges = match parse_sequence_set(&seq_spec, max_val) {
             Ok(r) => r,
             Err(err) => {
-                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                 return Ok(());
             }
         };
@@ -1841,12 +2151,18 @@ impl ImapSession {
             items.push("MODSEQ".to_string());
         }
 
+        let live_entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
+        let live_by_id: HashMap<String, ImapMessageEntry> = live_entries
+            .iter()
+            .map(|e| (e.message_id.clone(), e.clone()))
+            .collect();
+
         // RFC 7162 Section 3.2.6: UID FETCH ... (CHANGEDSINCE <n> VANISHED) emits
         // `* VANISHED (EARLIER) <uid_set>` for expunged UIDs matching the requested set.
         if modifiers.vanished
             && let Some(since) = modifiers.changed_since
         {
-            let existing_uids: HashSet<u32> = entries.iter().map(|e| e.uid).collect();
+            let existing_uids: HashSet<u32> = live_entries.iter().map(|e| e.uid).collect();
             let mut vanished = self
                 .state
                 .store
@@ -1881,58 +2197,80 @@ impl ImapSession {
             HashMap::new()
         };
 
-        let mut updated_entries = entries.clone();
+        let needs_raw = items.iter().any(|i| fetch_item_needs_raw(i));
+        let needs_msg = needs_raw || items.iter().any(|i| fetch_item_needs_stored_msg(i));
+        let mark_seen = items.iter().any(|item| {
+            let u = item.to_ascii_uppercase();
+            u == "RFC822" || u == "RFC822.TEXT" || u.starts_with("BODY[")
+        });
 
-        for (idx, entry) in entries.iter().enumerate() {
-            let key = if is_uid { entry.uid } else { entry.seq };
+        let mut updated_snapshot = sel.snapshot.clone();
+
+        for (idx, snap_entry) in sel.snapshot.iter().enumerate() {
+            let key = if is_uid {
+                snap_entry.uid
+            } else {
+                snap_entry.seq
+            };
             if !seq_set_contains(&ranges, key) {
                 continue;
             }
+            let Some(live_entry) = live_by_id.get(&snap_entry.message_id) else {
+                // Concurrently deleted: skip without shifting sequence numbers.
+                continue;
+            };
+            let mut current_entry = live_entry.clone();
+            current_entry.seq = snap_entry.seq;
+            current_entry.uid = snap_entry.uid;
+
             if let Some(since) = modifiers.changed_since
-                && entry.modseq() <= since
+                && current_entry.modseq() <= since
             {
                 continue;
             }
-            let Some(mut msg) = self.state.store.get_message(&entry.message_id).await? else {
-                continue;
-            };
-            if is_external_blob_store(self.state.blobs.as_ref()) {
-                msg.raw_rfc2822 = self.state.load_raw_rfc2822(&msg).await?;
-            }
 
-            let mut current_entry = entry.clone();
-            let mut mark_seen = false;
-            for item in &items {
-                let u = item.to_ascii_uppercase();
-                if u == "RFC822" || u == "RFC822.TEXT" || (u.starts_with("BODY[")) {
-                    mark_seen = true;
+            let msg_opt = if needs_msg {
+                let Some(mut msg) = self
+                    .state
+                    .store
+                    .get_message(&current_entry.message_id)
+                    .await?
+                else {
+                    continue;
+                };
+                if needs_raw && is_external_blob_store(self.state.blobs.as_ref()) {
+                    msg.raw_rfc2822 = self.state.load_raw_rfc2822(&msg).await?;
                 }
-            }
+                Some(msg)
+            } else {
+                None
+            };
+
             let mut marked_seen_now = false;
             if mark_seen
                 && !sel.read_only
                 && current_entry.label_ids.iter().any(|l| l == LABEL_UNREAD)
-            {
-                let is_flagged = current_entry.label_ids.iter().any(|l| l == LABEL_STARRED);
-                let is_draft = current_entry.label_ids.iter().any(|l| l == LABEL_DRAFT);
-                if let Ok(updated) = self
+                && let Ok(ImapStoreFlagsOutcome::Updated(updated)) = self
                     .state
                     .store
-                    .imap_set_flags(
+                    .imap_store_flags(
                         &current_entry.message_id,
-                        true,
-                        is_flagged,
-                        is_draft,
-                        current_entry.is_answered,
-                        current_entry.is_deleted,
+                        ImapFlagAction::Add,
+                        ImapFlagSet {
+                            seen: true,
+                            ..Default::default()
+                        },
+                        None,
                     )
                     .await
-                {
-                    current_entry.label_ids = updated.label_ids;
-                    current_entry.history_id = updated.history_id.max(1);
-                    updated_entries[idx] = current_entry.clone();
-                    marked_seen_now = true;
-                }
+            {
+                let updated = *updated;
+                current_entry.label_ids = updated.label_ids;
+                current_entry.history_id = updated.history_id.max(1);
+                current_entry.is_answered = updated.is_answered;
+                current_entry.is_deleted = updated.is_deleted;
+                updated_snapshot[idx] = current_entry.clone();
+                marked_seen_now = true;
             }
 
             let mut resp: Vec<u8> = Vec::new();
@@ -1951,7 +2289,13 @@ impl ImapSession {
                 } else if item.eq_ignore_ascii_case("MODSEQ") {
                     emitted_modseq = true;
                 }
-                write_fetch_item(&mut resp, item, &current_entry, &msg, &label_name_map);
+                write_fetch_item(
+                    &mut resp,
+                    item,
+                    &current_entry,
+                    msg_opt.as_ref(),
+                    &label_name_map,
+                );
             }
 
             if mark_seen && !sel.read_only && !emitted_flags {
@@ -1974,7 +2318,7 @@ impl ImapSession {
         }
 
         if let AuthState::Selected(ref mut s) = self.auth {
-            s.snapshot = updated_entries;
+            s.snapshot = updated_snapshot;
         }
 
         write_flush(stream, format!("{tag} OK FETCH completed\r\n").as_bytes()).await?;
@@ -2032,7 +2376,8 @@ impl ImapSession {
                     (us, 2usize)
                 }
                 Err(err) => {
-                    write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                    let safe_err = sanitize_imap_text(&err.to_string());
+                    write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                     return Ok(());
                 }
             }
@@ -2049,17 +2394,18 @@ impl ImapSession {
             return Ok(());
         }
 
-        let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
+        // RFC 3501 §5.2: resolve sequence numbers strictly against `sel.snapshot`.
         let seq_spec = args[0].as_str_lossy().unwrap_or_default();
         let max_val = if is_uid {
-            entries.last().map(|e| e.uid).unwrap_or(0)
+            sel.snapshot.last().map(|e| e.uid).unwrap_or(0)
         } else {
-            entries.len() as u32
+            sel.snapshot.len() as u32
         };
         let ranges = match parse_sequence_set(&seq_spec, max_val) {
             Ok(r) => r,
             Err(err) => {
-                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                 return Ok(());
             }
         };
@@ -2070,14 +2416,20 @@ impl ImapSession {
             .to_ascii_uppercase();
         let silent = action_raw.ends_with(".SILENT");
         let base_action = action_raw.trim_end_matches(".SILENT");
-        if !matches!(base_action, "FLAGS" | "+FLAGS" | "-FLAGS") {
-            write_flush(
-                stream,
-                format!("{tag} BAD Unsupported STORE action {action_raw}\r\n").as_bytes(),
-            )
-            .await?;
-            return Ok(());
-        }
+        let flag_action = match base_action {
+            "FLAGS" => ImapFlagAction::Replace,
+            "+FLAGS" => ImapFlagAction::Add,
+            "-FLAGS" => ImapFlagAction::Remove,
+            _ => {
+                let safe_action = sanitize_imap_text(&action_raw);
+                write_flush(
+                    stream,
+                    format!("{tag} BAD Unsupported STORE action {safe_action}\r\n").as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         let flags_idx = action_idx + 1;
         let mut req_flags: Vec<String> = Vec::new();
@@ -2099,65 +2451,50 @@ impl ImapSession {
         }
 
         let has_flag = |name: &str| req_flags.iter().any(|f| f.eq_ignore_ascii_case(name));
-        let mut updated_snapshot = entries.clone();
+        let flag_set = ImapFlagSet {
+            seen: has_flag("\\Seen"),
+            flagged: has_flag("\\Flagged"),
+            draft: has_flag("\\Draft"),
+            answered: has_flag("\\Answered"),
+            deleted: has_flag("\\Deleted"),
+        };
+
+        let mut updated_snapshot = sel.snapshot.clone();
         let mut modified_ids: Vec<u32> = Vec::new();
 
-        for (idx, entry) in entries.iter().enumerate() {
-            let key = if is_uid { entry.uid } else { entry.seq };
+        for (idx, snap_entry) in sel.snapshot.iter().enumerate() {
+            let key = if is_uid {
+                snap_entry.uid
+            } else {
+                snap_entry.seq
+            };
             if !seq_set_contains(&ranges, key) {
                 continue;
             }
-            if let Some(limit) = unchanged_since
-                && entry.modseq() > limit
-            {
-                modified_ids.push(key);
-                continue;
-            }
-            let cur_seen = !entry.label_ids.iter().any(|l| l == LABEL_UNREAD);
-            let cur_flagged = entry.label_ids.iter().any(|l| l == LABEL_STARRED);
-            let cur_draft = entry.label_ids.iter().any(|l| l == LABEL_DRAFT);
-            let cur_answered = entry.is_answered;
-            let cur_deleted = entry.is_deleted;
 
-            let (new_seen, new_flagged, new_draft, new_answered, new_deleted) = match base_action {
-                "FLAGS" => (
-                    has_flag("\\Seen"),
-                    has_flag("\\Flagged"),
-                    has_flag("\\Draft"),
-                    has_flag("\\Answered"),
-                    has_flag("\\Deleted"),
-                ),
-                "+FLAGS" => (
-                    cur_seen || has_flag("\\Seen"),
-                    cur_flagged || has_flag("\\Flagged"),
-                    cur_draft || has_flag("\\Draft"),
-                    cur_answered || has_flag("\\Answered"),
-                    cur_deleted || has_flag("\\Deleted"),
-                ),
-                "-FLAGS" => (
-                    cur_seen && !has_flag("\\Seen"),
-                    cur_flagged && !has_flag("\\Flagged"),
-                    cur_draft && !has_flag("\\Draft"),
-                    cur_answered && !has_flag("\\Answered"),
-                    cur_deleted && !has_flag("\\Deleted"),
-                ),
-                _ => unreachable!(),
-            };
-
-            let updated = self
+            // Atomic CAS against fresh DB `history_id` + skip concurrently deleted messages.
+            let updated = match self
                 .state
                 .store
-                .imap_set_flags(
-                    &entry.message_id,
-                    new_seen,
-                    new_flagged,
-                    new_draft,
-                    new_answered,
-                    new_deleted,
+                .imap_store_flags(
+                    &snap_entry.message_id,
+                    flag_action,
+                    flag_set,
+                    unchanged_since,
                 )
-                .await?;
+                .await?
+            {
+                ImapStoreFlagsOutcome::Updated(msg) => *msg,
+                ImapStoreFlagsOutcome::Modified => {
+                    modified_ids.push(key);
+                    continue;
+                }
+                ImapStoreFlagsOutcome::NotFound => {
+                    continue;
+                }
+            };
 
-            let old_set: HashSet<&str> = entry.label_ids.iter().map(String::as_str).collect();
+            let old_set: HashSet<&str> = snap_entry.label_ids.iter().map(String::as_str).collect();
             let new_set: HashSet<&str> = updated.label_ids.iter().map(String::as_str).collect();
             let added: Vec<String> = new_set
                 .difference(&old_set)
@@ -2179,7 +2516,7 @@ impl ImapSession {
                 );
             }
 
-            let mut new_entry = entry.clone();
+            let mut new_entry = snap_entry.clone();
             new_entry.label_ids = updated.label_ids;
             new_entry.history_id = updated.history_id.max(1);
             new_entry.is_answered = updated.is_answered;
@@ -2267,23 +2604,25 @@ impl ImapSession {
             return Ok(());
         }
 
-        let entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
+        // RFC 3501 §5.2: resolve sequence numbers strictly against `sel.snapshot`.
         let seq_spec = args[0].as_str_lossy().unwrap_or_default();
         let dst_mailbox = normalize_mailbox_name(&args[1].as_str_lossy().unwrap_or_default());
         let max_val = if is_uid {
-            entries.last().map(|e| e.uid).unwrap_or(0)
+            sel.snapshot.last().map(|e| e.uid).unwrap_or(0)
         } else {
-            entries.len() as u32
+            sel.snapshot.len() as u32
         };
         let ranges = match parse_sequence_set(&seq_spec, max_val) {
             Ok(r) => r,
             Err(err) => {
-                write_flush(stream, format!("{tag} BAD {err}\r\n").as_bytes()).await?;
+                let safe_err = sanitize_imap_text(&err.to_string());
+                write_flush(stream, format!("{tag} BAD {safe_err}\r\n").as_bytes()).await?;
                 return Ok(());
             }
         };
 
-        let matched: Vec<&ImapMessageEntry> = entries
+        let matched: Vec<&ImapMessageEntry> = sel
+            .snapshot
             .iter()
             .filter(|e| seq_set_contains(&ranges, if is_uid { e.uid } else { e.seq }))
             .collect();
@@ -2292,8 +2631,11 @@ impl ImapSession {
         let Some(dst_info) = self.state.store.imap_mailbox_info(&dst_mailbox).await? else {
             write_flush(
                 stream,
-                format!("{tag} NO [TRYCREATE] Mailbox does not exist: {dst_mailbox}\r\n")
-                    .as_bytes(),
+                format!(
+                    "{tag} NO [TRYCREATE] Mailbox does not exist: {}\r\n",
+                    imap_quote(&dst_mailbox)
+                )
+                .as_bytes(),
             )
             .await?;
             return Ok(());
@@ -2318,7 +2660,11 @@ impl ImapSession {
             None
         };
 
+        let moved_src_uids: HashSet<u32> = pairs.iter().map(|(s, _)| *s).collect();
         for entry in &matched {
+            if !moved_src_uids.contains(&entry.uid) {
+                continue;
+            }
             self.state.events.publish(
                 EventSource::Imap,
                 MailEvent::MessageUpdated {
@@ -2338,12 +2684,14 @@ impl ImapSession {
             let new_entries = self.state.store.imap_list_messages(&sel.mailbox).await?;
             let remaining: HashSet<&str> =
                 new_entries.iter().map(|e| e.message_id.as_str()).collect();
-            let mut removed_seqs: Vec<u32> = entries
+            let mut removed_seqs: Vec<u32> = sel
+                .snapshot
                 .iter()
                 .filter(|e| !remaining.contains(e.message_id.as_str()))
                 .map(|e| e.seq)
                 .collect();
-            let removed_uids: Vec<u32> = entries
+            let removed_uids: Vec<u32> = sel
+                .snapshot
                 .iter()
                 .filter(|e| !remaining.contains(e.message_id.as_str()))
                 .map(|e| e.uid)
@@ -2359,6 +2707,10 @@ impl ImapSession {
                     let adj = pre_seq.saturating_sub(idx as u32).max(1);
                     out.push_str(&format!("* {adj} EXPUNGE\r\n"));
                 }
+            }
+            let after_expunge_count = sel.snapshot.len().saturating_sub(removed_seqs.len());
+            if new_entries.len() > after_expunge_count {
+                out.push_str(&format!("* {} EXISTS\r\n", new_entries.len()));
             }
             if let AuthState::Selected(ref mut s) = self.auth {
                 s.snapshot = new_entries;
@@ -2387,16 +2739,21 @@ impl ImapSession {
         // Flush any changes that occurred right before subscribing.
         self.flush_selected_updates(stream).await?;
 
+        // Persistent buffer keeps partially received `DONE` bytes intact when `select!`
+        // wakes on an `EventBus` update (cancel-safe framing).
+        let mut line_buf: Vec<u8> = Vec::new();
+        let idle_deadline = tokio::time::sleep(IMAP_IDLE_TIMEOUT);
+        tokio::pin!(idle_deadline);
+
         loop {
             tokio::select! {
-                line_res = read_crlf_line(stream, 4096) => {
+                line_res = read_crlf_line_into(stream, &mut line_buf, 4096) => {
                     match line_res {
                         Ok(Some(line)) if line.trim().eq_ignore_ascii_case("DONE") => {
                             write_flush(stream, format!("{tag} OK IDLE terminated\r\n").as_bytes()).await?;
                             return Ok(true);
                         }
                         Ok(Some(_)) => {
-                            // Ignore stray empty/non-DONE lines while idling, or exit if malformed.
                             write_flush(stream, format!("{tag} BAD Expected DONE\r\n").as_bytes()).await?;
                             return Ok(true);
                         }
@@ -2421,6 +2778,10 @@ impl ImapSession {
                             return Ok(false);
                         }
                     }
+                }
+                () = &mut idle_deadline => {
+                    let _ = write_flush(stream, b"* BYE Autologout; idle for too long\r\n").await;
+                    return Ok(false);
                 }
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
@@ -2565,6 +2926,10 @@ fn parse_xoauth2_payload(decoded: &[u8]) -> Option<(String, String)> {
     }
 }
 
+fn is_valid_mailbox_name(name: &str) -> bool {
+    !name.is_empty() && !name.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
 fn is_reserved_mailbox(name: &str) -> bool {
     name.eq_ignore_ascii_case("INBOX")
         || name.eq_ignore_ascii_case("[Gmail]")
@@ -2622,14 +2987,29 @@ fn expand_fetch_items(arg: &ImapArg) -> Vec<String> {
     expanded
 }
 
+fn fetch_item_needs_raw(item: &str) -> bool {
+    let upper = item.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "RFC822" | "RFC822.HEADER" | "RFC822.TEXT" | "ENVELOPE" | "BODYSTRUCTURE" | "BODY"
+    ) || upper.starts_with("BODY[")
+        || upper.starts_with("BODY.PEEK[")
+}
+
+fn fetch_item_needs_stored_msg(item: &str) -> bool {
+    let upper = item.to_ascii_uppercase();
+    fetch_item_needs_raw(item) || matches!(upper.as_str(), "X-GM-MSGID" | "X-GM-THRID")
+}
+
 fn write_fetch_item(
     out: &mut Vec<u8>,
     item: &str,
     entry: &ImapMessageEntry,
-    msg: &StoredMessage,
+    msg: Option<&StoredMessage>,
     label_name_map: &HashMap<String, String>,
 ) {
     let upper = item.to_ascii_uppercase();
+    let raw_bytes: &[u8] = msg.map(|m| m.raw_rfc2822.as_slice()).unwrap_or(&[]);
     match upper.as_str() {
         "UID" => {
             out.extend_from_slice(format!("UID {}", entry.uid).as_bytes());
@@ -2642,44 +3022,58 @@ fn write_fetch_item(
             out.extend_from_slice(format!("MODSEQ ({})", entry.modseq()).as_bytes());
         }
         "INTERNALDATE" => {
-            let dt = format_internal_date(msg.internal_date_ms);
+            let ts = msg
+                .map(|m| m.internal_date_ms)
+                .unwrap_or(entry.internal_date_ms);
+            let dt = format_internal_date(ts);
             out.extend_from_slice(format!("INTERNALDATE {}", imap_quote(&dt)).as_bytes());
         }
         "RFC822.SIZE" => {
-            out.extend_from_slice(format!("RFC822.SIZE {}", msg.raw_rfc2822.len()).as_bytes());
+            let size = if !raw_bytes.is_empty() {
+                raw_bytes.len()
+            } else {
+                entry.size_estimate.max(0) as usize
+            };
+            out.extend_from_slice(format!("RFC822.SIZE {size}").as_bytes());
         }
         "RFC822" => {
             out.extend_from_slice(b"RFC822 ");
-            append_literal(out, &msg.raw_rfc2822);
+            append_literal(out, raw_bytes);
         }
         "RFC822.HEADER" => {
-            let hdr = extract_body_section(&msg.raw_rfc2822, &parse_body_section("HEADER"), None);
+            let hdr = extract_body_section(raw_bytes, &parse_body_section("HEADER"), None);
             out.extend_from_slice(b"RFC822.HEADER ");
             append_literal(out, &hdr);
         }
         "RFC822.TEXT" => {
-            let txt = extract_body_section(&msg.raw_rfc2822, &parse_body_section("TEXT"), None);
+            let txt = extract_body_section(raw_bytes, &parse_body_section("TEXT"), None);
             out.extend_from_slice(b"RFC822.TEXT ");
             append_literal(out, &txt);
         }
         "ENVELOPE" => {
-            let env = format_envelope(&msg.raw_rfc2822);
+            let env = format_envelope(raw_bytes);
             out.extend_from_slice(format!("ENVELOPE {env}").as_bytes());
         }
         "BODYSTRUCTURE" => {
-            let bs = format_bodystructure(&msg.raw_rfc2822, true);
+            let bs = format_bodystructure(raw_bytes, true);
             out.extend_from_slice(format!("BODYSTRUCTURE {bs}").as_bytes());
         }
         "BODY" => {
-            let bs = format_bodystructure(&msg.raw_rfc2822, false);
+            let bs = format_bodystructure(raw_bytes, false);
             out.extend_from_slice(format!("BODY {bs}").as_bytes());
         }
         "X-GM-MSGID" => {
-            let id = derive_xgm_u64(msg.upstream_gmail_id.as_deref(), &msg.id);
+            let id = match msg {
+                Some(m) => derive_xgm_u64(m.upstream_gmail_id.as_deref(), &m.id),
+                None => derive_xgm_u64(None, &entry.message_id),
+            };
             out.extend_from_slice(format!("X-GM-MSGID {id}").as_bytes());
         }
         "X-GM-THRID" => {
-            let id = derive_xgm_u64(msg.upstream_thread_id.as_deref(), &msg.thread_id);
+            let id = match msg {
+                Some(m) => derive_xgm_u64(m.upstream_thread_id.as_deref(), &m.thread_id),
+                None => derive_xgm_u64(None, &entry.thread_id),
+            };
             out.extend_from_slice(format!("X-GM-THRID {id}").as_bytes());
         }
         "X-GM-LABELS" => {
@@ -2690,7 +3084,7 @@ fn write_fetch_item(
             // Handle BODY[...] and BODY.PEEK[...]<offset.count>
             if let Some((section_raw, partial)) = parse_body_fetch_item(item) {
                 let section = parse_body_section(&section_raw);
-                let data = extract_body_section(&msg.raw_rfc2822, &section, partial);
+                let data = extract_body_section(raw_bytes, &section, partial);
                 let header_label = match partial {
                     Some((offset, _)) => format!("BODY[{section_raw}]<{offset}> "),
                     None => format!("BODY[{section_raw}] "),
@@ -2974,13 +3368,29 @@ enum SearchKey {
 }
 
 fn parse_search_criteria(args: &[ImapArg], max_seq: u32, max_uid: u32) -> AppResult<SearchKey> {
+    parse_search_criteria_depth(args, max_seq, max_uid, 0)
+}
+
+fn parse_search_criteria_depth(
+    args: &[ImapArg],
+    max_seq: u32,
+    max_uid: u32,
+    depth: usize,
+) -> AppResult<SearchKey> {
+    if depth > MAX_SEARCH_DEPTH {
+        return Err(AppError::BadRequest(format!(
+            "SEARCH criteria exceeds maximum nesting depth of {MAX_SEARCH_DEPTH}"
+        )));
+    }
     if args.is_empty() {
         return Ok(SearchKey::All);
     }
     let mut pos = 0usize;
     let mut keys = Vec::new();
     while pos < args.len() {
-        keys.push(parse_one_search_key(args, &mut pos, max_seq, max_uid)?);
+        keys.push(parse_one_search_key(
+            args, &mut pos, max_seq, max_uid, depth,
+        )?);
     }
     if keys.len() == 1 {
         Ok(keys.pop().unwrap())
@@ -2994,7 +3404,13 @@ fn parse_one_search_key(
     pos: &mut usize,
     max_seq: u32,
     max_uid: u32,
+    depth: usize,
 ) -> AppResult<SearchKey> {
+    if depth > MAX_SEARCH_DEPTH {
+        return Err(AppError::BadRequest(format!(
+            "SEARCH criteria exceeds maximum nesting depth of {MAX_SEARCH_DEPTH}"
+        )));
+    }
     if *pos >= args.len() {
         return Err(AppError::BadRequest(
             "Unexpected end of SEARCH criteria".to_string(),
@@ -3004,7 +3420,7 @@ fn parse_one_search_key(
     *pos += 1;
 
     if let ImapArg::List(sub) = arg {
-        return parse_search_criteria(sub, max_seq, max_uid);
+        return parse_search_criteria_depth(sub, max_seq, max_uid, depth + 1);
     }
 
     let tok = arg
@@ -3132,12 +3548,12 @@ fn parse_one_search_key(
             Ok(SearchKey::XGmThrId(n))
         }
         "NOT" => {
-            let inner = parse_one_search_key(args, pos, max_seq, max_uid)?;
+            let inner = parse_one_search_key(args, pos, max_seq, max_uid, depth + 1)?;
             Ok(SearchKey::Not(Box::new(inner)))
         }
         "OR" => {
-            let left = parse_one_search_key(args, pos, max_seq, max_uid)?;
-            let right = parse_one_search_key(args, pos, max_seq, max_uid)?;
+            let left = parse_one_search_key(args, pos, max_seq, max_uid, depth + 1)?;
+            let right = parse_one_search_key(args, pos, max_seq, max_uid, depth + 1)?;
             Ok(SearchKey::Or(Box::new(left), Box::new(right)))
         }
         _ => {
@@ -3188,6 +3604,21 @@ fn criteria_needs_full_message(key: &SearchKey) -> bool {
     }
 }
 
+fn criteria_needs_raw_rfc2822(key: &SearchKey) -> bool {
+    match key {
+        SearchKey::Body(_)
+        | SearchKey::Text(_)
+        | SearchKey::Header(_, _)
+        | SearchKey::SentSince(_)
+        | SearchKey::SentBefore(_)
+        | SearchKey::SentOn(_) => true,
+        SearchKey::Not(inner) => criteria_needs_raw_rfc2822(inner),
+        SearchKey::Or(a, b) => criteria_needs_raw_rfc2822(a) || criteria_needs_raw_rfc2822(b),
+        SearchKey::And(list) => list.iter().any(criteria_needs_raw_rfc2822),
+        _ => false,
+    }
+}
+
 fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack
         .to_ascii_lowercase()
@@ -3228,6 +3659,11 @@ fn eval_search_criteria(
         SearchKey::Body(s) => msg.is_some_and(|m| {
             contains_ci(&m.text_body, s)
                 || m.html_body.as_deref().is_some_and(|h| contains_ci(h, s))
+                || (!m.raw_rfc2822.is_empty()
+                    && contains_ci(
+                        &String::from_utf8_lossy(split_raw_header_and_body(&m.raw_rfc2822).1),
+                        s,
+                    ))
         }),
         SearchKey::Text(s) => msg.is_some_and(|m| {
             let raw = String::from_utf8_lossy(&m.raw_rfc2822);
@@ -3292,5 +3728,28 @@ mod tests {
             parse_xoauth2_payload(valid.as_bytes()),
             Some(("alice@example.com".to_string(), "tok-123".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_search_criteria_enforces_max_depth() {
+        let mut deep_not: Vec<ImapArg> =
+            (0..40).map(|_| ImapArg::Atom("NOT".to_string())).collect();
+        deep_not.push(ImapArg::Atom("SEEN".to_string()));
+        let err = parse_search_criteria(&deep_not, 10, 10)
+            .expect_err("deep NOT nesting must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let mut deep_or: Vec<ImapArg> = (0..40).map(|_| ImapArg::Atom("OR".to_string())).collect();
+        for _ in 0..41 {
+            deep_or.push(ImapArg::Atom("SEEN".to_string()));
+        }
+        let err =
+            parse_search_criteria(&deep_or, 10, 10).expect_err("deep OR nesting must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        // Within depth limit (10 nested NOTs) succeeds cleanly.
+        let mut ok_not: Vec<ImapArg> = (0..10).map(|_| ImapArg::Atom("NOT".to_string())).collect();
+        ok_not.push(ImapArg::Atom("SEEN".to_string()));
+        assert!(parse_search_criteria(&ok_not, 10, 10).is_ok());
     }
 }
