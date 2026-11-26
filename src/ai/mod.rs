@@ -4,6 +4,7 @@
 //!
 //! Owned by the `ai-mcp` worker.
 
+pub mod reply_context;
 pub mod rules;
 pub mod safety;
 pub mod scheduler;
@@ -71,6 +72,9 @@ use crate::{
     transport::{OutboundAttachment, OutboundMessage},
 };
 
+pub use reply_context::{
+    ReplyContextOptions, ReplyContextResponse, clean_subject, execute_get_reply_context,
+};
 pub use safety::{
     ConfigOutboundPolicy, DlpOutboundPolicy, FirstContactPolicy, OutboundCheck, OutboundDecision,
     OutboundPolicy, OutboundPolicyChain, PolicyCheck, check_recipients_policy,
@@ -192,6 +196,7 @@ pub fn router() -> Router<AppState> {
 /// Build the AI-first `/v1` router:
 /// - `GET /v1/capabilities`
 /// - `GET /v1/threads`, `POST /v1/threads/batch_triage`, `GET /v1/threads/{id}`, `POST /v1/threads/{id}/triage`
+/// - `GET /v1/threads/{id}/reply-context`
 /// - `GET /v1/messages`, `GET /v1/messages/{id}`, `GET /v1/messages/{id}/attachments/{attachment_id}`
 /// - `POST /v1/messages/send`, `POST /v1/messages/modify`
 /// - `GET /v1/drafts`, `POST /v1/drafts`, `POST /v1/drafts/{id}/send`, `DELETE /v1/drafts/{id}`
@@ -207,6 +212,10 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/threads/batch_triage", post(batch_triage_handler))
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/triage", post(triage_thread_handler))
+        .route(
+            "/v1/threads/{id}/reply-context",
+            get(get_reply_context_handler),
+        )
         .route(
             "/v1/threads/{id}/snooze",
             post(snooze_thread_handler).delete(unsnooze_thread_handler),
@@ -3368,6 +3377,14 @@ struct ReadThreadParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ReplyContextParams {
+    max_body_chars: Option<usize>,
+    max_style_samples: Option<usize>,
+    max_related_threads: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ListMessagesParams {
     q: Option<String>,
     label: Option<String>,
@@ -3504,6 +3521,7 @@ async fn get_capabilities(
             "GET /v1/threads",
             "POST /v1/threads/batch_triage",
             "GET /v1/threads/{id}",
+            "GET /v1/threads/{id}/reply-context",
             "POST /v1/threads/{id}/triage",
             "POST /v1/threads/{id}/snooze",
             "DELETE /v1/threads/{id}/snooze",
@@ -3671,6 +3689,38 @@ async fn get_thread(
         .await;
 
     let value = serde_json::to_value(projected).map_err(AppError::from)?;
+    Ok(Json(project_fields(value, params.fields.as_deref())?))
+}
+
+async fn get_reply_context_handler(
+    MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Query(params): Query<ReplyContextParams>,
+) -> Result<Json<Value>, AiError> {
+    let ctx = execute_get_reply_context(
+        &state,
+        &id,
+        ReplyContextOptions {
+            max_body_chars: params.max_body_chars,
+            max_style_samples: params.max_style_samples,
+            max_related_threads: params.max_related_threads,
+        },
+    )
+    .await?;
+
+    state
+        .record_audit(
+            principal.as_ref().map(|Extension(p)| p),
+            "/v1",
+            "read",
+            vec![id],
+            "ok",
+            Some("reply_context".to_string()),
+        )
+        .await;
+
+    let value = serde_json::to_value(ctx).map_err(AppError::from)?;
     Ok(Json(project_fields(value, params.fields.as_deref())?))
 }
 

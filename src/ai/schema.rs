@@ -66,6 +66,22 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
                 }
             }
         },
+        "mail.reply_context": {
+            "endpoint": "GET /v1/threads/{id}/reply-context",
+            "mcp_tool": "get_reply_context",
+            "description": "Fetch the quote-stripped thread, annotation, participant contacts, recent sent style samples to the primary recipient, and related threads in one call.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "max_body_chars": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "max_style_samples": { "type": "integer", "minimum": 0, "maximum": 10, "default": 3 },
+                    "max_related_threads": { "type": "integer", "minimum": 0, "maximum": 20, "default": 5 },
+                    "fields": { "type": "string" }
+                }
+            }
+        },
         "mail.read": {
             "endpoint": "GET /v1/messages/{id} | GET /v1/threads/{id}",
             "mcp_tool": "read_email | read_thread",
@@ -414,6 +430,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "snooze" | "snooze_thread" => "mail.snooze",
             "scheduled" | "list_scheduled_sends" | "cancel_scheduled_send" => "mail.scheduled",
             "annotations" | "annotate_thread" | "get_thread_annotations" => "mail.annotations",
+            "reply_context" | "reply-context" | "get_reply_context" => "mail.reply_context",
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
@@ -453,6 +470,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "POST /v1/threads/{id}/triage",
             "POST /v1/threads/{id}/snooze",
             "DELETE /v1/threads/{id}/snooze",
+            "GET /v1/threads/{id}/reply-context",
             "GET /v1/threads/{id}/annotations",
             "PUT /v1/threads/{id}/annotations",
             "PATCH /v1/threads/{id}/annotations",
