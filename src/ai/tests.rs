@@ -1131,6 +1131,7 @@ impl MailStore for TestMailStore {
     async fn claim_due_scheduled_sends(
         &self,
         _now_ms: i64,
+        _stale_lease_ms: i64,
     ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
         Ok(Vec::new())
     }

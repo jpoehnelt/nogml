@@ -1322,6 +1322,9 @@ pub async fn run_stdio(state: AppState) -> AppResult<()> {
     run_stdio_io(state, stdin, stdout).await
 }
 
+/// Maximum number of JSON-RPC requests permitted in a single MCP batch array.
+pub const MAX_MCP_BATCH_REQUESTS: usize = 100;
+
 /// Transport-agnostic stdio framing loop (used by `run_stdio` and unit tests).
 pub async fn run_stdio_io<R, W>(state: AppState, reader: R, mut writer: W) -> AppResult<()>
 where
@@ -1348,6 +1351,16 @@ where
                         Value::Null,
                         ERR_INVALID_REQUEST,
                         "Empty JSON-RPC batch",
+                        None,
+                    ))
+                } else if batch.len() > MAX_MCP_BATCH_REQUESTS {
+                    Some(jsonrpc_error(
+                        Value::Null,
+                        ERR_INVALID_REQUEST,
+                        format!(
+                            "JSON-RPC batch exceeds maximum of {MAX_MCP_BATCH_REQUESTS} requests (got {})",
+                            batch.len()
+                        ),
                         None,
                     ))
                 } else {
@@ -1466,6 +1479,16 @@ async fn mcp_http_post(
                     Value::Null,
                     ERR_INVALID_REQUEST,
                     "Empty JSON-RPC batch",
+                    None,
+                ))
+            } else if batch.len() > MAX_MCP_BATCH_REQUESTS {
+                Some(jsonrpc_error(
+                    Value::Null,
+                    ERR_INVALID_REQUEST,
+                    format!(
+                        "JSON-RPC batch exceeds maximum of {MAX_MCP_BATCH_REQUESTS} requests (got {})",
+                        batch.len()
+                    ),
                     None,
                 ))
             } else {

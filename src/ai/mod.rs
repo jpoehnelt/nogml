@@ -2225,7 +2225,7 @@ pub async fn execute_delete_thread_annotation(
     }))
 }
 
-/// Parse an approval status query string (`pending`, `approved`, `rejected`, `expired`, `all`, or empty).
+/// Parse an approval status query string (`pending`, `approving`, `approved`, `rejected`, `expired`, `all`, or empty).
 pub fn parse_approval_status_filter(raw: Option<&str>) -> AppResult<Option<ApprovalStatus>> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
@@ -2233,7 +2233,10 @@ pub fn parse_approval_status_filter(raw: Option<&str>) -> AppResult<Option<Appro
         Some(s) => ApprovalStatus::parse_str(s).map(Some).ok_or_else(|| {
             AppError::validation(
                 format!("Invalid approval status filter '{s}'"),
-                Some("Use one of: pending, approved, rejected, expired, or all.".to_string()),
+                Some(
+                    "Use one of: pending, approving, approved, rejected, expired, or all."
+                        .to_string(),
+                ),
             )
         }),
     }
@@ -2277,35 +2280,20 @@ pub async fn execute_approve_approval(
     let in_flight_key = format!("{}:{}", state.mailbox_id(), id);
     let _in_flight = ApprovalInFlightGuard::try_acquire(&state.approval_in_flight, &in_flight_key)?;
 
-    let approval = state
-        .store
-        .get_pending_approval(id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Approval '{id}' not found")))?;
-
     let now_ms = Utc::now().timestamp_millis();
-    if approval.status == ApprovalStatus::Expired || approval.expires_at_ms <= now_ms {
-        // Persist expired status atomically in the store and return 409 Conflict.
-        let _ = state
-            .store
-            .resolve_pending_approval(id, ApprovalStatus::Approved, None, None, None, None)
-            .await;
-        return Err(AppError::Conflict(format!("Approval '{id}' has expired")));
-    }
-
-    if approval.status != ApprovalStatus::Pending {
-        return Err(AppError::Conflict(format!(
-            "Approval '{id}' is already {}",
-            approval.status
-        )));
-    }
+    // Atomically claim the approval in the backing store (`Pending -> Approving`) before
+    // invoking the transport so concurrent multi-node replicas can never double-send.
+    let approval = state.store.claim_pending_approval(id, now_ms).await?;
 
     let outbound = &approval.outbound_message;
     let idempotency_key = format!("approval-{id}");
-    let send_outcome = state
-        .transport
-        .send(outbound, Some(&idempotency_key))
-        .await?;
+    let send_outcome = match state.transport.send(outbound, Some(&idempotency_key)).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = state.store.release_claimed_approval(id).await;
+            return Err(err);
+        }
+    };
 
     let raw_rfc2822 = crate::transport::ensure_raw_rfc2822(outbound, &state.config.user_email)?;
     let text_body = outbound.text.clone().unwrap_or_default();
@@ -2346,9 +2334,13 @@ pub async fn execute_approve_approval(
             .ok()
             .flatten()
             .map(|d| d.message.id);
+        let att_ids = match draft_msg_id.as_deref() {
+            Some(mid) => state.collect_external_attachment_ids(mid).await,
+            None => Vec::new(),
+        };
         let _ = state.store.delete_draft(draft_id).await;
         if let Some(mid) = draft_msg_id {
-            let _ = state.post_delete_message(&mid, &[]).await;
+            let _ = state.post_delete_message(&mid, &att_ids).await;
         }
     }
 

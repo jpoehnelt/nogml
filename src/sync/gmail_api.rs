@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -51,6 +51,102 @@ fn token_cache() -> &'static Mutex<HashMap<String, CachedToken>> {
     TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn oauth_cache_key(config: &Config) -> Option<String> {
+    let client_id = config
+        .gmail_client_id
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
+    let refresh_token = config
+        .gmail_refresh_token
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
+    Some(format!(
+        "{}|{}|{}",
+        config.gmail_oauth_token_url, client_id, refresh_token
+    ))
+}
+
+/// Remove any cached OAuth2 access token for `config` so the next request refreshes it.
+pub fn invalidate_access_token(config: &Config) {
+    if let Some(key) = oauth_cache_key(config)
+        && let Ok(mut guard) = token_cache().lock()
+    {
+        guard.remove(&key);
+    }
+}
+
+#[derive(Clone)]
+struct GmailAuth {
+    config: Arc<Config>,
+    current_token: Arc<tokio::sync::RwLock<String>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl GmailAuth {
+    async fn acquire(client: &Client, config: Arc<Config>) -> AppResult<Self> {
+        let token = acquire_access_token(client, &config).await?;
+        Ok(Self {
+            config,
+            current_token: Arc::new(tokio::sync::RwLock::new(token)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    async fn token(&self) -> String {
+        self.current_token.read().await.clone()
+    }
+
+    fn can_refresh(&self) -> bool {
+        let has_static = self
+            .config
+            .gmail_access_token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        !has_static
+            && self
+                .config
+                .gmail_client_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && self
+                .config
+                .gmail_client_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && self
+                .config
+                .gmail_refresh_token
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+    }
+
+    /// On HTTP 401 Unauthorized, invalidate `TOKEN_CACHE`, refresh the OAuth2 access token once
+    /// (serialized across concurrent tasks), and return the fresh token.
+    async fn refresh_after_401(
+        &self,
+        client: &Client,
+        failed_token: &str,
+    ) -> AppResult<Option<String>> {
+        if !self.can_refresh() {
+            return Ok(None);
+        }
+        let _guard = self.refresh_lock.lock().await;
+        {
+            let cur = self.current_token.read().await;
+            if *cur != failed_token {
+                return Ok(Some(cur.clone()));
+            }
+        }
+        invalidate_access_token(&self.config);
+        let refreshed = acquire_access_token(client, &self.config).await?;
+        {
+            let mut cur = self.current_token.write().await;
+            *cur = refreshed.clone();
+        }
+        Ok(Some(refreshed))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
@@ -87,14 +183,14 @@ impl SyncSource for GmailApiSyncSource {
         opts: &SyncRunOptions,
     ) -> AppResult<PullReport> {
         let client = build_http_client()?;
-        let token = acquire_access_token(&client, &state.config).await?;
+        let auth = GmailAuth::acquire(&client, state.config.clone()).await?;
         let base = state.config.gmail_api_base_url.trim_end_matches('/');
         let user_id = encode_path_segment(&state.config.gmail_user_id);
 
         let mut report = PullReport::default();
 
         // 1. Sync upstream user labels and build upstream_label_id -> local_label_id map.
-        let label_map = sync_labels(&client, base, &user_id, &token, state, &mut report).await?;
+        let label_map = sync_labels(&client, base, &user_id, &auth, state, &mut report).await?;
 
         // 2. Attempt incremental sync if we have a checkpoint and `full` was not requested.
         let mut need_full = opts.full || sync_state.last_history_id.is_none();
@@ -103,7 +199,7 @@ impl SyncSource for GmailApiSyncSource {
                 &client,
                 base,
                 &user_id,
-                &token,
+                &auth,
                 &start_history_id,
                 &label_map,
                 state,
@@ -133,7 +229,7 @@ impl SyncSource for GmailApiSyncSource {
                 &client,
                 base,
                 &user_id,
-                &token,
+                &auth,
                 opts,
                 &label_map,
                 state,
@@ -161,7 +257,7 @@ impl SyncSource for GmailApiSyncSource {
         }
 
         let client = build_http_client()?;
-        let token = acquire_access_token(&client, &state.config).await?;
+        let auth = GmailAuth::acquire(&client, state.config.clone()).await?;
         let base = state.config.gmail_api_base_url.trim_end_matches('/');
         let user_id = encode_path_segment(&state.config.gmail_user_id);
 
@@ -198,7 +294,7 @@ impl SyncSource for GmailApiSyncSource {
                         remove_label_ids,
                     })?;
                     let (status, body) =
-                        request_with_retry(&client, Method::POST, &url, &token, Some(payload))
+                        request_with_retry(&client, Method::POST, &url, &auth, Some(payload))
                             .await?;
                     if status == StatusCode::NOT_FOUND {
                         warn!(
@@ -237,7 +333,7 @@ impl SyncSource for GmailApiSyncSource {
                             &client,
                             Method::POST,
                             &modify_url,
-                            &token,
+                            &auth,
                             Some(payload),
                         )
                         .await?;
@@ -263,7 +359,7 @@ impl SyncSource for GmailApiSyncSource {
                     let trash_url =
                         format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}/trash");
                     let (status, body) =
-                        request_with_retry(&client, Method::POST, &trash_url, &token, None).await?;
+                        request_with_retry(&client, Method::POST, &trash_url, &auth, None).await?;
                     if status == StatusCode::NOT_FOUND {
                         warn!(
                             upstream_id = %mutation.upstream_id,
@@ -287,7 +383,7 @@ impl SyncSource for GmailApiSyncSource {
                     let delete_url =
                         format!("{base}/gmail/v1/users/{user_id}/messages/{encoded_id}");
                     let (status, body) =
-                        request_with_retry(&client, Method::DELETE, &delete_url, &token, None)
+                        request_with_retry(&client, Method::DELETE, &delete_url, &auth, None)
                             .await?;
                     if status == StatusCode::NOT_FOUND {
                         debug!(
@@ -415,12 +511,12 @@ async fn sync_labels(
     client: &Client,
     base: &str,
     user_id: &str,
-    token: &str,
+    auth: &GmailAuth,
     state: &AppState,
     report: &mut PullReport,
 ) -> AppResult<HashMap<String, String>> {
     let url = format!("{base}/gmail/v1/users/{user_id}/labels");
-    let (status, body) = get_with_retry(client, &url, token).await?;
+    let (status, body) = get_with_retry(client, &url, auth).await?;
     if !status.is_success() {
         return Err(AppError::Upstream {
             status: status.as_u16(),
@@ -467,7 +563,7 @@ async fn run_incremental(
     client: &Client,
     base: &str,
     user_id: &str,
-    token: &str,
+    auth: &GmailAuth,
     start_history_id: &str,
     label_map: &HashMap<String, String>,
     state: &AppState,
@@ -487,7 +583,7 @@ async fn run_incremental(
             url.push_str(&encode_path_segment(pt));
         }
 
-        let (status, body) = get_with_retry(client, &url, token).await?;
+        let (status, body) = get_with_retry(client, &url, auth).await?;
         if status == StatusCode::NOT_FOUND {
             return Ok(IncrementalOutcome::HistoryExpired);
         }
@@ -518,8 +614,12 @@ async fn run_incremental(
                     continue;
                 }
                 to_fetch.remove(&uid);
+                let att_ids = match state.store.find_message_by_upstream_id(&uid).await? {
+                    Some(existing) => state.collect_external_attachment_ids(&existing.id).await,
+                    None => Vec::new(),
+                };
                 if let Some(removed_msg) = state.store.delete_message_by_upstream_id(&uid).await? {
-                    let _ = state.post_delete_message(&removed_msg.id, &[]).await;
+                    let _ = state.post_delete_message(&removed_msg.id, &att_ids).await;
                     report.messages_deleted += 1;
                     state.events.publish(
                         EventSource::GmailSync,
@@ -541,7 +641,7 @@ async fn run_incremental(
                     if !mapped.is_empty() {
                         let updated = state
                             .store
-                            .modify_message_labels(&local.id, &mapped, &[])
+                            .modify_synced_message_labels(&local.id, &mapped, &[])
                             .await?;
                         report.messages_updated += 1;
                         state.events.publish(
@@ -568,7 +668,7 @@ async fn run_incremental(
                     if !mapped.is_empty() {
                         let updated = state
                             .store
-                            .modify_message_labels(&local.id, &[], &mapped)
+                            .modify_synced_message_labels(&local.id, &[], &mapped)
                             .await?;
                         report.messages_updated += 1;
                         state.events.publish(
@@ -595,7 +695,7 @@ async fn run_incremental(
 
     if !to_fetch.is_empty() {
         let ids: Vec<String> = to_fetch.into_iter().collect();
-        fetch_and_upsert_messages(client, base, user_id, token, ids, label_map, state, report)
+        fetch_and_upsert_messages(client, base, user_id, auth, ids, label_map, state, report)
             .await?;
     }
 
@@ -609,7 +709,7 @@ async fn run_full_backfill(
     client: &Client,
     base: &str,
     user_id: &str,
-    token: &str,
+    auth: &GmailAuth,
     opts: &SyncRunOptions,
     label_map: &HashMap<String, String>,
     state: &AppState,
@@ -617,7 +717,7 @@ async fn run_full_backfill(
 ) -> AppResult<String> {
     // Capture baseline historyId BEFORE listing messages so concurrent changes aren't missed.
     let profile_url = format!("{base}/gmail/v1/users/{user_id}/profile");
-    let (status, body) = get_with_retry(client, &profile_url, token).await?;
+    let (status, body) = get_with_retry(client, &profile_url, auth).await?;
     if !status.is_success() {
         return Err(AppError::Upstream {
             status: status.as_u16(),
@@ -651,7 +751,7 @@ async fn run_full_backfill(
             url.push_str(&encode_path_segment(pt));
         }
 
-        let (status, body) = get_with_retry(client, &url, token).await?;
+        let (status, body) = get_with_retry(client, &url, auth).await?;
         if !status.is_success() {
             return Err(AppError::Upstream {
                 status: status.as_u16(),
@@ -709,7 +809,7 @@ async fn run_full_backfill(
         client,
         base,
         user_id,
-        token,
+        auth,
         missing_ids,
         label_map,
         state,
@@ -725,7 +825,7 @@ async fn fetch_and_upsert_messages(
     client: &Client,
     base: &str,
     user_id: &str,
-    token: &str,
+    auth: &GmailAuth,
     ids: Vec<String>,
     label_map: &HashMap<String, String>,
     state: &AppState,
@@ -737,9 +837,9 @@ async fn fetch_and_upsert_messages(
             "{base}/gmail/v1/users/{user_id}/messages/{}?format=raw",
             encode_path_segment(&id)
         );
-        let token = token.to_string();
+        let auth = auth.clone();
         async move {
-            let res = get_with_retry(&client, &url, &token).await;
+            let res = get_with_retry(&client, &url, &auth).await;
             (id, res)
         }
     }))
@@ -830,23 +930,26 @@ fn map_local_to_upstream_labels(
 async fn get_with_retry(
     client: &Client,
     url: &str,
-    bearer_token: &str,
+    auth: &GmailAuth,
 ) -> AppResult<(StatusCode, Vec<u8>)> {
-    request_with_retry(client, Method::GET, url, bearer_token, None).await
+    request_with_retry(client, Method::GET, url, auth, None).await
 }
 
 async fn request_with_retry(
     client: &Client,
     method: Method,
     url: &str,
-    bearer_token: &str,
+    auth: &GmailAuth,
     json_body: Option<Vec<u8>>,
 ) -> AppResult<(StatusCode, Vec<u8>)> {
     let mut delay = Duration::from_millis(100);
-    for attempt in 0..3 {
+    let mut refreshed_on_401 = false;
+    let mut attempt = 0u8;
+    loop {
+        let bearer_token = auth.token().await;
         let mut req = client
             .request(method.clone(), url)
-            .bearer_auth(bearer_token);
+            .bearer_auth(&bearer_token);
         if let Some(ref body) = json_body {
             req = req
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -857,8 +960,20 @@ async fn request_with_retry(
             Ok(r) => {
                 let status = r.status();
                 let bytes = r.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+                if status == StatusCode::UNAUTHORIZED
+                    && !refreshed_on_401
+                    && auth
+                        .refresh_after_401(client, &bearer_token)
+                        .await?
+                        .is_some()
+                {
+                    refreshed_on_401 = true;
+                    debug!(url = %url, "Refreshed Gmail OAuth2 token after HTTP 401; retrying request");
+                    continue;
+                }
                 let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
                 if retryable && attempt < 2 {
+                    attempt += 1;
                     tokio::time::sleep(delay).await;
                     delay *= 3;
                     continue;
@@ -867,6 +982,7 @@ async fn request_with_retry(
             }
             Err(err) => {
                 if attempt < 2 {
+                    attempt += 1;
                     tokio::time::sleep(delay).await;
                     delay *= 3;
                     continue;
@@ -875,7 +991,6 @@ async fn request_with_retry(
             }
         }
     }
-    unreachable!("loop always returns")
 }
 
 /// Decode base64url (unpadded or padded) or standard base64 tolerantly.

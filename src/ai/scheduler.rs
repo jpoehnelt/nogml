@@ -10,11 +10,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     AppState,
-    ai::{MAX_LIST_LIMIT, channel_for_source, validate_resource_id},
+    ai::{
+        MAX_LIST_LIMIT, channel_for_source,
+        safety::{OutboundCheck, OutboundDecision},
+        validate_resource_id,
+    },
     auth::Principal,
     error::{AppError, AppResult},
     events::{EventSource, MailEvent},
@@ -24,7 +28,8 @@ use crate::{
         truncate_to_millis,
     },
     storage::{
-        NewAttachmentInput, NewLabelInput, NewMessageInput, ScheduledSendStatus, TriagePatch,
+        DEFAULT_SCHEDULED_SEND_STALE_LEASE_MS, NewAttachmentInput, NewLabelInput, NewMessageInput,
+        ScheduledSendStatus, TriagePatch,
     },
 };
 
@@ -85,7 +90,7 @@ async fn ensure_snoozed_label(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
-/// Parse a scheduled send status query string (`pending`, `sent`, `canceled`, `failed`, `all`, or empty).
+/// Parse a scheduled send status query string (`pending`, `sending`, `sent`, `canceled`, `failed`, `all`, or empty).
 pub fn parse_scheduled_send_status_filter(
     raw: Option<&str>,
 ) -> AppResult<Option<ScheduledSendStatus>> {
@@ -95,7 +100,7 @@ pub fn parse_scheduled_send_status_filter(
         Some(s) => ScheduledSendStatus::parse_str(s).map(Some).ok_or_else(|| {
             AppError::validation(
                 format!("Invalid scheduled send status filter '{s}'"),
-                Some("Use one of: pending, sent, canceled, failed, or all.".to_string()),
+                Some("Use one of: pending, sending, sent, canceled, failed, or all.".to_string()),
             )
         }),
     }
@@ -421,32 +426,148 @@ pub async fn process_due_scheduler_items(
         report.snoozes_woken += 1;
     }
 
-    // 2. Dispatch due pending scheduled sends across all mailboxes.
-    let due_sends = state.store.claim_due_scheduled_sends(now_ms).await?;
-    for item in due_sends {
-        let mb_state = state.for_mailbox(&item.mailbox_id);
-        let in_flight_key = format!("{}:{}", mb_state.mailbox_id(), item.id);
+    // 2. Atomically claim and dispatch due scheduled sends across all mailboxes.
+    let due_sends = state
+        .store
+        .claim_due_scheduled_sends(now_ms, DEFAULT_SCHEDULED_SEND_STALE_LEASE_MS)
+        .await?;
+    for current in due_sends {
+        let mb_state = state.for_mailbox(&current.mailbox_id);
+        let in_flight_key = format!("{}:{}", mb_state.mailbox_id(), current.id);
         let Ok(_in_flight) =
             ScheduledInFlightGuard::try_acquire(&state.scheduled_in_flight, &in_flight_key)
         else {
             continue;
         };
 
-        let current = match mb_state.store.get_scheduled_send(&item.id).await {
-            Ok(Some(rec)) if rec.status == ScheduledSendStatus::Pending => rec,
-            Ok(_) => continue,
-            Err(err) => {
+        let outbound = &current.outbound_message;
+
+        // Re-evaluate outbound safety/policy at dispatch time so policy tightenings
+        // made after scheduling are enforced before contacting the upstream transport.
+        let policy_check = OutboundCheck {
+            from: if outbound.from.trim().is_empty() {
+                mb_state.config.user_email.clone()
+            } else {
+                outbound.from.clone()
+            },
+            to: outbound.to.clone(),
+            cc: outbound.cc.clone(),
+            bcc: outbound.bcc.clone(),
+            subject: outbound.subject.clone(),
+            text: outbound.text.clone(),
+            html: outbound.html.clone(),
+            attachment_filenames: outbound
+                .attachments
+                .iter()
+                .filter_map(|a| a.filename.clone())
+                .collect(),
+            thread_id: current.thread_id.clone(),
+            mailbox_id: Some(mb_state.mailbox_id().to_string()),
+            is_draft_send: false,
+            agent_policy: None,
+        };
+        match mb_state.evaluate_outbound_policy(&policy_check).await {
+            Ok(OutboundDecision::Allow) => {}
+            Ok(OutboundDecision::Deny { code, reason, .. }) => {
+                let err_msg = format!("Blocked by outbound policy ({code}): {reason}");
                 warn!(
-                    %err,
-                    mailbox_id = %item.mailbox_id,
-                    scheduled_id = %item.id,
-                    "Failed to reload scheduled send before dispatch"
+                    mailbox_id = %current.mailbox_id,
+                    scheduled_id = %current.id,
+                    code = %code,
+                    "Scheduled send blocked by outbound policy at dispatch"
                 );
+                let _ = mb_state
+                    .store
+                    .fail_scheduled_send(&current.id, &err_msg)
+                    .await;
+                mb_state
+                    .record_audit(
+                        None,
+                        "system",
+                        "send",
+                        vec![current.id.clone()],
+                        "denied",
+                        Some(err_msg),
+                    )
+                    .await;
+                report.scheduled_failed += 1;
                 continue;
             }
-        };
+            Ok(OutboundDecision::HoldForApproval { reason }) => {
+                let err_msg = format!("Blocked by outbound policy (hold_for_approval): {reason}");
+                warn!(
+                    mailbox_id = %current.mailbox_id,
+                    scheduled_id = %current.id,
+                    "Scheduled send requires approval under current outbound policy; marking failed"
+                );
+                let _ = mb_state
+                    .store
+                    .fail_scheduled_send(&current.id, &err_msg)
+                    .await;
+                mb_state
+                    .record_audit(
+                        None,
+                        "system",
+                        "send",
+                        vec![current.id.clone()],
+                        "denied",
+                        Some(err_msg),
+                    )
+                    .await;
+                report.scheduled_failed += 1;
+                continue;
+            }
+            Ok(OutboundDecision::DowngradeToDraft { reason }) => {
+                let err_msg = format!("Blocked by outbound policy (downgrade_to_draft): {reason}");
+                warn!(
+                    mailbox_id = %current.mailbox_id,
+                    scheduled_id = %current.id,
+                    "Scheduled send downgraded by current outbound policy; marking failed"
+                );
+                let _ = mb_state
+                    .store
+                    .fail_scheduled_send(&current.id, &err_msg)
+                    .await;
+                mb_state
+                    .record_audit(
+                        None,
+                        "system",
+                        "send",
+                        vec![current.id.clone()],
+                        "denied",
+                        Some(err_msg),
+                    )
+                    .await;
+                report.scheduled_failed += 1;
+                continue;
+            }
+            Err(err) => {
+                let err_msg = format!("Outbound policy evaluation failed at dispatch: {err}");
+                warn!(
+                    %err,
+                    mailbox_id = %current.mailbox_id,
+                    scheduled_id = %current.id,
+                    "Scheduled send outbound policy evaluation errored"
+                );
+                let _ = mb_state
+                    .store
+                    .fail_scheduled_send(&current.id, &err_msg)
+                    .await;
+                mb_state
+                    .record_audit(
+                        None,
+                        "system",
+                        "send",
+                        vec![current.id.clone()],
+                        "failed",
+                        Some(err_msg),
+                    )
+                    .await;
+                report.scheduled_failed += 1;
+                continue;
+            }
+        }
 
-        let outbound = &current.outbound_message;
         let transport_idem_key = format!("scheduled-{}", current.id);
         let send_outcome = match mb_state
             .transport
@@ -482,7 +603,28 @@ pub async fn process_due_scheduler_items(
         };
 
         let raw_rfc2822 =
-            crate::transport::ensure_raw_rfc2822(outbound, &mb_state.config.user_email)?;
+            match crate::transport::ensure_raw_rfc2822(outbound, &mb_state.config.user_email) {
+                Ok(raw) => raw,
+                Err(err) => {
+                    let err_msg = format!(
+                        "Post-send RFC2822 serialization failed (provider_message_id={}): {err}",
+                        send_outcome.provider_message_id
+                    );
+                    error!(
+                        %err,
+                        mailbox_id = %current.mailbox_id,
+                        scheduled_id = %current.id,
+                        provider_message_id = %send_outcome.provider_message_id,
+                        "Scheduled send succeeded on transport but failed to build RFC2822 copy"
+                    );
+                    let _ = mb_state
+                        .store
+                        .fail_scheduled_send(&current.id, &err_msg)
+                        .await;
+                    report.scheduled_failed += 1;
+                    continue;
+                }
+            };
         let text_body = outbound.text.clone().unwrap_or_default();
         let snippet = generate_snippet(&text_body, outbound.html.as_deref());
         let rfc822_message_id = outbound
@@ -513,7 +655,7 @@ pub async fn process_due_scheduler_items(
             })
             .collect();
 
-        let stored = mb_state
+        let stored = match mb_state
             .store
             .insert_message(NewMessageInput {
                 id: None,
@@ -544,15 +686,65 @@ pub async fn process_due_scheduler_items(
                 is_deleted: false,
                 attachments,
             })
-            .await?;
+            .await
+        {
+            Ok(msg) => msg,
+            Err(err) => {
+                let err_msg = format!(
+                    "Post-send SENT message persistence failed (provider_message_id={}): {err}",
+                    send_outcome.provider_message_id
+                );
+                error!(
+                    %err,
+                    mailbox_id = %current.mailbox_id,
+                    scheduled_id = %current.id,
+                    provider_message_id = %send_outcome.provider_message_id,
+                    "Scheduled send dispatched on transport but failed to persist SENT copy"
+                );
+                let _ = mb_state
+                    .store
+                    .fail_scheduled_send(&current.id, &err_msg)
+                    .await;
+                report.scheduled_failed += 1;
+                continue;
+            }
+        };
 
-        mb_state.post_store_message(&stored).await?;
+        if let Err(err) = mb_state.post_store_message(&stored).await {
+            warn!(
+                %err,
+                mailbox_id = %current.mailbox_id,
+                scheduled_id = %current.id,
+                message_id = %stored.id,
+                "Scheduled send post_store_message (blob/search/contacts) failed after send"
+            );
+        }
         mb_state.metrics.inc_messages_sent();
 
-        mb_state
+        if let Err(err) = mb_state
             .store
             .complete_scheduled_send(&current.id, &stored.id, &send_outcome.provider_message_id)
-            .await?;
+            .await
+        {
+            let err_msg = format!(
+                "Post-send completion failed (sent_message_id={}, provider_message_id={}): {err}",
+                stored.id, send_outcome.provider_message_id
+            );
+            error!(
+                %err,
+                mailbox_id = %current.mailbox_id,
+                scheduled_id = %current.id,
+                sent_message_id = %stored.id,
+                provider_message_id = %send_outcome.provider_message_id,
+                "Scheduled send dispatched and stored but complete_scheduled_send failed"
+            );
+            let _ = mb_state
+                .store
+                .fail_scheduled_send(&current.id, &err_msg)
+                .await;
+            report.scheduled_failed += 1;
+            continue;
+        }
 
         mb_state.events.publish(
             EventSource::System,

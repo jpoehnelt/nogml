@@ -231,6 +231,7 @@ impl MailStore for MockStore {
             thread_id,
             label_ids: input.label_ids,
             upstream_gmail_id: stored.upstream_gmail_id.clone(),
+            source: "local".to_string(),
         });
         s.messages.push(stored.clone());
         Ok(stored)
@@ -294,6 +295,7 @@ impl MailStore for MockStore {
                 thread_id: cloned.thread_id.clone(),
                 label_ids: add_labels.to_vec(),
                 upstream_gmail_id: cloned.upstream_gmail_id.clone(),
+                source: "local".to_string(),
             });
         }
         if !remove_labels.is_empty() {
@@ -304,6 +306,7 @@ impl MailStore for MockStore {
                 thread_id: cloned.thread_id.clone(),
                 label_ids: remove_labels.to_vec(),
                 upstream_gmail_id: cloned.upstream_gmail_id.clone(),
+                source: "local".to_string(),
             });
         }
         Ok(cloned)
@@ -342,6 +345,7 @@ impl MailStore for MockStore {
                 thread_id: m.thread_id,
                 label_ids: m.label_ids,
                 upstream_gmail_id: m.upstream_gmail_id,
+                source: "local".to_string(),
             });
         }
         s.messages.retain(|m| m.id != id);
@@ -924,6 +928,7 @@ impl MailStore for MockStore {
     async fn claim_due_scheduled_sends(
         &self,
         _now_ms: i64,
+        _stale_lease_ms: i64,
     ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
         Ok(Vec::new())
     }

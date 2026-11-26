@@ -96,6 +96,8 @@ pub struct AppState {
     pub events: EventBus,
     pub sync_lock: Arc<Mutex<()>>,
     pub resumable_uploads: Arc<ResumableUploadStore>,
+    /// Maximum aggregate serialized response bytes permitted for `POST /batch/gmail/v1`.
+    pub max_batch_response_bytes: usize,
     /// Tracks approval IDs currently being approved/rejected to prevent concurrent double-sends.
     pub approval_in_flight: Arc<StdMutex<HashSet<String>>>,
     /// Tracks scheduled send IDs currently being dispatched or canceled to prevent concurrent races.
@@ -231,6 +233,7 @@ impl AppState {
             events,
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
+            max_batch_response_bytes: crate::gmail::batch::MAX_BATCH_RESPONSE_BYTES,
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -318,6 +321,7 @@ impl AppState {
             events: EventBus::with_mailbox(&primary_mailbox_id),
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
+            max_batch_response_bytes: crate::gmail::batch::MAX_BATCH_RESPONSE_BYTES,
             approval_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             scheduled_in_flight: Arc::new(StdMutex::new(HashSet::new())),
             used_oauth_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -439,6 +443,7 @@ impl AppState {
             events,
             sync_lock,
             resumable_uploads: self.resumable_uploads.clone(),
+            max_batch_response_bytes: self.max_batch_response_bytes,
             approval_in_flight: self.approval_in_flight.clone(),
             scheduled_in_flight: self.scheduled_in_flight.clone(),
             used_oauth_codes: self.used_oauth_codes.clone(),
@@ -495,6 +500,18 @@ impl AppState {
     /// Replace the [`OutboundPolicy`] backend on this `AppState`.
     pub fn with_outbound_policy(mut self, outbound_policy: Arc<dyn OutboundPolicy>) -> Self {
         self.outbound_policy = outbound_policy;
+        self
+    }
+
+    /// Replace the [`ResumableUploadStore`] on this `AppState`.
+    pub fn with_resumable_uploads(mut self, resumable_uploads: Arc<ResumableUploadStore>) -> Self {
+        self.resumable_uploads = resumable_uploads;
+        self
+    }
+
+    /// Override the maximum aggregate response byte cap for `POST /batch/gmail/v1`.
+    pub fn with_max_batch_response_bytes(mut self, max_batch_response_bytes: usize) -> Self {
+        self.max_batch_response_bytes = max_batch_response_bytes;
         self
     }
 
@@ -608,6 +625,21 @@ impl AppState {
             return Ok(bytes);
         }
         Ok(att.data.clone())
+    }
+
+    /// Collect attachment IDs for `message_id` when an external `BlobStore` is active,
+    /// so callers can pass them to [`Self::post_delete_message`] after deleting the DB row.
+    pub async fn collect_external_attachment_ids(&self, message_id: &str) -> Vec<String> {
+        if !is_external_blob_store(self.blobs.as_ref()) {
+            return Vec::new();
+        }
+        self.store
+            .list_attachment_meta(message_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.id)
+            .collect()
     }
 
     /// Clean up external blobs and search index entry for a deleted message.

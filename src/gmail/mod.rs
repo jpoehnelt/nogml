@@ -1861,14 +1861,15 @@ async fn batch_delete_messages(
     let mut existing_msgs = Vec::with_capacity(req.ids.len());
     for id in &req.ids {
         if let Some(msg) = state.store.get_message(id).await? {
-            existing_msgs.push(msg);
+            let att_ids = state.collect_external_attachment_ids(&msg.id).await;
+            existing_msgs.push((msg, att_ids));
         }
     }
 
     state.store.batch_delete_messages(&req.ids).await?;
 
-    for msg in existing_msgs {
-        let _ = state.post_delete_message(&msg.id, &[]).await;
+    for (msg, att_ids) in existing_msgs {
+        let _ = state.post_delete_message(&msg.id, &att_ids).await;
         state.events.publish(
             EventSource::Api,
             MailEvent::MessageDeleted {
@@ -2153,23 +2154,28 @@ async fn delete_thread(
     validate_resource_id(&id)?;
 
     let existing = state.store.get_thread(&id).await?;
+    let mut existing_with_atts = Vec::new();
+    if let Some(detail) = existing {
+        for msg in detail.messages {
+            let att_ids = state.collect_external_attachment_ids(&msg.id).await;
+            existing_with_atts.push((msg, att_ids));
+        }
+    }
     let deleted = state.store.delete_thread(&id).await?;
     if !deleted {
         return Err(AppError::NotFound(format!("Thread '{id}' not found")));
     }
 
-    if let Some(detail) = existing {
-        for msg in detail.messages {
-            let _ = state.post_delete_message(&msg.id, &[]).await;
-            state.events.publish(
-                EventSource::Api,
-                MailEvent::MessageDeleted {
-                    message_id: msg.id,
-                    thread_id: msg.thread_id,
-                    labels: msg.label_ids,
-                },
-            );
-        }
+    for (msg, att_ids) in existing_with_atts {
+        let _ = state.post_delete_message(&msg.id, &att_ids).await;
+        state.events.publish(
+            EventSource::Api,
+            MailEvent::MessageDeleted {
+                message_id: msg.id,
+                thread_id: msg.thread_id,
+                labels: msg.label_ids,
+            },
+        );
     }
 
     state
@@ -2547,7 +2553,7 @@ async fn complete_send_draft(
     let raw_bytes = match raw_bytes {
         Some(bytes) if !bytes.is_empty() => bytes,
         _ => match existing_draft.as_ref() {
-            Some(d) => d.message.raw_rfc2822.clone(),
+            Some(d) => state.load_raw_rfc2822(&d.message).await?,
             None => {
                 return Err(AppError::BadRequest(
                     "drafts.send requires either an existing draft 'id' or a raw RFC 2822 message"
@@ -2555,6 +2561,11 @@ async fn complete_send_draft(
                 ));
             }
         },
+    };
+
+    let existing_draft_att_ids = match existing_draft.as_ref() {
+        Some(d) => state.collect_external_attachment_ids(&d.message.id).await,
+        None => Vec::new(),
     };
 
     let thread_id = metadata
@@ -2583,7 +2594,12 @@ async fn complete_send_draft(
     .await?;
 
     if let Some(ref did) = draft_id {
-        let _ = state.store.delete_draft(did).await?;
+        let deleted = state.store.delete_draft(did).await?;
+        if deleted && let Some(d) = existing_draft {
+            let _ = state
+                .post_delete_message(&d.message.id, &existing_draft_att_ids)
+                .await;
+        }
     }
 
     format_gmail_message(&stored, MessageFormat::Minimal, &[])
@@ -2692,13 +2708,17 @@ async fn delete_draft(
     validate_resource_id(&id)?;
 
     let existing = state.store.get_draft(&id).await?;
+    let att_ids = match existing.as_ref() {
+        Some(d) => state.collect_external_attachment_ids(&d.message.id).await,
+        None => Vec::new(),
+    };
     let deleted = state.store.delete_draft(&id).await?;
     if !deleted {
         return Err(AppError::NotFound(format!("Draft '{id}' not found")));
     }
 
     if let Some(d) = existing {
-        let _ = state.post_delete_message(&d.message.id, &[]).await;
+        let _ = state.post_delete_message(&d.message.id, &att_ids).await;
         state.events.publish(
             EventSource::Api,
             MailEvent::MessageDeleted {
@@ -2785,13 +2805,32 @@ async fn list_history(
     let query = params.parse_history_list_query()?;
     let page = state.store.list_history(&query).await?;
 
+    // Cache current message labels once per unique message ID so `labelsAdded[].message.labelIds`
+    // and `labelsRemoved[].message.labelIds` reflect the message's current labels (matching Gmail
+    // API semantics), falling back to the history entry's labels if the message was later deleted.
+    let mut current_labels_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    for entry in &page.entries {
+        if !current_labels_cache.contains_key(&entry.message_id) {
+            let current = state
+                .store
+                .get_message(&entry.message_id)
+                .await?
+                .map(|m| m.label_ids);
+            current_labels_cache.insert(entry.message_id.clone(), current);
+        }
+    }
+
     let mut grouped: BTreeMap<u64, HistoryRecordAcc> = BTreeMap::new();
     for entry in page.entries {
         let acc = grouped.entry(entry.history_id).or_default();
+        let resolved_msg_labels = match current_labels_cache.get(&entry.message_id) {
+            Some(Some(current)) => (!current.is_empty()).then(|| current.clone()),
+            _ => (!entry.label_ids.is_empty()).then(|| entry.label_ids.clone()),
+        };
         let msg = Message {
             id: entry.message_id.clone(),
             thread_id: entry.thread_id.clone(),
-            label_ids: (!entry.label_ids.is_empty()).then(|| entry.label_ids.clone()),
+            label_ids: resolved_msg_labels,
             ..Default::default()
         };
 

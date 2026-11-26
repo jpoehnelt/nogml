@@ -5,14 +5,19 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use async_imap::{Session, types::Flag};
+use async_imap::{
+    Session,
+    imap_proto::{AttributeValue, Response as ImapResponse, Status as ImapStatus},
+};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
@@ -94,9 +99,180 @@ impl AsyncWrite for UpstreamImapStream {
     }
 }
 
+#[derive(Debug, Default)]
+struct FetchedImapMessage {
+    uid: Option<u32>,
+    raw_bytes: Vec<u8>,
+    internal_date_ms: Option<i64>,
+    is_seen: bool,
+    is_flagged: bool,
+    is_draft: bool,
+    is_answered: bool,
+    is_deleted: bool,
+    gmail_labels: Option<Vec<String>>,
+    gmail_msg_id: Option<u64>,
+    gmail_thr_id: Option<u64>,
+}
+
+async fn uid_fetch_batch(
+    session: &mut Session<UpstreamImapStream>,
+    seq_set: &str,
+    query: &str,
+    command_timeout: Duration,
+) -> AppResult<Vec<FetchedImapMessage>> {
+    with_imap_timeout(
+        command_timeout,
+        "IMAP UID FETCH",
+        async {
+            let cmd_tag = session
+                .run_command(&format!("UID FETCH {seq_set} {query}"))
+                .await
+                .map_err(|e| AppError::Upstream {
+                    status: 502,
+                    message: format!("IMAP UID FETCH send failed: {e}"),
+                })?;
+
+            let mut out = Vec::new();
+            while let Some(resp) =
+                session
+                    .read_response()
+                    .await
+                    .map_err(|e| AppError::Upstream {
+                        status: 502,
+                        message: format!("IMAP UID FETCH read error: {e}"),
+                    })?
+            {
+                match resp.parsed() {
+                    ImapResponse::Fetch(_, attrs) => {
+                        let mut item = FetchedImapMessage::default();
+                        for attr in attrs {
+                            match attr {
+                                AttributeValue::Uid(u) => item.uid = Some(*u),
+                                AttributeValue::Flags(raw_flags) => {
+                                    for flag in raw_flags {
+                                        let f = flag.as_ref();
+                                        if f.eq_ignore_ascii_case("\\Seen") {
+                                            item.is_seen = true;
+                                        } else if f.eq_ignore_ascii_case("\\Flagged") {
+                                            item.is_flagged = true;
+                                        } else if f.eq_ignore_ascii_case("\\Draft") {
+                                            item.is_draft = true;
+                                        } else if f.eq_ignore_ascii_case("\\Answered") {
+                                            item.is_answered = true;
+                                        } else if f.eq_ignore_ascii_case("\\Deleted") {
+                                            item.is_deleted = true;
+                                        }
+                                    }
+                                }
+                                AttributeValue::InternalDate(dt) => {
+                                    item.internal_date_ms = DateTime::parse_from_str(
+                                        dt.as_ref(),
+                                        "%d-%b-%Y %H:%M:%S %z",
+                                    )
+                                    .ok()
+                                    .map(|d| d.timestamp_millis());
+                                }
+                                AttributeValue::BodySection {
+                                    section: None,
+                                    data: Some(body),
+                                    ..
+                                }
+                                | AttributeValue::Rfc822(Some(body)) => {
+                                    item.raw_bytes = body.as_ref().to_vec();
+                                }
+                                AttributeValue::GmailLabels(labels) => {
+                                    item.gmail_labels = Some(
+                                        labels.iter().map(|s| s.as_ref().to_string()).collect(),
+                                    );
+                                }
+                                AttributeValue::GmailMsgId(id) => item.gmail_msg_id = Some(*id),
+                                AttributeValue::GmailThrId(id) => item.gmail_thr_id = Some(*id),
+                                _ => {}
+                            }
+                        }
+                        out.push(item);
+                    }
+                    ImapResponse::Done {
+                        tag,
+                        status,
+                        outcome,
+                        ..
+                    } if tag == &cmd_tag => {
+                        if matches!(status, ImapStatus::Ok) {
+                            return Ok(out);
+                        }
+                        return Err(AppError::Upstream {
+                            status: 502,
+                            message: format!("IMAP UID FETCH rejected ({status:?}): {outcome:?}"),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            Err(AppError::Upstream {
+                status: 502,
+                message: "IMAP connection closed before UID FETCH completion".to_string(),
+            })
+        },
+        |err| err,
+    )
+    .await
+}
+
+/// Default TCP + TLS connect timeout for upstream IMAP sync.
+pub const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default per-command timeout for upstream IMAP sync operations.
+pub const IMAP_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum number of UIDs fetched per `UID FETCH` batch to bound peak memory usage.
+pub const IMAP_FETCH_BATCH_SIZE: usize = 25;
+
+async fn with_imap_timeout<F, T, E>(
+    timeout: Duration,
+    op: &str,
+    fut: F,
+    map_err: impl FnOnce(E) -> AppError,
+) -> AppResult<T>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(err)) => Err(map_err(err)),
+        Err(_) => Err(AppError::Upstream {
+            status: 504,
+            message: format!("{op} timed out after {}ms", timeout.as_millis()),
+        }),
+    }
+}
+
 /// Upstream Gmail IMAP [`SyncSource`] implementation.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct GmailImapSyncSource;
+#[derive(Debug, Clone, Copy)]
+pub struct GmailImapSyncSource {
+    connect_timeout: Duration,
+    command_timeout: Duration,
+}
+
+impl Default for GmailImapSyncSource {
+    fn default() -> Self {
+        Self {
+            connect_timeout: IMAP_CONNECT_TIMEOUT,
+            command_timeout: IMAP_COMMAND_TIMEOUT,
+        }
+    }
+}
+
+impl GmailImapSyncSource {
+    /// Construct a [`GmailImapSyncSource`] with custom connect and per-command timeouts.
+    pub fn with_timeouts(connect_timeout: Duration, command_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            command_timeout,
+        }
+    }
+}
 
 #[async_trait]
 impl SyncSource for GmailImapSyncSource {
@@ -125,18 +301,34 @@ impl SyncSource for GmailImapSyncSource {
         sync_state: &mut SyncState,
         opts: &SyncRunOptions,
     ) -> AppResult<PullReport> {
-        let mut session = connect_imap_session(&state.config).await?;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let mut session =
+            connect_imap_session(&state.config, connect_timeout, command_timeout).await?;
 
-        let has_xgm = match session.capabilities().await {
-            Ok(caps) => caps.has_str("X-GM-EXT-1"),
-            Err(err) => {
+        let has_xgm = match tokio::time::timeout(command_timeout, session.capabilities()).await {
+            Ok(Ok(caps)) => caps.has_str("X-GM-EXT-1"),
+            Ok(Err(err)) => {
                 warn!(%err, "Failed to query IMAP capabilities; disabling X-GM-EXT-1");
                 false
             }
+            Err(_) => {
+                return Err(AppError::Upstream {
+                    status: 504,
+                    message: format!(
+                        "IMAP CAPABILITY timed out after {}ms",
+                        command_timeout.as_millis()
+                    ),
+                });
+            }
         };
 
-        let (selected_mailbox, mailbox) =
-            select_imap_mailbox(&mut session, &state.config.gmail_imap_mailbox).await?;
+        let (selected_mailbox, mailbox) = select_imap_mailbox(
+            &mut session,
+            &state.config.gmail_imap_mailbox,
+            command_timeout,
+        )
+        .await?;
 
         let mut report = PullReport::default();
 
@@ -164,10 +356,30 @@ impl SyncSource for GmailImapSyncSource {
                 .is_none_or(|uid_next| uid_next > last_uid.saturating_add(1));
 
         let max_messages = opts.max_messages.or(state.config.sync_max_messages);
-        let mut fetched_count = 0usize;
 
         if should_fetch {
-            let uid_range = format!("{}:*", last_uid.saturating_add(1));
+            let start_uid = last_uid.saturating_add(1);
+            let search_query = format!("UID {start_uid}:*");
+            let uid_set = with_imap_timeout(
+                command_timeout,
+                "IMAP UID SEARCH",
+                session.uid_search(&search_query),
+                |e| AppError::Upstream {
+                    status: 502,
+                    message: format!("IMAP UID SEARCH failed: {e}"),
+                },
+            )
+            .await?;
+
+            // RFC 3501: `N:*` can include the max UID even when max < N. Filter strictly > last_uid,
+            // sort ascending so `last_uid` advances monotonically without skipping out-of-order UIDs,
+            // and slice to `max_messages` before fetching any message bodies.
+            let mut uids: Vec<u32> = uid_set.into_iter().filter(|&u| u > last_uid).collect();
+            uids.sort_unstable();
+            if let Some(cap) = max_messages {
+                uids.truncate(cap);
+            }
+
             let query = if has_xgm {
                 "(UID FLAGS INTERNALDATE BODY.PEEK[] X-GM-MSGID X-GM-THRID X-GM-LABELS)"
             } else {
@@ -176,159 +388,136 @@ impl SyncSource for GmailImapSyncSource {
 
             info!(
                 mailbox = %selected_mailbox,
-                uid_range = %uid_range,
+                uid_count = uids.len(),
+                start_uid,
                 has_xgm,
-                "Fetching upstream IMAP messages"
+                "Fetching upstream IMAP messages in bounded batches"
             );
 
-            let fetches_stream =
-                session
-                    .uid_fetch(&uid_range, query)
-                    .await
-                    .map_err(|e| AppError::Upstream {
-                        status: 502,
-                        message: format!("IMAP UID FETCH failed: {e}"),
-                    })?;
-            let fetches: Vec<_> =
-                fetches_stream
-                    .try_collect()
-                    .await
-                    .map_err(|e| AppError::Upstream {
-                        status: 502,
-                        message: format!("IMAP UID FETCH stream error: {e}"),
-                    })?;
+            for chunk in uids.chunks(IMAP_FETCH_BATCH_SIZE) {
+                let seq_set = chunk
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-            for fetch in fetches {
-                let Some(uid) = fetch.uid else {
-                    continue;
-                };
-                // RFC 3501: `N:*` returns the max UID even when max < N. Skip already-synced UIDs.
-                if uid <= last_uid {
-                    continue;
-                }
-                if let Some(cap) = max_messages
-                    && fetched_count >= cap
-                {
-                    break;
-                }
+                let mut fetches =
+                    uid_fetch_batch(&mut session, &seq_set, query, command_timeout).await?;
 
-                let raw_bytes = fetch.body().unwrap_or_default().to_vec();
-                let internal_date_ms = fetch.internal_date().map(|dt| dt.timestamp_millis());
+                fetches.sort_by_key(|f| f.uid.unwrap_or(0));
 
-                let mut is_seen = false;
-                let mut is_flagged = false;
-                let mut is_draft = false;
-                let mut is_answered = false;
-                let mut is_deleted = false;
-                for flag in fetch.flags() {
-                    match flag {
-                        Flag::Seen => is_seen = true,
-                        Flag::Flagged => is_flagged = true,
-                        Flag::Draft => is_draft = true,
-                        Flag::Answered => is_answered = true,
-                        Flag::Deleted => is_deleted = true,
-                        _ => {}
+                for fetch in fetches {
+                    let Some(uid) = fetch.uid else {
+                        continue;
+                    };
+                    if uid <= last_uid {
+                        continue;
                     }
-                }
 
-                let mut label_set: HashSet<String> = HashSet::new();
-                if !is_seen {
-                    label_set.insert(LABEL_UNREAD.to_string());
-                }
-                if is_flagged {
-                    label_set.insert(LABEL_STARRED.to_string());
-                }
-                if is_draft {
-                    label_set.insert(LABEL_DRAFT.to_string());
-                }
+                    let mut label_set: HashSet<String> = HashSet::new();
+                    if !fetch.is_seen {
+                        label_set.insert(LABEL_UNREAD.to_string());
+                    }
+                    if fetch.is_flagged {
+                        label_set.insert(LABEL_STARRED.to_string());
+                    }
+                    if fetch.is_draft {
+                        label_set.insert(LABEL_DRAFT.to_string());
+                    }
 
-                if let Some(xgm_labels) = fetch.gmail_labels() {
-                    for raw_lbl in xgm_labels {
-                        let s = raw_lbl.as_ref().trim();
-                        if s.is_empty() {
-                            continue;
-                        }
-                        match s {
-                            "\\Inbox" => {
-                                label_set.insert(LABEL_INBOX.to_string());
+                    if let Some(xgm_labels) = fetch.gmail_labels {
+                        for raw_lbl in xgm_labels {
+                            let s = raw_lbl.trim();
+                            if s.is_empty() {
+                                continue;
                             }
-                            "\\Sent" => {
-                                label_set.insert(LABEL_SENT.to_string());
-                            }
-                            "\\Draft" | "\\Drafts" => {
-                                label_set.insert(LABEL_DRAFT.to_string());
-                            }
-                            "\\Trash" => {
-                                label_set.insert(LABEL_TRASH.to_string());
-                            }
-                            "\\Junk" | "\\Spam" => {
-                                label_set.insert(LABEL_SPAM.to_string());
-                            }
-                            "\\Important" => {
-                                label_set.insert(LABEL_IMPORTANT.to_string());
-                            }
-                            "\\Starred" => {
-                                label_set.insert(LABEL_STARRED.to_string());
-                            }
-                            "\\All" | "\\AllMail" => {}
-                            other if other.starts_with('\\') => {}
-                            user_name => {
-                                let local_id = if let Some(existing) =
-                                    user_label_cache.get(user_name)
-                                {
-                                    existing.clone()
-                                } else {
-                                    let stored = state
-                                        .store
-                                        .upsert_upstream_label(NewLabelInput {
-                                            name: user_name.to_string(),
-                                            upstream_label_id: Some(format!("imap:{user_name}")),
-                                            ..Default::default()
-                                        })
-                                        .await?;
-                                    report.labels_synced += 1;
-                                    user_label_cache
-                                        .insert(user_name.to_string(), stored.id.clone());
-                                    stored.id
-                                };
-                                label_set.insert(local_id);
+                            match s {
+                                "\\Inbox" => {
+                                    label_set.insert(LABEL_INBOX.to_string());
+                                }
+                                "\\Sent" => {
+                                    label_set.insert(LABEL_SENT.to_string());
+                                }
+                                "\\Draft" | "\\Drafts" => {
+                                    label_set.insert(LABEL_DRAFT.to_string());
+                                }
+                                "\\Trash" => {
+                                    label_set.insert(LABEL_TRASH.to_string());
+                                }
+                                "\\Junk" | "\\Spam" => {
+                                    label_set.insert(LABEL_SPAM.to_string());
+                                }
+                                "\\Important" => {
+                                    label_set.insert(LABEL_IMPORTANT.to_string());
+                                }
+                                "\\Starred" => {
+                                    label_set.insert(LABEL_STARRED.to_string());
+                                }
+                                "\\All" | "\\AllMail" => {}
+                                other if other.starts_with('\\') => {}
+                                user_name => {
+                                    let local_id =
+                                        if let Some(existing) = user_label_cache.get(user_name) {
+                                            existing.clone()
+                                        } else {
+                                            let stored = state
+                                                .store
+                                                .upsert_upstream_label(NewLabelInput {
+                                                    name: user_name.to_string(),
+                                                    upstream_label_id: Some(format!(
+                                                        "imap:{user_name}"
+                                                    )),
+                                                    ..Default::default()
+                                                })
+                                                .await?;
+                                            report.labels_synced += 1;
+                                            user_label_cache
+                                                .insert(user_name.to_string(), stored.id.clone());
+                                            stored.id
+                                        };
+                                    label_set.insert(local_id);
+                                }
                             }
                         }
+                    } else if selected_mailbox.eq_ignore_ascii_case("INBOX") {
+                        label_set.insert(LABEL_INBOX.to_string());
                     }
-                } else if selected_mailbox.eq_ignore_ascii_case("INBOX") {
-                    label_set.insert(LABEL_INBOX.to_string());
+
+                    let upstream_gmail_id = match fetch.gmail_msg_id {
+                        Some(id) => Some(format!("{id:x}")),
+                        None => Some(format!(
+                            "imap:{}:{}:{uid}",
+                            selected_mailbox,
+                            uid_validity.unwrap_or(0)
+                        )),
+                    };
+                    let upstream_thread_id = fetch.gmail_thr_id.map(|id| format!("{id:x}"));
+
+                    let input = parse_raw_to_new_message_input(
+                        fetch.raw_bytes,
+                        label_set.into_iter().collect(),
+                        fetch.internal_date_ms,
+                        "gmail_imap",
+                        upstream_gmail_id,
+                        upstream_thread_id,
+                        fetch.is_answered,
+                        fetch.is_deleted,
+                    );
+
+                    let _ = ingest_synced_message(state, input, &mut report).await?;
+
+                    if uid > last_uid {
+                        last_uid = uid;
+                    }
                 }
-
-                let upstream_gmail_id = match fetch.gmail_msg_id() {
-                    Some(&id) => Some(format!("{id:x}")),
-                    None => Some(format!(
-                        "imap:{}:{}:{uid}",
-                        selected_mailbox,
-                        uid_validity.unwrap_or(0)
-                    )),
-                };
-
-                let input = parse_raw_to_new_message_input(
-                    raw_bytes,
-                    label_set.into_iter().collect(),
-                    internal_date_ms,
-                    "gmail_imap",
-                    upstream_gmail_id,
-                    None,
-                    is_answered,
-                    is_deleted,
-                );
-
-                let _ = ingest_synced_message(state, input, &mut report).await?;
-
-                if uid > last_uid {
-                    last_uid = uid;
-                }
-                fetched_count += 1;
             }
         }
 
-        let _ = session.logout().await;
+        let _ = tokio::time::timeout(
+            command_timeout.min(Duration::from_secs(5)),
+            session.logout(),
+        )
+        .await;
 
         sync_state.imap_mailbox = Some(selected_mailbox);
         sync_state.imap_uid_validity = uid_validity;
@@ -352,18 +541,31 @@ impl SyncSource for GmailImapSyncSource {
             return Ok(PushReport::default());
         }
 
-        let mut session = connect_imap_session(&state.config).await?;
-        let (has_xgm, has_move, has_uidplus) = match session.capabilities().await {
-            Ok(caps) => (
-                caps.has_str("X-GM-EXT-1"),
-                caps.has_str("MOVE"),
-                caps.has_str("UIDPLUS"),
-            ),
-            Err(err) => {
-                warn!(%err, "Failed to query IMAP capabilities during pushback");
-                (false, false, false)
-            }
-        };
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let mut session =
+            connect_imap_session(&state.config, connect_timeout, command_timeout).await?;
+        let (has_xgm, has_move, has_uidplus) =
+            match tokio::time::timeout(command_timeout, session.capabilities()).await {
+                Ok(Ok(caps)) => (
+                    caps.has_str("X-GM-EXT-1"),
+                    caps.has_str("MOVE"),
+                    caps.has_str("UIDPLUS"),
+                ),
+                Ok(Err(err)) => {
+                    warn!(%err, "Failed to query IMAP capabilities during pushback");
+                    (false, false, false)
+                }
+                Err(_) => {
+                    return Err(AppError::Upstream {
+                        status: 504,
+                        message: format!(
+                            "IMAP CAPABILITY timed out after {}ms",
+                            command_timeout.as_millis()
+                        ),
+                    });
+                }
+            };
 
         let preferred_mailbox = state
             .store
@@ -373,7 +575,7 @@ impl SyncSource for GmailImapSyncSource {
             .unwrap_or_else(|| state.config.gmail_imap_mailbox.clone());
 
         let (selected_mailbox, mailbox) =
-            select_imap_mailbox(&mut session, &preferred_mailbox).await?;
+            select_imap_mailbox(&mut session, &preferred_mailbox, command_timeout).await?;
         let selected_uid_validity = mailbox.uid_validity.unwrap_or(0);
 
         let mut pushed = 0u64;
@@ -385,6 +587,7 @@ impl SyncSource for GmailImapSyncSource {
                 &selected_mailbox,
                 selected_uid_validity,
                 has_xgm,
+                command_timeout,
             )
             .await?
             else {
@@ -404,19 +607,39 @@ impl SyncSource for GmailImapSyncSource {
                     add_labels,
                     remove_labels,
                 } => {
-                    performed_op |=
-                        apply_imap_flag_deltas(&mut session, &uid_str, add_labels, remove_labels)
-                            .await?;
+                    performed_op |= apply_imap_flag_deltas(
+                        &mut session,
+                        &uid_str,
+                        add_labels,
+                        remove_labels,
+                        command_timeout,
+                    )
+                    .await?;
 
                     // When operating directly on INBOX, removing INBOX archives the message to All Mail.
                     if remove_labels.iter().any(|l| l == LABEL_INBOX)
                         && selected_mailbox.eq_ignore_ascii_case("INBOX")
                         && has_move
                     {
-                        if let Err(err) = session.uid_mv(&uid_str, "[Gmail]/All Mail").await {
-                            debug!(%err, uid, "IMAP archive move to [Gmail]/All Mail skipped");
-                        } else {
-                            performed_op = true;
+                        match tokio::time::timeout(
+                            command_timeout,
+                            session.uid_mv(&uid_str, "[Gmail]/All Mail"),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => performed_op = true,
+                            Ok(Err(err)) => {
+                                debug!(%err, uid, "IMAP archive move to [Gmail]/All Mail skipped");
+                            }
+                            Err(_) => {
+                                return Err(AppError::Upstream {
+                                    status: 504,
+                                    message: format!(
+                                        "IMAP UID MOVE timed out after {}ms",
+                                        command_timeout.as_millis()
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -424,28 +647,83 @@ impl SyncSource for GmailImapSyncSource {
                     add_labels,
                     remove_labels,
                 } => {
-                    let _ =
-                        apply_imap_flag_deltas(&mut session, &uid_str, add_labels, remove_labels)
-                            .await?;
+                    let _ = apply_imap_flag_deltas(
+                        &mut session,
+                        &uid_str,
+                        add_labels,
+                        remove_labels,
+                        command_timeout,
+                    )
+                    .await?;
 
                     if !selected_mailbox.eq_ignore_ascii_case("[Gmail]/Trash")
                         && !selected_mailbox.eq_ignore_ascii_case("Trash")
                     {
                         if has_move {
-                            let moved = session.uid_mv(&uid_str, "[Gmail]/Trash").await.is_ok()
-                                || session.uid_mv(&uid_str, "Trash").await.is_ok();
+                            let moved_gmail = match tokio::time::timeout(
+                                command_timeout,
+                                session.uid_mv(&uid_str, "[Gmail]/Trash"),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => true,
+                                Ok(Err(_)) => false,
+                                Err(_) => {
+                                    return Err(AppError::Upstream {
+                                        status: 504,
+                                        message: format!(
+                                            "IMAP UID MOVE to Trash timed out after {}ms",
+                                            command_timeout.as_millis()
+                                        ),
+                                    });
+                                }
+                            };
+                            let moved = if moved_gmail {
+                                true
+                            } else {
+                                match tokio::time::timeout(
+                                    command_timeout,
+                                    session.uid_mv(&uid_str, "Trash"),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => true,
+                                    Ok(Err(_)) => false,
+                                    Err(_) => {
+                                        return Err(AppError::Upstream {
+                                            status: 504,
+                                            message: format!(
+                                                "IMAP UID MOVE to Trash timed out after {}ms",
+                                                command_timeout.as_millis()
+                                            ),
+                                        });
+                                    }
+                                }
+                            };
                             if !moved {
-                                mark_deleted_and_expunge(&mut session, &uid_str, has_uidplus)
-                                    .await?;
+                                mark_deleted_and_expunge(
+                                    &mut session,
+                                    &uid_str,
+                                    has_uidplus,
+                                    command_timeout,
+                                )
+                                .await?;
                             }
                         } else {
-                            mark_deleted_and_expunge(&mut session, &uid_str, has_uidplus).await?;
+                            mark_deleted_and_expunge(
+                                &mut session,
+                                &uid_str,
+                                has_uidplus,
+                                command_timeout,
+                            )
+                            .await?;
                         }
                     }
                     performed_op = true;
                 }
                 LocalMutationKind::Delete => {
-                    mark_deleted_and_expunge(&mut session, &uid_str, has_uidplus).await?;
+                    mark_deleted_and_expunge(&mut session, &uid_str, has_uidplus, command_timeout)
+                        .await?;
                     performed_op = true;
                 }
             }
@@ -455,14 +733,22 @@ impl SyncSource for GmailImapSyncSource {
             }
         }
 
-        let _ = session.logout().await;
+        let _ = tokio::time::timeout(
+            command_timeout.min(Duration::from_secs(5)),
+            session.logout(),
+        )
+        .await;
         Ok(PushReport {
             messages_pushed: pushed,
         })
     }
 }
 
-async fn connect_imap_session(config: &Config) -> AppResult<Session<UpstreamImapStream>> {
+async fn connect_imap_session(
+    config: &Config,
+    connect_timeout: Duration,
+    command_timeout: Duration,
+) -> AppResult<Session<UpstreamImapStream>> {
     ensure_crypto_provider();
 
     let user = config
@@ -480,12 +766,16 @@ async fn connect_imap_session(config: &Config) -> AppResult<Session<UpstreamImap
 
     let host = &config.gmail_imap_host;
     let port = config.gmail_imap_port;
-    let tcp = TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(|e| AppError::Upstream {
+    let tcp = with_imap_timeout(
+        connect_timeout,
+        "IMAP TCP connect",
+        TcpStream::connect((host.as_str(), port)),
+        |e| AppError::Upstream {
             status: 502,
             message: format!("Failed to connect to IMAP server {host}:{port}: {e}"),
-        })?;
+        },
+    )
+    .await?;
 
     let stream = if config.gmail_imap_tls {
         let mut root_store = RootCertStore::empty();
@@ -496,54 +786,74 @@ async fn connect_imap_session(config: &Config) -> AppResult<Session<UpstreamImap
         let connector = TlsConnector::from(Arc::new(tls_cfg));
         let server_name = ServerName::try_from(host.clone())
             .map_err(|e| AppError::Config(format!("Invalid IMAP TLS hostname '{host}': {e}")))?;
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| AppError::Upstream {
+        let tls = with_imap_timeout(
+            connect_timeout,
+            "IMAP TLS handshake",
+            connector.connect(server_name, tcp),
+            |e| AppError::Upstream {
                 status: 502,
                 message: format!("IMAP TLS handshake failed with {host}:{port}: {e}"),
-            })?;
+            },
+        )
+        .await?;
         UpstreamImapStream::Tls(Box::new(tls))
     } else {
         UpstreamImapStream::Plain(tcp)
     };
 
     let mut client = async_imap::Client::new(stream);
-    client
-        .read_response()
-        .await
-        .map_err(|e| AppError::Upstream {
+    with_imap_timeout(
+        command_timeout,
+        "IMAP greeting",
+        client.read_response(),
+        |e| AppError::Upstream {
             status: 502,
             message: format!("Failed reading IMAP greeting: {e}"),
-        })?;
+        },
+    )
+    .await?;
 
-    client
-        .login(user, pass)
-        .await
-        .map_err(|(err, _)| AppError::Unauthorized(format!("IMAP login failed: {err}")))
+    with_imap_timeout(
+        command_timeout,
+        "IMAP LOGIN",
+        client.login(user, pass),
+        |(err, _)| AppError::Unauthorized(format!("IMAP login failed: {err}")),
+    )
+    .await
 }
 
 async fn select_imap_mailbox(
     session: &mut Session<UpstreamImapStream>,
     configured_mbx: &str,
+    command_timeout: Duration,
 ) -> AppResult<(String, async_imap::types::Mailbox)> {
-    match session.select(configured_mbx).await {
-        Ok(mbx) => Ok((configured_mbx.to_string(), mbx)),
-        Err(err) => {
+    match tokio::time::timeout(command_timeout, session.select(configured_mbx)).await {
+        Ok(Ok(mbx)) => Ok((configured_mbx.to_string(), mbx)),
+        Ok(Err(err)) => {
             warn!(
                 mailbox = %configured_mbx,
                 %err,
                 "Failed to select configured IMAP mailbox; falling back to INBOX"
             );
-            let mbx = session
-                .select("INBOX")
-                .await
-                .map_err(|e| AppError::Upstream {
+            let mbx = with_imap_timeout(
+                command_timeout,
+                "IMAP SELECT INBOX",
+                session.select("INBOX"),
+                |e| AppError::Upstream {
                     status: 502,
                     message: format!("Failed to select INBOX: {e}"),
-                })?;
+                },
+            )
+            .await?;
             Ok(("INBOX".to_string(), mbx))
         }
+        Err(_) => Err(AppError::Upstream {
+            status: 504,
+            message: format!(
+                "IMAP SELECT timed out after {}ms",
+                command_timeout.as_millis()
+            ),
+        }),
     }
 }
 
@@ -553,6 +863,7 @@ async fn resolve_imap_uid(
     selected_mailbox: &str,
     selected_uid_validity: u32,
     has_xgm: bool,
+    command_timeout: Duration,
 ) -> AppResult<Option<u32>> {
     // 1. Direct fallback format `imap:<mailbox>:<uidvalidity>:<uid>`.
     if let Some(rest) = mutation.upstream_id.strip_prefix("imap:")
@@ -570,14 +881,28 @@ async fn resolve_imap_uid(
         && let Ok(xgm_id) = u64::from_str_radix(mutation.upstream_id.trim(), 16)
         && xgm_id > 0
     {
-        match session.uid_search(format!("X-GM-MSGID {xgm_id}")).await {
-            Ok(uids) => {
+        match tokio::time::timeout(
+            command_timeout,
+            session.uid_search(format!("X-GM-MSGID {xgm_id}")),
+        )
+        .await
+        {
+            Ok(Ok(uids)) => {
                 if let Some(&uid) = uids.iter().min() {
                     return Ok(Some(uid));
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 debug!(%err, xgm_id, "IMAP X-GM-MSGID search failed");
+            }
+            Err(_) => {
+                return Err(AppError::Upstream {
+                    status: 504,
+                    message: format!(
+                        "IMAP X-GM-MSGID search timed out after {}ms",
+                        command_timeout.as_millis()
+                    ),
+                });
             }
         }
     }
@@ -586,17 +911,28 @@ async fn resolve_imap_uid(
     if let Some(ref mid) = mutation.rfc822_message_id {
         let safe_mid = mid.replace(['"', '\\', '\r', '\n'], "");
         if !safe_mid.is_empty() {
-            match session
-                .uid_search(format!("HEADER Message-ID \"{safe_mid}\""))
-                .await
+            match tokio::time::timeout(
+                command_timeout,
+                session.uid_search(format!("HEADER Message-ID \"{safe_mid}\"")),
+            )
+            .await
             {
-                Ok(uids) => {
+                Ok(Ok(uids)) => {
                     if let Some(&uid) = uids.iter().min() {
                         return Ok(Some(uid));
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     debug!(%err, message_id = %safe_mid, "IMAP HEADER Message-ID search failed");
+                }
+                Err(_) => {
+                    return Err(AppError::Upstream {
+                        status: 504,
+                        message: format!(
+                            "IMAP HEADER Message-ID search timed out after {}ms",
+                            command_timeout.as_millis()
+                        ),
+                    });
                 }
             }
         }
@@ -610,6 +946,7 @@ async fn apply_imap_flag_deltas(
     uid_str: &str,
     add_labels: &[String],
     remove_labels: &[String],
+    command_timeout: Duration,
 ) -> AppResult<bool> {
     let mut add_flags: Vec<&'static str> = Vec::new();
     let mut remove_flags: Vec<&'static str> = Vec::new();
@@ -636,33 +973,37 @@ async fn apply_imap_flag_deltas(
     let mut did_store = false;
     if !add_flags.is_empty() {
         let query = format!("+FLAGS ({})", add_flags.join(" "));
-        let stream = session
-            .uid_store(uid_str, query)
-            .await
-            .map_err(|e| AppError::Upstream {
+        let _: Vec<_> = with_imap_timeout(
+            command_timeout,
+            "IMAP UID STORE +FLAGS",
+            async {
+                let stream = session.uid_store(uid_str, query).await?;
+                stream.try_collect().await
+            },
+            |e| AppError::Upstream {
                 status: 502,
                 message: format!("IMAP UID STORE +FLAGS failed: {e}"),
-            })?;
-        let _: Vec<_> = stream.try_collect().await.map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("IMAP UID STORE +FLAGS stream error: {e}"),
-        })?;
+            },
+        )
+        .await?;
         did_store = true;
     }
 
     if !remove_flags.is_empty() {
         let query = format!("-FLAGS ({})", remove_flags.join(" "));
-        let stream = session
-            .uid_store(uid_str, query)
-            .await
-            .map_err(|e| AppError::Upstream {
+        let _: Vec<_> = with_imap_timeout(
+            command_timeout,
+            "IMAP UID STORE -FLAGS",
+            async {
+                let stream = session.uid_store(uid_str, query).await?;
+                stream.try_collect().await
+            },
+            |e| AppError::Upstream {
                 status: 502,
                 message: format!("IMAP UID STORE -FLAGS failed: {e}"),
-            })?;
-        let _: Vec<_> = stream.try_collect().await.map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("IMAP UID STORE -FLAGS stream error: {e}"),
-        })?;
+            },
+        )
+        .await?;
         did_store = true;
     }
 
@@ -673,40 +1014,50 @@ async fn mark_deleted_and_expunge(
     session: &mut Session<UpstreamImapStream>,
     uid_str: &str,
     has_uidplus: bool,
+    command_timeout: Duration,
 ) -> AppResult<()> {
-    let stream = session
-        .uid_store(uid_str, "+FLAGS (\\Deleted)")
-        .await
-        .map_err(|e| AppError::Upstream {
+    let _: Vec<_> = with_imap_timeout(
+        command_timeout,
+        "IMAP UID STORE (\\Deleted)",
+        async {
+            let stream = session.uid_store(uid_str, "+FLAGS (\\Deleted)").await?;
+            stream.try_collect().await
+        },
+        |e| AppError::Upstream {
             status: 502,
             message: format!("IMAP UID STORE +FLAGS (\\Deleted) failed: {e}"),
-        })?;
-    let _: Vec<_> = stream.try_collect().await.map_err(|e| AppError::Upstream {
-        status: 502,
-        message: format!("IMAP UID STORE (\\Deleted) stream error: {e}"),
-    })?;
+        },
+    )
+    .await?;
 
     if has_uidplus {
-        let exp = session
-            .uid_expunge(uid_str)
-            .await
-            .map_err(|e| AppError::Upstream {
+        let _: Vec<_> = with_imap_timeout(
+            command_timeout,
+            "IMAP UID EXPUNGE",
+            async {
+                let exp = session.uid_expunge(uid_str).await?;
+                exp.try_collect().await
+            },
+            |e| AppError::Upstream {
                 status: 502,
                 message: format!("IMAP UID EXPUNGE failed: {e}"),
-            })?;
-        let _: Vec<_> = exp.try_collect().await.map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("IMAP UID EXPUNGE stream error: {e}"),
-        })?;
+            },
+        )
+        .await?;
     } else {
-        let exp = session.expunge().await.map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("IMAP EXPUNGE failed: {e}"),
-        })?;
-        let _: Vec<_> = exp.try_collect().await.map_err(|e| AppError::Upstream {
-            status: 502,
-            message: format!("IMAP EXPUNGE stream error: {e}"),
-        })?;
+        let _: Vec<_> = with_imap_timeout(
+            command_timeout,
+            "IMAP EXPUNGE",
+            async {
+                let exp = session.expunge().await?;
+                exp.try_collect().await
+            },
+            |e| AppError::Upstream {
+                status: 502,
+                message: format!("IMAP EXPUNGE failed: {e}"),
+            },
+        )
+        .await?;
     }
 
     Ok(())

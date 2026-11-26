@@ -308,7 +308,11 @@ impl MailStore for TestMailStore {
         Ok(self.inner.lock().unwrap().all_mail_uid_next as u64)
     }
     async fn list_history(&self, _: &HistoryListQuery) -> AppResult<HistoryListPage> {
-        unimplemented!()
+        Ok(HistoryListPage {
+            entries: Vec::new(),
+            next_page_token: None,
+            current_history_id: self.inner.lock().unwrap().all_mail_uid_next as u64,
+        })
     }
     async fn insert_message(&self, input: NewMessageInput) -> AppResult<StoredMessage> {
         let mut inner = self.inner.lock().unwrap();
@@ -1126,6 +1130,7 @@ impl MailStore for TestMailStore {
     }
     async fn claim_due_scheduled_sends(
         &self,
+        _: i64,
         _: i64,
     ) -> AppResult<Vec<crate::storage::ScheduledSend>> {
         Ok(Vec::new())
