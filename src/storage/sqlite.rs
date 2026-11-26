@@ -31,13 +31,14 @@ use crate::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
-        ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription, compute_contact_is_vip, normalize_contact_email,
+        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, InboxRule, InboxRuleActions,
+        InboxRulePatch, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
+        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
+        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
+        UpsertOutcomeKind, UserSettings, WatchSubscription, apply_inbox_rule_patch,
+        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
         normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
@@ -365,6 +366,21 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_sends_mailbox_status_send_at
     ON scheduled_sends (mailbox_id, status, send_at_ms, id);
 CREATE INDEX IF NOT EXISTS idx_scheduled_sends_due_status
     ON scheduled_sends (status, send_at_ms, mailbox_id, id);
+
+CREATE TABLE IF NOT EXISTS inbox_rules (
+    mailbox_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    match_query TEXT NOT NULL,
+    vip_only INTEGER NOT NULL DEFAULT 0,
+    actions_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (mailbox_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_rules_mailbox_created
+    ON inbox_rules (mailbox_id, created_at_ms ASC, id ASC);
 "#;
 
 /// SQLite-backed implementation of [`MailStore`], partitioned by `mailbox_id`.
@@ -6323,6 +6339,161 @@ impl MailStore for SqliteStore {
         })
         .await
     }
+
+    async fn create_inbox_rule(&self, input: &NewInboxRule) -> AppResult<InboxRule> {
+        let input = input.clone();
+        self.run_blocking(move |conn, mb| {
+            let now_ms = Utc::now().timestamp_millis();
+            let id = format!("rule_{}", Uuid::new_v4().simple());
+            let name = input.name.trim().to_string();
+            let match_query = input.match_query.trim().to_string();
+            let actions = normalize_inbox_rule_actions(&input.actions);
+            let actions_json = serde_json::to_string(&actions)?;
+            let enabled_int: i64 = i64::from(input.enabled);
+            let vip_only_int: i64 = i64::from(input.vip_only);
+
+            conn.execute(
+                "INSERT INTO inbox_rules (
+                    mailbox_id, id, name, enabled, match_query, vip_only,
+                    actions_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    mb,
+                    &id,
+                    &name,
+                    enabled_int,
+                    &match_query,
+                    vip_only_int,
+                    &actions_json,
+                    now_ms,
+                    now_ms
+                ],
+            )
+            .map_err(sql_err)?;
+
+            Ok(InboxRule {
+                id,
+                mailbox_id: mb.to_string(),
+                name,
+                enabled: input.enabled,
+                match_query,
+                vip_only: input.vip_only,
+                actions,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            })
+        })
+        .await
+    }
+
+    async fn get_inbox_rule(&self, id: &str) -> AppResult<Option<InboxRule>> {
+        let id = id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let row = conn
+                .query_row(
+                    "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                            actions_json, created_at_ms, updated_at_ms
+                     FROM inbox_rules
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &id],
+                    inbox_rule_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            row.transpose()
+        })
+        .await
+    }
+
+    async fn list_inbox_rules(&self) -> AppResult<Vec<InboxRule>> {
+        self.run_blocking(move |conn, mb| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                            actions_json, created_at_ms, updated_at_ms
+                     FROM inbox_rules
+                     WHERE mailbox_id = ?1
+                     ORDER BY created_at_ms ASC, id ASC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![mb], inbox_rule_from_row)
+                .map_err(sql_err)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(sql_err)??);
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn patch_inbox_rule(&self, id: &str, patch: &InboxRulePatch) -> AppResult<InboxRule> {
+        let id = id.to_string();
+        let patch = patch.clone();
+        self.run_blocking(move |conn, mb| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_err)?;
+            let existing = tx
+                .query_row(
+                    "SELECT id, mailbox_id, name, enabled, match_query, vip_only,
+                            actions_json, created_at_ms, updated_at_ms
+                     FROM inbox_rules
+                     WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &id],
+                    inbox_rule_from_row,
+                )
+                .optional()
+                .map_err(sql_err)?
+                .transpose()?
+                .ok_or_else(|| AppError::NotFound(format!("Inbox rule not found: {id}")))?;
+
+            let now_ms = Utc::now().timestamp_millis();
+            let updated = apply_inbox_rule_patch(existing, &patch, now_ms);
+            let actions_json = serde_json::to_string(&updated.actions)?;
+            let enabled_int: i64 = i64::from(updated.enabled);
+            let vip_only_int: i64 = i64::from(updated.vip_only);
+
+            tx.execute(
+                "UPDATE inbox_rules
+                 SET name = ?1, enabled = ?2, match_query = ?3, vip_only = ?4,
+                     actions_json = ?5, updated_at_ms = ?6
+                 WHERE mailbox_id = ?7 AND id = ?8",
+                params![
+                    &updated.name,
+                    enabled_int,
+                    &updated.match_query,
+                    vip_only_int,
+                    &actions_json,
+                    updated.updated_at_ms,
+                    mb,
+                    &id
+                ],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(updated)
+        })
+        .await
+    }
+
+    async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
+        let id = id.to_string();
+        self.run_blocking(move |conn, mb| {
+            let affected = conn
+                .execute(
+                    "DELETE FROM inbox_rules WHERE mailbox_id = ?1 AND id = ?2",
+                    params![mb, &id],
+                )
+                .map_err(sql_err)?;
+            if affected == 0 {
+                return Err(AppError::NotFound(format!("Inbox rule not found: {id}")));
+            }
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn scheduled_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<ScheduledSend>> {
@@ -6362,6 +6533,39 @@ fn scheduled_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResul
     })();
 
     Ok(parsed)
+}
+
+fn inbox_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppResult<InboxRule>> {
+    let id: String = row.get(0)?;
+    let mailbox_id: String = row.get(1)?;
+    let name: String = row.get(2)?;
+    let enabled_int: i64 = row.get(3)?;
+    let match_query: String = row.get(4)?;
+    let vip_only_int: i64 = row.get(5)?;
+    let actions_json: String = row.get(6)?;
+    let created_at_ms: i64 = row.get(7)?;
+    let updated_at_ms: i64 = row.get(8)?;
+
+    let actions: InboxRuleActions = match serde_json::from_str(&actions_json) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(Err(AppError::Storage(format!(
+                "Corrupt inbox_rules actions_json: {e}"
+            ))));
+        }
+    };
+
+    Ok(Ok(InboxRule {
+        id,
+        mailbox_id,
+        name,
+        enabled: enabled_int != 0,
+        match_query,
+        vip_only: vip_only_int != 0,
+        actions,
+        created_at_ms,
+        updated_at_ms,
+    }))
 }
 
 fn contact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRecord> {

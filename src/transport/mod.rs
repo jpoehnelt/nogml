@@ -608,6 +608,9 @@ pub async fn ingest_inbound_rfc2822(
         },
     );
 
+    // 6. Evaluate per-mailbox inbox rules (label mutations + async signed webhooks).
+    let stored = crate::ai::rules::evaluate_inbox_rules(store, events, &stored, true).await;
+
     Ok(IngestOutcome::Stored {
         message: stored,
         decision,

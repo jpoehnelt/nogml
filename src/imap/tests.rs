@@ -1112,6 +1112,33 @@ impl MailStore for TestMailStore {
     ) -> AppResult<crate::storage::ScheduledSend> {
         unimplemented!()
     }
+
+    async fn create_inbox_rule(
+        &self,
+        _: &crate::storage::NewInboxRule,
+    ) -> AppResult<crate::storage::InboxRule> {
+        Err(AppError::Storage("unimplemented in mock".to_string()))
+    }
+
+    async fn get_inbox_rule(&self, _: &str) -> AppResult<Option<crate::storage::InboxRule>> {
+        Ok(None)
+    }
+
+    async fn list_inbox_rules(&self) -> AppResult<Vec<crate::storage::InboxRule>> {
+        Ok(Vec::new())
+    }
+
+    async fn patch_inbox_rule(
+        &self,
+        id: &str,
+        _: &crate::storage::InboxRulePatch,
+    ) -> AppResult<crate::storage::InboxRule> {
+        Err(AppError::NotFound(format!("Inbox rule not found: {id}")))
+    }
+
+    async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
+        Err(AppError::NotFound(format!("Inbox rule not found: {id}")))
+    }
 }
 
 pub(crate) fn test_app_state(mut config: Config) -> AppState {

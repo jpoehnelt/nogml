@@ -1506,7 +1506,6 @@ impl ImapSession {
 
         match self.state.store.imap_append(&target_mailbox, input).await {
             Ok((uid_validity, uid, stored)) => {
-                let _ = self.state.post_store_message(&stored).await;
                 self.state.events.publish(
                     EventSource::Imap,
                     MailEvent::MessageReceived {
@@ -1518,6 +1517,14 @@ impl ImapSession {
                         labels: stored.label_ids.clone(),
                     },
                 );
+                let stored = crate::ai::rules::evaluate_inbox_rules(
+                    self.state.store.as_ref(),
+                    &self.state.events,
+                    &stored,
+                    self.state.config.untrusted_content_guard,
+                )
+                .await;
+                let _ = self.state.post_store_message(&stored).await;
                 write_flush(
                     stream,
                     format!("{tag} OK [APPENDUID {uid_validity} {uid}] APPEND completed\r\n")

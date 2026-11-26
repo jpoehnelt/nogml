@@ -30,7 +30,7 @@ use crate::{
         UpsertThreadAnnotationRequest, default_extracted_object,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord,
+        AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord, InboxRuleActions, NewInboxRule,
         validate_and_normalize_contact_email,
     },
     sync,
@@ -234,6 +234,7 @@ impl McpServer {
             | "lookup_contact"
             | "list_vips"
             | "list_scheduled_sends"
+            | "list_rules"
             | "sync_status" => AuthScope::Read,
             "create_draft"
             | "triage_thread"
@@ -242,6 +243,8 @@ impl McpServer {
             | "cancel_scheduled_send"
             | "annotate_thread"
             | "modify_labels"
+            | "create_rule"
+            | "delete_rule"
             | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
             "unsubscribe" => {
@@ -275,6 +278,8 @@ impl McpServer {
                     "snooze_thread" => "snooze",
                     "cancel_scheduled_send" => "cancel_scheduled_send",
                     "modify_labels" => "modify",
+                    "create_rule" => "create_rule",
+                    "delete_rule" => "delete_rule",
                     "unsubscribe" => "unsubscribe",
                     _ => "read",
                 };
@@ -311,6 +316,9 @@ impl McpServer {
                     "list_labels" => self.tool_list_labels().await,
                     "lookup_contact" => self.tool_lookup_contact(arguments).await,
                     "list_vips" => self.tool_list_vips(arguments).await,
+                    "list_rules" => self.tool_list_rules().await,
+                    "create_rule" => self.tool_create_rule(arguments).await,
+                    "delete_rule" => self.tool_delete_rule(arguments).await,
                     "sync_gmail" => self.tool_sync_gmail(arguments).await,
                     "sync_status" => self.tool_sync_status().await,
                     _ => unreachable!(),
@@ -1122,6 +1130,94 @@ impl McpServer {
         }))
     }
 
+    async fn tool_list_rules(&self) -> AppResult<Value> {
+        ai::rules::execute_list_rules(&self.state).await
+    }
+
+    async fn tool_create_rule(&self, args: Value) -> AppResult<Value> {
+        fn default_true() -> bool {
+            true
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            name: String,
+            #[serde(default = "default_true")]
+            enabled: bool,
+            #[serde(default)]
+            match_query: String,
+            #[serde(default)]
+            vip_only: bool,
+            #[serde(default)]
+            actions: Option<InboxRuleActions>,
+            #[serde(default)]
+            add_labels: Vec<String>,
+            #[serde(default)]
+            remove_labels: Vec<String>,
+            #[serde(default)]
+            archive: Option<bool>,
+            #[serde(default)]
+            mark_read: Option<bool>,
+            #[serde(default)]
+            webhook_url: Option<String>,
+            #[serde(default)]
+            webhook_secret: Option<String>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let mut actions = parsed.actions.unwrap_or_default();
+        if !parsed.add_labels.is_empty() {
+            actions.add_labels.extend(parsed.add_labels);
+        }
+        if !parsed.remove_labels.is_empty() {
+            actions.remove_labels.extend(parsed.remove_labels);
+        }
+        if let Some(archive) = parsed.archive {
+            actions.archive = archive;
+        }
+        if let Some(mark_read) = parsed.mark_read {
+            actions.mark_read = mark_read;
+        }
+        if parsed.webhook_url.is_some() {
+            actions.webhook_url = parsed.webhook_url;
+        }
+        if parsed.webhook_secret.is_some() {
+            actions.webhook_secret = parsed.webhook_secret;
+        }
+
+        let input = NewInboxRule {
+            name: parsed.name,
+            enabled: parsed.enabled,
+            match_query: parsed.match_query,
+            vip_only: parsed.vip_only,
+            actions,
+        };
+        ai::rules::execute_create_rule_with_context(
+            &self.state,
+            input,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
+    }
+
+    async fn tool_delete_rule(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            #[serde(alias = "id")]
+            rule_id: String,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        ai::rules::execute_delete_rule_with_context(
+            &self.state,
+            &parsed.rule_id,
+            Some(self.principal.clone()),
+            EventSource::Mcp,
+        )
+        .await
+    }
+
     async fn tool_sync_gmail(&self, args: Value) -> AppResult<Value> {
         let req: SyncTriggerRequest = serde_json::from_value(args)?;
         let opts = ai::parse_sync_trigger(req)?;
@@ -1498,7 +1594,7 @@ fn resource_templates() -> Value {
 }
 
 fn tool_catalog() -> Value {
-    json!([
+    let mut tools = json!([
         {
             "name": "search_emails",
             "description": "Search emails using FTS5 full-text or hybrid semantic search and structured filters (labels, unread, from, to, has_attachment). Returns compact messages without base64 blobs.",
@@ -1953,41 +2049,115 @@ fn tool_catalog() -> Value {
                 "idempotentHint": true,
                 "openWorldHint": false
             }
-        },
-        {
-            "name": "sync_gmail",
-            "description": "Trigger an upstream Gmail synchronization pass (incremental or full).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mode": { "type": "string", "enum": ["incremental", "full"], "default": "incremental" },
-                    "provider": { "type": "string", "enum": ["api", "imap"] },
-                    "max_messages": { "type": "integer", "minimum": 1 },
-                    "query": { "type": "string" }
-                }
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": true
-            }
-        },
-        {
-            "name": "sync_status",
-            "description": "Get upstream Gmail sync state, last sync time, checkpoint, and mailbox message counts.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            },
-            "annotations": {
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false
-            }
         }
-    ])
+    ]);
+    if let Some(arr) = tools.as_array_mut() {
+        arr.extend([
+            json!({
+                "name": "list_rules",
+                "description": "List all per-mailbox event-driven inbox rules (webhook secrets are redacted).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": false
+                }
+            }),
+            json!({
+                "name": "create_rule",
+                "description": "Create a per-mailbox declarative inbox rule evaluated on inbound ingestion to automatically add/remove labels, archive, mark read, or trigger an HMAC-SHA256 signed webhook.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string", "description": "Human-readable name for the rule" },
+                        "enabled": { "type": "boolean", "default": true },
+                        "match_query": { "type": "string", "description": "Gmail search query (e.g. 'from:@stripe.com subject:dispute'); optional only when vip_only is true" },
+                        "vip_only": { "type": "boolean", "default": false, "description": "Match only when sender is a VIP contact" },
+                        "add_labels": { "type": "array", "items": { "type": "string" } },
+                        "remove_labels": { "type": "array", "items": { "type": "string" } },
+                        "archive": { "type": "boolean", "default": false },
+                        "mark_read": { "type": "boolean", "default": false },
+                        "webhook_url": { "type": "string", "description": "Optional http:// or https:// webhook URL notified on match" },
+                        "webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing secret for X-Nogml-Signature" },
+                        "actions": {
+                            "type": "object",
+                            "description": "Optional nested actions object",
+                            "properties": {
+                                "add_labels": { "type": "array", "items": { "type": "string" } },
+                                "remove_labels": { "type": "array", "items": { "type": "string" } },
+                                "archive": { "type": "boolean", "default": false },
+                                "mark_read": { "type": "boolean", "default": false },
+                                "webhook_url": { "type": "string" },
+                                "webhook_secret": { "type": "string" }
+                            }
+                        }
+                    }
+                },
+                "annotations": {
+                    "readOnlyHint": false,
+                    "destructiveHint": false,
+                    "idempotentHint": false,
+                    "openWorldHint": false
+                }
+            }),
+            json!({
+                "name": "delete_rule",
+                "description": "Delete a per-mailbox inbox rule by ID.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["rule_id"],
+                    "properties": {
+                        "rule_id": { "type": "string", "description": "ID of the inbox rule to delete" }
+                    }
+                },
+                "annotations": {
+                    "readOnlyHint": false,
+                    "destructiveHint": true,
+                    "idempotentHint": true,
+                    "openWorldHint": false
+                }
+            }),
+            json!({
+                "name": "sync_gmail",
+                "description": "Trigger an upstream Gmail synchronization pass (incremental or full).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["incremental", "full"], "default": "incremental" },
+                        "provider": { "type": "string", "enum": ["api", "imap"] },
+                        "max_messages": { "type": "integer", "minimum": 1 },
+                        "query": { "type": "string" }
+                    }
+                },
+                "annotations": {
+                    "readOnlyHint": false,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": true
+                }
+            }),
+            json!({
+                "name": "sync_status",
+                "description": "Get upstream Gmail sync state, last sync time, checkpoint, and mailbox message counts.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": false
+                }
+            }),
+        ]);
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -2068,7 +2238,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 22 tools
+        // tools/list advertises all 25 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -2101,12 +2271,15 @@ mod tests {
             "list_labels",
             "lookup_contact",
             "list_vips",
+            "list_rules",
+            "create_rule",
+            "delete_rule",
             "sync_gmail",
             "sync_status",
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 25);
     }
 
     #[tokio::test]
