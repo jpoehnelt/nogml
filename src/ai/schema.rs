@@ -186,6 +186,25 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "description": "List all system and user labels with message/thread counts.",
             "inputSchema": { "type": "object", "properties": {} }
         },
+        "mail.contacts": {
+            "endpoint": "GET /v1/contacts | GET /v1/contacts/{email} | PATCH /v1/contacts/{email}",
+            "mcp_tool": "lookup_contact | list_vips",
+            "description": "Inspect the local per-mailbox contact graph, filter contacts or VIPs, and update VIP overrides or notes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "email": { "type": "string" },
+                    "q": { "type": "string" },
+                    "vip_only": { "type": "boolean", "default": false },
+                    "replied_only": { "type": "boolean", "default": false },
+                    "domain": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                    "is_vip": { "type": "boolean" },
+                    "display_name": { "type": "string" },
+                    "notes": { "type": "string" }
+                }
+            }
+        },
         "mail.approvals": {
             "endpoint": "GET /v1/approvals | GET /v1/approvals/{id} | POST /v1/approvals/{id}/approve | POST /v1/approvals/{id}/reject",
             "description": "List, inspect, approve, or reject outbound emails held for human approval.",
@@ -251,6 +270,7 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "modify" | "modify_labels" => "mail.modify_labels",
             "unsubscribe" => "mail.unsubscribe",
             "labels" | "list_labels" => "mail.labels",
+            "contacts" | "lookup_contact" | "list_vips" | "vips" => "mail.contacts",
             "approvals" | "approve" | "reject" => "mail.approvals",
             "watch" | "events" => "mail.watch",
             "sync" | "sync_gmail" => "sync.gmail",
@@ -296,6 +316,9 @@ pub fn runtime_schema(command: Option<&str>) -> Value {
             "GET /v1/approvals/{id}",
             "POST /v1/approvals/{id}/approve",
             "POST /v1/approvals/{id}/reject",
+            "GET /v1/contacts",
+            "GET /v1/contacts/{email}",
+            "PATCH /v1/contacts/{email}",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",

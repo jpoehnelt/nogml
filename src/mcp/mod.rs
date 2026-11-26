@@ -26,7 +26,10 @@ use crate::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
         AiTriageRequest, LABEL_INBOX, SyncTriggerRequest,
     },
-    storage::{AiSearchQuery, AiThreadQuery},
+    storage::{
+        AiSearchQuery, AiThreadQuery, ContactQuery, ContactRecord,
+        validate_and_normalize_contact_email,
+    },
     sync,
 };
 
@@ -224,6 +227,8 @@ impl McpServer {
             | "read_email"
             | "read_attachment_text"
             | "list_labels"
+            | "lookup_contact"
+            | "list_vips"
             | "sync_status" => AuthScope::Read,
             "create_draft" | "triage_thread" | "modify_labels" | "sync_gmail" => AuthScope::Write,
             "send_email" | "send_draft" => AuthScope::Send,
@@ -264,6 +269,8 @@ impl McpServer {
                     "modify_labels" => self.tool_modify_labels(arguments).await,
                     "unsubscribe" => self.tool_unsubscribe(arguments).await,
                     "list_labels" => self.tool_list_labels().await,
+                    "lookup_contact" => self.tool_lookup_contact(arguments).await,
+                    "list_vips" => self.tool_list_vips(arguments).await,
                     "sync_gmail" => self.tool_sync_gmail(arguments).await,
                     "sync_status" => self.tool_sync_status().await,
                     _ => unreachable!(),
@@ -553,7 +560,7 @@ impl McpServer {
         }
 
         let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let page = self
+        let mut page = self
             .state
             .store
             .list_thread_summaries(&AiThreadQuery {
@@ -565,6 +572,8 @@ impl McpServer {
                 cursor: parsed.cursor,
             })
             .await?;
+
+        ai::enrich_thread_summaries_with_contacts(&self.state, &mut page.threads).await?;
 
         Ok(json!({
             "threads": page.threads,
@@ -785,6 +794,69 @@ impl McpServer {
             })
             .collect();
         Ok(json!({ "labels": items }))
+    }
+
+    async fn tool_lookup_contact(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            email: String,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let (email, domain) =
+            validate_and_normalize_contact_email(&parsed.email).map_err(|_| {
+                AppError::validation(
+                    format!("Invalid contact email address '{}'", parsed.email),
+                    Some("Provide a valid email address such as alice@example.com.".to_string()),
+                )
+            })?;
+
+        if let Some(contact) = self.state.store.get_contact(&email).await? {
+            let contact =
+                ai::sanitize_contact_record(contact, self.state.config.untrusted_content_guard);
+            let mut value = serde_json::to_value(contact)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("found".to_string(), Value::Bool(true));
+            }
+            Ok(value)
+        } else {
+            Ok(json!({
+                "found": false,
+                "email": email,
+                "domain": domain,
+                "sent_count": 0,
+                "received_count": 0,
+                "replied_by_me_count": 0,
+                "is_vip": false,
+            }))
+        }
+    }
+
+    async fn tool_list_vips(&self, args: Value) -> AppResult<Value> {
+        #[derive(Debug, Default, Deserialize)]
+        struct Args {
+            limit: Option<usize>,
+        }
+
+        let parsed: Args = serde_json::from_value(args)?;
+        let limit = parsed.limit.unwrap_or(50).clamp(1, 200);
+        let vips: Vec<ContactRecord> = self
+            .state
+            .store
+            .list_contacts(&ContactQuery {
+                vip_only: true,
+                limit,
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .map(|c| ai::sanitize_contact_record(c, self.state.config.untrusted_content_guard))
+            .collect();
+        let count = vips.len();
+        Ok(json!({
+            "vips": vips,
+            "count": count,
+        }))
     }
 
     async fn tool_sync_gmail(&self, args: Value) -> AppResult<Value> {
@@ -1419,6 +1491,39 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "lookup_contact",
+            "description": "Look up a contact in the local per-mailbox contact graph by email address, returning sent/received/reply counts, timestamps, VIP status, and notes.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                    "email": { "type": "string", "description": "Contact email address to look up" }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_vips",
+            "description": "List VIP contacts for the active mailbox (inferred from reply frequency or marked manually), ordered by activity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "sync_gmail",
             "description": "Trigger an upstream Gmail synchronization pass (incremental or full).",
             "inputSchema": {
@@ -1532,7 +1637,7 @@ mod tests {
             .unwrap();
         assert_eq!(ping["result"], json!({}));
 
-        // tools/list advertises all 14 tools
+        // tools/list advertises all 16 tools
         let tools_resp = server
             .handle_request(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
             .await
@@ -1557,12 +1662,14 @@ mod tests {
             "modify_labels",
             "unsubscribe",
             "list_labels",
+            "lookup_contact",
+            "list_vips",
             "sync_gmail",
             "sync_status",
         ] {
             assert!(names.contains(&expected), "missing MCP tool '{expected}'");
         }
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 16);
     }
 
     #[tokio::test]

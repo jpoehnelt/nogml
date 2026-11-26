@@ -19,8 +19,8 @@ use crate::{
     config::{Config, StorageBackend},
     error::{AppError, AppResult},
     models::{
-        AttachmentMeta, AutoForwarding, EmailAddress, ImapSettings, LabelColor, PopSettings,
-        Profile, SendAs, ThreadSummary, VacationSettings,
+        AttachmentMeta, AutoForwarding, ContactSummary, EmailAddress, ImapSettings, LabelColor,
+        PopSettings, Profile, SendAs, ThreadSummary, VacationSettings,
     },
     transport::OutboundMessage,
 };
@@ -477,6 +477,165 @@ pub struct NewPendingApprovalInput {
     pub expires_at_ms: i64,
 }
 
+// ============================================================================
+// Per-Mailbox Contact Graph & VIP Detection Types
+// ============================================================================
+
+/// Minimum `replied_by_me_count` required to infer VIP status automatically when
+/// no manual `vip_override` has been set.
+pub const VIP_REPLY_THRESHOLD: u64 = 3;
+
+/// Direction of an observed email interaction with a contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactDirection {
+    Sent,
+    Received,
+}
+
+/// Single observed contact interaction recorded when storing sent or received mail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactInteraction {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub direction: ContactDirection,
+    #[serde(default)]
+    pub is_reply: bool,
+    pub timestamp_ms: i64,
+}
+
+/// Per-mailbox contact profile derived from sent/received mail and optional user overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactRecord {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub domain: String,
+    pub sent_count: u64,
+    pub received_count: u64,
+    pub replied_by_me_count: u64,
+    pub first_seen_at_ms: i64,
+    pub last_seen_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replied_at_ms: Option<i64>,
+    pub is_vip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip_override: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl ContactRecord {
+    pub fn to_summary(&self) -> ContactSummary {
+        ContactSummary {
+            email: self.email.clone(),
+            display_name: self.display_name.clone(),
+            domain: self.domain.clone(),
+            sent_count: self.sent_count,
+            received_count: self.received_count,
+            replied_by_me_count: self.replied_by_me_count,
+            is_vip: self.is_vip,
+            last_replied_at_ms: self.last_replied_at_ms,
+            notes: self.notes.clone(),
+        }
+    }
+}
+
+impl From<&ContactRecord> for ContactSummary {
+    fn from(value: &ContactRecord) -> Self {
+        value.to_summary()
+    }
+}
+
+impl From<ContactRecord> for ContactSummary {
+    fn from(value: ContactRecord) -> Self {
+        ContactSummary {
+            email: value.email,
+            display_name: value.display_name,
+            domain: value.domain,
+            sent_count: value.sent_count,
+            received_count: value.received_count,
+            replied_by_me_count: value.replied_by_me_count,
+            is_vip: value.is_vip,
+            last_replied_at_ms: value.last_replied_at_ms,
+            notes: value.notes,
+        }
+    }
+}
+
+/// Filter parameters for `MailStore::list_contacts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContactQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub vip_only: bool,
+    #[serde(default)]
+    pub replied_only: bool,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub limit: usize,
+}
+
+/// Partial update payload for `MailStore::patch_contact`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContactPatch {
+    #[serde(default)]
+    pub is_vip: Option<bool>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Compute effective VIP status from an optional manual override and reply count.
+pub fn compute_contact_is_vip(vip_override: Option<bool>, replied_by_me_count: u64) -> bool {
+    vip_override.unwrap_or(replied_by_me_count >= VIP_REPLY_THRESHOLD)
+}
+
+/// Normalize a raw email string or `"Name <email>"` header into a lowercase bare email address.
+pub fn normalize_contact_email(raw: &str) -> String {
+    let parsed = parse_simple_email_address(raw);
+    parsed.email.trim().to_ascii_lowercase()
+}
+
+/// Extract the lowercase domain portion of an email address (empty if `@` is absent).
+pub fn extract_email_domain(email: &str) -> String {
+    email
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Normalize an optional string field by trimming whitespace and turning empty strings into `None`.
+pub fn normalize_optional_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Normalize a contact email and validate that it contains a non-empty local part and domain.
+pub fn validate_and_normalize_contact_email(raw: &str) -> AppResult<(String, String)> {
+    let email = normalize_contact_email(raw);
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(AppError::BadRequest(format!(
+            "Invalid contact email address: '{raw}'"
+        )));
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(AppError::BadRequest(format!(
+            "Invalid contact email address: '{raw}'"
+        )));
+    }
+    Ok((email.clone(), domain.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     pub send_as: Vec<SendAs>,
@@ -731,6 +890,15 @@ pub trait MailStore: Send + Sync {
         sent_message_id: Option<String>,
         provider_message_id: Option<String>,
     ) -> AppResult<PendingApproval>;
+
+    // --- Per-Mailbox Contact Graph & VIP Detection ---
+    async fn record_contact_interaction(
+        &self,
+        interaction: &ContactInteraction,
+    ) -> AppResult<ContactRecord>;
+    async fn get_contact(&self, email: &str) -> AppResult<Option<ContactRecord>>;
+    async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>>;
+    async fn patch_contact(&self, email: &str, patch: &ContactPatch) -> AppResult<ContactRecord>;
 }
 
 /// Construct the configured `MailStore` implementation (`sqlite`, `memory`, or `postgres`).

@@ -14,10 +14,11 @@ use nogml::{
         LabelColor, SYSTEM_LABEL_IDS,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, ApprovalStatus, HistoryEventKind, HistoryListQuery,
-        MailStore, MemoryStore, MessageListQuery, NewAttachmentInput, NewLabelInput,
-        NewMessageInput, NewPendingApprovalInput, SqliteStore, SyncState, TriagePatch,
-        UpdateLabelInput, UpsertOutcomeKind, WatchSubscription, open_store,
+        AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactDirection, ContactInteraction,
+        ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery, MailStore, MemoryStore,
+        MessageListQuery, NewAttachmentInput, NewLabelInput, NewMessageInput,
+        NewPendingApprovalInput, SqliteStore, SyncState, TriagePatch, UpdateLabelInput,
+        UpsertOutcomeKind, WatchSubscription, open_store,
     },
     transport::OutboundMessage,
 };
@@ -1072,6 +1073,253 @@ async fn contract_multi_mailbox_isolation(
         .await
         .unwrap();
     assert_eq!(bob_uid, 1);
+
+    // Contacts are strictly isolated per mailbox
+    alice
+        .record_contact_interaction(&ContactInteraction {
+            email: "Shared@Partner.com".to_string(),
+            display_name: Some("Alice Partner".to_string()),
+            direction: ContactDirection::Sent,
+            is_reply: true,
+            timestamp_ms: 1_700_000_100_000,
+        })
+        .await
+        .unwrap();
+    alice
+        .patch_contact(
+            "shared@partner.com",
+            &ContactPatch {
+                is_vip: Some(true),
+                display_name: None,
+                notes: Some("Alice secret note".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        bob.get_contact("shared@partner.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        bob.list_contacts(&ContactQuery::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let bob_contact = bob
+        .record_contact_interaction(&ContactInteraction {
+            email: "shared@partner.com".to_string(),
+            display_name: Some("Bob Partner".to_string()),
+            direction: ContactDirection::Received,
+            is_reply: false,
+            timestamp_ms: 1_700_000_200_000,
+        })
+        .await
+        .unwrap();
+    assert!(!bob_contact.is_vip);
+    assert_eq!(bob_contact.received_count, 1);
+    assert_eq!(bob_contact.sent_count, 0);
+
+    let alice_contact = alice
+        .get_contact("shared@partner.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(alice_contact.is_vip);
+    assert_eq!(alice_contact.notes.as_deref(), Some("Alice secret note"));
+    assert_eq!(alice_contact.sent_count, 1);
+    assert_eq!(alice_contact.received_count, 0);
+}
+
+async fn contract_contacts_stats_vip_filtering_and_patch(store: Arc<dyn MailStore>) {
+    // 1. Invalid email rejected
+    let bad = store
+        .record_contact_interaction(&ContactInteraction {
+            email: "not-an-email".to_string(),
+            display_name: None,
+            direction: ContactDirection::Received,
+            is_reply: false,
+            timestamp_ms: 1_000,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(bad, AppError::BadRequest(_)));
+
+    // 2. Receiving mail creates contact with normalized email/domain & received_count=1
+    let c1 = store
+        .record_contact_interaction(&ContactInteraction {
+            email: "Alice <Alice.Smith@Acme.COM>".to_string(),
+            display_name: None,
+            direction: ContactDirection::Received,
+            is_reply: false,
+            timestamp_ms: 2_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(c1.email, "alice.smith@acme.com");
+    assert_eq!(c1.domain, "acme.com");
+    assert_eq!(c1.display_name.as_deref(), Some("Alice"));
+    assert_eq!(c1.received_count, 1);
+    assert_eq!(c1.sent_count, 0);
+    assert_eq!(c1.replied_by_me_count, 0);
+    assert_eq!(c1.first_seen_at_ms, 2_000);
+    assert_eq!(c1.last_seen_at_ms, 2_000);
+    assert_eq!(c1.last_replied_at_ms, None);
+    assert!(!c1.is_vip);
+    assert_eq!(c1.vip_override, None);
+
+    // Earlier timestamp updates first_seen_at_ms without regressing last_seen_at_ms
+    let c1 = store
+        .record_contact_interaction(&ContactInteraction {
+            email: "alice.smith@acme.com".to_string(),
+            display_name: Some("Should Not Overwrite".to_string()),
+            direction: ContactDirection::Sent,
+            is_reply: false,
+            timestamp_ms: 1_500,
+        })
+        .await
+        .unwrap();
+    assert_eq!(c1.display_name.as_deref(), Some("Alice"));
+    assert_eq!(c1.sent_count, 1);
+    assert_eq!(c1.replied_by_me_count, 0);
+    assert_eq!(c1.first_seen_at_ms, 1_500);
+    assert_eq!(c1.last_seen_at_ms, 2_000);
+    assert!(!c1.is_vip);
+
+    // 3. Three replies trigger automatic VIP inference (replied_by_me_count >= 3)
+    for (i, ts) in [3_000_i64, 4_000, 5_000].into_iter().enumerate() {
+        let rec = store
+            .record_contact_interaction(&ContactInteraction {
+                email: "alice.smith@acme.com".to_string(),
+                display_name: None,
+                direction: ContactDirection::Sent,
+                is_reply: true,
+                timestamp_ms: ts,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rec.replied_by_me_count, (i + 1) as u64);
+        assert_eq!(rec.last_replied_at_ms, Some(ts));
+        assert_eq!(rec.is_vip, i + 1 >= 3);
+        assert_eq!(rec.vip_override, None);
+    }
+
+    // 4. Manual override can demote an inferred VIP and stays false after further replies
+    let demoted = store
+        .patch_contact(
+            "ALICE.SMITH@ACME.COM",
+            &ContactPatch {
+                is_vip: Some(false),
+                display_name: Some("Alice Smith".to_string()),
+                notes: Some("Former vendor_50%".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!demoted.is_vip);
+    assert_eq!(demoted.vip_override, Some(false));
+    assert_eq!(demoted.display_name.as_deref(), Some("Alice Smith"));
+    assert_eq!(demoted.notes.as_deref(), Some("Former vendor_50%"));
+
+    let after_reply = store
+        .record_contact_interaction(&ContactInteraction {
+            email: "alice.smith@acme.com".to_string(),
+            display_name: None,
+            direction: ContactDirection::Sent,
+            is_reply: true,
+            timestamp_ms: 6_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_reply.replied_by_me_count, 4);
+    assert!(!after_reply.is_vip, "manual vip_override=false must stick");
+    assert_eq!(after_reply.vip_override, Some(false));
+
+    // 5. Cold sender & manual VIP promotion
+    store
+        .record_contact_interaction(&ContactInteraction {
+            email: "cold@spammy.io".to_string(),
+            display_name: Some("Cold Outreach".to_string()),
+            direction: ContactDirection::Received,
+            is_reply: false,
+            timestamp_ms: 7_000,
+        })
+        .await
+        .unwrap();
+
+    let ceo = store
+        .patch_contact(
+            "ceo@acme.com",
+            &ContactPatch {
+                is_vip: Some(true),
+                display_name: Some("Chief Exec".to_string()),
+                notes: Some("Board member".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ceo.is_vip);
+    assert_eq!(ceo.vip_override, Some(true));
+    assert_eq!(ceo.sent_count, 0);
+    assert_eq!(ceo.received_count, 0);
+
+    // 6. Filtering: vip_only, replied_only, domain, q (including LIKE wildcards), limit, ordering
+    let vips = store
+        .list_contacts(&ContactQuery {
+            vip_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(vips.len(), 1);
+    assert_eq!(vips[0].email, "ceo@acme.com");
+
+    let replied = store
+        .list_contacts(&ContactQuery {
+            replied_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replied.len(), 1);
+    assert_eq!(replied[0].email, "alice.smith@acme.com");
+
+    let acme = store
+        .list_contacts(&ContactQuery {
+            domain: Some("@ACME.COM".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(acme.len(), 2);
+    // VIPs always sort first
+    assert_eq!(acme[0].email, "ceo@acme.com");
+    assert_eq!(acme[1].email, "alice.smith@acme.com");
+
+    // Search q matches notes and escapes literal % and _
+    let wildcard_q = store
+        .list_contacts(&ContactQuery {
+            q: Some("vendor_50%".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(wildcard_q.len(), 1);
+    assert_eq!(wildcard_q[0].email, "alice.smith@acme.com");
+
+    let limited = store
+        .list_contacts(&ContactQuery {
+            limit: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].email, "ceo@acme.com");
 }
 
 /// Master contract test runner executing every `MailStore` invariant suite on isolated mailboxes.
@@ -1082,6 +1330,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     let mb_fts = format!("{prefix}-fts-{suffix}@contract.test");
     let mb_sync = format!("{prefix}-sync-{suffix}@contract.test");
     let mb_apr = format!("{prefix}-apr-{suffix}@contract.test");
+    let mb_contacts = format!("{prefix}-contacts-{suffix}@contract.test");
     let mb_alice = format!("{prefix}-alice-{suffix}@contract.test");
     let mb_bob = format!("{prefix}-bob-{suffix}@contract.test");
 
@@ -1090,6 +1339,7 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_fts_ai_search_and_cursor_pagination(base_store.for_mailbox(&mb_fts)).await;
     contract_upsert_dedup_settings_watch_sync_state(base_store.for_mailbox(&mb_sync)).await;
     contract_pending_approvals_atomic_transitions(base_store.for_mailbox(&mb_apr)).await;
+    contract_contacts_stats_vip_filtering_and_patch(base_store.for_mailbox(&mb_contacts)).await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
 }
 

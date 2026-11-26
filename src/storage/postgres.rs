@@ -29,13 +29,16 @@ use crate::{
         Profile, SYSTEM_LABEL_IDS, SendAs, ThreadSummary, VacationSettings, is_system_label,
     },
     storage::{
-        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, DraftListPage,
-        HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo, ImapMessageEntry,
-        MailStore, MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
+        AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus,
+        ContactDirection, ContactInteraction, ContactPatch, ContactQuery, ContactRecord,
+        DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery, ImapMailboxInfo,
+        ImapMessageEntry, MailStore, MessageListPage, MessageListQuery, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredAttachment, StoredDraft,
         StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, parse_simple_email_address,
+        UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
+        compute_contact_is_vip, normalize_contact_email, normalize_optional_text,
+        parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
 
@@ -57,7 +60,7 @@ const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -285,6 +288,27 @@ CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_status_created
     ON pending_approvals (mailbox_id, status, created_at_ms DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_mailbox_created
     ON pending_approvals (mailbox_id, created_at_ms DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    mailbox_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    display_name TEXT,
+    domain TEXT NOT NULL,
+    sent_count BIGINT NOT NULL DEFAULT 0,
+    received_count BIGINT NOT NULL DEFAULT 0,
+    replied_by_me_count BIGINT NOT NULL DEFAULT 0,
+    first_seen_at_ms BIGINT NOT NULL,
+    last_seen_at_ms BIGINT NOT NULL,
+    last_replied_at_ms BIGINT,
+    is_vip BOOLEAN NOT NULL DEFAULT FALSE,
+    vip_override BOOLEAN,
+    notes TEXT,
+    PRIMARY KEY (mailbox_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_vip_activity
+    ON contacts (mailbox_id, is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC);
+CREATE INDEX IF NOT EXISTS idx_contacts_mailbox_domain
+    ON contacts (mailbox_id, domain);
 "#;
 
 /// Build a `deadpool-postgres` pool from a PostgreSQL connection URL or libpq string.
@@ -1910,6 +1934,7 @@ fn build_thread_summary(thread_id: &str, messages: &[StoredMessage]) -> ThreadSu
         id: thread_id.to_string(),
         subject,
         participants,
+        sender_contact: None,
         snippet,
         labels,
         unread,
@@ -4985,4 +5010,248 @@ impl MailStore for PostgresStore {
             ..existing
         })
     }
+
+    async fn record_contact_interaction(
+        &self,
+        interaction: &ContactInteraction,
+    ) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(&interaction.email)?;
+        let parsed_name =
+            normalize_optional_text(interaction.display_name.as_deref()).or_else(|| {
+                let parsed = parse_simple_email_address(&interaction.email);
+                normalize_optional_text(parsed.name.as_deref())
+            });
+        let is_sent = interaction.direction == ContactDirection::Sent;
+        let is_received = interaction.direction == ContactDirection::Received;
+        let is_reply = is_sent && interaction.is_reply;
+        let ts = interaction.timestamp_ms;
+
+        let sent_inc: i64 = if is_sent { 1 } else { 0 };
+        let recv_inc: i64 = if is_received { 1 } else { 0 };
+        let reply_inc: i64 = if is_reply { 1 } else { 0 };
+        let replied_ts: Option<i64> = is_reply.then_some(ts);
+        let initial_vip = compute_contact_is_vip(None, reply_inc as u64);
+        let vip_threshold = VIP_REPLY_THRESHOLD as i64;
+
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let row = conn
+            .query_one(
+                "INSERT INTO contacts (
+                    mailbox_id, email, display_name, domain,
+                    sent_count, received_count, replied_by_me_count,
+                    first_seen_at_ms, last_seen_at_ms, last_replied_at_ms,
+                    is_vip, vip_override, notes
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, NULL, NULL)
+                 ON CONFLICT (mailbox_id, email) DO UPDATE SET
+                    display_name = COALESCE(contacts.display_name, EXCLUDED.display_name),
+                    sent_count = contacts.sent_count + EXCLUDED.sent_count,
+                    received_count = contacts.received_count + EXCLUDED.received_count,
+                    replied_by_me_count = contacts.replied_by_me_count + EXCLUDED.replied_by_me_count,
+                    first_seen_at_ms = LEAST(contacts.first_seen_at_ms, EXCLUDED.first_seen_at_ms),
+                    last_seen_at_ms = GREATEST(contacts.last_seen_at_ms, EXCLUDED.last_seen_at_ms),
+                    last_replied_at_ms = CASE
+                        WHEN EXCLUDED.last_replied_at_ms IS NULL THEN contacts.last_replied_at_ms
+                        WHEN contacts.last_replied_at_ms IS NULL THEN EXCLUDED.last_replied_at_ms
+                        ELSE GREATEST(contacts.last_replied_at_ms, EXCLUDED.last_replied_at_ms)
+                    END,
+                    is_vip = COALESCE(
+                        contacts.vip_override,
+                        (contacts.replied_by_me_count + EXCLUDED.replied_by_me_count) >= $11
+                    )
+                 RETURNING email, display_name, domain, sent_count, received_count,
+                           replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                           last_replied_at_ms, is_vip, vip_override, notes",
+                &[
+                    &mb,
+                    &email,
+                    &parsed_name,
+                    &domain,
+                    &sent_inc,
+                    &recv_inc,
+                    &reply_inc,
+                    &ts,
+                    &replied_ts,
+                    &initial_vip,
+                    &vip_threshold,
+                ],
+            )
+            .await
+            .map_err(pg_err)?;
+
+        Ok(contact_from_row(&row))
+    }
+
+    async fn get_contact(&self, email: &str) -> AppResult<Option<ContactRecord>> {
+        let normalized = normalize_contact_email(email);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let row = conn
+            .query_opt(
+                "SELECT email, display_name, domain, sent_count, received_count,
+                        replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                        last_replied_at_ms, is_vip, vip_override, notes
+                 FROM contacts
+                 WHERE mailbox_id = $1 AND email = $2",
+                &[&mb, &normalized],
+            )
+            .await
+            .map_err(pg_err)?;
+        Ok(row.as_ref().map(contact_from_row))
+    }
+
+    async fn list_contacts(&self, query: &ContactQuery) -> AppResult<Vec<ContactRecord>> {
+        let limit = if query.limit == 0 { 50 } else { query.limit } as i64;
+        let q_pattern = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", escape_pg_like(s)));
+        let domain_filter = query
+            .domain
+            .as_deref()
+            .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.clone();
+
+        let mut sql = String::from(
+            "SELECT email, display_name, domain, sent_count, received_count,
+                    replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                    last_replied_at_ms, is_vip, vip_override, notes
+             FROM contacts
+             WHERE mailbox_id = $1",
+        );
+        let mut params_vec: Vec<&(dyn ToSql + Sync)> = vec![&mb];
+
+        if query.vip_only {
+            sql.push_str(" AND is_vip = TRUE");
+        }
+        if query.replied_only {
+            sql.push_str(" AND replied_by_me_count > 0");
+        }
+        if let Some(ref dom) = domain_filter {
+            params_vec.push(dom);
+            sql.push_str(&format!(" AND domain = ${}", params_vec.len()));
+        }
+        if let Some(ref pat) = q_pattern {
+            params_vec.push(pat);
+            let idx = params_vec.len();
+            sql.push_str(&format!(
+                " AND (email ILIKE ${idx} ESCAPE '\\' \
+                       OR COALESCE(display_name, '') ILIKE ${idx} ESCAPE '\\' \
+                       OR domain ILIKE ${idx} ESCAPE '\\' \
+                       OR COALESCE(notes, '') ILIKE ${idx} ESCAPE '\\')"
+            ));
+        }
+
+        params_vec.push(&limit);
+        sql.push_str(&format!(
+            " ORDER BY is_vip DESC, replied_by_me_count DESC, last_seen_at_ms DESC, email ASC \
+              LIMIT ${}",
+            params_vec.len()
+        ));
+
+        let rows = conn.query(&sql, &params_vec).await.map_err(pg_err)?;
+        Ok(rows.iter().map(contact_from_row).collect())
+    }
+
+    async fn patch_contact(&self, email: &str, patch: &ContactPatch) -> AppResult<ContactRecord> {
+        let (email, domain) = validate_and_normalize_contact_email(email)?;
+        let now_ms = Utc::now().timestamp_millis();
+        let set_vip = patch.is_vip.is_some();
+        let vip_override = patch.is_vip;
+        let initial_vip = compute_contact_is_vip(vip_override, 0);
+        let set_name = patch.display_name.is_some();
+        let display_name = patch
+            .display_name
+            .as_deref()
+            .and_then(|s| normalize_optional_text(Some(s)));
+        let set_notes = patch.notes.is_some();
+        let notes = patch
+            .notes
+            .as_deref()
+            .and_then(|s| normalize_optional_text(Some(s)));
+        let vip_threshold = VIP_REPLY_THRESHOLD as i64;
+
+        let conn = self.ready_conn().await?;
+        let mb = self.mailbox_id.as_str();
+        let row = conn
+            .query_one(
+                "INSERT INTO contacts (
+                    mailbox_id, email, display_name, domain,
+                    sent_count, received_count, replied_by_me_count,
+                    first_seen_at_ms, last_seen_at_ms, last_replied_at_ms,
+                    is_vip, vip_override, notes
+                 ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, NULL, $6, $7, $8)
+                 ON CONFLICT (mailbox_id, email) DO UPDATE SET
+                    display_name = CASE WHEN $9 THEN EXCLUDED.display_name ELSE contacts.display_name END,
+                    vip_override = CASE WHEN $10 THEN EXCLUDED.vip_override ELSE contacts.vip_override END,
+                    is_vip = COALESCE(
+                        CASE WHEN $10 THEN EXCLUDED.vip_override ELSE contacts.vip_override END,
+                        contacts.replied_by_me_count >= $12
+                    ),
+                    notes = CASE WHEN $11 THEN EXCLUDED.notes ELSE contacts.notes END
+                 RETURNING email, display_name, domain, sent_count, received_count,
+                           replied_by_me_count, first_seen_at_ms, last_seen_at_ms,
+                           last_replied_at_ms, is_vip, vip_override, notes",
+                &[
+                    &mb,
+                    &email,
+                    &display_name,
+                    &domain,
+                    &now_ms,
+                    &initial_vip,
+                    &vip_override,
+                    &notes,
+                    &set_name,
+                    &set_vip,
+                    &set_notes,
+                    &vip_threshold,
+                ],
+            )
+            .await
+            .map_err(pg_err)?;
+
+        Ok(contact_from_row(&row))
+    }
+}
+
+fn contact_from_row(row: &Row) -> ContactRecord {
+    let sent_count: i64 = row.get(3);
+    let received_count: i64 = row.get(4);
+    let replied_by_me_count: i64 = row.get(5);
+    ContactRecord {
+        email: row.get(0),
+        display_name: row.get(1),
+        domain: row.get(2),
+        sent_count: sent_count.max(0) as u64,
+        received_count: received_count.max(0) as u64,
+        replied_by_me_count: replied_by_me_count.max(0) as u64,
+        first_seen_at_ms: row.get(6),
+        last_seen_at_ms: row.get(7),
+        last_replied_at_ms: row.get(8),
+        is_vip: row.get(9),
+        vip_override: row.get(10),
+        notes: row.get(11),
+    }
+}
+
+fn escape_pg_like(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }

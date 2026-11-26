@@ -50,13 +50,15 @@ use crate::{
     models::{
         AiCreateDraftRequest, AiModifyLabelsRequest, AiSendDraftRequest, AiSendEmailRequest,
         AiTriageRequest, AiUnsubscribeRequest, AttachmentTextExtraction, CompactMessage,
-        EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED, LABEL_TRASH,
-        LABEL_UNREAD, SyncTriggerRequest, ThreadDetail, UnsubscribeInfo,
+        ContactSummary, EmailAddress, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_STARRED,
+        LABEL_TRASH, LABEL_UNREAD, SyncTriggerRequest, ThreadDetail, ThreadSummary,
+        UnsubscribeInfo,
     },
     storage::{
-        AiSearchQuery, AiThreadQuery, ApprovalStatus, MessageListQuery, NewAttachmentInput,
-        NewMessageInput, NewPendingApprovalInput, PendingApproval, StoredMessage,
-        StoredThreadDetail, TriagePatch, parse_simple_email_address,
+        AiSearchQuery, AiThreadQuery, ApprovalStatus, ContactPatch, ContactQuery, ContactRecord,
+        MessageListQuery, NewAttachmentInput, NewMessageInput, NewPendingApprovalInput,
+        PendingApproval, StoredMessage, StoredThreadDetail, TriagePatch,
+        parse_simple_email_address, validate_and_normalize_contact_email,
     },
     sync::{self, SyncRunOptions},
     transport::{OutboundAttachment, OutboundMessage},
@@ -76,6 +78,8 @@ pub use unsubscribe::{
 
 const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
+const DEFAULT_CONTACTS_LIMIT: usize = 50;
+const MAX_CONTACTS_LIMIT: usize = 200;
 const DEFAULT_LIST_BODY_CHARS: usize = 1000;
 const SSE_REPLAY_LIMIT: usize = 1024;
 
@@ -124,6 +128,11 @@ pub fn ai_router() -> Router<AppState> {
         .route("/v1/approvals/{id}", get(get_approval_handler))
         .route("/v1/approvals/{id}/approve", post(approve_approval_handler))
         .route("/v1/approvals/{id}/reject", post(reject_approval_handler))
+        .route("/v1/contacts", get(list_contacts_handler))
+        .route(
+            "/v1/contacts/{email}",
+            get(get_contact_handler).patch(patch_contact_handler),
+        )
         .route("/v1/labels", get(list_labels))
         .route("/v1/search", get(search_messages))
         .route("/v1/events", get(events_sse_handler))
@@ -1292,6 +1301,7 @@ pub fn to_compact_message(
         thread_id: msg.thread_id.clone(),
         date,
         from: clean_addr(&msg.from_addr),
+        sender_contact: None,
         to: msg.to_addrs.iter().map(|a| clean_addr(a)).collect(),
         cc: msg.cc_addrs.iter().map(|a| clean_addr(a)).collect(),
         subject: clean(&msg.subject),
@@ -1322,6 +1332,53 @@ fn sanitize_unsubscribe(info: Option<UnsubscribeInfo>, guard: bool) -> Option<Un
     Some(info)
 }
 
+/// Sanitize untrusted header-derived display names on a [`ContactRecord`] when
+/// `untrusted_content_guard` is active.
+pub fn sanitize_contact_record(mut record: ContactRecord, guard: bool) -> ContactRecord {
+    if guard {
+        record.display_name = record.display_name.map(|n| sanitize_untrusted_text(&n));
+    }
+    record
+}
+
+/// Populate `sender_contact` on each [`ThreadSummary`] from the mailbox contact graph
+/// using the first non-self participant (or the first participant if all match self).
+pub async fn enrich_thread_summaries_with_contacts(
+    state: &AppState,
+    threads: &mut [ThreadSummary],
+) -> AppResult<()> {
+    let self_email = state.store.mailbox_id().trim().to_ascii_lowercase();
+    let guard = state.config.untrusted_content_guard;
+    let mut cache: HashMap<String, Option<ContactSummary>> = HashMap::new();
+
+    for thread in threads.iter_mut() {
+        let candidate = thread
+            .participants
+            .iter()
+            .find(|p| !p.email.eq_ignore_ascii_case(&self_email))
+            .or_else(|| thread.participants.first());
+        let Some(addr) = candidate else {
+            continue;
+        };
+        let key = addr.email.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(cached) = cache.get(&key) {
+            thread.sender_contact = cached.clone();
+        } else {
+            let summary = state
+                .store
+                .get_contact(&key)
+                .await?
+                .map(|c| sanitize_contact_record(c, guard).to_summary());
+            cache.insert(key, summary.clone());
+            thread.sender_contact = summary;
+        }
+    }
+    Ok(())
+}
+
 /// Build a full [`ThreadDetail`] with compact messages, participants, labels, optional attachment metadata, and `_meta`.
 pub async fn build_thread_detail(
     state: &AppState,
@@ -1338,6 +1395,8 @@ pub async fn build_thread_detail(
     let mut unread = false;
     let mut last_ms = i64::MIN;
     let mut subject = String::new();
+    let mut contact_cache: HashMap<String, Option<ContactSummary>> = HashMap::new();
+    let guard = state.config.untrusted_content_guard;
 
     let mut compact_messages = Vec::with_capacity(detail.messages.len());
 
@@ -1369,6 +1428,21 @@ pub async fn build_thread_detail(
             strip_quotes,
             include_html,
         );
+
+        let sender_key = compact.from.email.trim().to_ascii_lowercase();
+        if !sender_key.is_empty() {
+            if let Some(cached) = contact_cache.get(&sender_key) {
+                compact.sender_contact = cached.clone();
+            } else {
+                let summary = state
+                    .store
+                    .get_contact(&sender_key)
+                    .await?
+                    .map(|c| sanitize_contact_record(c, guard).to_summary());
+                contact_cache.insert(sender_key, summary.clone());
+                compact.sender_contact = summary;
+            }
+        }
 
         for addr in std::iter::once(&compact.from)
             .chain(compact.to.iter())
@@ -1418,7 +1492,7 @@ pub async fn build_thread_detail(
     })
 }
 
-/// Build a compact message populated with attachment metadata when requested.
+/// Build a compact message populated with attachment metadata and sender contact summary when available.
 pub async fn build_compact_message_with_meta(
     state: &AppState,
     msg: &StoredMessage,
@@ -1436,6 +1510,13 @@ pub async fn build_compact_message_with_meta(
         strip_quotes,
         include_html,
     );
+    if !compact.from.email.trim().is_empty() {
+        compact.sender_contact = state
+            .store
+            .get_contact(&compact.from.email)
+            .await?
+            .map(|c| sanitize_contact_record(c, state.config.untrusted_content_guard).to_summary());
+    }
     if include_attachments_meta && msg.has_attachments {
         let meta = state.store.list_attachment_meta(&msg.id).await?;
         if !meta.is_empty() {
@@ -2082,6 +2163,18 @@ struct ListApprovalsParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ListContactsParams {
+    q: Option<String>,
+    #[serde(default)]
+    vip_only: bool,
+    #[serde(default)]
+    replied_only: bool,
+    domain: Option<String>,
+    limit: Option<usize>,
+    fields: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct EventsParams {
     types: Option<String>,
     label: Option<String>,
@@ -2125,6 +2218,9 @@ async fn get_capabilities(
             "GET /v1/approvals/{id}",
             "POST /v1/approvals/{id}/approve",
             "POST /v1/approvals/{id}/reject",
+            "GET /v1/contacts",
+            "GET /v1/contacts/{email}",
+            "PATCH /v1/contacts/{email}",
             "GET /v1/labels",
             "GET /v1/search",
             "GET /v1/events",
@@ -2179,7 +2275,7 @@ async fn list_threads(
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .clamp(1, MAX_LIST_LIMIT);
 
-    let page = state
+    let mut page = state
         .store
         .list_thread_summaries(&AiThreadQuery {
             q: params.q,
@@ -2190,6 +2286,8 @@ async fn list_threads(
             cursor: params.cursor,
         })
         .await?;
+
+    enrich_thread_summaries_with_contacts(&state, &mut page.threads).await?;
 
     let body = json!({
         "threads": page.threads,
@@ -2790,5 +2888,79 @@ async fn sync_status_handler(
 ) -> Result<Json<Value>, AiError> {
     let status = sync::get_sync_status(&state).await?;
     let value = serde_json::to_value(status).map_err(AppError::from)?;
+    Ok(Json(project_fields(value, query.fields.as_deref())?))
+}
+
+async fn list_contacts_handler(
+    MailboxState(state): MailboxState,
+    Query(params): Query<ListContactsParams>,
+) -> Result<Json<Value>, AiError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_CONTACTS_LIMIT)
+        .clamp(1, MAX_CONTACTS_LIMIT);
+    let contacts: Vec<ContactRecord> = state
+        .store
+        .list_contacts(&ContactQuery {
+            q: params.q,
+            vip_only: params.vip_only,
+            replied_only: params.replied_only,
+            domain: params.domain,
+            limit,
+        })
+        .await?
+        .into_iter()
+        .map(|c| sanitize_contact_record(c, state.config.untrusted_content_guard))
+        .collect();
+
+    let count = contacts.len();
+    let body = json!({
+        "contacts": contacts,
+        "count": count,
+    });
+    Ok(Json(project_fields(body, params.fields.as_deref())?))
+}
+
+async fn get_contact_handler(
+    MailboxState(state): MailboxState,
+    Path(email): Path<String>,
+    Query(query): Query<FieldsQuery>,
+) -> Result<Json<Value>, AiError> {
+    let (normalized, _) = validate_and_normalize_contact_email(&email).map_err(|_| {
+        AppError::validation(
+            format!("Invalid contact email address '{email}'"),
+            Some("Provide a valid email address such as alice@example.com.".to_string()),
+        )
+    })?;
+
+    let contact = state
+        .store
+        .get_contact(&normalized)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Contact '{normalized}' not found")))?;
+    let contact = sanitize_contact_record(contact, state.config.untrusted_content_guard);
+    let value = serde_json::to_value(contact).map_err(AppError::from)?;
+    Ok(Json(project_fields(value, query.fields.as_deref())?))
+}
+
+async fn patch_contact_handler(
+    MailboxState(state): MailboxState,
+    Path(email): Path<String>,
+    Query(query): Query<FieldsQuery>,
+    Json(patch): Json<ContactPatch>,
+) -> Result<Json<Value>, AiError> {
+    let (normalized, _) = validate_and_normalize_contact_email(&email).map_err(|_| {
+        AppError::validation(
+            format!("Invalid contact email address '{email}'"),
+            Some("Provide a valid email address such as alice@example.com.".to_string()),
+        )
+    })?;
+    if let Some(ref display_name) = patch.display_name {
+        validate_email_header("display_name", display_name)?;
+    }
+
+    let updated = state.store.patch_contact(&normalized, &patch).await?;
+    let updated = sanitize_contact_record(updated, state.config.untrusted_content_guard);
+    let value = serde_json::to_value(updated).map_err(AppError::from)?;
     Ok(Json(project_fields(value, query.fields.as_deref())?))
 }
