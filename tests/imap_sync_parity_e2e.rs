@@ -1220,3 +1220,708 @@ async fn background_imap_idle_listener_triggers_immediate_sync_and_shuts_down() 
 
     let _ = server_shutdown_tx.send(true);
 }
+
+// ============================================================================
+// 8. Issue #86 Regression: OAuth2 bearer token safety & password preference
+// ============================================================================
+
+#[tokio::test]
+async fn imap_oauth2_prefers_password_and_refuses_leak_without_auth_xoauth2() {
+    // 1. Mock IMAP server that advertises AUTH=XOAUTH2 and records every command received.
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap();
+    let received_cmds1: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cmds1_clone = received_cmds1.clone();
+    let srv1 = tokio::spawn(async move {
+        let (stream, _) = listener1.accept().await.unwrap();
+        let (rh, mut wh) = stream.into_split();
+        let mut reader = BufReader::new(rh);
+        wh.write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2] Mock IMAP\r\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        while reader.read_line(&mut line).await.unwrap() > 0 {
+            let trimmed = line.trim().to_string();
+            cmds1_clone.lock().unwrap().push(trimmed.clone());
+            let mut parts = trimmed.splitn(3, ' ');
+            let tag = parts.next().unwrap_or("A0");
+            let cmd = parts.next().unwrap_or("").to_ascii_uppercase();
+            match cmd.as_str() {
+                "LOGIN" => {
+                    wh.write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                "CAPABILITY" => {
+                    wh.write_all(b"* CAPABILITY IMAP4rev1\r\n").await.unwrap();
+                    wh.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                "SELECT" => {
+                    wh.write_all(
+                        b"* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n* OK [UIDNEXT 1] ok\r\n",
+                    )
+                    .await
+                    .unwrap();
+                    wh.write_all(format!("{tag} OK [READ-WRITE] SELECT completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                "LOGOUT" => {
+                    wh.write_all(b"* BYE logout\r\n").await.unwrap();
+                    wh.write_all(format!("{tag} OK LOGOUT completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    break;
+                }
+                _ => {
+                    wh.write_all(format!("{tag} OK done\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            line.clear();
+        }
+    });
+
+    // Configure BOTH explicit gmail_imap_password AND Gmail OAuth2 creds (with broken refresh URL).
+    let mut cfg1 = Config::for_test();
+    cfg1.sync_mode = SyncMode::Imap;
+    cfg1.gmail_imap_host = addr1.ip().to_string();
+    cfg1.gmail_imap_port = addr1.port();
+    cfg1.gmail_imap_tls = false;
+    cfg1.gmail_imap_user = Some("user@thirdparty.test".to_string());
+    cfg1.gmail_imap_password = Some("explicit-imap-pass".to_string());
+    cfg1.gmail_access_token = Some("ya29.MUST_NEVER_BE_SENT".to_string());
+    cfg1.gmail_oauth_token_url = "http://127.0.0.1:1/unreachable-token".to_string();
+    cfg1.gmail_imap_mailbox = "INBOX".to_string();
+    let (_d1, state1) = make_sqlite_state(cfg1);
+
+    run_gmail_sync(&state1, SyncRunOptions::default())
+        .await
+        .expect("explicit gmail_imap_password should succeed via LOGIN without using OAuth2");
+    let _ = srv1.await;
+
+    let cmds1 = received_cmds1.lock().unwrap().clone();
+    assert!(
+        cmds1
+            .iter()
+            .any(|c| c.to_ascii_uppercase().contains(" LOGIN ")),
+        "expected LOGIN command, got {cmds1:?}"
+    );
+    assert!(
+        !cmds1.iter().any(|c| {
+            c.to_ascii_uppercase().contains("XOAUTH2") || c.contains("MUST_NEVER_BE_SENT")
+        }),
+        "OAuth2 bearer token must NEVER be sent when gmail_imap_password is set: {cmds1:?}"
+    );
+
+    // 2. Mock IMAP server that does NOT advertise AUTH=XOAUTH2 (neither in greeting nor CAPABILITY).
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let received_cmds2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cmds2_clone = received_cmds2.clone();
+    let srv2 = tokio::spawn(async move {
+        let (stream, _) = listener2.accept().await.unwrap();
+        let (rh, mut wh) = stream.into_split();
+        let mut reader = BufReader::new(rh);
+        wh.write_all(b"* OK Plain third-party IMAP ready\r\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        while reader.read_line(&mut line).await.unwrap() > 0 {
+            let trimmed = line.trim().to_string();
+            cmds2_clone.lock().unwrap().push(trimmed.clone());
+            let mut parts = trimmed.splitn(3, ' ');
+            let tag = parts.next().unwrap_or("C0");
+            let cmd = parts.next().unwrap_or("").to_ascii_uppercase();
+            if cmd == "CAPABILITY" {
+                wh.write_all(b"* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                wh.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                wh.write_all(format!("{tag} NO unsupported\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            line.clear();
+        }
+    });
+
+    let mut cfg2 = Config::for_test();
+    cfg2.sync_mode = SyncMode::Imap;
+    cfg2.gmail_imap_host = addr2.ip().to_string();
+    cfg2.gmail_imap_port = addr2.port();
+    cfg2.gmail_imap_tls = false;
+    cfg2.gmail_imap_user = Some("user@thirdparty.test".to_string());
+    cfg2.gmail_imap_password = None;
+    cfg2.gmail_access_token = Some("ya29.SECRET_OAUTH_TOKEN".to_string());
+    cfg2.gmail_imap_mailbox = "INBOX".to_string();
+    let (_d2, state2) = make_sqlite_state(cfg2);
+
+    let err2 = run_gmail_sync(&state2, SyncRunOptions::default())
+        .await
+        .expect_err("sync must fail when server does not advertise AUTH=XOAUTH2");
+    assert!(
+        err2.to_string().contains("AUTH=XOAUTH2"),
+        "unexpected error: {err2}"
+    );
+    let _ = srv2.await;
+
+    let cmds2 = received_cmds2.lock().unwrap().clone();
+    assert!(
+        cmds2
+            .iter()
+            .any(|c| c.to_ascii_uppercase().contains("CAPABILITY")),
+        "expected pre-auth CAPABILITY probe, got {cmds2:?}"
+    );
+    assert!(
+        !cmds2.iter().any(|c| {
+            c.to_ascii_uppercase().contains("AUTHENTICATE") || c.contains("SECRET_OAUTH_TOKEN")
+        }),
+        "must never send AUTHENTICATE XOAUTH2 when AUTH=XOAUTH2 is not advertised: {cmds2:?}"
+    );
+
+    // 3. Non-Gmail third-party host with OAuth2 only is rejected before opening any socket.
+    let mut cfg3 = Config::for_test();
+    cfg3.sync_mode = SyncMode::Imap;
+    cfg3.gmail_imap_host = "imap.fastmail.com".to_string();
+    cfg3.gmail_imap_port = 993;
+    cfg3.gmail_imap_tls = true;
+    cfg3.gmail_imap_user = Some("user@fastmail.com".to_string());
+    cfg3.gmail_imap_password = None;
+    cfg3.gmail_access_token = Some("ya29.GOOGLE_TOKEN".to_string());
+    let (_d3, state3) = make_sqlite_state(cfg3);
+    let err3 = run_gmail_sync(&state3, SyncRunOptions::default())
+        .await
+        .expect_err("non-Gmail host must be rejected for Google OAuth2");
+    assert!(
+        err3.to_string().contains("non-Gmail"),
+        "unexpected error: {err3}"
+    );
+}
+
+// ============================================================================
+// 9. Issue #86 Regression: X-GM-LABELS uses \Junk + Modified UTF-7 when
+//    UTF8=ACCEPT is absent
+// ============================================================================
+
+#[tokio::test]
+async fn imap_xgm_labels_uses_junk_and_modified_utf7_without_utf8_accept() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let store_cmds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let store_cmds_clone = store_cmds.clone();
+
+    let raw_msg = b"From: alice@example.com\r\nTo: me@example.com\r\nSubject: MUTF7 Test\r\nMessage-ID: <mutf7-1@example.com>\r\n\r\nBody";
+    let raw_len = raw_msg.len();
+
+    let srv = tokio::spawn(async move {
+        // Serve 2 connections: connection 1 for pull, connection 2 for push_changes.
+        for _ in 0..3 {
+            let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                break;
+            };
+            let (rh, mut wh) = stream.into_split();
+            let mut reader = BufReader::new(rh);
+            wh.write_all(b"* OK Mock Gmail IMAP without UTF8=ACCEPT\r\n")
+                .await
+                .unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                let trimmed = line.trim().to_string();
+                let mut parts = trimmed.splitn(3, ' ');
+                let tag = parts.next().unwrap_or("A0");
+                let cmd = parts.next().unwrap_or("").to_ascii_uppercase();
+                let rest = parts.next().unwrap_or("");
+                let rest_upper = rest.to_ascii_uppercase();
+                match cmd.as_str() {
+                    "LOGIN" => {
+                        wh.write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "CAPABILITY" => {
+                        // Deliberately advertise X-GM-EXT-1 WITHOUT UTF8=ACCEPT!
+                        wh.write_all(b"* CAPABILITY IMAP4rev1 X-GM-EXT-1 UIDPLUS\r\n")
+                            .await
+                            .unwrap();
+                        wh.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "SELECT" => {
+                        wh.write_all(
+                            b"* 1 EXISTS\r\n* OK [UIDVALIDITY 77] ok\r\n* OK [UIDNEXT 2] ok\r\n",
+                        )
+                        .await
+                        .unwrap();
+                        wh.write_all(
+                            format!("{tag} OK [READ-WRITE] SELECT completed\r\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "UID" if rest_upper.starts_with("SEARCH") => {
+                        wh.write_all(b"* SEARCH 1\r\n").await.unwrap();
+                        wh.write_all(format!("{tag} OK SEARCH completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "UID" if rest_upper.starts_with("FETCH") => {
+                        if rest_upper.contains("BODY.PEEK[]") {
+                            let header = format!(
+                                "* 1 FETCH (UID 1 FLAGS (\\Seen) INTERNALDATE \"04-Jan-2025 12:00:00 +0000\" X-GM-MSGID 1001 X-GM-THRID 2001 X-GM-LABELS (\\Inbox \"Caf&AOk-/&kc2JgQ-\") BODY[] {{{raw_len}}}\r\n"
+                            );
+                            wh.write_all(header.as_bytes()).await.unwrap();
+                            wh.write_all(raw_msg).await.unwrap();
+                            wh.write_all(b")\r\n").await.unwrap();
+                        } else {
+                            wh.write_all(
+                                b"* 1 FETCH (UID 1 FLAGS (\\Seen) X-GM-MSGID 1001 X-GM-LABELS (\\Inbox \"Caf&AOk-/&kc2JgQ-\"))\r\n",
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        wh.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "UID" if rest_upper.starts_with("STORE") => {
+                        store_cmds_clone.lock().unwrap().push(trimmed.clone());
+                        wh.write_all(format!("{tag} OK STORE completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "LOGOUT" => {
+                        wh.write_all(b"* BYE logout\r\n").await.unwrap();
+                        wh.write_all(format!("{tag} OK LOGOUT completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {
+                        wh.write_all(format!("{tag} OK done\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                }
+                line.clear();
+            }
+        }
+    });
+
+    let mut cfg = Config::for_test();
+    cfg.sync_mode = SyncMode::Imap;
+    cfg.sync_bidirectional = true;
+    cfg.gmail_imap_host = addr.ip().to_string();
+    cfg.gmail_imap_port = addr.port();
+    cfg.gmail_imap_tls = false;
+    cfg.gmail_imap_user = Some("me@example.com".to_string());
+    cfg.gmail_imap_password = Some("pass".to_string());
+    cfg.gmail_imap_mailbox = "[Gmail]/All Mail".to_string();
+    let (_dir, state) = make_sqlite_state(cfg);
+
+    // Pass 1: Pull message with MUTF-7 encoded X-GM-LABELS ("Caf&AOk-/&kc2JgQ-").
+    let r1 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r1.messages_added, 1);
+
+    let labels = state.store.list_labels().await.unwrap();
+    let decoded_lbl = labels
+        .iter()
+        .find(|l| l.name == "Café/重要")
+        .expect("MUTF-7 X-GM-LABELS must decode to UTF-8 label 'Café/重要'");
+    let synced_msg = state
+        .store
+        .find_message_by_upstream_id("3e9")
+        .await
+        .unwrap()
+        .expect("synced message by hex X-GM-MSGID 1001 == 0x3e9");
+    assert!(synced_msg.label_ids.contains(&decoded_lbl.id));
+
+    // Create another non-ASCII label "日本語" + add LABEL_SPAM locally, then push.
+    let jp_lbl = state
+        .store
+        .create_label(NewLabelInput {
+            name: "日本語".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .modify_message_labels(
+            &synced_msg.id,
+            &[nogml::models::LABEL_SPAM.to_string(), jp_lbl.id.clone()],
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let r2 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r2.messages_pushed, 1);
+    srv.abort();
+
+    let cmds = store_cmds.lock().unwrap().clone();
+    let xgm_store = cmds
+        .iter()
+        .find(|c| c.contains("+X-GM-LABELS"))
+        .expect("expected UID STORE +X-GM-LABELS command");
+    assert!(
+        xgm_store.contains("\\Junk"),
+        "LABEL_SPAM must map to \\Junk on the wire, got: {xgm_store}"
+    );
+    assert!(
+        !xgm_store.contains("\\Spam"),
+        "invalid \\Spam token must never be sent: {xgm_store}"
+    );
+    assert!(
+        xgm_store.is_ascii(),
+        "without UTF8=ACCEPT, X-GM-LABELS command must be 7-bit ASCII MUTF-7, got: {xgm_store}"
+    );
+    let expected_jp_mutf7 = nogml::sync::gmail_imap::encode_imap_mutf7("日本語");
+    assert!(
+        xgm_store.contains(&expected_jp_mutf7),
+        "expected MUTF-7 encoded label {expected_jp_mutf7} in {xgm_store}"
+    );
+}
+
+// ============================================================================
+// 10. Issue #86 Regression: CONDSTORE without QRESYNC detects expunged UIDs
+//     even when HIGHESTMODSEQ does not change
+// ============================================================================
+
+#[tokio::test]
+async fn imap_condstore_without_qresync_propagates_expunge_with_unchanged_highestmodseq() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expunged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let expunged_srv = expunged.clone();
+
+    let raw1 =
+        b"From: a@example.com\r\nSubject: Msg One\r\nMessage-ID: <cs-1@example.com>\r\n\r\nOne";
+    let raw2 =
+        b"From: b@example.com\r\nSubject: Msg Two\r\nMessage-ID: <cs-2@example.com>\r\n\r\nTwo";
+
+    let srv = tokio::spawn(async move {
+        for _ in 0..3 {
+            let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                break;
+            };
+            let (rh, mut wh) = stream.into_split();
+            let mut reader = BufReader::new(rh);
+            wh.write_all(b"* OK Mock CONDSTORE-only IMAP\r\n")
+                .await
+                .unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                let trimmed = line.trim().to_string();
+                let mut parts = trimmed.splitn(3, ' ');
+                let tag = parts.next().unwrap_or("A0");
+                let cmd = parts.next().unwrap_or("").to_ascii_uppercase();
+                let rest = parts.next().unwrap_or("");
+                let rest_upper = rest.to_ascii_uppercase();
+                let is_expunged = expunged_srv.load(std::sync::atomic::Ordering::SeqCst);
+
+                match cmd.as_str() {
+                    "LOGIN" => {
+                        wh.write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "CAPABILITY" => {
+                        // CONDSTORE only (NO QRESYNC, like imap.gmail.com)
+                        wh.write_all(b"* CAPABILITY IMAP4rev1 CONDSTORE ENABLE\r\n")
+                            .await
+                            .unwrap();
+                        wh.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "ENABLE" => {
+                        wh.write_all(b"* ENABLED CONDSTORE\r\n").await.unwrap();
+                        wh.write_all(format!("{tag} OK ENABLE completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "SELECT" => {
+                        // Notice HIGHESTMODSEQ stays 50 both BEFORE and AFTER UID 1 is expunged!
+                        let exists = if is_expunged { 1 } else { 2 };
+                        wh.write_all(
+                            format!(
+                                "* {exists} EXISTS\r\n* OK [UIDVALIDITY 99] ok\r\n* OK [UIDNEXT 3] ok\r\n* OK [HIGHESTMODSEQ 50] ok\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                        wh.write_all(
+                            format!("{tag} OK [READ-WRITE] SELECT completed\r\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "UID" if rest_upper.starts_with("SEARCH") => {
+                        if is_expunged {
+                            wh.write_all(b"* SEARCH 2\r\n").await.unwrap();
+                        } else {
+                            wh.write_all(b"* SEARCH 1 2\r\n").await.unwrap();
+                        }
+                        wh.write_all(format!("{tag} OK SEARCH completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "UID" if rest_upper.starts_with("FETCH") => {
+                        if rest_upper.contains("BODY.PEEK[]") {
+                            let h1 = format!(
+                                "* 1 FETCH (UID 1 FLAGS (\\Seen) MODSEQ (49) INTERNALDATE \"04-Jan-2025 12:00:00 +0000\" BODY[] {{{}}}\r\n",
+                                raw1.len()
+                            );
+                            wh.write_all(h1.as_bytes()).await.unwrap();
+                            wh.write_all(raw1).await.unwrap();
+                            wh.write_all(b")\r\n").await.unwrap();
+                            let h2 = format!(
+                                "* 2 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (50) INTERNALDATE \"04-Jan-2025 12:01:00 +0000\" BODY[] {{{}}}\r\n",
+                                raw2.len()
+                            );
+                            wh.write_all(h2.as_bytes()).await.unwrap();
+                            wh.write_all(raw2).await.unwrap();
+                            wh.write_all(b")\r\n").await.unwrap();
+                        }
+                        wh.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "LOGOUT" => {
+                        wh.write_all(b"* BYE logout\r\n").await.unwrap();
+                        wh.write_all(format!("{tag} OK LOGOUT completed\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {
+                        wh.write_all(format!("{tag} OK done\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                }
+                line.clear();
+            }
+        }
+    });
+
+    let mut cfg = Config::for_test();
+    cfg.sync_mode = SyncMode::Imap;
+    cfg.gmail_imap_host = addr.ip().to_string();
+    cfg.gmail_imap_port = addr.port();
+    cfg.gmail_imap_tls = false;
+    cfg.gmail_imap_user = Some("me@example.com".to_string());
+    cfg.gmail_imap_password = Some("pass".to_string());
+    cfg.gmail_imap_mailbox = "INBOX".to_string();
+    let (_dir, state) = make_sqlite_state(cfg);
+
+    // Pass 1: Initial sync fetches UID 1 and UID 2 with HIGHESTMODSEQ = 50.
+    let r1 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r1.messages_added, 2);
+    assert!(
+        state
+            .store
+            .find_message_by_upstream_id("imap:INBOX:99:1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Expunge UID 1 upstream WITHOUT bumping HIGHESTMODSEQ (still 50!).
+    expunged.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Pass 2: Incremental sync MUST still detect UID 1 vanished and delete it locally.
+    let r2 = run_gmail_sync(&state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r2.messages_deleted, 1);
+    assert!(
+        state
+            .store
+            .find_message_by_upstream_id("imap:INBOX:99:1")
+            .await
+            .unwrap()
+            .is_none(),
+        "expunged UID 1 must be deleted locally even when HIGHESTMODSEQ is unchanged"
+    );
+    assert!(
+        state
+            .store
+            .find_message_by_upstream_id("imap:INBOX:99:2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    srv.abort();
+}
+
+// ============================================================================
+// 11. Issue #86 Regression: External BlobStore hydration on IMAP APPEND and
+//     external blob cleanup on IMAP sync-driven deletions
+// ============================================================================
+
+#[tokio::test]
+async fn imap_sync_hydrates_external_blobs_on_append_and_cleans_blobs_on_vanish() {
+    let (_up_dir, upstream_state) = make_sqlite_state(Config::for_test());
+    let up_raw = b"From: alice@upstream.test\r\nTo: me@example.com\r\nSubject: Vanish Blob Test\r\nMessage-ID: <vanish-blob-1@upstream.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: text/plain\r\n\r\nBody\r\n--b1\r\nContent-Type: text/plain; name=\"doc.txt\"\r\nContent-Disposition: attachment; filename=\"doc.txt\"\r\n\r\nattachment-bytes\r\n--b1--\r\n".to_vec();
+    let up_msg = upstream_state
+        .store
+        .insert_message(parse_raw_to_new_message_input(
+            up_raw,
+            vec![LABEL_INBOX.to_string(), LABEL_UNREAD.to_string()],
+            None,
+            "local",
+            Some("1900000000000801".to_string()),
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+    let (addr, shutdown_tx) = start_embedded_imap_server(upstream_state.clone()).await;
+
+    // Configure local node with an external FsBlobStore + bidirectional IMAP sync.
+    let local_dir = TempDir::new().unwrap();
+    let mut local_cfg = Config::for_test();
+    local_cfg.storage = StorageBackend::Sqlite;
+    local_cfg.db_path = local_dir.path().join("local.db");
+    local_cfg.blob_backend = nogml::config::BlobBackend::Fs;
+    local_cfg.blob_dir = local_dir.path().join("blobs");
+    local_cfg.sync_mode = SyncMode::Imap;
+    local_cfg.sync_bidirectional = true;
+    local_cfg.gmail_imap_host = addr.ip().to_string();
+    local_cfg.gmail_imap_port = addr.port();
+    local_cfg.gmail_imap_tls = false;
+    local_cfg.gmail_imap_user = Some("agent@example.com".to_string());
+    local_cfg.gmail_imap_password = Some("secret-pass".to_string());
+    local_cfg.gmail_imap_mailbox = "[Gmail]/All Mail".to_string();
+    let local_state = AppState::from_config(local_cfg).unwrap();
+
+    // Pass 1: Pull upstream message with attachment into local external FsBlobStore.
+    let r1 = run_gmail_sync(&local_state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r1.messages_added, 1);
+
+    let local_pulled = local_state
+        .store
+        .find_message_by_upstream_id("1900000000000801")
+        .await
+        .unwrap()
+        .unwrap();
+    let pulled_raw_key = nogml::blob::raw_message_blob_key(&local_pulled.id);
+    let pulled_att_ids = local_state
+        .collect_external_attachment_ids(&local_pulled.id)
+        .await;
+    assert!(
+        !pulled_att_ids.is_empty(),
+        "expected attachment on pulled message"
+    );
+    assert!(
+        local_state
+            .blobs
+            .get(&pulled_raw_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for att_id in &pulled_att_ids {
+        let key = nogml::blob::attachment_blob_key(&local_pulled.id, att_id);
+        assert!(local_state.blobs.get(&key).await.unwrap().is_some());
+    }
+
+    // Create a local Sent message whose rich HTML MIME lives ONLY in FsBlobStore
+    // (DB `raw_rfc2822` is empty, simulating offloaded blob storage!).
+    let rich_raw = b"From: me@example.com\r\nTo: bob@example.com\r\nSubject: Hydrated HTML Sent\r\nMessage-ID: <hydrated-sent-1@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\nX-Custom-Header: preserved-from-blob\r\n\r\n<h1>Rich HTML from BlobStore</h1>".to_vec();
+    let mut sent_input = parse_raw_to_new_message_input(
+        rich_raw.clone(),
+        vec![LABEL_SENT.to_string()],
+        None,
+        "local",
+        None,
+        None,
+        false,
+        false,
+    );
+    sent_input.raw_rfc2822 = Vec::new(); // Empty in DB; only present in external BlobStore!
+    let local_sent = local_state.store.insert_message(sent_input).await.unwrap();
+    local_state
+        .blobs
+        .put(
+            &nogml::blob::raw_message_blob_key(&local_sent.id),
+            &rich_raw,
+        )
+        .await
+        .unwrap();
+
+    // Also delete `up_msg` upstream so Pass 2 both:
+    // (a) deletes `local_pulled` on vanish (cleaning up external blobs!), and
+    // (b) pushes `local_sent` via IMAP APPEND hydrated from FsBlobStore!
+    upstream_state
+        .store
+        .delete_message(&up_msg.id)
+        .await
+        .unwrap();
+
+    let r2 = run_gmail_sync(&local_state, SyncRunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r2.messages_deleted, 1);
+    assert_eq!(r2.messages_pushed, 1);
+
+    // Verify external blobs for the vanished message were cleaned up (no leak!).
+    assert!(
+        local_state
+            .blobs
+            .get(&pulled_raw_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "raw blob for vanished message must be deleted"
+    );
+    for att_id in &pulled_att_ids {
+        let key = nogml::blob::attachment_blob_key(&local_pulled.id, att_id);
+        assert!(
+            local_state.blobs.get(&key).await.unwrap().is_none(),
+            "attachment blob {att_id} for vanished message must be deleted"
+        );
+    }
+
+    // Verify the upstream APPENDed message contains the full hydrated HTML + custom header from BlobStore!
+    let appended_up = upstream_state
+        .store
+        .find_message_by_rfc_message_id("<hydrated-sent-1@example.com>")
+        .await
+        .unwrap()
+        .expect("locally created Sent message should be APPENDed upstream");
+    let appended_raw = String::from_utf8_lossy(&appended_up.raw_rfc2822);
+    assert!(
+        appended_raw.contains("<h1>Rich HTML from BlobStore</h1>"),
+        "APPENDed message must preserve HTML hydrated from external BlobStore, got: {appended_raw}"
+    );
+    assert!(
+        appended_raw.contains("X-Custom-Header: preserved-from-blob"),
+        "APPENDed message must preserve headers hydrated from external BlobStore, got: {appended_raw}"
+    );
+
+    let _ = shutdown_tx.send(true);
+}

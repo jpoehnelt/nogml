@@ -2005,6 +2005,7 @@ impl MailTransport for RecordingMemoryTransport {
         Ok(SendOutcome {
             provider: "in_memory_transport".to_string(),
             provider_message_id: format!("mem_tx_{n}"),
+            provider_thread_id: None,
         })
     }
 }

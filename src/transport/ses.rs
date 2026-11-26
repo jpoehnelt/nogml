@@ -677,6 +677,7 @@ impl MailTransport for SesTransport {
         Ok(SendOutcome {
             provider: self.name().to_string(),
             provider_message_id,
+            provider_thread_id: None,
         })
     }
 }

@@ -121,6 +121,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording".to_string(),
             provider_message_id: format!("rec_msg_{idx}"),
+            provider_thread_id: None,
         })
     }
 }

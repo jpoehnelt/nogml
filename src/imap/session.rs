@@ -3298,11 +3298,22 @@ impl ImapSession {
                 return Ok(());
             }
 
+            // Custom user label: decode RFC 3501 Modified UTF-7 (for Gmail X-GM-LABELS clients
+            // without UTF8=ACCEPT), reject system labels, then resolve by exact name,
+            // case-insensitive name, or user label ID.
+            let decoded_custom = crate::sync::gmail_imap::decode_imap_mutf7(trimmed);
+            let custom_name = decoded_custom.trim();
+            if custom_name.is_empty() {
+                continue;
+            }
             if existing_labels.iter().any(|l| {
                 l.label_type != "user"
-                    && (l.id.eq_ignore_ascii_case(trimmed) || l.name.eq_ignore_ascii_case(trimmed))
+                    && (l.id.eq_ignore_ascii_case(trimmed)
+                        || l.name.eq_ignore_ascii_case(trimmed)
+                        || l.id.eq_ignore_ascii_case(custom_name)
+                        || l.name.eq_ignore_ascii_case(custom_name))
             }) {
-                let safe = sanitize_imap_text(trimmed);
+                let safe = sanitize_imap_text(custom_name);
                 write_flush(
                     stream,
                     format!("{tag} NO Unsupported Gmail system label {safe}\r\n").as_bytes(),
@@ -3311,19 +3322,18 @@ impl ImapSession {
                 return Ok(());
             }
 
-            // Custom user label: find existing by exact name, case-insensitive name, or user label ID.
             let found_id = existing_labels
                 .iter()
-                .find(|l| l.label_type == "user" && l.name == trimmed)
+                .find(|l| l.label_type == "user" && l.name == custom_name)
                 .or_else(|| {
-                    existing_labels
-                        .iter()
-                        .find(|l| l.label_type == "user" && l.name.eq_ignore_ascii_case(trimmed))
+                    existing_labels.iter().find(|l| {
+                        l.label_type == "user" && l.name.eq_ignore_ascii_case(custom_name)
+                    })
                 })
                 .or_else(|| {
                     existing_labels
                         .iter()
-                        .find(|l| l.label_type == "user" && l.id == trimmed)
+                        .find(|l| l.label_type == "user" && l.id == custom_name)
                 })
                 .map(|l| l.id.clone());
 
@@ -3334,7 +3344,7 @@ impl ImapSession {
                         .state
                         .store
                         .create_label(NewLabelInput {
-                            name: trimmed.to_string(),
+                            name: custom_name.to_string(),
                             ..Default::default()
                         })
                         .await
@@ -3349,7 +3359,8 @@ impl ImapSession {
                             existing_labels
                                 .iter()
                                 .find(|l| {
-                                    l.label_type == "user" && l.name.eq_ignore_ascii_case(trimmed)
+                                    l.label_type == "user"
+                                        && l.name.eq_ignore_ascii_case(custom_name)
                                 })
                                 .map(|l| l.id.clone())
                         }

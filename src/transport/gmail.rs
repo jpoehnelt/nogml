@@ -284,9 +284,11 @@ impl MailTransport for GmailApiTransport {
                 });
             }
 
+            let provider_thread_id = (!sent.thread_id.trim().is_empty()).then_some(sent.thread_id);
             return Ok(SendOutcome {
                 provider: self.name().to_string(),
                 provider_message_id: sent.id,
+                provider_thread_id,
             });
         }
     }
@@ -405,5 +407,48 @@ mod tests {
         let outcome = transport.send(&msg, None).await.unwrap();
         assert_eq!(outcome.provider, "gmail");
         assert_eq!(outcome.provider_message_id, "18f_gmail_sent_99");
+        assert_eq!(
+            outcome.provider_thread_id.as_deref(),
+            Some("18f_gmail_thr_42")
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_transport_send_new_thread_populates_provider_thread_id() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/gmail/v1/users/me/messages/send"))
+            .and(header("authorization", "Bearer static-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "18f_new_msg_1",
+                "threadId": "18f_new_thr_1",
+                "labelIds": ["SENT"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::for_test();
+        cfg.gmail_api_base_url = server.uri();
+        cfg.gmail_access_token = Some("static-tok".to_string());
+
+        let transport = GmailApiTransport::from_config(&cfg).unwrap();
+        let msg = OutboundMessage {
+            from: "me@example.com".to_string(),
+            to: vec!["alice@example.com".to_string()],
+            subject: "Brand New Thread".to_string(),
+            text: Some("Hello new thread".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = transport.send(&msg, None).await.unwrap();
+        assert_eq!(outcome.provider, "gmail");
+        assert_eq!(outcome.provider_message_id, "18f_new_msg_1");
+        assert_eq!(outcome.provider_thread_id.as_deref(), Some("18f_new_thr_1"));
+
+        let (up_mid, up_tid) = crate::transport::upstream_gmail_ids_from_send(&outcome, None);
+        assert_eq!(up_mid.as_deref(), Some("18f_new_msg_1"));
+        assert_eq!(up_tid.as_deref(), Some("18f_new_thr_1"));
     }
 }

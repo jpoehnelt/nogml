@@ -109,6 +109,7 @@ impl MailTransport for CountingTransport {
         Ok(SendOutcome {
             provider: "counting_mock".to_string(),
             provider_message_id: format!("mock_{n}"),
+            provider_thread_id: None,
         })
     }
 }

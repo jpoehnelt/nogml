@@ -74,6 +74,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording_mock".to_string(),
             provider_message_id: format!("prov_msg_{idx}"),
+            provider_thread_id: None,
         })
     }
 }

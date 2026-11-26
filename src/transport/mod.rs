@@ -281,10 +281,18 @@ pub fn upstream_gmail_ids_from_send(
     upstream_thread_id: Option<String>,
 ) -> (Option<String>, Option<String>) {
     if outcome.provider == "gmail" && !outcome.provider_message_id.trim().is_empty() {
-        (
-            Some(outcome.provider_message_id.clone()),
-            upstream_thread_id.filter(|s| !s.trim().is_empty()),
-        )
+        let tid = outcome
+            .provider_thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                upstream_thread_id
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        (Some(outcome.provider_message_id.clone()), tid)
     } else {
         (None, None)
     }
@@ -295,6 +303,7 @@ pub fn upstream_gmail_ids_from_send(
 pub struct SendOutcome {
     pub provider: String,
     pub provider_message_id: String,
+    pub provider_thread_id: Option<String>,
 }
 
 /// Declared transport capabilities for runtime inspection and routing.

@@ -2959,6 +2959,19 @@ impl MailStore for MemoryStore {
                 }
             }
 
+            let mut thread_id_backfilled = false;
+            if let Some(ref utid) = input.upstream_thread_id
+                && !utid.trim().is_empty()
+                && let Some(m) = state.messages.get_mut(&existing_id)
+                && m.upstream_thread_id
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+            {
+                m.upstream_thread_id = Some(utid.trim().to_string());
+                thread_id_backfilled = true;
+            }
+            let _ = thread_id_backfilled;
+
             let updated =
                 if labels_changed {
                     state.modify_message_labels_resolved_with_source(

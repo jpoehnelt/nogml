@@ -70,6 +70,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording_test".to_string(),
             provider_message_id: format!("rec_{n}"),
+            provider_thread_id: None,
         })
     }
 }

@@ -590,7 +590,10 @@ fn test_xgm_labels_mapping_and_quoting() {
             LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_STARRED,
             LABEL_TRASH, LABEL_UNREAD,
         },
-        sync::gmail_imap::{map_local_label_to_xgm_token, quote_imap_string},
+        sync::gmail_imap::{
+            decode_imap_mutf7, encode_imap_mutf7, map_local_label_to_xgm_token,
+            map_local_label_to_xgm_token_with_utf8, quote_imap_string,
+        },
     };
 
     let mut user_names = HashMap::new();
@@ -615,7 +618,7 @@ fn test_xgm_labels_mapping_and_quoting() {
     );
     assert_eq!(
         map_local_label_to_xgm_token(LABEL_SPAM, &user_names).as_deref(),
-        Some("\\Spam")
+        Some("\\Junk")
     );
     assert_eq!(
         map_local_label_to_xgm_token(LABEL_TRASH, &user_names).as_deref(),
@@ -645,7 +648,15 @@ fn test_xgm_labels_mapping_and_quoting() {
     );
     assert_eq!(
         map_local_label_to_xgm_token("Label_3", &user_names).as_deref(),
+        Some("\"Caf&AOk-/&kc2JgQ-\"")
+    );
+    assert_eq!(
+        map_local_label_to_xgm_token_with_utf8("Label_3", &user_names, true).as_deref(),
         Some("\"Café/重要\"")
+    );
+    assert_eq!(
+        decode_imap_mutf7(&encode_imap_mutf7("Café/重要 & 🚀")),
+        "Café/重要 & 🚀"
     );
     assert_eq!(
         map_local_label_to_xgm_token("Label_bad_crlf", &user_names),
@@ -743,4 +754,79 @@ fn test_config_imap_parity_fields_and_oauth2_configured() {
     assert!(!cfg.has_background_sync());
     cfg.gmail_imap_idle = true;
     assert!(cfg.has_background_sync());
+}
+
+#[test]
+fn test_imap_xoauth2_target_validation_and_mutf7_roundtrip() {
+    use crate::sync::gmail_imap::{
+        decode_imap_mutf7, encode_imap_mutf7, validate_imap_xoauth2_target,
+    };
+
+    // Non-Gmail third-party IMAP host must never receive Google OAuth2 bearer tokens.
+    let mut third_party = Config::for_test();
+    third_party.gmail_imap_host = "imap.fastmail.com".to_string();
+    third_party.gmail_imap_tls = true;
+    assert!(validate_imap_xoauth2_target(&third_party).is_err());
+
+    // Plaintext (non-TLS) non-loopback host must never receive OAuth2 bearer tokens.
+    let mut plaintext_gmail = Config::for_test();
+    plaintext_gmail.gmail_imap_host = "imap.gmail.com".to_string();
+    plaintext_gmail.gmail_imap_tls = false;
+    assert!(validate_imap_xoauth2_target(&plaintext_gmail).is_err());
+
+    // TLS Gmail IMAP hosts and loopback test hosts are accepted.
+    let mut tls_gmail = Config::for_test();
+    tls_gmail.gmail_imap_host = "imap.gmail.com".to_string();
+    tls_gmail.gmail_imap_tls = true;
+    assert!(validate_imap_xoauth2_target(&tls_gmail).is_ok());
+
+    let mut tls_googlemail = Config::for_test();
+    tls_googlemail.gmail_imap_host = "imap.googlemail.com".to_string();
+    tls_googlemail.gmail_imap_tls = true;
+    assert!(validate_imap_xoauth2_target(&tls_googlemail).is_ok());
+
+    let mut loopback = Config::for_test();
+    loopback.gmail_imap_host = "127.0.0.1".to_string();
+    loopback.gmail_imap_tls = false;
+    assert!(validate_imap_xoauth2_target(&loopback).is_ok());
+
+    // RFC 3501 section 5.1.3 Modified UTF-7 edge cases.
+    assert_eq!(encode_imap_mutf7("Work/Urgent"), "Work/Urgent");
+    assert_eq!(encode_imap_mutf7("R&D"), "R&-D");
+    assert_eq!(decode_imap_mutf7("R&-D"), "R&D");
+    // U+FFFF encodes in Modified Base64 with ',' instead of '/' (`&,,8-`).
+    let ffff = "\u{ffff}";
+    let enc_ffff = encode_imap_mutf7(ffff);
+    assert!(
+        enc_ffff.contains(','),
+        "expected comma in Modified Base64, got {enc_ffff}"
+    );
+    assert!(!enc_ffff.contains('/'));
+    assert_eq!(decode_imap_mutf7(&enc_ffff), ffff);
+
+    for sample in [
+        "",
+        "ASCII Only 123",
+        "A&B&&C",
+        "Café",
+        "日本語/プロジェクト",
+        "Café/重要",
+        "Rocket 🚀 Launch",
+        "é&日本語&🎉",
+    ] {
+        let encoded = encode_imap_mutf7(sample);
+        assert!(
+            encoded.is_ascii(),
+            "MUTF-7 output must be 7-bit ASCII for {sample:?}: {encoded:?}"
+        );
+        assert_eq!(
+            decode_imap_mutf7(&encoded),
+            sample,
+            "round-trip failed for {sample:?} (encoded {encoded:?})"
+        );
+    }
+
+    // Malformed shift sequence falls back safely instead of panicking or truncating.
+    assert_eq!(decode_imap_mutf7("R&D"), "R&D");
+    assert_eq!(decode_imap_mutf7("Bad&/invalid-"), "Bad&/invalid-");
 }

@@ -182,6 +182,7 @@ impl MailTransport for ResendTransport {
         Ok(SendOutcome {
             provider: self.name().to_string(),
             provider_message_id: resp.id,
+            provider_thread_id: None,
         })
     }
 }

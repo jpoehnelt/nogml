@@ -78,6 +78,7 @@ impl MailTransport for NoopTransport {
         Ok(SendOutcome {
             provider: "noop".to_string(),
             provider_message_id: "msg_noop_1".to_string(),
+            provider_thread_id: None,
         })
     }
 }

@@ -21,7 +21,7 @@ use crate::{
     net_guard::{
         UrlGuardOptions, build_pinned_http_client, validate_and_pin_url, validate_url_static,
     },
-    search::{SearchQuery, matches_message, parse_query, try_parse_query},
+    search::{SearchQuery, matches_message, parse_query, rewrite_query_labels, try_parse_query},
     storage::{
         InboxRule, InboxRuleActions, InboxRulePatch, InboxRuleView, MailStore, MessageListQuery,
         NewInboxRule, NewLabelInput, StoredMessage, normalize_inbox_rule_actions,
@@ -471,12 +471,19 @@ async fn is_sender_vip(store: &dyn MailStore, from_addr: &str) -> bool {
     }
 }
 
-fn rule_matches_query(rule: &InboxRule, msg: &StoredMessage) -> bool {
+fn rule_matches_query(
+    rule: &InboxRule,
+    msg: &StoredMessage,
+    label_name_to_id: &HashMap<String, String>,
+) -> bool {
     let trimmed = rule.match_query.trim();
     if trimmed.is_empty() {
         return rule.vip_only;
     }
-    let query = parse_query(trimmed);
+    let mut query = parse_query(trimmed);
+    if !label_name_to_id.is_empty() {
+        query = rewrite_query_labels(query, label_name_to_id);
+    }
     matches_message(&query, msg)
 }
 
@@ -502,6 +509,17 @@ fn matches_filter_text_expr(haystack: &str, expr: &str) -> bool {
 
 /// Evaluate whether a Gmail `users.settings.filters` entry matches a [`StoredMessage`].
 pub fn gmail_filter_matches(filter: &GmailFilter, msg: &StoredMessage) -> bool {
+    gmail_filter_matches_with_labels(filter, msg, &HashMap::new())
+}
+
+/// Evaluate whether a Gmail `users.settings.filters` entry matches a [`StoredMessage`],
+/// rewriting custom `label:` / `in:` query terms through `label_name_to_id` so human label names
+/// match messages storing opaque user label IDs (e.g. `Label_1234`).
+pub fn gmail_filter_matches_with_labels(
+    filter: &GmailFilter,
+    msg: &StoredMessage,
+    label_name_to_id: &HashMap<String, String>,
+) -> bool {
     let Some(ref criteria) = filter.criteria else {
         return false;
     };
@@ -544,7 +562,10 @@ pub fn gmail_filter_matches(filter: &GmailFilter, msg: &StoredMessage) -> bool {
         && !query.trim().is_empty()
     {
         has_any = true;
-        let parsed = parse_query(query.trim());
+        let mut parsed = parse_query(query.trim());
+        if !label_name_to_id.is_empty() {
+            parsed = rewrite_query_labels(parsed, label_name_to_id);
+        }
         if !matches_message(&parsed, msg) {
             return false;
         }
@@ -554,7 +575,10 @@ pub fn gmail_filter_matches(filter: &GmailFilter, msg: &StoredMessage) -> bool {
         && !neg.trim().is_empty()
     {
         has_any = true;
-        let parsed = parse_query(neg.trim());
+        let mut parsed = parse_query(neg.trim());
+        if !label_name_to_id.is_empty() {
+            parsed = rewrite_query_labels(parsed, label_name_to_id);
+        }
         if !parsed.terms.is_empty() && matches_message(&parsed, msg) {
             return false;
         }
@@ -714,6 +738,18 @@ pub async fn evaluate_inbox_rules_with_cipher(
         return msg.clone();
     }
 
+    let mut label_name_to_id: HashMap<String, String> = HashMap::new();
+    if let Ok(labels) = store.list_labels().await {
+        for lbl in labels {
+            let lower = lbl.name.to_ascii_lowercase();
+            let hyphen = lower.replace('/', "-");
+            let space_hyphen = lower.replace(['/', ' '], "-");
+            label_name_to_id.insert(lower, lbl.id.clone());
+            label_name_to_id.insert(hyphen, lbl.id.clone());
+            label_name_to_id.insert(space_hyphen, lbl.id);
+        }
+    }
+
     let mut sender_vip_cache: Option<bool> = None;
     let mut matched_rules: Vec<InboxRule> = Vec::new();
 
@@ -732,14 +768,14 @@ pub async fn evaluate_inbox_rules_with_cipher(
             }
         }
 
-        if rule_matches_query(&rule, msg) {
+        if rule_matches_query(&rule, msg, &label_name_to_id) {
             matched_rules.push(rule);
         }
     }
 
     let matched_gmail_filters: Vec<GmailFilter> = gmail_filters
         .into_iter()
-        .filter(|f| gmail_filter_matches(f, msg))
+        .filter(|f| gmail_filter_matches_with_labels(f, msg, &label_name_to_id))
         .collect();
 
     if matched_rules.is_empty() && matched_gmail_filters.is_empty() {

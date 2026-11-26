@@ -117,6 +117,7 @@ impl MailTransport for RecordingTransport {
         Ok(SendOutcome {
             provider: "recording_mock".to_string(),
             provider_message_id: format!("re_sent_{n}"),
+            provider_thread_id: None,
         })
     }
 }
