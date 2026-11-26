@@ -584,6 +584,7 @@ async fn execute_gmail_send(
         ));
     }
 
+    let raw_from = mime::validate_raw_from_header(&raw_bytes)?;
     let parsed = mime::parse_rfc2822(&raw_bytes)?;
     validate_parsed_headers(&parsed)?;
 
@@ -593,7 +594,21 @@ async fn execute_gmail_send(
         &raw_bytes,
         idempotency_key,
     )?;
-    outbound.from = crate::ai::safety::resolve_authorized_from(state, Some(&outbound.from)).await?;
+    let candidate_from = match &raw_from {
+        Some((raw_val, _)) => raw_val.as_str(),
+        None => outbound.from.as_str(),
+    };
+    outbound.from = crate::ai::safety::resolve_authorized_from(state, Some(candidate_from)).await?;
+    if let Some((_, raw_addr)) = &raw_from {
+        let auth_addr = crate::storage::parse_strict_single_mailbox(&outbound.from)
+            .map_err(|reason| AppError::validation(reason, None))?;
+        if !raw_addr.email.eq_ignore_ascii_case(&auth_addr.email) {
+            return Err(AppError::Forbidden(format!(
+                "Raw RFC 2822 From header '{}' does not match authorized sender '{}'",
+                raw_addr.email, auth_addr.email
+            )));
+        }
+    }
 
     let agent_policy = principal.and_then(|p| p.agent_policy.clone());
     let policy_check = OutboundCheck {

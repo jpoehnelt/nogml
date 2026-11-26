@@ -1149,6 +1149,7 @@ async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pr
     cfg.oauth2_client_secret = None;
     cfg.oauth2_signing_secret = Some("public-client-signing-secret-key-99".to_string());
     cfg.oauth2_redirect_uris = vec!["http://127.0.0.1:8765/cb".to_string()];
+    cfg.auth_tokens = vec!["tok-global-admin".to_string()];
     cfg.scoped_tokens = vec![
         ScopedTokenConfig {
             token: "tok-alice-read".to_string(),
@@ -1407,7 +1408,24 @@ async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pr
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
-    // 9. Admin token CAN authorize another configured mailbox via login_hint
+    // 9a. Mailbox-scoped Admin token MUST NOT authorize another mailbox via login_hint
+    let (s, err) = http_json(
+        &app,
+        "GET",
+        &format!(
+            "/oauth2/authorize?response_type=code&client_id=public-cli-client\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb\
+             &login_hint=bob@example.com&scope=read\
+             &code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        Some("Bearer tok-alice-admin"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(err["error"], "access_denied");
+
+    // 9b. Global operator admin token CAN authorize another configured mailbox via login_hint
     let admin_auth = app
         .clone()
         .oneshot(
@@ -1418,7 +1436,7 @@ async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pr
                      &login_hint=bob@example.com&scope=read\
                      &code_challenge={challenge}&code_challenge_method=S256"
                 ))
-                .header(header::AUTHORIZATION, "Bearer tok-alice-admin")
+                .header(header::AUTHORIZATION, "Bearer tok-global-admin")
                 .body(Body::empty())
                 .unwrap(),
         )

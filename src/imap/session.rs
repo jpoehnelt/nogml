@@ -847,7 +847,7 @@ impl ImapSession {
                 {
                     if principal.can_access_mailbox(&authzid) {
                         principal.mailbox_id = crate::config::normalize_mailbox_id(&authzid);
-                    } else if !principal.has_scope(AuthScope::Admin) {
+                    } else {
                         return self
                             .record_auth_failure(
                                 tag,

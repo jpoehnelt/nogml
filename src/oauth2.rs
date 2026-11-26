@@ -121,6 +121,7 @@ impl OAuth2Verifier {
             shared_mailboxes: Vec::new(),
             scopes: claims.scopes,
             agent_policy: claims.agent_policy,
+            is_global_admin: false,
         })
     }
 }
@@ -765,7 +766,7 @@ async fn authorize_handler(
         }
     };
 
-    // Bind authorization code to authenticated principal's mailbox (or allow Admin to specify login_hint).
+    // Bind authorization code to authenticated principal's mailbox (or allow global admin to specify login_hint).
     let target_mailbox = match params
         .login_hint
         .as_deref()
@@ -777,7 +778,7 @@ async fn authorize_handler(
             let norm = crate::config::normalize_mailbox_id(hint);
             if norm.eq_ignore_ascii_case(&principal.mailbox_id) {
                 principal.mailbox_id.clone()
-            } else if principal.has_scope(AuthScope::Admin) {
+            } else if principal.is_global_admin() {
                 match resolve_oauth2_mailbox(&state.config, Some(hint)) {
                     Ok(mb) => mb,
                     Err(msg) => {
@@ -788,7 +789,7 @@ async fn authorize_handler(
                 return oauth2_error(
                     StatusCode::FORBIDDEN,
                     "access_denied",
-                    "Insufficient scope to authorize another mailbox",
+                    "Global admin privilege is required to authorize another mailbox",
                 );
             }
         }
@@ -1124,6 +1125,7 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                     shared_mailboxes: Vec::new(),
                     scopes: claims.scopes.clone(),
                     agent_policy: claims.agent_policy.clone(),
+                    is_global_admin: false,
                 };
                 if !requested.iter().all(|s| orig.has_scope(*s)) {
                     return oauth2_error(

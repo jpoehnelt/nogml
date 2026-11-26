@@ -1099,6 +1099,57 @@ impl Config {
                     .is_some_and(|s| !s.trim().is_empty()))
     }
 
+    /// Clear all legacy single-account `[sync]` credentials and settings on this config.
+    ///
+    /// Used by `AppState::for_mailbox` whenever scoping to a non-primary mailbox so legacy
+    /// `[sync]` credentials belonging to the primary mailbox can never leak or be used by
+    /// another tenant.
+    pub fn clear_legacy_sync_config(&mut self) {
+        self.sync_interval_secs = 0;
+        self.sync_query = None;
+        self.sync_bidirectional = false;
+        self.gmail_client_id = None;
+        self.gmail_client_secret = None;
+        self.gmail_refresh_token = None;
+        self.gmail_access_token = None;
+        self.gmail_imap_user = None;
+        self.gmail_imap_password = None;
+        self.gmail_imap_idle = false;
+    }
+
+    /// Validate `[[sync.accounts]]` entries for empty or duplicate `mailbox_id` values and
+    /// malformed upstream URLs. Returns `(errors, warnings)`.
+    pub fn validate_sync_accounts(&self) -> (Vec<String>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut seen_sync_mailboxes = HashSet::new();
+        for (idx, acct) in self.sync_accounts.iter().enumerate() {
+            let mb = normalize_mailbox_id(&acct.mailbox_id);
+            if mb.is_empty() {
+                errors.push(format!("sync.accounts[{idx}].mailbox_id must not be empty"));
+            } else if !seen_sync_mailboxes.insert(mb.clone()) {
+                errors.push(format!("sync.accounts[{idx}] duplicates mailbox_id '{mb}'"));
+            }
+            validate_optional_url(
+                &format!("sync.accounts[{idx}].gmail_api_base_url"),
+                Some(acct.gmail_api_base_url.as_str()),
+                &mut errors,
+            );
+            validate_optional_url(
+                &format!("sync.accounts[{idx}].gmail_oauth_token_url"),
+                Some(acct.gmail_oauth_token_url.as_str()),
+                &mut errors,
+            );
+            if acct.interval_secs > 0 && !acct.is_configured() {
+                warnings.push(format!(
+                    "sync.accounts[{idx}] ('{}') has interval_secs > 0, but no upstream Gmail sync credentials are configured",
+                    acct.mailbox_id
+                ));
+            }
+        }
+        (errors, warnings)
+    }
+
     /// Returns `true` when any upstream Gmail sync credentials are configured.
     pub fn gmail_sync_configured(&self) -> bool {
         match self.sync_mode {
@@ -3500,31 +3551,9 @@ pub fn validate_config(
         );
     }
 
-    let mut seen_sync_mailboxes = HashSet::new();
-    for (idx, acct) in config.sync_accounts.iter().enumerate() {
-        let mb = normalize_mailbox_id(&acct.mailbox_id);
-        if mb.is_empty() {
-            errors.push(format!("sync.accounts[{idx}].mailbox_id must not be empty"));
-        } else if !seen_sync_mailboxes.insert(mb.clone()) {
-            warnings.push(format!("sync.accounts[{idx}] duplicates mailbox_id '{mb}'"));
-        }
-        validate_optional_url(
-            &format!("sync.accounts[{idx}].gmail_api_base_url"),
-            Some(acct.gmail_api_base_url.as_str()),
-            &mut errors,
-        );
-        validate_optional_url(
-            &format!("sync.accounts[{idx}].gmail_oauth_token_url"),
-            Some(acct.gmail_oauth_token_url.as_str()),
-            &mut errors,
-        );
-        if acct.interval_secs > 0 && !acct.is_configured() {
-            warnings.push(format!(
-                "sync.accounts[{idx}] ('{}') has interval_secs > 0, but no upstream Gmail sync credentials are configured",
-                acct.mailbox_id
-            ));
-        }
-    }
+    let (sync_account_errors, sync_account_warnings) = config.validate_sync_accounts();
+    errors.extend(sync_account_errors);
+    warnings.extend(sync_account_warnings);
 
     for (alias, target) in &config.mailbox_aliases {
         let norm_alias = normalize_mailbox_id(alias);

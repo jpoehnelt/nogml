@@ -1805,6 +1805,16 @@ fn finalize_runtime_config(loaded: LoadedConfig, force_stderr: bool) -> AppResul
         warn!("{warning}");
     }
     loaded.resolution.into_result()?;
+    let (sync_errors, sync_warnings) = loaded.config.validate_sync_accounts();
+    for warning in sync_warnings {
+        warn!("{warning}");
+    }
+    if !sync_errors.is_empty() {
+        return Err(AppError::Config(format!(
+            "Invalid [[sync.accounts]] configuration: {}",
+            sync_errors.join("; ")
+        )));
+    }
     Ok(loaded.config)
 }
 

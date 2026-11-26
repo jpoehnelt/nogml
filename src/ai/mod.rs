@@ -1010,8 +1010,33 @@ pub async fn execute_send_draft_with_context(
         Vec::new()
     };
 
+    let raw_loaded = state.load_raw_rfc2822(msg).await?;
+    let raw_from = if !raw_loaded.is_empty() {
+        crate::mime::validate_raw_from_header(&raw_loaded)?
+    } else {
+        None
+    };
+    let candidate_from = if let Some((ref raw_val, _)) = raw_from {
+        raw_val.as_str()
+    } else if !msg.from_addr.trim().is_empty() {
+        msg.from_addr.as_str()
+    } else {
+        state.config.user_email.as_str()
+    };
+    let authorized_from = safety::resolve_authorized_from(state, Some(candidate_from)).await?;
+    if let Some((_, ref raw_addr)) = raw_from {
+        let auth_addr = crate::storage::parse_strict_single_mailbox(&authorized_from)
+            .map_err(|reason| AppError::validation(reason, None))?;
+        if !raw_addr.email.eq_ignore_ascii_case(&auth_addr.email) {
+            return Err(AppError::Forbidden(format!(
+                "Draft raw RFC 2822 From header '{}' does not match authorized sender '{}'",
+                raw_addr.email, auth_addr.email
+            )));
+        }
+    }
+
     if req.dry_run {
-        let preview = safety::evaluate_resolved_dry_run(
+        let mut preview = safety::evaluate_resolved_dry_run(
             state,
             &msg.to_addrs,
             &msg.cc_addrs,
@@ -1024,10 +1049,13 @@ pub async fn execute_send_draft_with_context(
             Some(&msg.thread_id),
             msg.in_reply_to.as_deref(),
             msg.references_header.as_deref(),
-            Some(msg.raw_rfc2822.len()),
+            Some(raw_loaded.len()),
             agent_policy.as_ref(),
         )
         .await?;
+        if let Some(ref mut p) = preview.preview {
+            p.from = authorized_from;
+        }
         state
             .record_audit(
                 principal.as_ref(),
@@ -1052,11 +1080,7 @@ pub async fn execute_send_draft_with_context(
     validate_recipients_syntax(&msg.to_addrs, &msg.cc_addrs, &msg.bcc_addrs)?;
 
     let resolved = safety::ResolvedOutbound {
-        from: if msg.from_addr.trim().is_empty() {
-            state.config.user_email.clone()
-        } else {
-            msg.from_addr.clone()
-        },
+        from: authorized_from,
         to: msg.to_addrs.clone(),
         cc: msg.cc_addrs.clone(),
         bcc: msg.bcc_addrs.clone(),
@@ -1125,10 +1149,10 @@ pub async fn execute_send_draft_with_context(
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| format!("<{}@{}>", Uuid::new_v4(), state.config.default_domain));
 
-            let raw_rfc2822 = if msg.raw_rfc2822.is_empty() {
+            let raw_rfc2822 = if raw_loaded.is_empty() {
                 build_outbound_rfc2822(&resolved, &rfc_message_id)?
             } else {
-                state.load_raw_rfc2822(msg).await?
+                raw_loaded
             };
 
             let mut outbound_msg = build_outbound_message(&resolved, &rfc_message_id, &raw_rfc2822);
@@ -1221,7 +1245,6 @@ pub async fn execute_send_draft_with_context(
         }
     }
 
-    let raw_loaded = state.load_raw_rfc2822(msg).await?;
     let raw_rfc2822 = if raw_loaded.is_empty() {
         let input = ComposeEmailInput {
             from: resolved.from.clone(),
@@ -2371,35 +2394,77 @@ pub async fn execute_approve_approval(
     if let Some(ref up_tid) = resolved_upstream_tid {
         outbound.set_upstream_thread_id(up_tid);
     }
+    let raw_from = if !outbound.raw_rfc2822.is_empty() {
+        match crate::mime::validate_raw_from_header(&outbound.raw_rfc2822) {
+            Ok(rf) => rf,
+            Err(err) => {
+                let _ = state.store.release_claimed_approval(id).await;
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+    let candidate_from = if let Some((ref raw_val, _)) = raw_from {
+        raw_val.as_str()
+    } else if !outbound.from.trim().is_empty() {
+        outbound.from.as_str()
+    } else {
+        state.config.user_email.as_str()
+    };
+    let authorized_from = match safety::resolve_authorized_from(state, Some(candidate_from)).await {
+        Ok(from) => from,
+        Err(err) => {
+            let _ = state.store.release_claimed_approval(id).await;
+            return Err(err);
+        }
+    };
+    if let Some((_, ref raw_addr)) = raw_from {
+        let auth_addr = match crate::storage::parse_strict_single_mailbox(&authorized_from) {
+            Ok(addr) => addr,
+            Err(reason) => {
+                let _ = state.store.release_claimed_approval(id).await;
+                return Err(AppError::validation(reason, None));
+            }
+        };
+        if !raw_addr.email.eq_ignore_ascii_case(&auth_addr.email) {
+            let _ = state.store.release_claimed_approval(id).await;
+            return Err(AppError::Forbidden(format!(
+                "Pending approval raw RFC 2822 From header '{}' does not match authorized sender '{}'",
+                raw_addr.email, auth_addr.email
+            )));
+        }
+    }
+    outbound.from = authorized_from;
     let outbound = &outbound;
 
-    // Re-check deliverability protection (suppression list, circuit breaker, daily quota)
-    // right before dispatch in case a recipient bounced or domain paused while pending.
-    let deliv_check = OutboundCheck {
-        from: if outbound.from.trim().is_empty() {
-            state.config.user_email.clone()
-        } else {
-            outbound.from.clone()
-        },
+    // Re-check hard-deny outbound and deliverability policies right before dispatch
+    // (verified From domain, allowed_recipients, max_send_recipients, draft_only, DLP Deny,
+    // suppression list, daily domain quota, and circuit breaker).
+    let policy_check = OutboundCheck {
+        from: outbound.from.clone(),
         to: outbound.to.clone(),
         cc: outbound.cc.clone(),
         bcc: outbound.bcc.clone(),
         subject: outbound.subject.clone(),
         text: outbound.text.clone(),
         html: outbound.html.clone(),
-        attachment_filenames: Vec::new(),
+        attachment_filenames: outbound
+            .attachments
+            .iter()
+            .filter_map(|a| a.filename.clone())
+            .collect(),
         thread_id: approval.thread_id.clone(),
         mailbox_id: Some(state.mailbox_id().to_string()),
         is_draft_send: approval.draft_id.is_some(),
         agent_policy: None,
     };
-    if let OutboundDecision::Deny { code, reason, hint } =
-        state.deliverability_policy.evaluate(&deliv_check).await?
+    if let Err(err) = state
+        .evaluate_approval_dispatch_policies(&policy_check)
+        .await
     {
-        state.metrics.inc_policy_deny();
-        state.metrics.inc_deliverability_blocked(&code);
         let _ = state.store.release_claimed_approval(id).await;
-        return Err(policy_deny_to_error(code, reason, hint));
+        return Err(err);
     }
     let idempotency_key = format!("approval-{id}");
     let send_outcome = match state.transport.send(outbound, Some(&idempotency_key)).await {
@@ -4869,12 +4934,15 @@ async fn events_sse_handler(
 
 async fn sync_gmail_handler(
     MailboxState(state): MailboxState,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<FieldsQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, AiError> {
     let req: SyncTriggerRequest = parse_optional_json(&body)?;
     let opts = parse_sync_trigger(req)?;
-    let report = sync::run_gmail_sync(&state, opts).await?;
+    let report =
+        sync::run_gmail_sync_for_principal(&state, opts, principal.as_ref().map(|Extension(p)| p))
+            .await?;
     let value = serde_json::to_value(report).map_err(AppError::from)?;
     Ok(Json(project_fields(value, query.fields.as_deref())?))
 }
@@ -5251,6 +5319,9 @@ async fn add_suppression_handler(
     Query(query): Query<FieldsQuery>,
     Json(req): Json<AddSuppressionRequest>,
 ) -> Result<(StatusCode, Json<Value>), AiError> {
+    if let Some(Extension(ref p)) = principal {
+        p.require_global_admin()?;
+    }
     let reason = match req
         .reason
         .as_deref()
@@ -5322,6 +5393,9 @@ async fn delete_suppression_handler(
     Path(email): Path<String>,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
+    if let Some(Extension(ref p)) = principal {
+        p.require_global_admin()?;
+    }
     let normalized = crate::storage::validate_and_normalize_suppression_email(&email)?;
     let deleted = state.store.delete_suppression(&normalized).await?;
     if !deleted {
@@ -5408,6 +5482,9 @@ async fn resume_deliverability_domain_handler(
     Path(domain): Path<String>,
     Query(query): Query<FieldsQuery>,
 ) -> Result<Json<Value>, AiError> {
+    if let Some(Extension(ref p)) = principal {
+        p.require_global_admin()?;
+    }
     let norm = crate::storage::validate_deliverability_domain(&domain)?;
     let now_ms = Utc::now().timestamp_millis();
     state
@@ -5449,6 +5526,9 @@ async fn pause_deliverability_domain_handler(
     Query(query): Query<FieldsQuery>,
     body_bytes: Bytes,
 ) -> Result<Json<Value>, AiError> {
+    if let Some(Extension(ref p)) = principal {
+        p.require_global_admin()?;
+    }
     let norm = crate::storage::validate_deliverability_domain(&domain)?;
     let req: PauseDeliverabilityRequest = if body_bytes.is_empty() {
         PauseDeliverabilityRequest::default()

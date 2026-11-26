@@ -403,6 +403,65 @@ impl AppState {
         res
     }
 
+    /// Re-evaluate hard-deny outbound policies (verified From domain, allowed_recipients,
+    /// max_send_recipients, draft_only, DLP Deny, suppression list, daily domain quota,
+    /// and deliverability circuit breaker) without blocking on `HoldForApproval`.
+    pub async fn evaluate_approval_dispatch_policies(
+        &self,
+        check: &crate::ai::safety::OutboundCheck,
+    ) -> AppResult<()> {
+        let decision = match self.outbound_policy.evaluate(check).await {
+            Err(err) => {
+                if matches!(
+                    err,
+                    crate::error::AppError::RecipientNotAllowed { .. }
+                        | crate::error::AppError::PolicyDenied { .. }
+                        | crate::error::AppError::DraftOnlyBlocked { .. }
+                        | crate::error::AppError::Validation { .. }
+                ) {
+                    self.metrics.inc_policy_deny();
+                }
+                return Err(err);
+            }
+            Ok(deny @ crate::ai::safety::OutboundDecision::Deny { .. }) => deny,
+            Ok(other) => match self.deliverability_policy.evaluate(check).await {
+                Ok(deny @ crate::ai::safety::OutboundDecision::Deny { .. }) => deny,
+                Ok(_) => other,
+                Err(err) => return Err(err),
+            },
+        };
+        match decision {
+            crate::ai::safety::OutboundDecision::Allow
+            | crate::ai::safety::OutboundDecision::HoldForApproval { .. } => Ok(()),
+            crate::ai::safety::OutboundDecision::DowngradeToDraft { .. } => {
+                self.metrics.inc_policy_deny();
+                Err(crate::error::AppError::draft_only_blocked())
+            }
+            crate::ai::safety::OutboundDecision::Deny { code, reason, hint } => {
+                self.metrics.inc_policy_deny();
+                self.metrics.inc_deliverability_blocked(&code);
+                if code == "draft_only_mode" {
+                    return Err(crate::error::AppError::DraftOnlyBlocked {
+                        hint: hint.unwrap_or(reason),
+                    });
+                }
+                let details = if code == "recipient_suppressed" {
+                    let suppressed = crate::deliverability::extract_suppressed_from_reason(&reason);
+                    (!suppressed.is_empty())
+                        .then(|| serde_json::json!({ "suppressed": suppressed }))
+                } else {
+                    None
+                };
+                Err(crate::error::AppError::PolicyDenied {
+                    code,
+                    message: reason,
+                    hint,
+                    details,
+                })
+            }
+        }
+    }
+
     /// Record a successfully dispatched outbound send in Prometheus metrics and persistent
     /// deliverability telemetry (`deliverability_events` with `kind = "sent"`).
     pub async fn record_outbound_sent(&self, from: &str, to: &[String], provider: &str) {
@@ -447,6 +506,12 @@ impl AppState {
         self.events.mailbox_id()
     }
 
+    /// Returns `true` when this `AppState` is scoped to the server's primary mailbox.
+    pub fn is_primary_mailbox(&self) -> bool {
+        self.mailbox_id()
+            .eq_ignore_ascii_case(&self.primary_mailbox_id)
+    }
+
     /// Return a lightweight `AppState` scoped strictly to `mailbox_id`:
     /// - `store` is partitioned via [`MailStore::for_mailbox`]
     /// - `blobs` is prefixed with `mailboxes/<sanitized_mb>/...` in multi-mailbox mode or
@@ -481,17 +546,20 @@ impl AppState {
             .unwrap_or_else(|| self.outbound_policy.clone());
         let events = self.events.for_mailbox(&target);
 
-        let config = if self.config.user_email.eq_ignore_ascii_case(&target) {
+        let is_primary = target.eq_ignore_ascii_case(&self.primary_mailbox_id);
+        let config = if is_primary && self.config.user_email.eq_ignore_ascii_case(&target) {
             self.config.clone()
         } else {
             let mut cloned = (*self.config).clone();
-            if !target.eq_ignore_ascii_case(&self.primary_mailbox_id)
-                && !cloned
+            if !is_primary {
+                if !cloned
                     .mailboxes
                     .iter()
                     .any(|m| m.eq_ignore_ascii_case(&self.primary_mailbox_id))
-            {
-                cloned.mailboxes.push(self.primary_mailbox_id.clone());
+                {
+                    cloned.mailboxes.push(self.primary_mailbox_id.clone());
+                }
+                cloned.clear_legacy_sync_config();
             }
             cloned.user_email = target.clone();
             Arc::new(cloned)
@@ -1039,6 +1107,7 @@ mod pluggable_seam_tests {
                     shared_mailboxes: Vec::new(),
                     scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
                     agent_policy: None,
+                    is_global_admin: false,
                 })
             } else {
                 Err(AppError::Unauthorized("custom auth denied".to_string()))

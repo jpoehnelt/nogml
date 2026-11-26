@@ -84,9 +84,10 @@ fn base_config() -> Config {
     cfg.default_domain = "acme.example".to_string();
     cfg.resend_webhook_secret = Some(TEST_RESEND_SECRET.to_string());
     cfg.ses_webhook_secret = Some(TEST_SES_SECRET.to_string());
+    cfg.auth_tokens = vec!["tok_admin".to_string()];
     cfg.scoped_tokens = vec![
         ScopedTokenConfig {
-            token: "tok_admin".to_string(),
+            token: "tok_scoped_admin".to_string(),
             mailbox_id: Some("sender@acme.example".to_string()),
             shared_mailboxes: Vec::new(),
             scopes: vec![

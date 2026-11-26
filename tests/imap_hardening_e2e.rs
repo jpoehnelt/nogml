@@ -687,19 +687,26 @@ async fn tls_logindisabled_reauth_authzid_and_five_failure_disconnect() {
     // --- Part B: Admin authzid override + 5 consecutive failed logins disconnect ---
     let (plain_addr, shutdown_plain) = spawn_plain_imap(state, None).await;
 
-    // Admin token may specify a non-matching authzid.
+    // Admin token without shared_mailboxes access to delegate@example.com MUST receive
+    // AUTHORIZATIONFAILED rather than silently logging into authcid.
     let tcp_adm = TcpStream::connect(plain_addr).await.unwrap();
     let mut r_adm = BufReader::new(tcp_adm);
     let _ = read_line_timeout(&mut r_adm).await.unwrap();
     let admin_az_b64 = base64::engine::general_purpose::STANDARD
         .encode("delegate@example.com\0agent@example.com\0tok-admin");
-    let adm_ok = send_cmd(
+    let adm_fail = send_cmd(
         &mut r_adm,
         "AD1",
         &format!("AUTHENTICATE PLAIN {admin_az_b64}"),
     )
     .await;
-    assert!(adm_ok.last().unwrap().starts_with("AD1 OK"));
+    assert!(
+        adm_fail
+            .last()
+            .unwrap()
+            .contains("AD1 NO [AUTHORIZATIONFAILED]"),
+        "unauthorized Admin authzid must fail with AUTHORIZATIONFAILED, got {adm_fail:?}"
+    );
 
     // 5 consecutive failed logins must disconnect with `* BYE Too many failed login attempts`.
     let tcp_bf = TcpStream::connect(plain_addr).await.unwrap();

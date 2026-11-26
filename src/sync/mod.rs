@@ -21,12 +21,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     AppState,
+    auth::Principal,
     config::{Config, SyncMode},
-    error::AppResult,
+    error::{AppError, AppResult},
     events::{EventSource, MailEvent},
     filter::{FilterDecision, InboundMessage, apply_filter_labels},
     models::{LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_TRASH, LABEL_UNREAD, SyncStatusResponse},
@@ -306,13 +307,43 @@ pub fn account_key_for_mode(state: &AppState, mode: SyncMode) -> String {
 /// Run a single upstream Gmail sync pass (guarded by the mailbox's `state.sync_lock`).
 ///
 /// When `config.sync_accounts` contains an entry matching `state.mailbox_id()`, that account's
-/// credentials and sync parameters are applied automatically.
+/// credentials and sync parameters are applied automatically. Non-primary mailboxes without a
+/// matching `[[sync.accounts]]` entry are refused and never fall back to legacy `[sync]` settings.
 pub async fn run_gmail_sync(state: &AppState, opts: SyncRunOptions) -> AppResult<SyncRunReport> {
-    let effective_state = state
-        .config
-        .sync_account_for_mailbox(state.mailbox_id())
-        .map(|acct| state.for_sync_account(acct));
+    run_gmail_sync_for_principal(state, opts, None).await
+}
+
+/// Run a single upstream Gmail sync pass with caller authorization context.
+///
+/// Enforces tenant isolation (refusing legacy `[sync]` fallback for non-primary mailboxes lacking
+/// a `[[sync.accounts]]` entry) and rejects `bidirectional: true` request overrides unless
+/// `config.sync_bidirectional` is already enabled for the target sync account or the caller holds
+/// global admin privileges.
+pub async fn run_gmail_sync_for_principal(
+    state: &AppState,
+    opts: SyncRunOptions,
+    principal: Option<&Principal>,
+) -> AppResult<SyncRunReport> {
+    let effective_state = match state.config.sync_account_for_mailbox(state.mailbox_id()) {
+        Some(acct) => Some(state.for_sync_account(acct)),
+        None if !state.is_primary_mailbox() => {
+            return Err(AppError::Forbidden(format!(
+                "Upstream Gmail sync is not configured for mailbox '{}'; configure a [[sync.accounts]] entry for this mailbox",
+                state.mailbox_id()
+            )));
+        }
+        None => None,
+    };
     let target_state = effective_state.as_ref().unwrap_or(state);
+    if opts.bidirectional == Some(true)
+        && !target_state.config.sync_bidirectional
+        && !principal.is_some_and(Principal::is_global_admin)
+    {
+        return Err(AppError::Forbidden(
+            "Bidirectional sync override requires sync.bidirectional to be enabled or a global admin token"
+                .to_string(),
+        ));
+    }
     let mode = opts.mode.unwrap_or(target_state.config.sync_mode);
     let source = open_sync_source(mode);
     run_sync_source(target_state, source.as_ref(), opts).await
@@ -835,10 +866,30 @@ async fn load_mutation_history_range(
 
 /// Build the current sync status snapshot (used by `GET /v1/sync/status` and MCP `sync_status`).
 pub async fn get_sync_status(state: &AppState) -> AppResult<SyncStatusResponse> {
-    let effective_state = state
-        .config
-        .sync_account_for_mailbox(state.mailbox_id())
-        .map(|acct| state.for_sync_account(acct));
+    let matched_account = state.config.sync_account_for_mailbox(state.mailbox_id());
+    if matched_account.is_none() && !state.is_primary_mailbox() {
+        let profile = state.store.get_profile(&state.config.user_email).await?;
+        let unread_count = state
+            .store
+            .get_label(LABEL_UNREAD)
+            .await?
+            .map(|l| i64::from(l.messages_total))
+            .unwrap_or(0);
+        return Ok(SyncStatusResponse {
+            enabled: false,
+            provider: "none".to_string(),
+            state: "idle".to_string(),
+            last_sync_at: None,
+            last_history_id: None,
+            last_error: None,
+            total_messages: i64::from(profile.messages_total),
+            unread_count,
+            bidirectional_enabled: false,
+            messages_pushed: 0,
+            extra: None,
+        });
+    }
+    let effective_state = matched_account.map(|acct| state.for_sync_account(acct));
     let state = effective_state.as_ref().unwrap_or(state);
     let mode = state.config.sync_mode;
     let source = open_sync_source(mode);
@@ -932,7 +983,13 @@ pub async fn run_background_sync(state: AppState, shutdown: watch::Receiver<bool
         if norm_mb.is_empty() {
             continue;
         }
-        covered_mailboxes.insert(norm_mb);
+        if !covered_mailboxes.insert(norm_mb.clone()) {
+            warn!(
+                mailbox_id = %norm_mb,
+                "Skipping duplicate [[sync.accounts]] entry in background sync"
+            );
+            continue;
+        }
         let acct_state = state.for_sync_account(acct);
         if acct.interval_secs > 0 {
             let loop_state = acct_state.clone();
