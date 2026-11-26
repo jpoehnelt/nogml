@@ -761,7 +761,8 @@ async fn execute_one_click_post(
     validate_unsubscribe_https_url_static(url, false)?;
 
     // 2. Enforce OutboundPolicy (draft_only, require_approval, custom policies) BEFORE DNS/HTTP.
-    match state.outbound_policy.evaluate(&outbound_check).await? {
+    let decision = state.evaluate_outbound_policy(&outbound_check).await?;
+    match decision {
         OutboundDecision::Allow => {}
         OutboundDecision::Deny { code, reason, hint } => {
             return Err(policy_deny_to_error(code, reason, hint));
@@ -955,7 +956,7 @@ async fn execute_mailto_unsubscribe(
 
     validate_recipients_syntax(&resolved.to, &resolved.cc, &resolved.bcc)?;
 
-    let decision = state.outbound_policy.evaluate(&policy_check).await?;
+    let decision = state.evaluate_outbound_policy(&policy_check).await?;
 
     let rfc_message_id = format!("<{}@{}>", Uuid::new_v4(), state.config.default_domain);
     let raw_rfc2822 = build_outbound_rfc2822(&resolved, &rfc_message_id)?;
@@ -1124,6 +1125,7 @@ async fn execute_mailto_unsubscribe(
         .await?;
 
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_sent();
 
     state.events.publish(
         source,

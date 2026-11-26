@@ -547,6 +547,7 @@ pub async fn process_due_scheduler_items(
             .await?;
 
         mb_state.post_store_message(&stored).await?;
+        mb_state.metrics.inc_messages_sent();
 
         mb_state
             .store

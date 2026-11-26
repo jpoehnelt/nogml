@@ -582,6 +582,8 @@ pub async fn handle_email_received(
 
         return match outcome {
             IngestOutcome::Stored { message, decision } => {
+                mb_state.metrics.record_filter_decision(&decision);
+                mb_state.metrics.inc_messages_received();
                 mb_state.post_store_message(&message).await?;
                 let filter_label = match decision {
                     FilterDecision::Allow => "allow",
@@ -612,15 +614,18 @@ pub async fn handle_email_received(
                 })),
             )
                 .into_response()),
-            IngestOutcome::Rejected { reason } => Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "status": "rejected",
-                    "mailbox_id": mb,
-                    "reason": reason,
-                })),
-            )
-                .into_response()),
+            IngestOutcome::Rejected { reason } => {
+                mb_state.metrics.inc_filter_reject();
+                Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "rejected",
+                        "mailbox_id": mb,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response())
+            }
         };
     }
 
@@ -643,6 +648,8 @@ pub async fn handle_email_received(
 
         match outcome {
             IngestOutcome::Stored { message, decision } => {
+                mb_state.metrics.record_filter_decision(&decision);
+                mb_state.metrics.inc_messages_received();
                 mb_state.post_store_message(&message).await?;
                 let filter_label = match decision {
                     FilterDecision::Allow => "allow",
@@ -678,6 +685,7 @@ pub async fn handle_email_received(
                 }));
             }
             IngestOutcome::Rejected { reason } => {
+                mb_state.metrics.inc_filter_reject();
                 if first_rejected.is_none() {
                     first_rejected = Some(reason.clone());
                 }

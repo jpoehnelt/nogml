@@ -113,15 +113,25 @@ export NOGML_DOMAIN=mail.example.com
 docker compose up -d --build
 ```
 
-4. Verify HTTPS, health, and authentication:
+4. Verify HTTPS, health, readiness, metrics, and authentication:
 
 ```bash
 curl -fsS "https://${NOGML_DOMAIN}/healthz"
+curl -fsS "https://${NOGML_DOMAIN}/readyz"
 curl -fsS -H "Authorization: Bearer $(cat secrets/nogml_auth_tokens)" \
   "https://${NOGML_DOMAIN}/v1/capabilities"
+curl -fsS -H "Authorization: Bearer $(cat secrets/nogml_auth_tokens)" \
+  "https://${NOGML_DOMAIN}/metrics"
 ```
 
 [`deploy/Caddyfile`](../deploy/Caddyfile) sets `flush_interval -1` so SSE (`/v1/events`) and MCP Streamable HTTP (`/mcp`) stream immediately, sets `request_body { max_size 40MB }` to match `nogml`'s 40 MiB attachment ceiling, and forwards `Host` and `X-Forwarded-Proto` so Gmail resumable upload `Location` headers use `https://`.
+
+## Observability and readiness probes
+
+- `GET /healthz` is unauthenticated and reports process liveness.
+- `GET /readyz` is unauthenticated and probes `MailStore` plus external `BlobStore` reachability. On dependency errors, full diagnostics are logged server-side and the endpoint returns HTTP `503` with sanitized status flags (`{"status":"not_ready","store":"ok|error","blobs":"ok|error"}`).
+- `GET /metrics` exposes Prometheus text format (`text/plain; version=0.0.4; charset=utf-8`) for `nogml_http_requests_total`, `nogml_messages_sent_total`, `nogml_messages_received_total`, `nogml_imap_active_connections`, `nogml_sse_active_connections`, `nogml_sync_runs_total`, `nogml_filter_decisions_total`, and `nogml_policy_decisions_total`. When auth tokens are configured, Prometheus scrapers must send a valid bearer token (a `read`-scoped token from `[[auth.scoped_tokens]]` is sufficient).
+- On `SIGTERM` or `SIGINT`, `nogml serve` signals active `/v1/events` SSE streams to close cleanly so HTTP graceful shutdown completes promptly before draining background workers.
 
 ## Bare-metal Linux with systemd
 

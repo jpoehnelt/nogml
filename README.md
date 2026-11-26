@@ -101,12 +101,16 @@ nogml serve \
   --allowed-recipients @example.com,partner@acme.org
 ```
 
-Check health and active backends:
+Check health, readiness, capabilities, and Prometheus metrics:
 
 ```bash
 curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:8080/readyz
 curl -s http://127.0.0.1:8080/v1/capabilities | jq .
+curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8080/metrics
 ```
+
+`GET /metrics` exports atomic Prometheus text metrics (`nogml_http_requests_total`, `nogml_messages_sent_total`, `nogml_messages_received_total`, `nogml_imap_active_connections`, `nogml_sse_active_connections`, `nogml_sync_runs_total`, `nogml_filter_decisions_total`, and `nogml_policy_decisions_total`) and is protected by standard bearer authentication whenever auth tokens are configured. `GET /readyz` verifies `MailStore` and external `BlobStore` reachability and returns a sanitized `503` payload on failure without exposing internal error details.
 
 ### 2. Run the MCP server (`nogml mcp`)
 

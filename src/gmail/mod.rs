@@ -583,7 +583,8 @@ async fn execute_gmail_send(
         is_draft_send,
         agent_policy,
     };
-    match state.outbound_policy.evaluate(&policy_check).await? {
+    let decision = state.evaluate_outbound_policy(&policy_check).await?;
+    match decision {
         OutboundDecision::Allow => {}
         OutboundDecision::Deny { code, reason, hint } => {
             state
@@ -661,6 +662,7 @@ async fn execute_gmail_send(
     );
     let stored = state.store.insert_message(input).await?;
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_sent();
 
     state.events.publish(
         EventSource::Api,
@@ -886,6 +888,7 @@ async fn complete_insert_message(
     );
     let stored = state.store.insert_message(input).await?;
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_received();
 
     state.events.publish(
         EventSource::Api,
@@ -969,6 +972,7 @@ async fn complete_import_message(
         provider_id: None,
     };
     let decision = state.filter.evaluate(&inbound_msg).await?;
+    state.metrics.record_filter_decision(&decision);
     if let FilterDecision::Reject { reason } = decision {
         return Err(AppError::Forbidden(format!(
             "Inbound message rejected by filter: {reason}"
@@ -1000,6 +1004,7 @@ async fn complete_import_message(
     );
     let stored = state.store.insert_message(input).await?;
     state.post_store_message(&stored).await?;
+    state.metrics.inc_messages_received();
 
     state.events.publish(
         EventSource::Api,

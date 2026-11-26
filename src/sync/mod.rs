@@ -181,7 +181,9 @@ pub(crate) async fn apply_sync_inbound_filter(
         provider_id: input.upstream_gmail_id.clone(),
     };
 
-    match state.filter.evaluate(&inbound).await? {
+    let decision = state.filter.evaluate(&inbound).await?;
+    state.metrics.record_filter_decision(&decision);
+    match decision {
         FilterDecision::Allow => Ok(true),
         FilterDecision::Reject { reason } => {
             tracing::info!(
@@ -216,6 +218,7 @@ pub async fn ingest_synced_message(
     match outcome.kind {
         UpsertOutcomeKind::Inserted => {
             report.messages_added += 1;
+            state.metrics.inc_messages_received();
             state.events.publish(
                 EventSource::GmailSync,
                 MailEvent::MessageReceived {
@@ -300,6 +303,16 @@ pub async fn run_gmail_sync(state: &AppState, opts: SyncRunOptions) -> AppResult
 /// last-write-wins so pulled changes never echo back), and pushed upstream via
 /// [`SyncSource::push_changes`].
 pub async fn run_sync_source(
+    state: &AppState,
+    source: &dyn SyncSource,
+    opts: SyncRunOptions,
+) -> AppResult<SyncRunReport> {
+    let result = run_sync_source_inner(state, source, opts).await;
+    state.metrics.record_sync_run(result.is_ok());
+    result
+}
+
+async fn run_sync_source_inner(
     state: &AppState,
     source: &dyn SyncSource,
     opts: SyncRunOptions,
