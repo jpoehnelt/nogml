@@ -6,6 +6,7 @@
 mod fields;
 mod payload;
 mod text;
+mod unsubscribe;
 
 use std::collections::HashMap;
 
@@ -25,13 +26,16 @@ use mail_parser::{MessageParser, PartKind};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{MessagePartHeader, ResendAttachment, ResendSendEmailRequest},
+    models::{MessagePartHeader, ResendAttachment, ResendSendEmailRequest, UnsubscribeInfo},
     storage::{NewAttachmentInput, parse_simple_email_address},
 };
 
 pub use fields::apply_fields_mask;
 pub use payload::build_gmail_payload;
 pub use text::{generate_snippet, sanitize_untrusted_text, strip_quoted_text};
+pub use unsubscribe::{
+    RFC8058_ONE_CLICK_BODY, parse_unsubscribe_from_raw, parse_unsubscribe_headers,
+};
 
 /// Result of parsing raw RFC 2822 bytes into structured headers, bodies, and attachments.
 #[derive(Debug, Clone)]
@@ -47,6 +51,7 @@ pub struct ParsedEmail {
     pub in_reply_to: Option<String>,
     pub references_header: Option<String>,
     pub headers: Vec<MessagePartHeader>,
+    pub unsubscribe: Option<UnsubscribeInfo>,
     pub text_body: String,
     pub html_body: Option<String>,
     pub snippet: String,
@@ -226,6 +231,7 @@ pub fn parse_rfc2822(raw: &[u8]) -> AppResult<ParsedEmail> {
     });
 
     let headers = payload::extract_part_headers(&message.root_part());
+    let unsubscribe = parse_unsubscribe_headers(&headers);
 
     let text_parts: Vec<String> = message
         .text_body()
@@ -264,6 +270,7 @@ pub fn parse_rfc2822(raw: &[u8]) -> AppResult<ParsedEmail> {
         in_reply_to,
         references_header,
         headers,
+        unsubscribe,
         text_body,
         html_body,
         snippet,

@@ -675,6 +675,17 @@ pub struct AttachmentMeta {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsubscribeInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub https_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailto: Option<String>,
+    pub one_click: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_body: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UntrustedMeta {
     pub untrusted_external_content: bool,
@@ -706,6 +717,8 @@ pub struct CompactMessage {
     pub in_reply_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rfc_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsubscribe: Option<UnsubscribeInfo>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<UntrustedMeta>,
 }
@@ -813,6 +826,14 @@ pub struct AiCreateDraftRequest {
 pub struct AiSendDraftRequest {
     #[serde(default)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiUnsubscribeRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub prefer_mailto: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
