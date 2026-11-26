@@ -12,6 +12,11 @@ use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
 
+/// Maximum nesting depth allowed in a `?fields=` mask (`(...)`, `/`, `.`).
+const MAX_FIELDS_DEPTH: usize = 32;
+/// Maximum selector nodes allowed in a `?fields=` mask.
+const MAX_FIELDS_NODES: usize = 512;
+
 #[derive(Debug, Clone, Default)]
 struct FieldNode {
     /// Whether all fields/contents at this node are selected (leaf field or `*`).
@@ -43,11 +48,35 @@ impl FieldNode {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    node_count: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            node_count: 0,
+        }
+    }
+
+    fn bump_node_count(&mut self) -> AppResult<()> {
+        self.node_count += 1;
+        if self.node_count > MAX_FIELDS_NODES {
+            return Err(AppError::BadRequest(format!(
+                "Fields mask exceeds maximum selector limit of {MAX_FIELDS_NODES}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_depth(depth: usize) -> AppResult<()> {
+        if depth > MAX_FIELDS_DEPTH {
+            return Err(AppError::BadRequest(format!(
+                "Fields mask exceeds maximum nesting depth of {MAX_FIELDS_DEPTH}"
+            )));
+        }
+        Ok(())
     }
 
     fn rest(&self) -> &'a str {
@@ -76,7 +105,7 @@ impl<'a> Parser<'a> {
 
     fn parse_root(&mut self) -> AppResult<FieldNode> {
         let mut root = FieldNode::default();
-        self.parse_field_list(&mut root, false)?;
+        self.parse_field_list(&mut root, false, 0)?;
         self.skip_ws();
         if self.pos < self.input.len() {
             return Err(AppError::BadRequest(format!(
@@ -88,7 +117,13 @@ impl<'a> Parser<'a> {
         Ok(root)
     }
 
-    fn parse_field_list(&mut self, target: &mut FieldNode, expect_rparen: bool) -> AppResult<()> {
+    fn parse_field_list(
+        &mut self,
+        target: &mut FieldNode,
+        expect_rparen: bool,
+        depth: usize,
+    ) -> AppResult<()> {
+        Self::check_depth(depth)?;
         let mut parsed_any = false;
         loop {
             self.skip_ws();
@@ -124,11 +159,12 @@ impl<'a> Parser<'a> {
                 Some('(') => {
                     // Allow root/grouped parenthesized list `(id,subject)` on top-level arrays/objects.
                     self.advance();
-                    self.parse_field_list(target, true)?;
+                    self.bump_node_count()?;
+                    self.parse_field_list(target, true, depth + 1)?;
                     parsed_any = true;
                 }
                 Some(_) => {
-                    self.parse_selector(target)?;
+                    self.parse_selector(target, depth)?;
                     parsed_any = true;
                 }
             }
@@ -167,12 +203,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_selector(&mut self, target: &mut FieldNode) -> AppResult<()> {
+    fn parse_selector(&mut self, target: &mut FieldNode, depth: usize) -> AppResult<()> {
         let mut segments: Vec<String> = Vec::new();
         loop {
             self.skip_ws();
             let seg = self.parse_segment()?;
+            self.bump_node_count()?;
             segments.push(seg);
+            Self::check_depth(depth + segments.len())?;
 
             self.skip_ws();
             if matches!(self.peek(), Some('/') | Some('.')) {
@@ -187,7 +225,7 @@ impl<'a> Parser<'a> {
         let sub_node = if self.peek() == Some('(') {
             self.advance();
             let mut node = FieldNode::default();
-            self.parse_field_list(&mut node, true)?;
+            self.parse_field_list(&mut node, true, depth + segments.len())?;
             Some(node)
         } else {
             None
@@ -198,10 +236,10 @@ impl<'a> Parser<'a> {
         for (idx, seg) in segments.iter().enumerate() {
             let is_last = idx + 1 == segments.len();
             if seg == "*" {
-                if let Some(ref sub) = sub_node
+                if let Some(sub) = sub_node
                     && is_last
                 {
-                    current.merge_from(sub.clone());
+                    current.merge_from(sub);
                 } else {
                     current.select_all = true;
                 }
@@ -494,5 +532,28 @@ mod tests {
             apply_fields_mask(top_array, "(id)").unwrap(),
             json!([{ "id": "a" }, { "id": "b" }])
         );
+    }
+
+    #[test]
+    fn rejects_excessive_nesting_depth_and_selector_count() {
+        let val = json!({ "id": "m1" });
+
+        // 3,000 nested '(' must return BadRequest instead of overflowing the stack.
+        let deep_parens = format!("{}{}", "(".repeat(3_000), "id");
+        let err = apply_fields_mask(val.clone(), &deep_parens).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        // 3,000 nested '/' path segments must return BadRequest.
+        let deep_slash = vec!["a"; 3_000].join("/");
+        let err = apply_fields_mask(val.clone(), &deep_slash).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        // More than 512 selectors must return BadRequest.
+        let too_many = (0..600)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = apply_fields_mask(val, &too_many).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

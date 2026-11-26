@@ -8,6 +8,8 @@ use crate::error::{AppError, AppResult};
 
 /// Maximum length of a single command line segment (excluding literal payloads).
 const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Maximum parenthesized list nesting depth in IMAP commands.
+const MAX_IMAP_LIST_DEPTH: usize = 32;
 
 /// A piece of a raw IMAP command before tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +282,11 @@ pub fn tokenize_chunks(chunks: &[RawChunk]) -> AppResult<Vec<ImapArg>> {
                         continue;
                     }
                     if b == b'(' {
+                        if stack.len() > MAX_IMAP_LIST_DEPTH {
+                            return Err(AppError::BadRequest(format!(
+                                "IMAP command exceeds maximum list nesting depth of {MAX_IMAP_LIST_DEPTH}"
+                            )));
+                        }
                         stack.push(Vec::new());
                         i += 1;
                         continue;
@@ -305,8 +312,9 @@ pub fn tokenize_chunks(chunks: &[RawChunk]) -> AppResult<Vec<ImapArg>> {
                         while i < bytes.len() {
                             let c = bytes[i];
                             if c == b'\\' && i + 1 < bytes.len() {
-                                out.push(bytes[i + 1] as char);
-                                i += 2;
+                                let ch = text[i + 1..].chars().next().unwrap();
+                                out.push(ch);
+                                i += 1 + ch.len_utf8();
                             } else if c == b'"' {
                                 i += 1;
                                 closed = true;
@@ -335,7 +343,8 @@ pub fn tokenize_chunks(chunks: &[RawChunk]) -> AppResult<Vec<ImapArg>> {
                         let c = bytes[i];
                         if in_quote {
                             if c == b'\\' && i + 1 < bytes.len() {
-                                i += 2;
+                                let ch = text[i + 1..].chars().next().unwrap();
+                                i += 1 + ch.len_utf8();
                                 continue;
                             }
                             if c == b'"' {
@@ -599,5 +608,36 @@ pub fn normalize_mailbox_name(name: &str) -> String {
         "INBOX".to_string()
     } else {
         name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handles_escaped_multibyte_utf8_in_quoted_strings_and_atoms() {
+        let cmd = parse_command_line(r#"A1 LOGIN "a\é" "p\日s""#).expect("valid command");
+        assert_eq!(cmd.tag, "A1");
+        assert_eq!(cmd.name, "LOGIN");
+        assert_eq!(
+            cmd.args,
+            vec![
+                ImapArg::Quoted("aé".to_string()),
+                ImapArg::Quoted("p日s".to_string()),
+            ]
+        );
+
+        let atom_cmd =
+            parse_command_line(r#"A2 FETCH 1 BODY.PEEK[HEADER.FIELDS ("a\é")]"#).expect("atom");
+        assert_eq!(atom_cmd.name, "FETCH");
+        assert_eq!(atom_cmd.args.len(), 2);
+    }
+
+    #[test]
+    fn rejects_deeply_nested_imap_lists() {
+        let deep = format!("A1 SEARCH {}", "(".repeat(3_000));
+        let err = parse_command_line(&deep).expect_err("deep nesting must fail");
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

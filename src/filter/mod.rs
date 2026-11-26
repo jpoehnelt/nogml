@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use crate::{
     config::Config,
     error::AppResult,
-    models::{LABEL_INBOX, LABEL_SPAM, LABEL_UNREAD},
+    models::{LABEL_INBOX, LABEL_SPAM, LABEL_TRASH, LABEL_UNREAD},
 };
 
 pub use auth_results::{
@@ -27,6 +27,18 @@ pub use auth_results::{
 };
 pub use llm::{LlmTriageConfig, LlmTriageFilter};
 pub use rspamd::{RspamdConfig, RspamdFilter};
+
+/// Security-sensitive labels that downstream filters (such as [`LlmTriageFilter`])
+/// must never strip via `FilterDecision::Mutate { remove_labels, .. }`.
+pub const PROTECTED_SECURITY_LABELS: &[&str] = &[LABEL_AUTH_FAIL, LABEL_SPAM, LABEL_TRASH];
+
+/// Returns `true` if `label` is a protected security label (case-insensitive).
+pub fn is_protected_security_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    PROTECTED_SECURITY_LABELS
+        .iter()
+        .any(|protected| trimmed.eq_ignore_ascii_case(protected))
+}
 
 /// Provider-agnostic inbound message view passed to [`InboundFilter`] implementations
 /// before persistence into `MailStore`.
@@ -117,7 +129,10 @@ pub fn apply_filter_labels(initial_labels: Vec<String>, decision: &FilterDecisio
                 labels.retain(|l| l != LABEL_INBOX);
             }
             if !remove_labels.is_empty() {
-                labels.retain(|l| !remove_labels.contains(l));
+                labels.retain(|l| {
+                    is_protected_security_label(l)
+                        || !remove_labels.iter().any(|r| r.eq_ignore_ascii_case(l))
+                });
             }
             for add in add_labels {
                 if !labels.contains(add) {
@@ -222,14 +237,22 @@ impl InboundFilter for FilterChain {
                     any_mutated = true;
                     skip_inbox |= skip;
                     for label in adds {
-                        remove_labels.retain(|l| l != &label);
-                        if !add_labels.contains(&label) {
+                        remove_labels.retain(|l| !l.eq_ignore_ascii_case(&label));
+                        if !add_labels.iter().any(|l| l.eq_ignore_ascii_case(&label)) {
                             add_labels.push(label);
                         }
                     }
                     for label in removes {
-                        add_labels.retain(|l| l != &label);
-                        if !remove_labels.contains(&label) {
+                        if is_protected_security_label(&label) {
+                            tracing::warn!(
+                                filter = filter.backend_name(),
+                                label = %label,
+                                "FilterChain blocked downstream removal of protected security label"
+                            );
+                            continue;
+                        }
+                        add_labels.retain(|l| !l.eq_ignore_ascii_case(&label));
+                        if !remove_labels.iter().any(|l| l.eq_ignore_ascii_case(&label)) {
                             remove_labels.push(label);
                         }
                     }
@@ -237,7 +260,7 @@ impl InboundFilter for FilterChain {
             }
         }
 
-        if any_mutated {
+        if any_mutated && (!add_labels.is_empty() || !remove_labels.is_empty() || skip_inbox) {
             Ok(FilterDecision::Mutate {
                 add_labels,
                 remove_labels,
@@ -430,5 +453,61 @@ mod tests {
             chain.active_filters(),
             vec!["auth_results", "rspamd", "llm_triage"]
         );
+    }
+
+    #[tokio::test]
+    async fn chain_blocks_downstream_removal_of_protected_security_labels() {
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+
+        let chain = FilterChain::new(vec![
+            Arc::new(StaticFilter {
+                decision: FilterDecision::Mutate {
+                    add_labels: vec![LABEL_AUTH_FAIL.into(), LABEL_SPAM.into(), "TEMP".into()],
+                    remove_labels: vec![],
+                    skip_inbox: false,
+                },
+                calls: auth_calls,
+            }),
+            Arc::new(StaticFilter {
+                decision: FilterDecision::Mutate {
+                    add_labels: vec!["SAFE".into()],
+                    remove_labels: vec![
+                        LABEL_AUTH_FAIL.into(),
+                        "auth_fail".into(),
+                        LABEL_SPAM.into(),
+                        LABEL_TRASH.into(),
+                        "TEMP".into(),
+                    ],
+                    skip_inbox: false,
+                },
+                calls: downstream_calls,
+            }),
+        ]);
+
+        let decision = chain.evaluate(&InboundMessage::default()).await.unwrap();
+        assert_eq!(
+            decision,
+            FilterDecision::Mutate {
+                add_labels: vec![LABEL_AUTH_FAIL.into(), LABEL_SPAM.into(), "SAFE".into()],
+                remove_labels: vec!["TEMP".into()],
+                skip_inbox: false,
+            }
+        );
+
+        let final_labels = apply_filter_labels(
+            vec![
+                LABEL_INBOX.into(),
+                LABEL_AUTH_FAIL.into(),
+                LABEL_TRASH.into(),
+            ],
+            &FilterDecision::Mutate {
+                add_labels: vec![],
+                remove_labels: vec![LABEL_AUTH_FAIL.into(), LABEL_TRASH.into()],
+                skip_inbox: false,
+            },
+        );
+        assert!(final_labels.contains(&LABEL_AUTH_FAIL.to_string()));
+        assert!(final_labels.contains(&LABEL_TRASH.to_string()));
     }
 }

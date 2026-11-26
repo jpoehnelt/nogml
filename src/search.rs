@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mail_parser::MessageParser;
 
 use crate::{
+    error::{AppError, AppResult},
     mime::normalize_message_id,
     models::{
         LABEL_DRAFT, LABEL_IMPORTANT, LABEL_INBOX, LABEL_SENT, LABEL_SNOOZED, LABEL_SPAM,
@@ -13,6 +14,11 @@ use crate::{
     },
     storage::StoredMessage,
 };
+
+/// Maximum nesting depth allowed for grouped or negated search expressions (`(`, `{`, `-`).
+pub const MAX_SEARCH_QUERY_DEPTH: usize = 32;
+/// Maximum AST nodes allowed in a single parsed search query.
+pub const MAX_SEARCH_QUERY_NODES: usize = 512;
 
 /// Parsed representation of a Gmail search query (`q=...`).
 #[derive(Debug, Clone, Default)]
@@ -142,9 +148,8 @@ fn tokenize(input: &str) -> Vec<Token> {
                 }
 
                 if let Some(cpos) = colon_pos {
-                    let rel = cpos - start;
-                    let key = raw_word[..rel].to_string();
-                    let val = raw_word[rel + 1..].to_string();
+                    let key: String = chars[start..cpos].iter().collect();
+                    let val: String = chars[cpos + 1..i].iter().collect();
                     if !key.is_empty() && !val.is_empty() {
                         tokens.push(Token::Word {
                             key: Some(key),
@@ -195,6 +200,7 @@ struct QueryParser {
     pos: usize,
     now_ms: i64,
     include_spam_trash: bool,
+    node_count: usize,
 }
 
 impl QueryParser {
@@ -204,7 +210,27 @@ impl QueryParser {
             pos: 0,
             now_ms,
             include_spam_trash: false,
+            node_count: 0,
         }
+    }
+
+    fn bump_nodes(&mut self) -> AppResult<()> {
+        self.node_count += 1;
+        if self.node_count > MAX_SEARCH_QUERY_NODES {
+            return Err(AppError::BadRequest(format!(
+                "Search query exceeds maximum expression limit of {MAX_SEARCH_QUERY_NODES} nodes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_depth(depth: usize) -> AppResult<()> {
+        if depth > MAX_SEARCH_QUERY_DEPTH {
+            return Err(AppError::BadRequest(format!(
+                "Search query exceeds maximum nesting depth of {MAX_SEARCH_QUERY_DEPTH}"
+            )));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -221,7 +247,13 @@ impl QueryParser {
         }
     }
 
-    fn parse_sequence(&mut self, stop_at: Option<&Token>, negated: bool) -> Vec<SearchTerm> {
+    fn parse_sequence(
+        &mut self,
+        stop_at: Option<&Token>,
+        negated: bool,
+        depth: usize,
+    ) -> AppResult<Vec<SearchTerm>> {
+        Self::check_depth(depth)?;
         let mut terms = Vec::new();
         while let Some(tok) = self.peek() {
             if stop_at == Some(tok) {
@@ -232,23 +264,25 @@ impl QueryParser {
                 self.advance();
                 continue;
             }
-            if let Some(term) = self.parse_or_expr(negated) {
+            if let Some(term) = self.parse_or_expr(negated, depth)? {
                 terms.push(term);
             }
         }
-        terms
+        Ok(terms)
     }
 
-    fn parse_or_expr(&mut self, negated: bool) -> Option<SearchTerm> {
-        let first = self.parse_unary(negated)?;
+    fn parse_or_expr(&mut self, negated: bool, depth: usize) -> AppResult<Option<SearchTerm>> {
+        let Some(first) = self.parse_unary(negated, depth)? else {
+            return Ok(None);
+        };
         if self.peek() != Some(&Token::Or) {
-            return Some(first);
+            return Ok(Some(first));
         }
 
         let mut branches = vec![first];
         while self.peek() == Some(&Token::Or) {
             self.advance(); // consume OR
-            if let Some(next_term) = self.parse_unary(negated) {
+            if let Some(next_term) = self.parse_unary(negated, depth)? {
                 branches.push(next_term);
             } else {
                 break;
@@ -256,36 +290,50 @@ impl QueryParser {
         }
 
         if branches.len() == 1 {
-            branches.pop()
+            Ok(branches.pop())
         } else {
-            Some(SearchTerm::Or(branches))
+            self.bump_nodes()?;
+            Ok(Some(SearchTerm::Or(branches)))
         }
     }
 
-    fn parse_unary(&mut self, negated: bool) -> Option<SearchTerm> {
+    fn parse_unary(&mut self, negated: bool, depth: usize) -> AppResult<Option<SearchTerm>> {
         if self.peek() == Some(&Token::Minus) {
+            Self::check_depth(depth + 1)?;
             self.advance();
-            let inner = self.parse_unary(!negated)?;
-            return Some(SearchTerm::Not(Box::new(inner)));
+            let Some(inner) = self.parse_unary(!negated, depth + 1)? else {
+                return Ok(None);
+            };
+            self.bump_nodes()?;
+            return Ok(Some(SearchTerm::Not(Box::new(inner))));
         }
-        self.parse_primary(negated)
+        self.parse_primary(negated, depth)
     }
 
-    fn parse_primary(&mut self, negated: bool) -> Option<SearchTerm> {
-        let tok = self.advance()?;
+    fn parse_primary(&mut self, negated: bool, depth: usize) -> AppResult<Option<SearchTerm>> {
+        let Some(tok) = self.advance() else {
+            return Ok(None);
+        };
         match tok {
             Token::LParen => {
-                let mut inner = self.parse_sequence(Some(&Token::RParen), negated);
+                Self::check_depth(depth + 1)?;
+                self.bump_nodes()?;
+                let mut inner = self.parse_sequence(Some(&Token::RParen), negated, depth + 1)?;
                 if self.peek() == Some(&Token::RParen) {
                     self.advance();
                 }
                 match inner.len() {
-                    0 => None,
-                    1 => inner.pop(),
-                    _ => Some(SearchTerm::And(inner)),
+                    0 => Ok(None),
+                    1 => Ok(inner.pop()),
+                    _ => {
+                        self.bump_nodes()?;
+                        Ok(Some(SearchTerm::And(inner)))
+                    }
                 }
             }
             Token::LBrace => {
+                Self::check_depth(depth + 1)?;
+                self.bump_nodes()?;
                 let mut branches = Vec::new();
                 while let Some(next_tok) = self.peek() {
                     if next_tok == &Token::RBrace {
@@ -296,22 +344,31 @@ impl QueryParser {
                         self.advance();
                         continue;
                     }
-                    if let Some(term) = self.parse_unary(negated) {
+                    if let Some(term) = self.parse_unary(negated, depth + 1)? {
                         branches.push(term);
                     } else {
                         break;
                     }
                 }
                 match branches.len() {
-                    0 => None,
-                    1 => branches.pop(),
-                    _ => Some(SearchTerm::Or(branches)),
+                    0 => Ok(None),
+                    1 => Ok(branches.pop()),
+                    _ => {
+                        self.bump_nodes()?;
+                        Ok(Some(SearchTerm::Or(branches)))
+                    }
                 }
             }
-            Token::Or => Some(SearchTerm::Text("OR".to_string())),
-            Token::Minus => None,
-            Token::RParen | Token::RBrace => None,
-            Token::Word { key, value } => Some(self.build_word_term(key, value, negated)),
+            Token::Or => {
+                self.bump_nodes()?;
+                Ok(Some(SearchTerm::Text("OR".to_string())))
+            }
+            Token::Minus => Ok(None),
+            Token::RParen | Token::RBrace => Ok(None),
+            Token::Word { key, value } => {
+                self.bump_nodes()?;
+                Ok(Some(self.build_word_term(key, value, negated)))
+            }
         }
     }
 
@@ -472,25 +529,43 @@ fn parse_size_bytes(raw: &str) -> Option<usize> {
     num.checked_mul(multiplier)
 }
 
+/// Parse a Gmail-style search query string, rejecting queries that exceed
+/// [`MAX_SEARCH_QUERY_DEPTH`] or [`MAX_SEARCH_QUERY_NODES`] with [`AppError::BadRequest`].
+pub fn try_parse_query(q: &str) -> AppResult<SearchQuery> {
+    try_parse_query_at(q, Utc::now().timestamp_millis())
+}
+
 /// Parse a Gmail-style search query string (supporting `from:`, `to:`, `cc:`, `bcc:`,
 /// `subject:`, `label:`/`l:`, `is:unread|read|starred|important|draft`,
 /// `in:inbox|sent|trash|spam|draft|drafts|anywhere`, `has:attachment`, `filename:`,
 /// `after:`, `before:`, `older_than:`, `newer_than:`, `larger:`, `smaller:`,
 /// `rfc822msgid:`, quoted phrases, `-negation`, `OR`, `{...}`, and `(...)`).
+///
+/// Queries that exceed [`MAX_SEARCH_QUERY_DEPTH`] or [`MAX_SEARCH_QUERY_NODES`] return
+/// an empty [`SearchQuery`] safely without overflowing the stack; prefer [`try_parse_query`]
+/// on request boundaries to return `400 Bad Request`.
 pub fn parse_query(q: &str) -> SearchQuery {
     parse_query_at(q, Utc::now().timestamp_millis())
 }
 
 /// Deterministic helper allowing tests to pin "now" for `older_than:` / `newer_than:`.
-fn parse_query_at(q: &str, now_ms: i64) -> SearchQuery {
+fn try_parse_query_at(q: &str, now_ms: i64) -> AppResult<SearchQuery> {
     let tokens = tokenize(q);
     let mut parser = QueryParser::new(tokens, now_ms);
-    let terms = parser.parse_sequence(None, false);
-    SearchQuery {
+    let terms = parser.parse_sequence(None, false, 0)?;
+    Ok(SearchQuery {
         raw: q.to_string(),
         include_spam_trash: parser.include_spam_trash,
         terms,
-    }
+    })
+}
+
+fn parse_query_at(q: &str, now_ms: i64) -> SearchQuery {
+    try_parse_query_at(q, now_ms).unwrap_or_else(|_| SearchQuery {
+        raw: q.to_string(),
+        include_spam_trash: false,
+        terms: Vec::new(),
+    })
 }
 
 /// Evaluate a parsed [`SearchQuery`] against a [`StoredMessage`].
@@ -869,6 +944,47 @@ mod tests {
         ] {
             let parsed = parse_query(weird);
             let _ = matches_message(&parsed, &msg);
+        }
+    }
+
+    #[test]
+    fn multibyte_utf8_before_colon_never_panics() {
+        let mut msg = sample_message();
+        msg.text_body = "Meet at café:10am with é:a".to_string();
+
+        for q in ["é:a", "café:10am", "日本語:値", "café:\"10am sharp\""] {
+            let parsed = try_parse_query(q).expect("valid utf8 query");
+            let _ = matches_message(&parsed, &msg);
+        }
+        assert!(matches_message(
+            &try_parse_query("café:10am").unwrap(),
+            &msg
+        ));
+        assert!(matches_message(&try_parse_query("é:a").unwrap(), &msg));
+    }
+
+    #[test]
+    fn deeply_nested_and_oversized_queries_return_bad_request_without_stack_overflow() {
+        let msg = sample_message();
+
+        for pathological in [
+            format!("{}a{}", "(".repeat(3_000), ")".repeat(3_000)),
+            format!("{}a{}", "{".repeat(3_000), "}".repeat(3_000)),
+            format!("{}a", "-".repeat(3_000)),
+            (0..600)
+                .map(|i| format!("word{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ] {
+            let err = try_parse_query(&pathological).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "expected BadRequest, got {err:?}"
+            );
+
+            // Infallible parse_query must also terminate safely without overflowing the stack.
+            let fallback = parse_query(&pathological);
+            let _ = matches_message(&fallback, &msg);
         }
     }
 }

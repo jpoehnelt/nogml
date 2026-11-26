@@ -1076,23 +1076,27 @@ fn collect_raw_text(nodes: &[Node]) -> String {
 }
 
 fn sanitize_href(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
+    // Strip BiDi overrides, invisible Unicode tag chars, and C0/C1 controls BEFORE
+    // checking the scheme so downstream `sanitize_untrusted_text` cannot mutate an
+    // obfuscated href like `java&#x202e;script:...` into `javascript:...` (mXSS).
+    let sanitized = crate::mime::sanitize_untrusted_text(raw);
+    let trimmed = sanitized.trim();
     if trimmed.is_empty() || trimmed == "#" {
         return None;
     }
 
-    // Strip ASCII whitespace and control chars before inspecting URL scheme to defeat
-    // obfuscated payloads like "java\nscript:alert(1)".
-    let compact_scheme: String = trimmed
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    // Reject control characters (including CR/LF/TAB) anywhere in the URL.
+    if trimmed.chars().any(char::is_control) {
+        return None;
+    }
 
-    for blocked in ["javascript:", "vbscript:", "data:"] {
-        if compact_scheme.starts_with(blocked) {
-            return None;
-        }
+    // Strict allowlist of safe schemes (case-insensitive).
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:"))
+    {
+        return None;
     }
 
     Some(trimmed.to_string())
@@ -1339,5 +1343,37 @@ mod tests {
         let (body3, from_html3) = select_body_or_html_markdown(real_plain, Some(rich_html));
         assert!(!from_html3);
         assert_eq!(body3, real_plain);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_bidi_mxss_and_enforces_scheme_allowlist() {
+        let html = concat!(
+            r#"<a href="java&#x202e;script:alert(1)">BiDi XSS</a> "#,
+            r#"<a href="java&#xE0001;script:alert(2)">Tag XSS</a> "#,
+            r#"<a href="data:text/html,<script>alert(3)</script>">Data URI</a> "#,
+            r#"<a href="vbscript:msgbox(1)">VBS</a> "#,
+            r#"<a href="ftp://files.example.com/a">FTP</a> "#,
+            r#"<a href="http://example.com/ok">HTTP</a> "#,
+            r#"<a href="https://example.com/ok">HTTPS</a> "#,
+            r#"<a href="mailto:user@example.com">Mailto</a>"#
+        );
+
+        let md = html_to_markdown(html);
+        let sanitized = crate::mime::sanitize_untrusted_text(&md);
+        for output in [&md, &sanitized] {
+            let lower = output.to_ascii_lowercase();
+            assert!(
+                !lower.contains("javascript:"),
+                "leaked javascript in {output}"
+            );
+            assert!(!lower.contains("data:text"), "leaked data uri in {output}");
+            assert!(!lower.contains("vbscript:"), "leaked vbscript in {output}");
+            assert!(!lower.contains("ftp://"), "leaked ftp in {output}");
+            assert!(output.contains("[HTTP](http://example.com/ok)"));
+            assert!(output.contains("[HTTPS](https://example.com/ok)"));
+            assert!(output.contains("[Mailto](mailto:user@example.com)"));
+            assert!(output.contains("BiDi XSS"));
+            assert!(output.contains("Tag XSS"));
+        }
     }
 }

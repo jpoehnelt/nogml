@@ -2539,8 +2539,12 @@ fn parse_xoauth2_payload(decoded: &[u8]) -> Option<(String, String)> {
             }
         } else if let Some(auth) = part.strip_prefix("auth=") {
             let trimmed = auth.trim();
-            if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
-                let tok = trimmed[7..].trim();
+            if trimmed
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+                && let Some(rest) = trimmed.get(7..)
+            {
+                let tok = rest.trim();
                 if !tok.is_empty() {
                     token = Some(tok.to_string());
                 }
@@ -3265,4 +3269,21 @@ fn sent_date(msg: Option<&StoredMessage>) -> Option<chrono::NaiveDate> {
     let parsed = mail_parser::MessageParser::new().parse(&m.raw_rfc2822)?;
     let dt = parsed.date()?;
     chrono::NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xoauth2_parser_handles_multibyte_utf8_without_panicking() {
+        let malformed = "user=alice@example.com\x01auth=éééé\x01\x01";
+        assert_eq!(parse_xoauth2_payload(malformed.as_bytes()), None);
+
+        let valid = "user=alice@example.com\x01auth=Bearer tok-123\x01\x01";
+        assert_eq!(
+            parse_xoauth2_payload(valid.as_bytes()),
+            Some(("alice@example.com".to_string(), "tok-123".to_string()))
+        );
+    }
 }

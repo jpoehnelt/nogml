@@ -473,7 +473,8 @@ fn has_private_key_block(input: &str) -> bool {
         let header_start = search_from + rel + "-----BEGIN ".len();
         let rest = &upper[header_start..];
         let line_end = rest.find(['\r', '\n']).unwrap_or(rest.len());
-        let line = &rest[..line_end.min(96)];
+        let safe_end = rest.floor_char_boundary(line_end.min(96));
+        let line = &rest[..safe_end];
         if let Some(end_dashes) = line.find("-----") {
             let label = &line[..end_dashes];
             if label.contains("PRIVATE KEY") {
@@ -1759,5 +1760,18 @@ mod tests {
             }
             other => panic!("expected Deny, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dlp_pem_scanner_handles_multibyte_utf8_across_byte_96_without_panicking() {
+        // 50 two-byte 'é' characters = 100 bytes; byte 96 lands in the middle of a char if shifted by 1.
+        let non_boundary_padding = format!("x{}", "é".repeat(50));
+        let harmless = format!("-----BEGIN {non_boundary_padding}-----");
+        assert!(scan_dlp_text(&harmless).is_empty());
+
+        // Real private key header preceded by multi-byte UTF-8 still detected.
+        let with_key =
+            format!("-----BEGIN {non_boundary_padding}\n-----BEGIN RSA PRIVATE KEY-----\nMIIE...");
+        assert_eq!(scan_dlp_text(&with_key), vec!["private_key_block"]);
     }
 }

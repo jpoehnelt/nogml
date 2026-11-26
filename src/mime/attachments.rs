@@ -29,8 +29,10 @@ pub const HARD_ATTACHMENT_MAX_CHARS: usize = 100_000;
 
 /// Maximum decompressed size per PDF stream (guards against zip/PDF bombs).
 const MAX_PDF_STREAM_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum cumulative decompressed bytes across all streams in a single PDF.
+/// Maximum cumulative decompressed/scanned bytes across all streams in a single PDF.
 const MAX_PDF_TOTAL_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum tokens tokenized from a single PDF content stream (guards against OOM/CPU DoS).
+const MAX_PDF_TOKENS: usize = 200_000;
 
 /// Clamp an optional requested `max_chars` value to `[0, HARD_ATTACHMENT_MAX_CHARS]`.
 pub fn clamp_attachment_max_chars(requested: Option<usize>) -> usize {
@@ -747,8 +749,12 @@ pub fn extract_pdf_text_streams(data: &[u8]) -> String {
                         }
                     }
                 }
-            } else {
-                let text = parse_pdf_content_stream_text(stream_bytes);
+            } else if total_decompressed < MAX_PDF_TOTAL_DECOMPRESSED_BYTES {
+                let remaining_budget = MAX_PDF_TOTAL_DECOMPRESSED_BYTES - total_decompressed;
+                let limit = remaining_budget.min(MAX_PDF_STREAM_DECOMPRESSED_BYTES);
+                let bounded_stream = &stream_bytes[..stream_bytes.len().min(limit)];
+                total_decompressed += bounded_stream.len();
+                let text = parse_pdf_content_stream_text(bounded_stream);
                 if !text.trim().is_empty() {
                     chunks.push(text);
                 }
@@ -760,7 +766,8 @@ pub fn extract_pdf_text_streams(data: &[u8]) -> String {
 
     // Fallback for minimal synthetic PDFs that put `BT ... ET` directly without `stream`/`endstream`.
     if !found_stream {
-        let direct = parse_pdf_content_stream_text(data);
+        let bounded_data = &data[..data.len().min(MAX_PDF_STREAM_DECOMPRESSED_BYTES)];
+        let direct = parse_pdf_content_stream_text(bounded_data);
         if !direct.trim().is_empty() {
             chunks.push(direct);
         }
@@ -874,10 +881,11 @@ fn parse_pdf_content_stream_text(stream: &[u8]) -> String {
 
 fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
     let mut tokens = Vec::new();
+    let mut token_budget = MAX_PDF_TOKENS;
     let mut i = 0;
     let len = bytes.len();
 
-    while i < len {
+    while i < len && token_budget > 0 {
         let b = bytes[i];
         if b.is_ascii_whitespace() {
             i += 1;
@@ -894,7 +902,8 @@ fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
         if b == b'(' {
             let (s, next) = parse_pdf_literal_string(bytes, i);
             tokens.push(PdfToken::Str(s));
-            i = next;
+            token_budget -= 1;
+            i = next.max(i + 1);
             continue;
         }
         // Dictionary << ... >> or hex string <...>
@@ -905,7 +914,8 @@ fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
             }
             let (s, next) = parse_pdf_hex_string(bytes, i);
             tokens.push(PdfToken::Str(s));
-            i = next;
+            token_budget -= 1;
+            i = next.max(i + 1);
             continue;
         }
         if b == b'>' {
@@ -914,12 +924,13 @@ fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
         }
         // Array [...]
         if b == b'[' {
-            let (arr, next) = parse_pdf_array(bytes, i);
+            token_budget -= 1;
+            let (arr, next) = parse_pdf_array(bytes, i, &mut token_budget);
             tokens.push(PdfToken::Array(arr));
-            i = next;
+            i = next.max(i + 1);
             continue;
         }
-        if b == b']' {
+        if matches!(b, b']' | b')' | b'{' | b'}') {
             i += 1;
             continue;
         }
@@ -934,6 +945,7 @@ fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
         // Quote operators `'` and `"`
         if b == b'\'' || b == b'"' {
             tokens.push(PdfToken::Word((b as char).to_string()));
+            token_budget -= 1;
             i += 1;
             continue;
         }
@@ -943,12 +955,17 @@ fn tokenize_pdf_stream(bytes: &[u8]) -> Vec<PdfToken> {
         while i < len && !is_pdf_delimiter(bytes[i]) && !bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        if i == start {
+            i += 1;
+            continue;
+        }
         let word = String::from_utf8_lossy(&bytes[start..i]).into_owned();
         if let Ok(num) = word.parse::<f64>() {
             tokens.push(PdfToken::Number(num));
         } else {
             tokens.push(PdfToken::Word(word));
         }
+        token_budget -= 1;
     }
 
     tokens
@@ -961,12 +978,12 @@ fn is_pdf_delimiter(b: u8) -> bool {
     )
 }
 
-fn parse_pdf_array(bytes: &[u8], start: usize) -> (Vec<PdfToken>, usize) {
+fn parse_pdf_array(bytes: &[u8], start: usize, token_budget: &mut usize) -> (Vec<PdfToken>, usize) {
     let mut items = Vec::new();
     let mut i = start + 1;
     let len = bytes.len();
 
-    while i < len {
+    while i < len && *token_budget > 0 {
         let b = bytes[i];
         if b.is_ascii_whitespace() {
             i += 1;
@@ -978,11 +995,13 @@ fn parse_pdf_array(bytes: &[u8], start: usize) -> (Vec<PdfToken>, usize) {
         if b == b'(' {
             let (s, next) = parse_pdf_literal_string(bytes, i);
             items.push(PdfToken::Str(s));
-            i = next;
+            *token_budget -= 1;
+            i = next.max(i + 1);
         } else if b == b'<' && (i + 1 >= len || bytes[i + 1] != b'<') {
             let (s, next) = parse_pdf_hex_string(bytes, i);
             items.push(PdfToken::Str(s));
-            i = next;
+            *token_budget -= 1;
+            i = next.max(i + 1);
         } else {
             let tok_start = i;
             while i < len && !is_pdf_delimiter(bytes[i]) && !bytes[i].is_ascii_whitespace() {
@@ -997,6 +1016,7 @@ fn parse_pdf_array(bytes: &[u8], start: usize) -> (Vec<PdfToken>, usize) {
                 .parse::<f64>()
             {
                 items.push(PdfToken::Number(num));
+                *token_budget -= 1;
             }
         }
     }
@@ -1346,5 +1366,43 @@ mod tests {
                 .unwrap()
                 .contains("exceeds maximum")
         );
+    }
+
+    #[test]
+    fn pdf_tokenizer_handles_stray_delimiters_and_caps_tokens_without_hanging() {
+        // Stray `{`, `}`, and `)` previously caused an infinite loop + OOM in tokenize_pdf_stream.
+        for payload in [
+            b"%PDF-1.4\n{" as &[u8],
+            b"%PDF-1.4\n}",
+            b"%PDF-1.4\n)",
+            b"%PDF-1.4\n{{{}}}))) BT (Hello after braces) Tj ET",
+        ] {
+            let text = extract_pdf_text_streams(payload);
+            if payload.ends_with(b"ET") {
+                assert_eq!(text, "Hello after braces");
+            }
+        }
+
+        // Token count cap: more than MAX_PDF_TOKENS tokens must terminate cleanly and stay bounded.
+        let mut huge_stream = Vec::with_capacity((MAX_PDF_TOKENS + 5_000) * 2);
+        for _ in 0..(MAX_PDF_TOKENS + 5_000) {
+            huge_stream.extend_from_slice(b"a ");
+        }
+        let tokens = tokenize_pdf_stream(&huge_stream);
+        assert_eq!(tokens.len(), MAX_PDF_TOKENS);
+
+        // Array elements also count against MAX_PDF_TOKENS.
+        let mut huge_array = Vec::with_capacity((MAX_PDF_TOKENS + 1_000) * 3);
+        huge_array.push(b'[');
+        for _ in 0..(MAX_PDF_TOKENS + 1_000) {
+            huge_array.extend_from_slice(b"1 ");
+        }
+        huge_array.push(b']');
+        let array_tokens = tokenize_pdf_stream(&huge_array);
+        assert_eq!(array_tokens.len(), 1);
+        match &array_tokens[0] {
+            PdfToken::Array(items) => assert!(items.len() <= MAX_PDF_TOKENS),
+            other => panic!("expected PdfToken::Array, got {other:?}"),
+        }
     }
 }

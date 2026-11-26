@@ -293,6 +293,53 @@ pub fn parse_rfc2822(raw: &[u8]) -> AppResult<ParsedEmail> {
     })
 }
 
+fn validate_no_header_crlf_or_nul(value: &str, field: &str) -> AppResult<()> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(AppError::Mime(format!(
+            "Header field {field} must not contain CR, LF, or NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn is_rfc2045_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            (0x21..=0x7E).contains(&b)
+                && !matches!(
+                    b,
+                    b'(' | b')'
+                        | b'<'
+                        | b'>'
+                        | b'@'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b'\\'
+                        | b'"'
+                        | b'/'
+                        | b'['
+                        | b']'
+                        | b'?'
+                        | b'='
+                )
+        })
+}
+
+fn validate_mime_media_type(ct: &str) -> AppResult<()> {
+    let Some((media_type, subtype)) = ct.split_once('/') else {
+        return Err(AppError::Mime(format!(
+            "Invalid attachment content_type {ct:?}: expected type/subtype"
+        )));
+    };
+    if !is_rfc2045_token(media_type) || !is_rfc2045_token(subtype) {
+        return Err(AppError::Mime(format!(
+            "Invalid attachment content_type {ct:?}: invalid MIME media-type token"
+        )));
+    }
+    Ok(())
+}
+
 /// Build an RFC 2822 message from structured fields using `mail-builder`.
 pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     let mut builder = MessageBuilder::new();
@@ -340,6 +387,7 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     builder = builder.subject(input.subject.as_str());
 
     if let Some(ref mid) = input.message_id {
+        validate_no_header_crlf_or_nul(mid, "message_id")?;
         let bare = strip_angle_brackets(mid);
         if !bare.is_empty() {
             builder = builder.message_id(BuilderMessageId::new(bare));
@@ -347,6 +395,7 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     }
 
     if let Some(ref irt) = input.in_reply_to {
+        validate_no_header_crlf_or_nul(irt, "in_reply_to")?;
         let ids = extract_bare_message_ids(irt);
         if !ids.is_empty() {
             builder = builder.in_reply_to(BuilderMessageId::from(ids));
@@ -354,6 +403,7 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     }
 
     if let Some(ref refs) = input.references {
+        validate_no_header_crlf_or_nul(refs, "references")?;
         let ids = extract_bare_message_ids(refs);
         if !ids.is_empty() {
             builder = builder.references(BuilderMessageId::from(ids));
@@ -363,13 +413,18 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     let mut extra_keys: Vec<&String> = input.extra_headers.keys().collect();
     extra_keys.sort();
     for key in extra_keys {
-        if key.is_empty() || key.contains('\r') || key.contains('\n') || key.contains(':') {
+        if key.is_empty()
+            || key.contains('\r')
+            || key.contains('\n')
+            || key.contains('\0')
+            || key.contains(':')
+        {
             return Err(AppError::Mime(format!("Invalid header name: {key:?}")));
         }
         let value = &input.extra_headers[key];
-        if value.contains('\r') || value.contains('\n') {
+        if value.contains(['\r', '\n', '\0']) {
             return Err(AppError::Mime(format!(
-                "Header value for {key:?} must not contain CR/LF"
+                "Header value for {key:?} must not contain CR/LF/NUL"
             )));
         }
         builder = builder.header(key.as_str(), BuilderText::new(value.as_str()));
@@ -383,11 +438,22 @@ pub fn build_rfc2822(input: &ComposeEmailInput) -> AppResult<Vec<u8>> {
     }
 
     for att in &input.attachments {
+        validate_no_header_crlf_or_nul(&att.content_type, "attachment content_type")?;
         let ct_str = if att.content_type.trim().is_empty() {
             "application/octet-stream"
         } else {
-            att.content_type.trim()
+            let trimmed = att.content_type.trim();
+            validate_mime_media_type(trimmed)?;
+            trimmed
         };
+
+        if let Some(ref name) = att.filename {
+            validate_no_header_crlf_or_nul(name, "attachment filename")?;
+        }
+
+        if let Some(ref cid) = att.content_id {
+            validate_no_header_crlf_or_nul(cid, "attachment content_id")?;
+        }
 
         if let Some(ref cid) = att.content_id
             && !cid.trim().is_empty()
@@ -873,5 +939,87 @@ mod tests {
             "ok\r\nBcc: attacker@evil.com".to_string(),
         );
         assert!(build_rfc2822(&bad_compose).is_err());
+    }
+
+    #[test]
+    fn build_rfc2822_rejects_crlf_nul_and_invalid_mime_types() {
+        let base = ComposeEmailInput {
+            from: "a@example.com".to_string(),
+            to: vec!["b@example.com".to_string()],
+            subject: "Hi".to_string(),
+            text: Some("body".to_string()),
+            ..Default::default()
+        };
+
+        // CRLF and NUL in message_id, in_reply_to, references
+        for bad in [
+            "<id@example.com>\r\nBcc: evil@example.com",
+            "<id@example.com>\nX-Evil: 1",
+            "<id@example.com>\0",
+        ] {
+            let mut c = base.clone();
+            c.message_id = Some(bad.to_string());
+            assert!(build_rfc2822(&c).is_err(), "message_id={bad:?} must fail");
+
+            let mut c = base.clone();
+            c.in_reply_to = Some(bad.to_string());
+            assert!(build_rfc2822(&c).is_err(), "in_reply_to={bad:?} must fail");
+
+            let mut c = base.clone();
+            c.references = Some(bad.to_string());
+            assert!(build_rfc2822(&c).is_err(), "references={bad:?} must fail");
+        }
+
+        // CRLF / NUL in attachment content_id
+        for bad_cid in ["<cid@example.com>\r\nX-Injected: 1", "<cid>\0"] {
+            let mut c = base.clone();
+            c.attachments.push(NewAttachmentInput {
+                part_id: String::new(),
+                filename: Some("logo.png".to_string()),
+                content_type: "image/png".to_string(),
+                content_id: Some(bad_cid.to_string()),
+                data: vec![1, 2, 3],
+            });
+            assert!(
+                build_rfc2822(&c).is_err(),
+                "content_id={bad_cid:?} must fail"
+            );
+        }
+
+        // CRLF / NUL / invalid token syntax in attachment content_type
+        for bad_ct in [
+            "text/plain\r\nX-Injected: 1",
+            "text/plain\nX-Injected: 1",
+            "text/plain\0",
+            "text/plain; charset=utf-8",
+            "not-a-mime-type",
+            "text/",
+            "/plain",
+            "text/plain/extra",
+        ] {
+            let mut c = base.clone();
+            c.attachments.push(NewAttachmentInput {
+                part_id: String::new(),
+                filename: Some("file.txt".to_string()),
+                content_type: bad_ct.to_string(),
+                content_id: None,
+                data: b"hi".to_vec(),
+            });
+            assert!(
+                build_rfc2822(&c).is_err(),
+                "content_type={bad_ct:?} must fail"
+            );
+        }
+
+        // Valid complex MIME media-type tokens still succeed.
+        let mut ok_compose = base;
+        ok_compose.attachments.push(NewAttachmentInput {
+            part_id: String::new(),
+            filename: Some("diagram.svg".to_string()),
+            content_type: "image/svg+xml".to_string(),
+            content_id: Some("<svg-1@example.com>".to_string()),
+            data: b"<svg/>".to_vec(),
+        });
+        assert!(build_rfc2822(&ok_compose).is_ok());
     }
 }

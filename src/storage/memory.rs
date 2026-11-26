@@ -922,8 +922,11 @@ fn rewrite_search_term_labels(
     }
 }
 
-fn parse_query_with_labels(state: &MemoryState, raw_q: &str) -> crate::search::SearchQuery {
-    let mut parsed = crate::search::parse_query(raw_q);
+fn parse_query_with_labels(
+    state: &MemoryState,
+    raw_q: &str,
+) -> AppResult<crate::search::SearchQuery> {
+    let mut parsed = crate::search::try_parse_query(raw_q)?;
     if !parsed.terms.is_empty() {
         let mut map = HashMap::new();
         for lbl in state.labels.values() {
@@ -938,7 +941,7 @@ fn parse_query_with_labels(state: &MemoryState, raw_q: &str) -> crate::search::S
             .map(|t| rewrite_search_term_labels(t, &map))
             .collect();
     }
-    parsed
+    Ok(parsed)
 }
 
 /// Tokenize an AI search query into case-insensitive phrases and terms,
@@ -1233,7 +1236,8 @@ impl MailStore for MemoryStore {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|raw| parse_query_with_labels(&state, raw));
+            .map(|raw| parse_query_with_labels(&state, raw))
+            .transpose()?;
 
         let resolved_labels: Vec<String> = query
             .label_ids
@@ -1422,7 +1426,8 @@ impl MailStore for MemoryStore {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|raw| parse_query_with_labels(&state, raw));
+            .map(|raw| parse_query_with_labels(&state, raw))
+            .transpose()?;
 
         let required_labels: Vec<String> = query
             .label_ids
@@ -1880,7 +1885,8 @@ impl MailStore for MemoryStore {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|raw| parse_query_with_labels(&state, raw));
+            .map(|raw| parse_query_with_labels(&state, raw))
+            .transpose()?;
         let effective_include_spam_trash =
             query.include_spam_trash || parsed_q.as_ref().is_some_and(|pq| pq.include_spam_trash);
 
