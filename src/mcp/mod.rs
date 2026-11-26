@@ -36,6 +36,8 @@ use crate::{
     sync,
 };
 
+mod prompts;
+
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 const DEFAULT_LIMIT: usize = 20;
@@ -127,6 +129,8 @@ impl McpServer {
             "resources/list" => Ok(json!({ "resources": static_resources() })),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": resource_templates() })),
             "resources/read" => self.handle_resources_read(params).await,
+            "prompts/list" => Ok(json!({ "prompts": prompts::prompt_catalog() })),
+            "prompts/get" => prompts::get_prompt(&params),
             other => Err(RpcError::new(
                 ERR_METHOD_NOT_FOUND,
                 format!("Method not found: {other}"),
@@ -192,7 +196,8 @@ impl McpServer {
             "protocolVersion": negotiated,
             "capabilities": {
                 "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false }
+                "resources": { "subscribe": false, "listChanged": false },
+                "prompts": {}
             },
             "serverInfo": {
                 "name": "nogml",
@@ -2177,6 +2182,71 @@ mod tests {
         config::{Config, DraftOnlyAction},
         models::{LABEL_INBOX, LABEL_UNREAD},
     };
+
+    #[tokio::test]
+    async fn mcp_prompts_list_get_and_invalid_params() {
+        let (state, _store, _resend) = make_test_state(Config::for_test());
+        let server = McpServer::new(state);
+        let call = |id: u64, method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+
+        let init = server
+            .handle_request(call(1, "initialize", json!({})))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(init["result"]["capabilities"]["prompts"].is_object());
+
+        let list = server
+            .handle_request(call(2, "prompts/list", json!({})))
+            .await
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = list["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "triage_inbox",
+                "daily_briefing",
+                "draft_reply",
+                "find_followups"
+            ]
+        );
+
+        let got = server
+            .handle_request(call(
+                3,
+                "prompts/get",
+                json!({ "name": "draft_reply", "arguments": { "thread_id": "t-42", "intent": "decline politely" } }),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = got["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(got["result"]["messages"][0]["role"], "user");
+        assert!(text.contains("\"t-42\"") && text.contains("decline politely"));
+        assert!(text.contains("get_reply_context") && text.contains("create_draft"));
+
+        for params in [
+            json!({ "name": "draft_reply" }),
+            json!({ "name": "nope" }),
+            json!({ "name": "triage_inbox", "arguments": { "limit": "0" } }),
+            json!({ "name": "triage_inbox", "arguments": "x" }),
+        ] {
+            let resp = server
+                .handle_request(call(4, "prompts/get", params))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp["error"]["code"], ERR_INVALID_PARAMS);
+        }
+    }
 
     #[tokio::test]
     async fn mcp_initialize_ping_and_tools_catalog() {
