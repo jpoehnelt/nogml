@@ -52,10 +52,24 @@ pub const PG_EVENTS_CHANNEL: &str = "nogml_events";
 /// Advisory lock key serializing idempotent DDL startup across concurrent nodes.
 const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 
+/// Monotonic schema version tracked in `nogml_schema_meta`.
+///
+/// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
+/// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
+/// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
+/// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
+const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
+
 /// Safe payload size threshold under PostgreSQL's 8000-byte `NOTIFY` limit.
 const MAX_PG_NOTIFY_BYTES: usize = 7_500;
 
 const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS nogml_schema_meta (
+    version INTEGER PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     mailbox_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -350,6 +364,9 @@ impl PostgresStore {
         self.schema_ready
             .get_or_try_init(|| async {
                 let mut conn = self.get_conn().await?;
+                if is_schema_current(&conn).await? {
+                    return Ok::<(), AppError>(());
+                }
                 let tx = conn.transaction().await.map_err(pg_err)?;
                 tx.execute(
                     "SELECT pg_advisory_xact_lock($1)",
@@ -357,7 +374,16 @@ impl PostgresStore {
                 )
                 .await
                 .map_err(pg_err)?;
-                tx.batch_execute(SCHEMA_SQL).await.map_err(pg_err)?;
+                if !is_schema_current(&tx).await? {
+                    tx.batch_execute(SCHEMA_SQL).await.map_err(pg_err)?;
+                    tx.execute(
+                        "INSERT INTO nogml_schema_meta (version) VALUES ($1)
+                         ON CONFLICT (version) DO NOTHING",
+                        &[&CURRENT_SCHEMA_VERSION],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                }
                 tx.commit().await.map_err(pg_err)?;
                 Ok::<(), AppError>(())
             })
@@ -732,10 +758,61 @@ async fn send_pg_notify(pool: &Pool, channel: &str, payload: &str) -> AppResult<
 // Seeding & Helper Functions
 // ============================================================================
 
+async fn is_schema_current(client: &impl GenericClient) -> AppResult<bool> {
+    let meta_exists: bool = client
+        .query_one("SELECT to_regclass('nogml_schema_meta') IS NOT NULL", &[])
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    if !meta_exists {
+        return Ok(false);
+    }
+    let current: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM nogml_schema_meta WHERE version >= $1)",
+            &[&CURRENT_SCHEMA_VERSION],
+        )
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    Ok(current)
+}
+
+async fn is_mailbox_seeded(client: &impl GenericClient, mailbox_id: &str) -> AppResult<bool> {
+    let expected_labels = SYSTEM_LABEL_IDS.len() as i64;
+    let expected_settings = SEEDED_SETTING_KEYS.len() as i64;
+    let seeded: bool = client
+        .query_one(
+            "SELECT
+                EXISTS (SELECT 1 FROM meta WHERE mailbox_id = $1 AND key = 'history_id')
+                AND EXISTS (SELECT 1 FROM meta WHERE mailbox_id = $1 AND key = 'next_uid_validity')
+                AND EXISTS (SELECT 1 FROM imap_meta WHERE mailbox_id = $1 AND mailbox_name = $2)
+                AND (SELECT COUNT(*) FROM labels WHERE mailbox_id = $1 AND id = ANY($3)) = $4
+                AND (SELECT COUNT(*) FROM settings WHERE mailbox_id = $1 AND key = ANY($5)) = $6",
+            &[
+                &mailbox_id,
+                &ALL_MAIL_MAILBOX,
+                &SYSTEM_LABEL_IDS,
+                &expected_labels,
+                &SEEDED_SETTING_KEYS,
+                &expected_settings,
+            ],
+        )
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    Ok(seeded)
+}
+
 async fn ensure_mailbox_seeded(
     conn: &mut deadpool_postgres::Object,
     mailbox_id: &str,
 ) -> AppResult<()> {
+    // Fast path: skip advisory lock and write statements when already seeded.
+    if is_mailbox_seeded(conn, mailbox_id).await? {
+        return Ok(());
+    }
+
     let tx = conn.transaction().await.map_err(pg_err)?;
     // Serialize per-mailbox seeding across concurrent nodes.
     tx.execute(
@@ -744,6 +821,11 @@ async fn ensure_mailbox_seeded(
     )
     .await
     .map_err(pg_err)?;
+
+    if is_mailbox_seeded(&tx, mailbox_id).await? {
+        tx.commit().await.map_err(pg_err)?;
+        return Ok(());
+    }
 
     tx.execute(
         "INSERT INTO meta (mailbox_id, key, int_val) VALUES ($1, 'history_id', 1)

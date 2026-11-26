@@ -1371,3 +1371,85 @@ async fn postgres_listen_notify_event_bus_bridge_fans_out_across_nodes() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle_b).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
 }
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_concurrent_connect_and_dml_never_deadlocks() {
+    use nogml::storage::PostgresStore;
+
+    let Ok(url) = std::env::var("NOGML_TEST_POSTGRES_URL") else {
+        eprintln!("Skipping Postgres concurrency test (NOGML_TEST_POSTGRES_URL not set)");
+        return;
+    };
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let writer_mb = format!("ddl-writer-{suffix}@postgres.test");
+    let writer_store = Arc::new(
+        PostgresStore::connect(&url, &writer_mb)
+            .await
+            .expect("initial PostgresStore::connect"),
+    );
+
+    // Verify schema version metadata was recorded.
+    let conn = writer_store.pool().get().await.expect("pool conn");
+    let max_version: Option<i32> = conn
+        .query_one("SELECT MAX(version) FROM nogml_schema_meta", &[])
+        .await
+        .expect("query nogml_schema_meta")
+        .get(0);
+    assert!(
+        max_version.unwrap_or(0) >= 1,
+        "expected nogml_schema_meta version >= 1, got {max_version:?}"
+    );
+    drop(conn);
+
+    // Run concurrent message/label DML alongside repeated fresh PostgresStore::connect calls
+    // (which previously deadlocked between UPDATE labels and CREATE INDEX IF NOT EXISTS).
+    let mut handles = Vec::new();
+
+    for worker_idx in 0..3 {
+        let store = writer_store.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..10 {
+                let ts = 1_700_000_000_000 + (worker_idx * 100 + i) as i64;
+                let msg = store
+                    .insert_message(sample_message(
+                        &format!("Concurrent {worker_idx}-{i}"),
+                        "sender@example.com",
+                        "Testing concurrent DDL/DML safety",
+                        ts,
+                    ))
+                    .await
+                    .expect("insert_message during concurrent connect");
+                store
+                    .modify_message_labels(&msg.id, &[LABEL_STARRED.to_string()], &[])
+                    .await
+                    .expect("modify_message_labels during concurrent connect");
+            }
+        }));
+    }
+
+    for conn_idx in 0..4 {
+        let url = url.clone();
+        let shared_mb = writer_mb.clone();
+        let fresh_mb = format!("ddl-peer-{suffix}-{conn_idx}@postgres.test");
+        handles.push(tokio::spawn(async move {
+            for iter in 0..4 {
+                let target_mb = if iter % 2 == 0 { &shared_mb } else { &fresh_mb };
+                let peer = PostgresStore::connect(&url, target_mb)
+                    .await
+                    .expect("concurrent PostgresStore::connect must not deadlock");
+                let labels = peer.list_labels().await.expect("list_labels on peer");
+                assert!(labels.len() >= SYSTEM_LABEL_IDS.len());
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.expect("concurrent task panicked");
+    }
+}
