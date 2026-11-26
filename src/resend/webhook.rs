@@ -278,11 +278,12 @@ pub async fn handle_email_received(
 ) -> AppResult<Response> {
     let email_id = event.data.email_id.trim();
 
-    // Resolve target local mailbox(es) strictly from top-level webhook envelope recipients.
+    // Resolve target local mailbox(es) strictly from top-level webhook envelope recipients
+    // (including verified BYOD domain catch-all routing when no explicit alias matches).
     let recipient_candidates = collect_resend_recipient_candidates(event);
     let target_mailboxes = state
-        .config
-        .resolve_inbound_mailboxes(&recipient_candidates);
+        .resolve_inbound_mailboxes(&recipient_candidates)
+        .await?;
     if target_mailboxes.is_empty() {
         tracing::info!(
             email_id = %email_id,
@@ -1453,6 +1454,43 @@ mod tests {
             Err(crate::error::AppError::NotFound(format!(
                 "Inbox rule not found: {id}"
             )))
+        }
+
+        async fn create_domain(
+            &self,
+            _input: crate::storage::NewDomainInput,
+        ) -> AppResult<crate::storage::DomainRecord> {
+            Err(crate::error::AppError::Internal(
+                "MockStore domains unsupported".into(),
+            ))
+        }
+
+        async fn get_domain(
+            &self,
+            _domain: &str,
+        ) -> AppResult<Option<crate::storage::DomainRecord>> {
+            Ok(None)
+        }
+
+        async fn list_domains(
+            &self,
+            _mailbox_id: Option<&str>,
+        ) -> AppResult<Vec<crate::storage::DomainRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn update_domain(
+            &self,
+            domain: &str,
+            _update: &crate::storage::DomainUpdate,
+        ) -> AppResult<crate::storage::DomainRecord> {
+            Err(crate::error::AppError::NotFound(format!(
+                "Domain '{domain}' not found"
+            )))
+        }
+
+        async fn delete_domain(&self, _domain: &str) -> AppResult<bool> {
+            Ok(false)
         }
     }
 

@@ -8,6 +8,7 @@ pub mod blob;
 pub mod config;
 pub mod crypto;
 pub mod doctor;
+pub mod domains;
 pub mod error;
 pub mod events;
 pub mod filter;
@@ -98,6 +99,8 @@ pub struct AppState {
     pub cipher: Arc<SecretCipher>,
     /// Underlying Resend client used by `POST /webhooks/resend` Receiving API fetches.
     pub resend: Arc<dyn ResendClient>,
+    /// Pluggable BYOD domain onboarding providers (`ses`, `resend`, `manual`).
+    pub domain_providers: Arc<crate::domains::DomainProviderRegistry>,
     pub events: EventBus,
     pub sync_lock: Arc<Mutex<()>>,
     pub resumable_uploads: Arc<ResumableUploadStore>,
@@ -213,6 +216,8 @@ impl AppState {
         let filter: Arc<dyn InboundFilter> = open_filter(&config);
         let auth: Arc<dyn AuthProvider> = Arc::new(StaticTokenAuthProvider::from_config(&config));
         let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
+        let domain_providers =
+            Arc::new(crate::domains::DomainProviderRegistry::from_config(&config));
         let sync_lock = Arc::new(Mutex::new(()));
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
@@ -237,6 +242,7 @@ impl AppState {
             outbound_policy,
             cipher,
             resend,
+            domain_providers,
             events,
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
@@ -313,6 +319,8 @@ impl AppState {
             Err(_) => Arc::new(StoreSearchIndex::new(store.clone())),
         };
         let outbound_policy: Arc<dyn OutboundPolicy> = open_outbound_policy(&config, store.clone());
+        let domain_providers =
+            Arc::new(crate::domains::DomainProviderRegistry::from_config(&config));
         let sync_lock = Arc::new(Mutex::new(()));
         let mut locks = HashMap::new();
         locks.insert(primary_mailbox_id.clone(), sync_lock.clone());
@@ -329,6 +337,7 @@ impl AppState {
             outbound_policy,
             cipher,
             resend,
+            domain_providers,
             events: EventBus::with_mailbox(&primary_mailbox_id),
             sync_lock,
             resumable_uploads: Arc::new(ResumableUploadStore::new()),
@@ -452,6 +461,7 @@ impl AppState {
             outbound_policy,
             cipher: self.cipher.clone(),
             resend: self.resend.clone(),
+            domain_providers: self.domain_providers.clone(),
             events,
             sync_lock,
             resumable_uploads: self.resumable_uploads.clone(),
@@ -527,6 +537,71 @@ impl AppState {
     pub fn with_cipher(mut self, cipher: Arc<SecretCipher>) -> Self {
         self.cipher = cipher;
         self
+    }
+
+    /// Register or override a [`crate::domains::DomainProvider`] implementation on this `AppState`.
+    pub fn with_domain_provider(
+        mut self,
+        provider: Arc<dyn crate::domains::DomainProvider>,
+    ) -> Self {
+        let mut registry = (*self.domain_providers).clone();
+        registry.insert(provider);
+        self.domain_providers = Arc::new(registry);
+        self
+    }
+
+    /// Resolve target local mailbox(es) for inbound webhook recipients (`recipient_candidates`),
+    /// honoring explicit `mailbox_aliases`, known configured mailboxes, and dynamic verified
+    /// BYOD domain `catch_all_mailbox` routing when no explicit alias or mailbox matches.
+    pub async fn resolve_inbound_mailboxes(
+        &self,
+        recipient_candidates: &[String],
+    ) -> AppResult<Vec<String>> {
+        let known = self.config.known_mailboxes();
+        let extracted = crate::config::extract_email_addresses(recipient_candidates);
+        let mut targets: Vec<String> = Vec::new();
+        let mut push_unique = |mb: String| {
+            if !mb.is_empty() && !targets.iter().any(|existing| existing == &mb) {
+                targets.push(mb);
+            }
+        };
+
+        for rcpt in &extracted {
+            if let Some(alias_target) = self.config.resolve_alias_target(rcpt)
+                && known.iter().any(|mb| mb == &alias_target)
+            {
+                push_unique(alias_target);
+                continue;
+            }
+
+            if known.iter().any(|mb| mb == rcpt) {
+                push_unique(rcpt.clone());
+                continue;
+            }
+
+            let domain = crate::storage::extract_email_domain(rcpt);
+            if !domain.is_empty()
+                && let Some(domain_rec) = self.store.get_domain(&domain).await?
+                && domain_rec.status == crate::domains::DomainStatus::Verified
+                && let Some(catch_all) = domain_rec
+                    .catch_all_mailbox
+                    .as_deref()
+                    .map(normalize_mailbox_id)
+                    .filter(|s| !s.is_empty())
+            {
+                push_unique(catch_all);
+            }
+        }
+
+        if !targets.is_empty() {
+            return Ok(targets);
+        }
+
+        if !self.config.has_explicit_mailbox_routing() {
+            return Ok(known);
+        }
+
+        Ok(Vec::new())
     }
 
     /// Encrypt `send_as.smtp_msa.password` in place using `self.cipher` when present and non-empty.

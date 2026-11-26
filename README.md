@@ -47,7 +47,8 @@ Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?field
 | `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
 | `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` (static tokens, scoped API keys, local OAuth2 HS256 JWTs) | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP (`LOGIN`, `PLAIN`, `XOAUTH2`) authentication returning `Principal`, scopes, and per-agent safety overrides |
 | `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
-| `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy`, `OutboundPolicyChain`, `FirstContactPolicy`, `DlpOutboundPolicy` | Composable send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202 and queueing for `/v1/approvals`, `Deny` returning 403), first-contact approval gating, outbound secret and PII DLP scanning, and `dry_run` checks |
+| `OutboundPolicy` | `src/ai/safety.rs` | `ConfigOutboundPolicy`, `OutboundPolicyChain`, `FirstContactPolicy`, `DlpOutboundPolicy`, `VerifiedFromDomainPolicy` | Composable send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202 and queueing for `/v1/approvals`, `Deny` returning 403), first-contact approval gating, verified `From` domain anti-spoofing, outbound secret and PII DLP scanning, and `dry_run` checks |
+| `DomainProvider` | `src/domains/` | `SesDomainProvider`, `ResendDomainProvider`, `ManualDomainProvider` | Self-serve BYOD custom domain onboarding (`/v1/domains`), DNS record provisioning, live verification checks, and verified catch-all inbound routing |
 | `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | Pluggable upstream pull and optional bidirectional pushback sharing single-flight locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
 
 Query `GET /v1/capabilities` to see the active backend names under `.backends`.
@@ -259,6 +260,7 @@ Every CLI flag has a matching environment variable:
 | `NOGML_DRAFT_ONLY_ACTION` | `--draft-only-action` | `block` | Action when `draft_only=true` (`block` or `downgrade`) |
 | `NOGML_REQUIRE_APPROVAL` | `--require-approval` | `false` | Hold outbound sends in the persistent approval queue until approved via `/v1/approvals` or CLI |
 | `NOGML_FIRST_CONTACT_APPROVAL` | `--first-contact-approval` | `false` | Hold outbound sends for human approval when any recipient has no prior sent history |
+| `NOGML_REQUIRE_VERIFIED_FROM_DOMAIN` | `--require-verified-from-domain` | `false` | Reject outbound sends whose `From` domain is neither `default_domain` nor a `verified` BYOD domain owned by the sender's mailbox |
 | `NOGML_DLP_ACTION` | `--dlp-action` | `off` | Outbound secret and PII DLP scanner action (`off`, `hold`, or `deny`) |
 | `NOGML_APPROVAL_TTL_SECS` | `--approval-ttl-secs` | `86400` | Time-to-live in seconds for pending outbound approval requests |
 | `NOGML_APPROVAL_WEBHOOK_URL` | `--approval-webhook-url` | *(none)* | Optional HTTP POST webhook URL (generic JSON and Slack-compatible `text`) notified when a send enters approval |

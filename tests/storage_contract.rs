@@ -15,11 +15,13 @@ use nogml::{
     },
     storage::{
         AiSearchQuery, AiThreadQuery, ApprovalStatus, AuditLogQuery, ContactDirection,
-        ContactInteraction, ContactPatch, ContactQuery, HistoryEventKind, HistoryListQuery,
+        ContactInteraction, ContactPatch, ContactQuery, DnsRecord, DnsRecordPurpose,
+        DomainProviderKind, DomainStatus, DomainUpdate, HistoryEventKind, HistoryListQuery,
         InboxRuleActions, InboxRulePatch, MailStore, MemoryStore, MessageListQuery,
-        NewAttachmentInput, NewAuditLogEntry, NewInboxRule, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, ScheduledSendStatus, SqliteStore, SyncState,
-        TriagePatch, UpdateLabelInput, UpsertOutcomeKind, WatchSubscription, open_store,
+        NewAttachmentInput, NewAuditLogEntry, NewDomainInput, NewInboxRule, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, ScheduledSendStatus,
+        SqliteStore, SyncState, TriagePatch, UpdateLabelInput, UpsertOutcomeKind,
+        WatchSubscription, open_store,
     },
     transport::OutboundMessage,
 };
@@ -2649,11 +2651,163 @@ async fn run_mail_store_contract_suite(base_store: Arc<dyn MailStore>, prefix: &
     contract_idempotency_keys_and_audit_log(base_store.for_mailbox(&mb_idem)).await;
     contract_snooze_and_scheduled_sends(base_store.clone(), &mb_sched_a, &mb_sched_b).await;
     contract_inbox_rules_crud(base_store.for_mailbox(&mb_rules)).await;
+    contract_domains_crud_and_isolation(base_store.clone(), &mb_alice, &mb_bob, &suffix).await;
     contract_storage_perf_and_parity(
         base_store.for_mailbox(&format!("{prefix}-parity-{suffix}@contract.test")),
     )
     .await;
     contract_multi_mailbox_isolation(base_store, &mb_alice, &mb_bob).await;
+}
+
+async fn contract_domains_crud_and_isolation(
+    base_store: Arc<dyn MailStore>,
+    mb_alice: &str,
+    mb_bob: &str,
+    suffix: &str,
+) {
+    let alice_store = base_store.for_mailbox(mb_alice);
+    let bob_store = base_store.for_mailbox(mb_bob);
+
+    let dom_a = format!("alpha-{suffix}.example");
+    let dom_b = format!("beta-{suffix}.example");
+
+    // 1. Create domain (mixed case + trailing dot normalizes to lowercase ASCII).
+    let created_a = alice_store
+        .create_domain(NewDomainInput {
+            id: None,
+            domain: format!("ALPHA-{suffix}.EXAMPLE."),
+            mailbox_id: mb_alice.to_string(),
+            provider: DomainProviderKind::Ses,
+            provider_domain_id: Some(dom_a.clone()),
+            status: DomainStatus::Pending,
+            dns_records: vec![DnsRecord {
+                record_type: "CNAME".to_string(),
+                name: format!("tok1._domainkey.{dom_a}"),
+                value: "tok1.dkim.amazonses.com".to_string(),
+                priority: None,
+                purpose: DnsRecordPurpose::Dkim,
+                verified: false,
+            }],
+            dkim_verified: false,
+            spf_verified: false,
+            dmarc_verified: false,
+            mx_verified: false,
+            catch_all_mailbox: Some(mb_alice.to_string()),
+            last_error: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created_a.domain, dom_a);
+    assert_eq!(created_a.mailbox_id, mb_alice);
+    assert_eq!(created_a.provider, DomainProviderKind::Ses);
+    assert_eq!(created_a.status, DomainStatus::Pending);
+    assert_eq!(created_a.dns_records.len(), 1);
+    assert!(created_a.verified_at.is_none());
+
+    // 2. Duplicate domain across another mailbox must fail with 409 Conflict (anti-hijacking).
+    let dup_err = bob_store
+        .create_domain(NewDomainInput {
+            id: None,
+            domain: dom_a.to_uppercase(),
+            mailbox_id: mb_bob.to_string(),
+            provider: DomainProviderKind::Resend,
+            provider_domain_id: Some("re_dom_dup".to_string()),
+            status: DomainStatus::Pending,
+            dns_records: Vec::new(),
+            dkim_verified: false,
+            spf_verified: false,
+            dmarc_verified: false,
+            mx_verified: false,
+            catch_all_mailbox: None,
+            last_error: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(dup_err, AppError::Conflict(_)));
+
+    // 3. Create second domain owned by Bob.
+    let created_b = bob_store
+        .create_domain(NewDomainInput {
+            id: None,
+            domain: dom_b.clone(),
+            mailbox_id: mb_bob.to_string(),
+            provider: DomainProviderKind::Resend,
+            provider_domain_id: Some("re_dom_123".to_string()),
+            status: DomainStatus::Verifying,
+            dns_records: Vec::new(),
+            dkim_verified: false,
+            spf_verified: true,
+            dmarc_verified: false,
+            mx_verified: false,
+            catch_all_mailbox: None,
+            last_error: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created_b.domain, dom_b);
+    assert_eq!(created_b.provider_domain_id.as_deref(), Some("re_dom_123"));
+
+    // 4. List domains filtered by mailbox vs all.
+    let alice_list = base_store.list_domains(Some(mb_alice)).await.unwrap();
+    assert!(alice_list.iter().any(|d| d.domain == dom_a));
+    assert!(!alice_list.iter().any(|d| d.domain == dom_b));
+
+    let all_list = base_store.list_domains(None).await.unwrap();
+    assert!(all_list.iter().any(|d| d.domain == dom_a));
+    assert!(all_list.iter().any(|d| d.domain == dom_b));
+
+    // 5. Update domain verification status, flags, timestamps, and catch-all.
+    let now = Utc::now();
+    let updated_a = base_store
+        .update_domain(
+            &dom_a,
+            &DomainUpdate {
+                status: Some(DomainStatus::Verified),
+                dkim_verified: Some(true),
+                spf_verified: Some(true),
+                dmarc_verified: Some(true),
+                mx_verified: Some(true),
+                verified_at: Some(Some(now)),
+                last_checked_at: Some(Some(now)),
+                last_error: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_a.status, DomainStatus::Verified);
+    assert!(updated_a.dkim_verified);
+    assert!(updated_a.spf_verified);
+    assert!(updated_a.dmarc_verified);
+    assert!(updated_a.mx_verified);
+    assert!(updated_a.verified_at.is_some());
+    assert!(updated_a.last_checked_at.is_some());
+
+    // 6. Get domain from any mailbox-scoped handle sees the updated global record.
+    let fetched = bob_store
+        .get_domain(&dom_a.to_uppercase())
+        .await
+        .unwrap()
+        .expect("domain should exist globally");
+    assert_eq!(fetched.id, created_a.id);
+    assert_eq!(fetched.status, DomainStatus::Verified);
+
+    // 7. Update missing domain -> NotFound.
+    assert!(matches!(
+        base_store
+            .update_domain(
+                &format!("missing-{suffix}.example"),
+                &DomainUpdate::default()
+            )
+            .await,
+        Err(AppError::NotFound(_))
+    ));
+
+    // 8. Delete both domains and confirm idempotency.
+    assert!(base_store.delete_domain(&dom_a).await.unwrap());
+    assert!(!base_store.delete_domain(&dom_a).await.unwrap());
+    assert!(base_store.delete_domain(&dom_b).await.unwrap());
+    assert!(base_store.get_domain(&dom_a).await.unwrap().is_none());
 }
 
 /// Regression contract suite for Issue #61:

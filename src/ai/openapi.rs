@@ -45,6 +45,12 @@ pub const V1_OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("patch", "/v1/rules/{id}"),
     ("delete", "/v1/rules/{id}"),
     ("post", "/v1/rules/{id}/test"),
+    ("get", "/v1/domains"),
+    ("post", "/v1/domains"),
+    ("get", "/v1/domains/{domain}"),
+    ("patch", "/v1/domains/{domain}"),
+    ("delete", "/v1/domains/{domain}"),
+    ("post", "/v1/domains/{domain}/verify"),
     ("get", "/v1/audit"),
     ("get", "/v1/labels"),
     ("get", "/v1/search"),
@@ -1142,6 +1148,131 @@ fn build_paths() -> Value {
         }),
     );
 
+    // /v1/domains
+    paths.insert(
+        "/v1/domains".to_string(),
+        json!({
+            "get": {
+                "operationId": "listDomains",
+                "summary": "List BYOD custom domains for the caller's mailbox (or all domains for admin)",
+                "tags": ["Domains"],
+                "x-required-scope": "read",
+                "parameters": [
+                    query_param("mailbox_id", "Optional mailbox filter (admin may filter any mailbox).", json!({ "type": "string" })),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Registered custom domains.", ref_schema("DomainListResponse")))],
+                    false,
+                    false
+                )
+            },
+            "post": {
+                "operationId": "createDomain",
+                "summary": "Register a custom BYOD domain and return required DNS verification records",
+                "tags": ["Domains"],
+                "x-required-scope": "write",
+                "parameters": [ref_param("Fields")],
+                "requestBody": json_request_body(
+                    true,
+                    ref_schema("CreateDomainRequest"),
+                    "Domain onboarding request."
+                ),
+                "responses": build_responses(
+                    vec![("201", json_ok("Created domain record with required DNS entries.", ref_schema("DomainRecord")))],
+                    false,
+                    true
+                )
+            }
+        }),
+    );
+
+    // /v1/domains/{domain}
+    paths.insert(
+        "/v1/domains/{domain}".to_string(),
+        json!({
+            "get": {
+                "operationId": "getDomain",
+                "summary": "Inspect verification status and DNS records for a custom domain",
+                "tags": ["Domains"],
+                "x-required-scope": "read",
+                "parameters": [
+                    path_param("domain", "Normalized DNS domain name (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Custom domain record.", ref_schema("DomainRecord")))],
+                    true,
+                    false
+                )
+            },
+            "patch": {
+                "operationId": "patchDomain",
+                "summary": "Update catch-all routing or admin-only manual verification fields for a custom domain",
+                "tags": ["Domains"],
+                "x-required-scope": "write",
+                "parameters": [
+                    path_param("domain", "Normalized DNS domain name (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "requestBody": json_request_body(
+                    true,
+                    ref_schema("PatchDomainRequest"),
+                    "Partial domain settings update."
+                ),
+                "responses": build_responses(
+                    vec![("200", json_ok("Updated custom domain record.", ref_schema("DomainRecord")))],
+                    true,
+                    false
+                )
+            },
+            "delete": {
+                "operationId": "deleteDomain",
+                "summary": "Delete a custom domain from its upstream provider and local store",
+                "tags": ["Domains"],
+                "x-required-scope": "write",
+                "parameters": [
+                    path_param("domain", "Normalized DNS domain name (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Deletion confirmation.", json!({
+                        "type": "object",
+                        "required": ["deleted", "domain"],
+                        "properties": {
+                            "deleted": { "type": "boolean" },
+                            "domain": { "type": "string" }
+                        }
+                    })))],
+                    true,
+                    false
+                )
+            }
+        }),
+    );
+
+    // /v1/domains/{domain}/verify
+    paths.insert(
+        "/v1/domains/{domain}/verify".to_string(),
+        json!({
+            "post": {
+                "operationId": "verifyDomain",
+                "summary": "Re-check live DNS verification status against the domain's provider",
+                "tags": ["Domains"],
+                "x-required-scope": "write",
+                "parameters": [
+                    path_param("domain", "Normalized DNS domain name (e.g. example.com)."),
+                    ref_param("Fields")
+                ],
+                "responses": build_responses(
+                    vec![("200", json_ok("Updated verification status and DNS records.", ref_schema("DomainRecord")))],
+                    true,
+                    false
+                )
+            }
+        }),
+    );
+
     // /v1/audit
     paths.insert(
         "/v1/audit".to_string(),
@@ -2035,6 +2166,93 @@ fn build_schemas() -> Value {
         }),
     );
 
+    schemas.insert(
+        "DnsRecord".to_string(),
+        json!({
+            "type": "object",
+            "required": ["type", "name", "value", "purpose", "verified"],
+            "properties": {
+                "type": { "type": "string", "description": "DNS record type (CNAME, TXT, MX)." },
+                "name": { "type": "string" },
+                "value": { "type": "string" },
+                "priority": { "type": ["integer", "null"] },
+                "purpose": { "type": "string", "enum": ["dkim", "spf", "dmarc", "mx", "mail_from", "verification", "other"] },
+                "verified": { "type": "boolean" }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "DomainRecord".to_string(),
+        json!({
+            "type": "object",
+            "required": [
+                "id", "domain", "mailbox_id", "provider", "status", "dns_records",
+                "dkim_verified", "spf_verified", "dmarc_verified", "mx_verified", "created_at"
+            ],
+            "properties": {
+                "id": { "type": "string" },
+                "domain": { "type": "string" },
+                "mailbox_id": { "type": "string" },
+                "provider": { "type": "string", "enum": ["ses", "resend", "manual"] },
+                "provider_domain_id": { "type": ["string", "null"] },
+                "status": { "type": "string", "enum": ["pending", "verifying", "verified", "failed"] },
+                "dns_records": { "type": "array", "items": ref_schema("DnsRecord") },
+                "dkim_verified": { "type": "boolean" },
+                "spf_verified": { "type": "boolean" },
+                "dmarc_verified": { "type": "boolean" },
+                "mx_verified": { "type": "boolean" },
+                "catch_all_mailbox": { "type": ["string", "null"] },
+                "created_at": { "type": "string", "format": "date-time" },
+                "verified_at": { "type": ["string", "null"], "format": "date-time" },
+                "last_checked_at": { "type": ["string", "null"], "format": "date-time" },
+                "last_error": { "type": ["string", "null"] }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "DomainListResponse".to_string(),
+        json!({
+            "type": "object",
+            "required": ["domains", "count"],
+            "properties": {
+                "domains": { "type": "array", "items": ref_schema("DomainRecord") },
+                "count": { "type": "integer" }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "CreateDomainRequest".to_string(),
+        json!({
+            "type": "object",
+            "required": ["domain"],
+            "properties": {
+                "domain": { "type": "string", "description": "Fully qualified domain name (ASCII or IDN)." },
+                "provider": { "type": "string", "enum": ["ses", "resend", "manual"] },
+                "mailbox_id": { "type": "string", "description": "Owner mailbox (defaults to caller mailbox; cross-mailbox requires admin)." },
+                "catch_all_mailbox": { "type": "string", "description": "Optional catch-all mailbox receiving unmatched inbound mail once domain is verified." }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "PatchDomainRequest".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "catch_all_mailbox": { "type": ["string", "null"], "description": "Set or clear the catch-all mailbox." },
+                "status": { "type": "string", "enum": ["pending", "verifying", "verified", "failed"] },
+                "dkim_verified": { "type": "boolean" },
+                "spf_verified": { "type": "boolean" },
+                "dmarc_verified": { "type": "boolean" },
+                "mx_verified": { "type": "boolean" },
+                "dns_records": { "type": "array", "items": ref_schema("DnsRecord") }
+            }
+        }),
+    );
+
     Value::Object(schemas)
 }
 
@@ -2073,6 +2291,7 @@ pub fn openapi_spec() -> Value {
             { "name": "Approvals", "description": "Human-in-the-loop outbound approval queue." },
             { "name": "Contacts", "description": "Per-mailbox contact graph and VIP overrides." },
             { "name": "Rules", "description": "Event-driven inbox rules and dry-run testing." },
+            { "name": "Domains", "description": "BYOD custom domain registration, DNS verification, and catch-all routing." },
             { "name": "Audit", "description": "Immutable append-only agent and API audit log." },
             { "name": "Labels", "description": "Mailbox system and user label metadata." },
             { "name": "Search", "description": "Full-text and hybrid semantic search." },

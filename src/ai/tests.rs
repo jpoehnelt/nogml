@@ -1179,6 +1179,38 @@ impl MailStore for TestMailStore {
     async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
         Err(AppError::NotFound(format!("Inbox rule not found: {id}")))
     }
+
+    async fn create_domain(
+        &self,
+        _input: crate::storage::NewDomainInput,
+    ) -> AppResult<crate::storage::DomainRecord> {
+        Err(AppError::Internal(
+            "TestMailStore domains unsupported".into(),
+        ))
+    }
+
+    async fn get_domain(&self, _domain: &str) -> AppResult<Option<crate::storage::DomainRecord>> {
+        Ok(None)
+    }
+
+    async fn list_domains(
+        &self,
+        _mailbox_id: Option<&str>,
+    ) -> AppResult<Vec<crate::storage::DomainRecord>> {
+        Ok(Vec::new())
+    }
+
+    async fn update_domain(
+        &self,
+        domain: &str,
+        _update: &crate::storage::DomainUpdate,
+    ) -> AppResult<crate::storage::DomainRecord> {
+        Err(AppError::NotFound(format!("Domain '{domain}' not found")))
+    }
+
+    async fn delete_domain(&self, _domain: &str) -> AppResult<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Default)]

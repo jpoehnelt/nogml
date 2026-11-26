@@ -22,16 +22,18 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
-        HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
-        ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
-        InboxRulePatch, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
+        ContactRecord, DomainRecord, DomainStatus, DomainUpdate, DraftListPage,
+        HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind, HistoryListPage,
+        HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet,
+        ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRulePatch,
+        MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry, NewDomainInput,
         NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
         PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
         StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
-        UpsertOutcomeKind, UserSettings, WatchSubscription, apply_inbox_rule_patch,
-        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
+        UpsertOutcomeKind, UserSettings, WatchSubscription, apply_domain_update,
+        apply_inbox_rule_patch, compute_contact_is_vip, normalize_and_validate_domain,
+        normalize_contact_email, normalize_domain_lookup_key, normalize_inbox_rule_actions,
         normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
@@ -831,6 +833,7 @@ pub struct MemoryStore {
     mailbox_id: String,
     mailboxes: Arc<RwLock<HashMap<String, Arc<RwLock<MemoryState>>>>>,
     state: Arc<RwLock<MemoryState>>,
+    domains: Arc<RwLock<HashMap<String, DomainRecord>>>,
 }
 
 impl Default for MemoryStore {
@@ -849,6 +852,7 @@ impl MemoryStore {
             mailbox_id,
             mailboxes: Arc::new(RwLock::new(map)),
             state,
+            domains: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1161,6 +1165,7 @@ impl MailStore for MemoryStore {
             mailbox_id: target,
             mailboxes: self.mailboxes.clone(),
             state,
+            domains: self.domains.clone(),
         })
     }
     async fn get_profile(&self, email_address: &str) -> AppResult<Profile> {
@@ -3810,6 +3815,125 @@ impl MailStore for MemoryStore {
             return Err(AppError::NotFound(format!("Inbox rule not found: {id}")));
         }
         Ok(())
+    }
+
+    async fn create_domain(&self, input: NewDomainInput) -> AppResult<DomainRecord> {
+        let domain = normalize_and_validate_domain(&input.domain)?;
+        let mailbox_id = crate::config::normalize_mailbox_id(&input.mailbox_id);
+        if mailbox_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "Domain mailbox_id must not be empty".to_string(),
+            ));
+        }
+        let catch_all_mailbox = input
+            .catch_all_mailbox
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let provider_domain_id = normalize_optional_text(input.provider_domain_id.as_deref());
+        let last_error = normalize_optional_text(input.last_error.as_deref());
+
+        let now = truncate_to_millis(Utc::now());
+        let verified_at = (input.status == DomainStatus::Verified).then_some(now);
+        let id = input
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("dom_{}", new_hex_id()));
+
+        let record = DomainRecord {
+            id,
+            domain: domain.clone(),
+            mailbox_id,
+            provider: input.provider,
+            provider_domain_id,
+            status: input.status,
+            dns_records: input.dns_records,
+            dkim_verified: input.dkim_verified,
+            spf_verified: input.spf_verified,
+            dmarc_verified: input.dmarc_verified,
+            mx_verified: input.mx_verified,
+            catch_all_mailbox,
+            created_at: now,
+            verified_at,
+            last_checked_at: None,
+            last_error,
+        };
+
+        let mut domains = self
+            .domains
+            .write()
+            .map_err(|_| AppError::Storage("MemoryStore domains write lock poisoned".into()))?;
+        if domains.contains_key(&domain) {
+            return Err(AppError::Conflict(format!(
+                "Domain '{domain}' is already registered"
+            )));
+        }
+        domains.insert(domain, record.clone());
+        Ok(record)
+    }
+
+    async fn get_domain(&self, domain: &str) -> AppResult<Option<DomainRecord>> {
+        let key = normalize_domain_lookup_key(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let domains = self
+            .domains
+            .read()
+            .map_err(|_| AppError::Storage("MemoryStore domains read lock poisoned".into()))?;
+        Ok(domains.get(&key).cloned())
+    }
+
+    async fn list_domains(&self, mailbox_id: Option<&str>) -> AppResult<Vec<DomainRecord>> {
+        let filter_mb = mailbox_id
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let domains = self
+            .domains
+            .read()
+            .map_err(|_| AppError::Storage("MemoryStore domains read lock poisoned".into()))?;
+        let mut results: Vec<DomainRecord> = domains
+            .values()
+            .filter(|rec| {
+                filter_mb
+                    .as_deref()
+                    .is_none_or(|mb| rec.mailbox_id.eq_ignore_ascii_case(mb))
+            })
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.domain.cmp(&b.domain))
+        });
+        Ok(results)
+    }
+
+    async fn update_domain(&self, domain: &str, update: &DomainUpdate) -> AppResult<DomainRecord> {
+        let key = normalize_domain_lookup_key(domain);
+        let mut domains = self
+            .domains
+            .write()
+            .map_err(|_| AppError::Storage("MemoryStore domains write lock poisoned".into()))?;
+        let existing = domains
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("Domain '{key}' not found")))?;
+        let updated = apply_domain_update(existing, update);
+        domains.insert(key, updated.clone());
+        Ok(updated)
+    }
+
+    async fn delete_domain(&self, domain: &str) -> AppResult<bool> {
+        let key = normalize_domain_lookup_key(domain);
+        let mut domains = self
+            .domains
+            .write()
+            .map_err(|_| AppError::Storage("MemoryStore domains write lock poisoned".into()))?;
+        Ok(domains.remove(&key).is_some())
     }
 }
 

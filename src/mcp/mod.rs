@@ -454,6 +454,7 @@ impl McpServer {
                         "draft_only_action": self.state.config.draft_only_action,
                         "require_approval": self.state.config.require_approval,
                         "first_contact_approval": self.state.config.first_contact_approval,
+                        "require_verified_from_domain": self.state.config.require_verified_from_domain,
                         "dlp_action": self.state.config.dlp_action,
                         "approval_ttl_secs": self.state.config.approval_ttl_secs,
                         "allowed_recipients_enabled": !self.state.config.allowed_recipients.is_empty(),

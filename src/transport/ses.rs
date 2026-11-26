@@ -1628,8 +1628,8 @@ pub async fn ses_webhook_handler(
     }
 
     let target_mailboxes = state
-        .config
-        .resolve_inbound_mailboxes(&recipient_candidates);
+        .resolve_inbound_mailboxes(&recipient_candidates)
+        .await?;
     if target_mailboxes.is_empty() {
         tracing::info!("Ignoring SES inbound email with no matching local mailbox");
         return Ok((

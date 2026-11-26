@@ -33,17 +33,19 @@ use crate::{
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
-        ContactRecord, DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
+        ContactRecord, DnsRecord, DomainProviderKind, DomainRecord, DomainStatus, DomainUpdate,
+        DraftListPage, HISTORY_SOURCE_LOCAL, HISTORY_SOURCE_SYNC, HistoryEventKind,
         HistoryListPage, HistoryListQuery, IdempotencyRecord, ImapExpungedEntry, ImapFlagAction,
         ImapFlagSet, ImapMailboxInfo, ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule,
         InboxRuleActions, InboxRulePatch, MAX_SQL_LIMIT, MailStore, MessageListPage,
-        MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput, NewMessageInput,
-        NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
+        MessageListQuery, NewAuditLogEntry, NewDomainInput, NewInboxRule, NewLabelInput,
+        NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
         ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
         StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
         TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        VIP_REPLY_THRESHOLD, WatchSubscription, apply_inbox_rule_patch, clamp_sql_limit,
-        compute_contact_is_vip, normalize_contact_email, normalize_inbox_rule_actions,
+        VIP_REPLY_THRESHOLD, WatchSubscription, apply_domain_update, apply_inbox_rule_patch,
+        clamp_sql_limit, compute_contact_is_vip, normalize_and_validate_domain,
+        normalize_contact_email, normalize_domain_lookup_key, normalize_inbox_rule_actions,
         normalize_optional_text, parse_simple_email_address, validate_and_normalize_contact_email,
     },
 };
@@ -66,7 +68,7 @@ pub(crate) const SCHEMA_ADVISORY_LOCK_KEY: i64 = 78_912_345_601;
 /// Bump this whenever `SCHEMA_SQL` adds or changes tables, columns, or indexes so existing
 /// databases apply the idempotent DDL once under the advisory lock and skip `SCHEMA_SQL` on
 /// subsequent startups (avoiding `ShareLock` deadlocks against concurrent DML).
-const CURRENT_SCHEMA_VERSION: i32 = 8;
+const CURRENT_SCHEMA_VERSION: i32 = 9;
 
 /// Default per-mailbox setting keys created by `ensure_mailbox_seeded`.
 const SEEDED_SETTING_KEYS: &[&str] = &["send_as", "vacation", "auto_forwarding", "imap", "pop"];
@@ -426,6 +428,29 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_mailbox_model
     ON message_embeddings (mailbox_id, model);
+
+CREATE TABLE IF NOT EXISTS domains (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL UNIQUE,
+    mailbox_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_domain_id TEXT,
+    status TEXT NOT NULL,
+    dns_records_json TEXT NOT NULL,
+    dkim_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    spf_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    dmarc_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    mx_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    catch_all_mailbox TEXT,
+    created_at_ms BIGINT NOT NULL,
+    verified_at_ms BIGINT,
+    last_checked_at_ms BIGINT,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_domains_mailbox_created
+    ON domains (mailbox_id, created_at_ms ASC, domain ASC);
+CREATE INDEX IF NOT EXISTS idx_domains_status
+    ON domains (status, domain);
 "#;
 
 const MIGRATION_V7_PRE_SQL: &str = r#"
@@ -7463,6 +7488,266 @@ impl MailStore for PostgresStore {
         }
         Ok(())
     }
+
+    async fn create_domain(&self, input: NewDomainInput) -> AppResult<DomainRecord> {
+        let domain = normalize_and_validate_domain(&input.domain)?;
+        let mailbox_id = crate::config::normalize_mailbox_id(&input.mailbox_id);
+        if mailbox_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "Domain mailbox_id must not be empty".to_string(),
+            ));
+        }
+        let catch_all_mailbox = input
+            .catch_all_mailbox
+            .as_deref()
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let provider_domain_id = normalize_optional_text(input.provider_domain_id.as_deref());
+        let last_error = normalize_optional_text(input.last_error.as_deref());
+
+        let now = truncate_to_millis(Utc::now());
+        let verified_at = (input.status == DomainStatus::Verified).then_some(now);
+        let id = input
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("dom_{}", new_hex_id()));
+        let dns_records_json = serde_json::to_string(&input.dns_records)?;
+        let created_at_ms = now.timestamp_millis();
+        let verified_at_ms = verified_at.map(|t| t.timestamp_millis());
+        let last_checked_at_ms: Option<i64> = None;
+
+        let conn = self.ready_conn().await?;
+        let provider_str = input.provider.as_str();
+        let status_str = input.status.as_str();
+        let res = conn
+            .execute(
+                "INSERT INTO domains (
+                     id, domain, mailbox_id, provider, provider_domain_id, status,
+                     dns_records_json, dkim_verified, spf_verified, dmarc_verified, mx_verified,
+                     catch_all_mailbox, created_at_ms, verified_at_ms, last_checked_at_ms, last_error
+                 ) VALUES (
+                     $1, $2, $3, $4, $5, $6,
+                     $7, $8, $9, $10, $11,
+                     $12, $13, $14, $15, $16
+                 )",
+                &[
+                    &id,
+                    &domain,
+                    &mailbox_id,
+                    &provider_str,
+                    &provider_domain_id,
+                    &status_str,
+                    &dns_records_json,
+                    &input.dkim_verified,
+                    &input.spf_verified,
+                    &input.dmarc_verified,
+                    &input.mx_verified,
+                    &catch_all_mailbox,
+                    &created_at_ms,
+                    &verified_at_ms,
+                    &last_checked_at_ms,
+                    &last_error,
+                ],
+            )
+            .await;
+
+        if let Err(err) = res {
+            if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                return Err(AppError::Conflict(format!(
+                    "Domain '{domain}' is already registered"
+                )));
+            }
+            return Err(pg_err(err));
+        }
+
+        Ok(DomainRecord {
+            id,
+            domain,
+            mailbox_id,
+            provider: input.provider,
+            provider_domain_id,
+            status: input.status,
+            dns_records: input.dns_records,
+            dkim_verified: input.dkim_verified,
+            spf_verified: input.spf_verified,
+            dmarc_verified: input.dmarc_verified,
+            mx_verified: input.mx_verified,
+            catch_all_mailbox,
+            created_at: now,
+            verified_at,
+            last_checked_at: None,
+            last_error,
+        })
+    }
+
+    async fn get_domain(&self, domain: &str) -> AppResult<Option<DomainRecord>> {
+        let key = normalize_domain_lookup_key(domain);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.ready_conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                        dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                        mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                        last_checked_at_ms, last_error
+                 FROM domains
+                 WHERE domain = $1",
+                &[&key],
+            )
+            .await
+            .map_err(pg_err)?;
+        row.as_ref().map(domain_from_row).transpose()
+    }
+
+    async fn list_domains(&self, mailbox_id: Option<&str>) -> AppResult<Vec<DomainRecord>> {
+        let filter_mb = mailbox_id
+            .map(crate::config::normalize_mailbox_id)
+            .filter(|s| !s.is_empty());
+        let conn = self.ready_conn().await?;
+        let rows = if let Some(mb) = filter_mb {
+            conn.query(
+                "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                        dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                        mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                        last_checked_at_ms, last_error
+                 FROM domains
+                 WHERE mailbox_id = $1
+                 ORDER BY created_at_ms ASC, domain ASC",
+                &[&mb],
+            )
+            .await
+            .map_err(pg_err)?
+        } else {
+            conn.query(
+                "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                        dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                        mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                        last_checked_at_ms, last_error
+                 FROM domains
+                 ORDER BY created_at_ms ASC, domain ASC",
+                &[],
+            )
+            .await
+            .map_err(pg_err)?
+        };
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            results.push(domain_from_row(row)?);
+        }
+        Ok(results)
+    }
+
+    async fn update_domain(&self, domain: &str, update: &DomainUpdate) -> AppResult<DomainRecord> {
+        let key = normalize_domain_lookup_key(domain);
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let row = tx
+            .query_opt(
+                "SELECT id, domain, mailbox_id, provider, provider_domain_id, status,
+                        dns_records_json, dkim_verified, spf_verified, dmarc_verified,
+                        mx_verified, catch_all_mailbox, created_at_ms, verified_at_ms,
+                        last_checked_at_ms, last_error
+                 FROM domains
+                 WHERE domain = $1
+                 FOR UPDATE",
+                &[&key],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| AppError::NotFound(format!("Domain '{key}' not found")))?;
+
+        let existing = domain_from_row(&row)?;
+        let updated = apply_domain_update(existing, update);
+        let dns_records_json = serde_json::to_string(&updated.dns_records)?;
+        let status_str = updated.status.as_str();
+        let verified_at_ms = updated.verified_at.map(|t| t.timestamp_millis());
+        let last_checked_at_ms = updated.last_checked_at.map(|t| t.timestamp_millis());
+
+        tx.execute(
+            "UPDATE domains
+             SET provider_domain_id = $1,
+                 status = $2,
+                 dns_records_json = $3,
+                 dkim_verified = $4,
+                 spf_verified = $5,
+                 dmarc_verified = $6,
+                 mx_verified = $7,
+                 catch_all_mailbox = $8,
+                 verified_at_ms = $9,
+                 last_checked_at_ms = $10,
+                 last_error = $11
+             WHERE domain = $12",
+            &[
+                &updated.provider_domain_id,
+                &status_str,
+                &dns_records_json,
+                &updated.dkim_verified,
+                &updated.spf_verified,
+                &updated.dmarc_verified,
+                &updated.mx_verified,
+                &updated.catch_all_mailbox,
+                &verified_at_ms,
+                &last_checked_at_ms,
+                &updated.last_error,
+                &key,
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(updated)
+    }
+
+    async fn delete_domain(&self, domain: &str) -> AppResult<bool> {
+        let key = normalize_domain_lookup_key(domain);
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.ready_conn().await?;
+        let affected = conn
+            .execute("DELETE FROM domains WHERE domain = $1", &[&key])
+            .await
+            .map_err(pg_err)?;
+        Ok(affected > 0)
+    }
+}
+
+fn domain_from_row(row: &Row) -> AppResult<DomainRecord> {
+    let provider_raw: String = row.get(3);
+    let provider = DomainProviderKind::parse_str(&provider_raw)
+        .ok_or_else(|| AppError::Storage(format!("Unknown domain provider '{provider_raw}'")))?;
+    let status_raw: String = row.get(5);
+    let status = DomainStatus::parse_str(&status_raw)
+        .ok_or_else(|| AppError::Storage(format!("Unknown domain status '{status_raw}'")))?;
+    let dns_records_json: String = row.get(6);
+    let dns_records: Vec<DnsRecord> = serde_json::from_str(&dns_records_json)
+        .map_err(|e| AppError::Storage(format!("Corrupt domains dns_records_json: {e}")))?;
+    let created_at_ms: i64 = row.get(12);
+    let verified_at_ms: Option<i64> = row.get(13);
+    let last_checked_at_ms: Option<i64> = row.get(14);
+    Ok(DomainRecord {
+        id: row.get(0),
+        domain: row.get(1),
+        mailbox_id: row.get(2),
+        provider,
+        provider_domain_id: row.get(4),
+        status,
+        dns_records,
+        dkim_verified: row.get(7),
+        spf_verified: row.get(8),
+        dmarc_verified: row.get(9),
+        mx_verified: row.get(10),
+        catch_all_mailbox: row.get(11),
+        created_at: DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now),
+        verified_at: verified_at_ms.and_then(DateTime::from_timestamp_millis),
+        last_checked_at: last_checked_at_ms.and_then(DateTime::from_timestamp_millis),
+        last_error: row.get(15),
+    })
 }
 
 fn scheduled_send_from_row(row: &Row) -> AppResult<ScheduledSend> {
@@ -7572,5 +7857,36 @@ mod tests {
         )
         .expect("build TLS postgres pool");
         assert!(pool.status().max_size > 0);
+    }
+
+    #[test]
+    fn postgres_schema_version_9_includes_domains_table_and_indexes() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS domains"));
+        for col in [
+            "id TEXT PRIMARY KEY",
+            "domain TEXT NOT NULL UNIQUE",
+            "mailbox_id TEXT NOT NULL",
+            "provider TEXT NOT NULL",
+            "provider_domain_id TEXT",
+            "status TEXT NOT NULL",
+            "dns_records_json TEXT NOT NULL",
+            "dkim_verified BOOLEAN NOT NULL DEFAULT FALSE",
+            "spf_verified BOOLEAN NOT NULL DEFAULT FALSE",
+            "dmarc_verified BOOLEAN NOT NULL DEFAULT FALSE",
+            "mx_verified BOOLEAN NOT NULL DEFAULT FALSE",
+            "catch_all_mailbox TEXT",
+            "created_at_ms BIGINT NOT NULL",
+            "verified_at_ms BIGINT",
+            "last_checked_at_ms BIGINT",
+            "last_error TEXT",
+            "idx_domains_mailbox_created",
+            "idx_domains_status",
+        ] {
+            assert!(
+                SCHEMA_SQL.contains(col),
+                "Postgres SCHEMA_SQL missing expected DDL fragment: {col}"
+            );
+        }
     }
 }

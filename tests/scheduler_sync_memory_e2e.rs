@@ -830,6 +830,36 @@ impl MailStore for FailingInsertStore {
     async fn delete_inbox_rule(&self, id: &str) -> AppResult<()> {
         self.inner.delete_inbox_rule(id).await
     }
+
+    async fn create_domain(
+        &self,
+        input: nogml::storage::NewDomainInput,
+    ) -> AppResult<nogml::storage::DomainRecord> {
+        self.inner.create_domain(input).await
+    }
+
+    async fn get_domain(&self, domain: &str) -> AppResult<Option<nogml::storage::DomainRecord>> {
+        self.inner.get_domain(domain).await
+    }
+
+    async fn list_domains(
+        &self,
+        mailbox_id: Option<&str>,
+    ) -> AppResult<Vec<nogml::storage::DomainRecord>> {
+        self.inner.list_domains(mailbox_id).await
+    }
+
+    async fn update_domain(
+        &self,
+        domain: &str,
+        update: &nogml::storage::DomainUpdate,
+    ) -> AppResult<nogml::storage::DomainRecord> {
+        self.inner.update_domain(domain, update).await
+    }
+
+    async fn delete_domain(&self, domain: &str) -> AppResult<bool> {
+        self.inner.delete_domain(domain).await
+    }
 }
 
 #[tokio::test]
