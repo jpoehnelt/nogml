@@ -19,8 +19,9 @@ use crate::{
     config::{Config, StorageBackend},
     error::{AppError, AppResult},
     models::{
-        AttachmentMeta, AutoForwarding, ContactSummary, EmailAddress, ImapSettings, LabelColor,
-        PopSettings, Profile, SendAs, ThreadSummary, VacationSettings,
+        AttachmentMeta, AutoForwarding, ContactSummary, EmailAddress, ImapSettings, LABEL_DRAFT,
+        LABEL_STARRED, LABEL_UNREAD, LabelColor, PopSettings, Profile, SendAs, ThreadSummary,
+        VacationSettings,
     },
     transport::OutboundMessage,
 };
@@ -345,6 +346,85 @@ impl ImapMessageEntry {
     pub fn modseq(&self) -> u64 {
         self.history_id.max(1)
     }
+}
+
+/// Result of expunging a single `\Deleted` message from an IMAP mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImapExpungedEntry {
+    /// 1-based sequence number in the mailbox immediately before expunge.
+    pub seq: u32,
+    /// Mailbox-specific UID of the expunged message.
+    pub uid: u32,
+    pub message_id: String,
+    pub thread_id: String,
+    pub label_ids: Vec<String>,
+    /// `true` when permanently deleted from storage (Trash expunge), `false` when moved to Trash.
+    pub permanently_deleted: bool,
+    /// Attachment IDs belonging to the message when `permanently_deleted` is `true`,
+    /// enabling callers to clean up external `BlobStore` objects.
+    pub attachment_ids: Vec<String>,
+}
+
+/// Mode for an IMAP `STORE` / `UID STORE` flag update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImapFlagAction {
+    Replace,
+    Add,
+    Remove,
+}
+
+/// Set of IMAP system flags (`\Seen`, `\Flagged`, `\Draft`, `\Answered`, `\Deleted`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImapFlagSet {
+    pub seen: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub answered: bool,
+    pub deleted: bool,
+}
+
+impl ImapFlagSet {
+    /// Compute resulting flags given `current` message flags and an `action`.
+    pub fn apply(self, current: Self, action: ImapFlagAction) -> Self {
+        match action {
+            ImapFlagAction::Replace => self,
+            ImapFlagAction::Add => Self {
+                seen: current.seen || self.seen,
+                flagged: current.flagged || self.flagged,
+                draft: current.draft || self.draft,
+                answered: current.answered || self.answered,
+                deleted: current.deleted || self.deleted,
+            },
+            ImapFlagAction::Remove => Self {
+                seen: current.seen && !self.seen,
+                flagged: current.flagged && !self.flagged,
+                draft: current.draft && !self.draft,
+                answered: current.answered && !self.answered,
+                deleted: current.deleted && !self.deleted,
+            },
+        }
+    }
+
+    /// Derive the current [`ImapFlagSet`] from a [`StoredMessage`].
+    pub fn from_message(msg: &StoredMessage) -> Self {
+        Self {
+            seen: !msg.label_ids.iter().any(|l| l == LABEL_UNREAD),
+            flagged: msg.label_ids.iter().any(|l| l == LABEL_STARRED),
+            draft: msg.label_ids.iter().any(|l| l == LABEL_DRAFT),
+            answered: msg.is_answered,
+            deleted: msg.is_deleted,
+        }
+    }
+}
+
+/// Outcome of an atomic [`MailStore::imap_store_flags`] operation.
+#[derive(Debug, Clone)]
+pub enum ImapStoreFlagsOutcome {
+    Updated(Box<StoredMessage>),
+    /// Atomic `UNCHANGEDSINCE` precondition failed because current `MODSEQ > unchanged_since`.
+    Modified,
+    /// Message was concurrently deleted before flags could be updated.
+    NotFound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1353,8 +1433,48 @@ pub trait MailStore: Send + Sync {
         is_answered: bool,
         is_deleted: bool,
     ) -> AppResult<StoredMessage>;
+    /// Atomically apply an IMAP `STORE` flag mutation with optional RFC 7162 `UNCHANGEDSINCE` CAS.
+    async fn imap_store_flags(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        flags: ImapFlagSet,
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let Some(old_msg) = self.get_message(message_id).await? else {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        };
+        if let Some(limit) = unchanged_since
+            && old_msg.history_id.max(1) > limit
+        {
+            return Ok(ImapStoreFlagsOutcome::Modified);
+        }
+        let next = flags.apply(ImapFlagSet::from_message(&old_msg), action);
+        let updated = self
+            .imap_set_flags(
+                message_id,
+                next.seen,
+                next.flagged,
+                next.draft,
+                next.answered,
+                next.deleted,
+            )
+            .await?;
+        Ok(ImapStoreFlagsOutcome::Updated(Box::new(updated)))
+    }
     /// Expunges messages marked `is_deleted` in `mailbox_name` and returns their 1-based sequence numbers (pre-expunge).
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>>;
+    /// Expunges `\Deleted` messages in `mailbox_name` matching `uid_ranges` (or all `\Deleted` messages
+    /// when `uid_ranges` is `None`), returning rich [`ImapExpungedEntry`] records including attachment IDs
+    /// for permanently deleted messages (Trash expunge).
+    async fn imap_expunge_uids(
+        &self,
+        mailbox_name: &str,
+        uid_ranges: Option<&[(u32, u32)]>,
+    ) -> AppResult<Vec<ImapExpungedEntry>> {
+        let _ = (mailbox_name, uid_ranges);
+        Ok(Vec::new())
+    }
     /// Copies or moves `message_ids` from `src_mailbox` to `dst_mailbox`; returns `(src_uid, dst_uid)` pairs.
     async fn imap_copy_or_move(
         &self,

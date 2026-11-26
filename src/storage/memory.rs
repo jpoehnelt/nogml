@@ -23,7 +23,8 @@ use crate::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, InboxRule, InboxRulePatch, MailStore,
+        IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
+        ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRulePatch, MailStore,
         MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule, NewLabelInput,
         NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval, ScheduledSend,
         ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft, StoredHistoryEntry,
@@ -2498,22 +2499,103 @@ impl MailStore for MemoryStore {
         Ok(updated)
     }
 
+    async fn imap_store_flags(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        flags: ImapFlagSet,
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let mut state = self.write_state()?;
+        let (old_hid, next, flags_changed) = {
+            let Some(msg) = state.messages.get_mut(message_id) else {
+                return Ok(ImapStoreFlagsOutcome::NotFound);
+            };
+            if let Some(limit) = unchanged_since
+                && msg.history_id.max(1) > limit
+            {
+                return Ok(ImapStoreFlagsOutcome::Modified);
+            }
+            let next = flags.apply(ImapFlagSet::from_message(msg), action);
+            let changed = msg.is_answered != next.answered || msg.is_deleted != next.deleted;
+            let old_hid = msg.history_id;
+            msg.is_answered = next.answered;
+            msg.is_deleted = next.deleted;
+            (old_hid, next, changed)
+        };
+        let mut add = Vec::new();
+        let mut rem = Vec::new();
+        if next.seen {
+            rem.push(LABEL_UNREAD.to_string());
+        } else {
+            add.push(LABEL_UNREAD.to_string());
+        }
+        if next.flagged {
+            add.push(LABEL_STARRED.to_string());
+        } else {
+            rem.push(LABEL_STARRED.to_string());
+        }
+        if next.draft {
+            add.push(LABEL_DRAFT.to_string());
+        } else {
+            rem.push(LABEL_DRAFT.to_string());
+        }
+        let mut updated = state.modify_message_labels_resolved(message_id, &add, &rem)?;
+        if flags_changed && updated.history_id == old_hid {
+            let new_hid = state.bump_history_id();
+            if let Some(msg) = state.messages.get_mut(message_id) {
+                msg.history_id = new_hid;
+            }
+            updated.history_id = new_hid;
+        }
+        Ok(ImapStoreFlagsOutcome::Updated(Box::new(updated)))
+    }
+
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>> {
+        let entries = self.imap_expunge_uids(mailbox_name, None).await?;
+        Ok(entries.into_iter().map(|e| e.seq).collect())
+    }
+
+    async fn imap_expunge_uids(
+        &self,
+        mailbox_name: &str,
+        uid_ranges: Option<&[(u32, u32)]>,
+    ) -> AppResult<Vec<ImapExpungedEntry>> {
         let mut state = self.write_state()?;
         let resolved = state
             .resolve_imap_mailbox(mailbox_name)
             .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
         let entries = state.imap_list_messages_resolved(&resolved);
 
-        let mut expunged_seqs = Vec::new();
+        let mut expunged = Vec::new();
         for entry in entries {
             if !entry.is_deleted {
                 continue;
             }
-            expunged_seqs.push(entry.seq);
+            if let Some(ranges) = uid_ranges
+                && !ranges
+                    .iter()
+                    .any(|&(lo, hi)| entry.uid >= lo && entry.uid <= hi)
+            {
+                continue;
+            }
             match &resolved {
                 ResolvedMailbox::Label { id, .. } if id == LABEL_TRASH => {
+                    let attachment_ids = state
+                        .attachments
+                        .get(&entry.message_id)
+                        .map(|atts| atts.iter().map(|a| a.id.clone()).collect())
+                        .unwrap_or_default();
                     state.delete_message_inner(&entry.message_id);
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: true,
+                        attachment_ids,
+                    });
                 }
                 ResolvedMailbox::AllMail => {
                     if let Some(m) = state.messages.get_mut(&entry.message_id) {
@@ -2524,6 +2606,15 @@ impl MailStore for MemoryStore {
                         &[LABEL_TRASH.to_string()],
                         &[LABEL_INBOX.to_string()],
                     )?;
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: false,
+                        attachment_ids: Vec::new(),
+                    });
                 }
                 ResolvedMailbox::Label { id, .. } => {
                     if let Some(m) = state.messages.get_mut(&entry.message_id) {
@@ -2534,10 +2625,19 @@ impl MailStore for MemoryStore {
                         &[LABEL_TRASH.to_string()],
                         std::slice::from_ref(id),
                     )?;
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: false,
+                        attachment_ids: Vec::new(),
+                    });
                 }
             }
         }
-        Ok(expunged_seqs)
+        Ok(expunged)
     }
 
     async fn imap_copy_or_move(

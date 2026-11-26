@@ -599,6 +599,130 @@ async fn contract_imap_uids_flags_move_expunge_vanished(store: Arc<dyn MailStore
     let trash_expunged = store.imap_expunge(TRASH_MAILBOX).await.unwrap();
     assert_eq!(trash_expunged, vec![1]);
     assert!(store.get_message(&m1.id).await.unwrap().is_none());
+
+    // Selective UID EXPUNGE (`imap_expunge_uids`) + attachment_ids + atomic `imap_store_flags` CAS
+    let mut a_in = sample_message(
+        "UID Expunge One",
+        "u1@example.com",
+        "First selective expunge candidate",
+        1_700_000_010_000,
+    );
+    a_in.attachments.push(NewAttachmentInput {
+        part_id: "2".to_string(),
+        filename: Some("keep.txt".to_string()),
+        content_type: "text/plain".to_string(),
+        content_id: None,
+        data: b"att-bytes".to_vec(),
+    });
+    let (_, u_a, msg_a) = store.imap_append("INBOX", a_in).await.unwrap();
+    let (_, u_b, msg_b) = store
+        .imap_append(
+            "INBOX",
+            sample_message(
+                "UID Expunge Two",
+                "u2@example.com",
+                "Second selective expunge candidate",
+                1_700_000_011_000,
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Atomic UNCHANGEDSINCE CAS: stale modseq must return Modified without mutating.
+    let stale_modseq = msg_a.history_id.max(1);
+    let updated_a = store
+        .imap_store_flags(
+            &msg_a.id,
+            nogml::storage::ImapFlagAction::Add,
+            nogml::storage::ImapFlagSet {
+                deleted: true,
+                ..Default::default()
+            },
+            Some(stale_modseq),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        updated_a,
+        nogml::storage::ImapStoreFlagsOutcome::Updated(ref m) if m.is_deleted
+    ));
+    let cas_rejected = store
+        .imap_store_flags(
+            &msg_a.id,
+            nogml::storage::ImapFlagAction::Add,
+            nogml::storage::ImapFlagSet {
+                flagged: true,
+                ..Default::default()
+            },
+            Some(stale_modseq),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        cas_rejected,
+        nogml::storage::ImapStoreFlagsOutcome::Modified
+    ));
+    let fresh_a = store.get_message(&msg_a.id).await.unwrap().unwrap();
+    assert!(!fresh_a.label_ids.contains(&LABEL_STARRED.to_string()));
+
+    // Mark msg_b \Deleted too, then expunge ONLY u_a -> msg_b must stay in INBOX with \Deleted!
+    store
+        .imap_set_flags(&msg_b.id, false, false, false, false, true)
+        .await
+        .unwrap();
+    let selective = store
+        .imap_expunge_uids("INBOX", Some(&[(u_a, u_a)]))
+        .await
+        .unwrap();
+    assert_eq!(selective.len(), 1);
+    assert_eq!(selective[0].uid, u_a);
+    assert_eq!(selective[0].message_id, msg_a.id);
+    assert!(!selective[0].permanently_deleted);
+
+    let inbox_after = store.imap_list_messages("INBOX").await.unwrap();
+    assert_eq!(inbox_after.len(), 1);
+    assert_eq!(inbox_after[0].uid, u_b);
+    assert!(inbox_after[0].is_deleted);
+
+    // Permanently expunge msg_a from Trash -> returns permanently_deleted = true and attachment IDs.
+    let trash_list = store.imap_list_messages(TRASH_MAILBOX).await.unwrap();
+    let trash_entry_a = trash_list
+        .iter()
+        .find(|e| e.message_id == msg_a.id)
+        .expect("msg_a should be in Trash");
+    store
+        .imap_set_flags(&msg_a.id, true, false, false, false, true)
+        .await
+        .unwrap();
+    let perm = store
+        .imap_expunge_uids(
+            TRASH_MAILBOX,
+            Some(&[(trash_entry_a.uid, trash_entry_a.uid)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(perm.len(), 1);
+    assert!(perm[0].permanently_deleted);
+    assert_eq!(perm[0].attachment_ids.len(), 1);
+    assert!(store.get_message(&msg_a.id).await.unwrap().is_none());
+
+    // Atomic store on deleted message returns NotFound.
+    let missing = store
+        .imap_store_flags(
+            &msg_a.id,
+            nogml::storage::ImapFlagAction::Add,
+            nogml::storage::ImapFlagSet {
+                seen: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        missing,
+        nogml::storage::ImapStoreFlagsOutcome::NotFound
+    ));
 }
 
 async fn contract_fts_ai_search_and_cursor_pagination(store: Arc<dyn MailStore>) {

@@ -36,11 +36,11 @@ use crate::{
     resend::ResendClient,
     storage::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, DraftListPage, HistoryListPage,
-        HistoryListQuery, ImapMailboxInfo, ImapMessageEntry, MailStore, MessageListPage,
-        MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment, StoredDraft,
-        StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage, TriagePatch,
-        TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind, UserSettings,
-        WatchSubscription,
+        HistoryListQuery, ImapExpungedEntry, ImapMailboxInfo, ImapMessageEntry, MailStore,
+        MessageListPage, MessageListQuery, NewLabelInput, NewMessageInput, StoredAttachment,
+        StoredDraft, StoredLabel, StoredMessage, StoredThreadDetail, SyncState, ThreadListPage,
+        TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome, UpsertOutcomeKind,
+        UserSettings, WatchSubscription,
     },
 };
 
@@ -679,19 +679,42 @@ impl MailStore for TestMailStore {
         Ok(msg)
     }
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>> {
+        let entries = self.imap_expunge_uids(mailbox_name, None).await?;
+        Ok(entries.into_iter().map(|e| e.seq).collect())
+    }
+    async fn imap_expunge_uids(
+        &self,
+        mailbox_name: &str,
+        uid_ranges: Option<&[(u32, u32)]>,
+    ) -> AppResult<Vec<ImapExpungedEntry>> {
         let mut inner = self.inner.lock().unwrap();
         let entries = Self::list_mailbox_entries_locked(&inner, mailbox_name)?;
         let Some((_, label_opt)) = Self::mailbox_to_label(&inner, mailbox_name) else {
             return Err(AppError::NotFound(mailbox_name.to_string()));
         };
-        let mut expunged_seqs = Vec::new();
+        let mut expunged = Vec::new();
         for entry in entries {
             if !entry.is_deleted {
                 continue;
             }
-            expunged_seqs.push(entry.seq);
+            if let Some(ranges) = uid_ranges
+                && !ranges
+                    .iter()
+                    .any(|&(lo, hi)| entry.uid >= lo && entry.uid <= hi)
+            {
+                continue;
+            }
             if label_opt.as_deref() == Some(LABEL_TRASH) {
                 inner.messages.remove(&entry.message_id);
+                expunged.push(ImapExpungedEntry {
+                    seq: entry.seq,
+                    uid: entry.uid,
+                    message_id: entry.message_id,
+                    thread_id: entry.thread_id,
+                    label_ids: entry.label_ids,
+                    permanently_deleted: true,
+                    attachment_ids: Vec::new(),
+                });
             } else if let Some(mut msg) = inner.messages.get(&entry.message_id).cloned() {
                 if let Some(ref lid) = label_opt {
                     msg.label_ids.retain(|l| l != lid);
@@ -702,9 +725,18 @@ impl MailStore for TestMailStore {
                 }
                 msg.is_deleted = false;
                 inner.messages.insert(entry.message_id.clone(), msg);
+                expunged.push(ImapExpungedEntry {
+                    seq: entry.seq,
+                    uid: entry.uid,
+                    message_id: entry.message_id,
+                    thread_id: entry.thread_id,
+                    label_ids: entry.label_ids,
+                    permanently_deleted: false,
+                    attachment_ids: Vec::new(),
+                });
             }
         }
-        Ok(expunged_seqs)
+        Ok(expunged)
     }
     async fn imap_copy_or_move(
         &self,

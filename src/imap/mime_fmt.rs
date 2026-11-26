@@ -123,7 +123,7 @@ pub fn extract_body_section(
                 split_raw_header_and_body(raw).0.to_vec()
             } else {
                 find_part_by_path(raw, path)
-                    .map(|p| p.header)
+                    .map(|p| p.embedded_message.map(|(h, _)| h).unwrap_or(p.mime_header))
                     .unwrap_or_default()
             }
         }
@@ -136,7 +136,7 @@ pub fn extract_body_section(
                 split_raw_header_and_body(raw).0.to_vec()
             } else {
                 find_part_by_path(raw, part_path)
-                    .map(|p| p.header)
+                    .map(|p| p.embedded_message.map(|(h, _)| h).unwrap_or(p.mime_header))
                     .unwrap_or_default()
             };
             filter_header_fields(&hdr_bytes, fields, *negate)
@@ -146,7 +146,7 @@ pub fn extract_body_section(
                 split_raw_header_and_body(raw).1.to_vec()
             } else {
                 find_part_by_path(raw, path)
-                    .map(|p| p.body)
+                    .map(|p| p.embedded_message.map(|(_, b)| b).unwrap_or(p.body))
                     .unwrap_or_default()
             }
         }
@@ -155,7 +155,7 @@ pub fn extract_body_section(
                 split_raw_header_and_body(raw).0.to_vec()
             } else {
                 find_part_by_path(raw, path)
-                    .map(|p| p.header)
+                    .map(|p| p.mime_header)
                     .unwrap_or_default()
             }
         }
@@ -176,17 +176,37 @@ pub fn extract_body_section(
 }
 
 struct ExtractedPart {
-    header: Vec<u8>,
+    mime_header: Vec<u8>,
     body: Vec<u8>,
+    embedded_message: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+fn is_message_rfc822(part: &MessagePart<'_>) -> bool {
+    part.nested().is_some()
+        || part.content_type().is_some_and(|ct| {
+            ct.ctype().eq_ignore_ascii_case("message")
+                && ct
+                    .subtype()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("rfc822"))
+        })
 }
 
 fn find_part_by_path(raw: &[u8], path: &[usize]) -> Option<ExtractedPart> {
     let parsed = MessageParser::new().parse(raw)?;
     let root = parsed.root_part();
     let part = resolve_mime_part(root, path)?;
+    let mime_header = part.raw_headers().to_vec();
+    let body = part.raw_body().to_vec();
+    let embedded_message = if is_message_rfc822(&part) {
+        let (hdr, bdy) = split_raw_header_and_body(&body);
+        Some((hdr.to_vec(), bdy.to_vec()))
+    } else {
+        None
+    };
     Some(ExtractedPart {
-        header: part.raw_headers().to_vec(),
-        body: part.raw_body().to_vec(),
+        mime_header,
+        body,
+        embedded_message,
     })
 }
 
@@ -710,4 +730,87 @@ fn normalize_msg_id(raw: &str) -> String {
 fn make_snippet(text: &str) -> String {
     let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     normalized.chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_message_rfc822_header_and_text_inspect_inner_message() {
+        let raw = concat!(
+            "From: outer@example.com\r\n",
+            "To: dest@example.com\r\n",
+            "Subject: Outer Wrapper\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"bnd-outer\"\r\n",
+            "\r\n",
+            "--bnd-outer\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Outer intro text.\r\n",
+            "--bnd-outer\r\n",
+            "Content-Type: message/rfc822\r\n",
+            "Content-Disposition: attachment; filename=\"forwarded.eml\"\r\n",
+            "\r\n",
+            "From: inner@example.com\r\n",
+            "To: reader@example.com\r\n",
+            "Subject: Inner Secret Subject\r\n",
+            "X-Inner-Id: inner-99\r\n",
+            "\r\n",
+            "Inner embedded body line.\r\n",
+            "--bnd-outer--\r\n"
+        );
+
+        let part2_header = String::from_utf8(extract_body_section(
+            raw.as_bytes(),
+            &parse_body_section("2.HEADER"),
+            None,
+        ))
+        .unwrap();
+        assert!(
+            part2_header.contains("Subject: Inner Secret Subject"),
+            "BODY[2.HEADER] must return embedded headers, got: {part2_header:?}"
+        );
+        assert!(part2_header.contains("From: inner@example.com"));
+        assert!(!part2_header.contains("Outer Wrapper"));
+        assert!(!part2_header.contains("Content-Type: message/rfc822"));
+
+        let part2_subject_only = String::from_utf8(extract_body_section(
+            raw.as_bytes(),
+            &parse_body_section("2.HEADER.FIELDS (Subject)"),
+            None,
+        ))
+        .unwrap();
+        assert!(part2_subject_only.contains("Subject: Inner Secret Subject"));
+        assert!(!part2_subject_only.contains("X-Inner-Id"));
+        assert!(!part2_subject_only.contains("Outer Wrapper"));
+
+        let part2_text = String::from_utf8(extract_body_section(
+            raw.as_bytes(),
+            &parse_body_section("2.TEXT"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(part2_text.trim(), "Inner embedded body line.");
+        assert!(!part2_text.contains("Subject: Inner Secret Subject"));
+        assert!(!part2_text.contains("Outer intro text"));
+
+        let part2_mime = String::from_utf8(extract_body_section(
+            raw.as_bytes(),
+            &parse_body_section("2.MIME"),
+            None,
+        ))
+        .unwrap();
+        assert!(part2_mime.contains("Content-Type: message/rfc822"));
+
+        let part2_whole = String::from_utf8(extract_body_section(
+            raw.as_bytes(),
+            &parse_body_section("2"),
+            None,
+        ))
+        .unwrap();
+        assert!(part2_whole.contains("Subject: Inner Secret Subject"));
+        assert!(part2_whole.contains("Inner embedded body line."));
+    }
 }

@@ -34,11 +34,12 @@ use crate::{
         AiMessagePage, AiSearchQuery, AiThreadPage, AiThreadQuery, ApprovalStatus, AuditLogEntry,
         AuditLogQuery, ContactDirection, ContactInteraction, ContactPatch, ContactQuery,
         ContactRecord, DraftListPage, HistoryEventKind, HistoryListPage, HistoryListQuery,
-        IdempotencyRecord, ImapMailboxInfo, ImapMessageEntry, InboxRule, InboxRuleActions,
-        InboxRulePatch, MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry,
-        NewInboxRule, NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend,
-        PendingApproval, ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment,
-        StoredDraft, StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
+        IdempotencyRecord, ImapExpungedEntry, ImapFlagAction, ImapFlagSet, ImapMailboxInfo,
+        ImapMessageEntry, ImapStoreFlagsOutcome, InboxRule, InboxRuleActions, InboxRulePatch,
+        MailStore, MessageListPage, MessageListQuery, NewAuditLogEntry, NewInboxRule,
+        NewLabelInput, NewMessageInput, NewPendingApprovalInput, NewScheduledSend, PendingApproval,
+        ScheduledSend, ScheduledSendStatus, SnoozedThread, StoredAttachment, StoredDraft,
+        StoredHistoryEntry, StoredLabel, StoredMessage, StoredThreadDetail, SyncState,
         ThreadListPage, TriagePatch, TriageResult, UpdateLabelInput, UpsertOutcome,
         UpsertOutcomeKind, UserSettings, VIP_REPLY_THRESHOLD, WatchSubscription,
         apply_inbox_rule_patch, compute_contact_is_vip, normalize_contact_email,
@@ -4494,7 +4495,92 @@ impl MailStore for PostgresStore {
         Ok(msg)
     }
 
+    async fn imap_store_flags(
+        &self,
+        message_id: &str,
+        action: ImapFlagAction,
+        flags: ImapFlagSet,
+        unchanged_since: Option<u64>,
+    ) -> AppResult<ImapStoreFlagsOutcome> {
+        let mut conn = self.ready_conn().await?;
+        let tx = conn.transaction().await.map_err(pg_err)?;
+        let mb = self.mailbox_id.as_str();
+
+        // Acquire a row-level lock so UNCHANGEDSINCE check and update are atomic under READ COMMITTED.
+        let locked = tx
+            .query_opt(
+                "SELECT id FROM messages WHERE mailbox_id = $1 AND id = $2 FOR UPDATE",
+                &[&mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        if locked.is_none() {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        }
+
+        let Some(old_msg) = load_message_by_id(&tx, mb, message_id).await? else {
+            return Ok(ImapStoreFlagsOutcome::NotFound);
+        };
+        if let Some(limit) = unchanged_since
+            && old_msg.history_id.max(1) > limit
+        {
+            return Ok(ImapStoreFlagsOutcome::Modified);
+        }
+        let next = flags.apply(ImapFlagSet::from_message(&old_msg), action);
+        let flags_changed =
+            old_msg.is_answered != next.answered || old_msg.is_deleted != next.deleted;
+
+        let mut add = Vec::new();
+        let mut rem = Vec::new();
+        if next.seen {
+            rem.push(LABEL_UNREAD.to_string());
+        } else {
+            add.push(LABEL_UNREAD.to_string());
+        }
+        if next.flagged {
+            add.push(LABEL_STARRED.to_string());
+        } else {
+            rem.push(LABEL_STARRED.to_string());
+        }
+        if next.draft {
+            add.push(LABEL_DRAFT.to_string());
+        } else {
+            rem.push(LABEL_DRAFT.to_string());
+        }
+
+        tx.execute(
+            "UPDATE messages SET is_answered = $1, is_deleted = $2 WHERE mailbox_id = $3 AND id = $4",
+            &[&next.answered, &next.deleted, &mb, &message_id],
+        )
+        .await
+        .map_err(pg_err)?;
+
+        let mut msg = modify_message_labels_resolved_tx(&tx, mb, message_id, &add, &rem).await?;
+        if flags_changed && msg.history_id == old_msg.history_id {
+            let new_hid = bump_history_id(&tx, mb).await?;
+            let new_hid_i64 = new_hid as i64;
+            tx.execute(
+                "UPDATE messages SET history_id = $1 WHERE mailbox_id = $2 AND id = $3",
+                &[&new_hid_i64, &mb, &message_id],
+            )
+            .await
+            .map_err(pg_err)?;
+            msg.history_id = new_hid;
+        }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(ImapStoreFlagsOutcome::Updated(Box::new(msg)))
+    }
+
     async fn imap_expunge(&self, mailbox_name: &str) -> AppResult<Vec<u32>> {
+        let entries = self.imap_expunge_uids(mailbox_name, None).await?;
+        Ok(entries.into_iter().map(|e| e.seq).collect())
+    }
+
+    async fn imap_expunge_uids(
+        &self,
+        mailbox_name: &str,
+        uid_ranges: Option<&[(u32, u32)]>,
+    ) -> AppResult<Vec<ImapExpungedEntry>> {
         let mut conn = self.ready_conn().await?;
         let tx = conn.transaction().await.map_err(pg_err)?;
         let mb = self.mailbox_id.as_str();
@@ -4504,15 +4590,41 @@ impl MailStore for PostgresStore {
             .ok_or_else(|| AppError::NotFound(format!("Mailbox not found: {mailbox_name}")))?;
         let entries = load_imap_messages_resolved(&tx, mb, &resolved).await?;
 
-        let mut expunged_seqs = Vec::new();
+        let mut expunged = Vec::new();
         for entry in entries {
             if !entry.is_deleted {
                 continue;
             }
-            expunged_seqs.push(entry.seq);
+            if let Some(ranges) = uid_ranges
+                && !ranges
+                    .iter()
+                    .any(|&(lo, hi)| entry.uid >= lo && entry.uid <= hi)
+            {
+                continue;
+            }
             match &resolved {
                 ResolvedMailbox::Label { id, .. } if id == LABEL_TRASH => {
+                    let att_rows = tx
+                        .query(
+                            "SELECT id FROM attachments WHERE mailbox_id = $1 AND message_id = $2 ORDER BY id ASC",
+                            &[&mb, &entry.message_id],
+                        )
+                        .await
+                        .map_err(pg_err)?;
+                    let attachment_ids: Vec<String> = att_rows
+                        .into_iter()
+                        .map(|r| r.get::<_, String>(0))
+                        .collect();
                     delete_message_tx(&tx, mb, &entry.message_id).await?;
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: true,
+                        attachment_ids,
+                    });
                 }
                 ResolvedMailbox::AllMail => {
                     tx.execute(
@@ -4529,6 +4641,15 @@ impl MailStore for PostgresStore {
                         &[LABEL_INBOX.to_string()],
                     )
                     .await?;
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: false,
+                        attachment_ids: Vec::new(),
+                    });
                 }
                 ResolvedMailbox::Label { id, .. } => {
                     tx.execute(
@@ -4545,11 +4666,20 @@ impl MailStore for PostgresStore {
                         std::slice::from_ref(id),
                     )
                     .await?;
+                    expunged.push(ImapExpungedEntry {
+                        seq: entry.seq,
+                        uid: entry.uid,
+                        message_id: entry.message_id,
+                        thread_id: entry.thread_id,
+                        label_ids: entry.label_ids,
+                        permanently_deleted: false,
+                        attachment_ids: Vec::new(),
+                    });
                 }
             }
         }
         tx.commit().await.map_err(pg_err)?;
-        Ok(expunged_seqs)
+        Ok(expunged)
     }
 
     async fn imap_copy_or_move(
