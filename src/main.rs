@@ -160,6 +160,10 @@ struct CommonConfigArgs {
     #[arg(long, env = "NOGML_MAILBOXES", value_delimiter = ',', global = true)]
     mailboxes: Vec<String>,
 
+    /// Comma-separated mailbox alias mappings (`alias@example.com=target@example.com`).
+    #[arg(long, env = "NOGML_MAILBOX_ALIASES", global = true)]
+    mailbox_aliases: Option<String>,
+
     /// Default domain for generated Message-IDs and fallback sender addresses.
     #[arg(
         long,
@@ -1293,6 +1297,12 @@ impl CommonConfigArgs {
         if is_explicit(root_matches, "mailboxes") {
             cfg.mailboxes = self.mailboxes;
         }
+        if is_explicit(root_matches, "mailbox_aliases") {
+            cfg.mailbox_aliases = match self.mailbox_aliases.as_deref() {
+                Some(raw) => nogml::config::parse_mailbox_aliases(raw)?,
+                None => Default::default(),
+            };
+        }
         if is_explicit(root_matches, "default_domain") {
             cfg.default_domain = self.default_domain;
         }
@@ -1898,6 +1908,7 @@ async fn run_remote_mail(
             let mut req: AiSendEmailRequest = match payload {
                 Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                 None => AiSendEmailRequest {
+                    from: None,
                     to,
                     cc,
                     bcc,
@@ -1942,6 +1953,7 @@ async fn run_remote_mail(
             let mut req: AiCreateDraftRequest = match payload {
                 Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                 None => AiCreateDraftRequest {
+                    from: None,
                     to,
                     cc,
                     bcc,
@@ -2231,7 +2243,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
             let config = finalize_runtime_config(loaded, false)?;
             let bind = config.bind;
             let has_imap = config.imap_bind.is_some() || config.imap_tls_bind.is_some();
-            let has_bg_sync = config.sync_interval_secs > 0;
+            let has_bg_sync = config.has_background_sync();
             let has_watch_webhook = config
                 .watch_webhook_url
                 .as_deref()
@@ -2343,8 +2355,15 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                 } => {
                     let target_state =
                         match mailbox.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            Some(mb) => state.for_mailbox(mb),
-                            None => state,
+                            Some(mb) => match state.config.sync_account_for_mailbox(mb) {
+                                Some(acct) => state.for_sync_account(acct),
+                                None => state.for_mailbox(mb),
+                            },
+                            None => match state.config.sync_account_for_mailbox(state.mailbox_id())
+                            {
+                                Some(acct) => state.for_sync_account(acct),
+                                None => state,
+                            },
                         };
                     let report = sync::run_gmail_sync(
                         &target_state,
@@ -3042,6 +3061,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     let mut req: AiSendEmailRequest = match payload {
                         Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                         None => AiSendEmailRequest {
+                            from: None,
                             to,
                             cc,
                             bcc,
@@ -3080,6 +3100,7 @@ async fn run(cli: Cli, matches: ArgMatches) -> AppResult<ExitCode> {
                     let mut req: AiCreateDraftRequest = match payload {
                         Some(raw) => serde_json::from_value(read_json_payload(&raw)?)?,
                         None => AiCreateDraftRequest {
+                            from: None,
                             to,
                             cc,
                             bcc,

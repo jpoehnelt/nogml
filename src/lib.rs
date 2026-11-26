@@ -43,12 +43,12 @@ use tokio::sync::{Mutex, watch};
 
 use crate::{
     ai::safety::{OutboundPolicy, open_outbound_policy},
-    auth::{AuthProvider, Principal, StaticTokenAuthProvider},
+    auth::{AuthProvider, Principal, ResolvedMailbox, StaticTokenAuthProvider},
     blob::{
         BlobStore, InlineBlobStore, PrefixedBlobStore, attachment_blob_key, is_external_blob_store,
         open_blob_store, raw_message_blob_key,
     },
-    config::{Config, normalize_mailbox_id},
+    config::{Config, SyncAccountConfig, normalize_mailbox_id},
     crypto::SecretCipher,
     error::AppResult,
     events::EventBus,
@@ -472,6 +472,14 @@ impl AppState {
         }
     }
 
+    /// Return a lightweight `AppState` scoped strictly to `account.mailbox_id` with all upstream
+    /// sync settings overridden from `account`.
+    pub fn for_sync_account(&self, account: &SyncAccountConfig) -> Self {
+        let mut scoped = self.for_mailbox(&account.mailbox_id);
+        scoped.config = Arc::new(account.apply_to_config(&scoped.config));
+        scoped
+    }
+
     /// Replace the [`BlobStore`] backend on this `AppState`.
     pub fn with_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
         let active_mb = self.mailbox_id().to_string();
@@ -608,6 +616,9 @@ impl AppState {
         let is_self = |addr: &str| {
             (!self_email.is_empty() && addr == self_email)
                 || (!config_email.is_empty() && addr == config_email)
+                || (!self_email.is_empty()
+                    && self.config.resolve_alias_target(addr).as_deref()
+                        == Some(self_email.as_str()))
         };
 
         if msg.label_ids.iter().any(|l| l == LABEL_SENT) {
@@ -767,11 +778,11 @@ impl AppState {
     }
 }
 
-/// Axum extractor that resolves the authenticated [`Principal`] from request extensions
-/// (populated by [`auth::require_auth`]) and scopes [`AppState`] strictly to
-/// `principal.mailbox_id`.
+/// Axum extractor that resolves the target mailbox from request extensions
+/// (`ResolvedMailbox` or `Principal`, populated by [`auth::require_auth`]) and scopes
+/// [`AppState`] strictly to that mailbox.
 ///
-/// Falls back to the router's default [`AppState`] when no `Principal` extension is present.
+/// Falls back to the router's default [`AppState`] when neither extension is present.
 pub struct MailboxState(pub AppState);
 
 impl<S> FromRequestParts<S> for MailboxState
@@ -783,10 +794,14 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let base = AppState::from_ref(state);
-        let scoped = match parts.extensions.get::<Principal>() {
-            Some(principal) => base.for_mailbox(&principal.mailbox_id),
-            None => base,
-        };
+        let scoped =
+            if let Some(ResolvedMailbox(mailbox_id)) = parts.extensions.get::<ResolvedMailbox>() {
+                base.for_mailbox(mailbox_id)
+            } else if let Some(principal) = parts.extensions.get::<Principal>() {
+                base.for_mailbox(&principal.mailbox_id)
+            } else {
+                base
+            };
         Ok(Self(scoped))
     }
 }
@@ -890,6 +905,7 @@ mod pluggable_seam_tests {
             if token == Some("jwt-valid") {
                 Ok(Principal {
                     mailbox_id: "agent@example.com".to_string(),
+                    shared_mailboxes: Vec::new(),
                     scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
                     agent_policy: None,
                 })

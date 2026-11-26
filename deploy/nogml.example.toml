@@ -51,10 +51,15 @@ tokens = ["file:///run/secrets/nogml_auth_tokens"]
 [[auth.scoped_tokens]]
 token = "env://NOGML_READONLY_TOKEN"
 mailbox_id = "agent@example.com"
+shared_mailboxes = ["support@example.com"]
 scopes = ["read"]
 draft_only = true
 allowed_recipients = ["@example.com"]
 max_send_recipients = 5
+
+[mailboxes.aliases]
+"a@example.com" = "agent@example.com"
+"sales@example.com" = "support@example.com"
 
 [oauth2]
 client_id = "nogml-local-client"
@@ -129,6 +134,25 @@ gmail_imap_tls = true
 gmail_imap_user = "you@gmail.com"
 gmail_imap_password = "env://GMAIL_IMAP_PASSWORD"
 gmail_imap_mailbox = "[Gmail]/All Mail"
+
+# Multi-account background sync (each account runs with its own per-mailbox lock and schedule):
+# [[sync.accounts]]
+# mailbox_id = "alice@example.com"
+# mode = "api"
+# interval_secs = 60
+# query = "newer_than:30d"
+# max_messages = 500
+# bidirectional = false
+# gmail_client_id = "alice-client-id.apps.googleusercontent.com"
+# gmail_client_secret = "env://ALICE_GMAIL_CLIENT_SECRET"
+# gmail_refresh_token = "file:///run/secrets/alice_gmail_refresh_token"
+#
+# [[sync.accounts]]
+# mailbox_id = "bob@example.com"
+# mode = "imap"
+# interval_secs = 120
+# gmail_imap_user = "bob@gmail.com"
+# gmail_imap_password = "file:///run/secrets/bob_gmail_imap_password"
 
 [watch]
 webhook_url = "https://hooks.example.com/nogml-watch"

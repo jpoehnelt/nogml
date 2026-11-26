@@ -873,6 +873,7 @@ async fn e2e_approvals_endpoints_require_admin_scope() {
         ScopedTokenConfig {
             token: "tok-read".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -881,6 +882,7 @@ async fn e2e_approvals_endpoints_require_admin_scope() {
         ScopedTokenConfig {
             token: "tok-send".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
             draft_only: None,
             allowed_recipients: None,
@@ -889,6 +891,7 @@ async fn e2e_approvals_endpoints_require_admin_scope() {
         ScopedTokenConfig {
             token: "tok-admin".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,

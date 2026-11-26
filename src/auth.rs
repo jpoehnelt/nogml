@@ -72,6 +72,8 @@ pub struct ScopedTokenConfig {
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mailbox_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_mailboxes: Vec<String>,
     #[serde(default)]
     pub scopes: Vec<AuthScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +89,7 @@ impl std::fmt::Debug for ScopedTokenConfig {
         f.debug_struct("ScopedTokenConfig")
             .field("token", &crate::secrets::REDACTED)
             .field("mailbox_id", &self.mailbox_id)
+            .field("shared_mailboxes", &self.shared_mailboxes)
             .field("scopes", &self.scopes)
             .field("draft_only", &self.draft_only)
             .field("allowed_recipients", &self.allowed_recipients)
@@ -106,6 +109,15 @@ impl ScopedTokenConfig {
             .unwrap_or(default_mailbox)
             .to_string();
 
+        let primary_norm = crate::config::normalize_mailbox_id(&mailbox_id);
+        let mut shared_mailboxes = Vec::new();
+        for raw in &self.shared_mailboxes {
+            let norm = crate::config::normalize_mailbox_id(raw);
+            if !norm.is_empty() && norm != primary_norm && !shared_mailboxes.contains(&norm) {
+                shared_mailboxes.push(norm);
+            }
+        }
+
         let agent_policy = if self.draft_only.is_some()
             || self.allowed_recipients.is_some()
             || self.max_send_recipients.is_some()
@@ -121,6 +133,7 @@ impl ScopedTokenConfig {
 
         Principal {
             mailbox_id,
+            shared_mailboxes,
             scopes: self.scopes.clone(),
             agent_policy,
         }
@@ -131,16 +144,27 @@ impl ScopedTokenConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     pub mailbox_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_mailboxes: Vec<String>,
     pub scopes: Vec<AuthScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_policy: Option<AgentPolicyOverride>,
 }
+
+/// Target mailbox resolved for an authenticated HTTP request (either `principal.mailbox_id`
+/// or an authorized shared mailbox requested via Gmail `{userId}` or `X-Nogml-Mailbox`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMailbox(pub String);
+
+/// HTTP header selecting a target mailbox for `/v1/*` and `/mcp` requests.
+pub const MAILBOX_HEADER: &str = "x-nogml-mailbox";
 
 impl Principal {
     /// Construct a full-access principal for `mailbox_id`.
     pub fn full_access(mailbox_id: impl Into<String>) -> Self {
         Self {
             mailbox_id: mailbox_id.into(),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,
@@ -149,6 +173,22 @@ impl Principal {
             ],
             agent_policy: None,
         }
+    }
+
+    /// Returns `true` if this principal is authorized to access `target` mailbox
+    /// (either `target` equals `self.mailbox_id` or `target` is listed in `self.shared_mailboxes`,
+    /// compared case-insensitively).
+    pub fn can_access_mailbox(&self, target: &str) -> bool {
+        let target_norm = crate::config::normalize_mailbox_id(target);
+        if target_norm.is_empty() {
+            return false;
+        }
+        if self.mailbox_id.trim().eq_ignore_ascii_case(&target_norm) {
+            return true;
+        }
+        self.shared_mailboxes
+            .iter()
+            .any(|mb| mb.trim().eq_ignore_ascii_case(&target_norm))
     }
 
     pub fn has_scope(&self, scope: AuthScope) -> bool {
@@ -180,7 +220,7 @@ pub trait AuthProvider: Send + Sync {
     /// Authenticate an IMAP `AUTHENTICATE XOAUTH2` exchange (`user=<user>\x01auth=Bearer <token>\x01\x01`).
     ///
     /// Defaults to validating `access_token` via [`Self::authenticate_bearer`] and verifying
-    /// `username` matches the resolved [`Principal::mailbox_id`].
+    /// `username` is authorized by [`Principal::can_access_mailbox`].
     async fn authenticate_xoauth2(
         &self,
         username: &str,
@@ -191,13 +231,17 @@ pub trait AuthProvider: Send + Sync {
                 "Missing XOAUTH2 access token".to_string(),
             ));
         }
-        let principal = self.authenticate_bearer(Some(access_token)).await?;
-        if !username.eq_ignore_ascii_case(&principal.mailbox_id) {
-            return Err(AppError::Unauthorized(
-                "XOAUTH2 username does not match token mailbox".to_string(),
-            ));
+        let mut principal = self.authenticate_bearer(Some(access_token)).await?;
+        if username.eq_ignore_ascii_case(&principal.mailbox_id) {
+            return Ok(principal);
         }
-        Ok(principal)
+        if principal.can_access_mailbox(username) {
+            principal.mailbox_id = crate::config::normalize_mailbox_id(username);
+            return Ok(principal);
+        }
+        Err(AppError::Unauthorized(
+            "XOAUTH2 username does not match token mailbox".to_string(),
+        ))
     }
 
     fn backend_name(&self) -> &'static str;
@@ -306,11 +350,15 @@ impl AuthProvider for StaticTokenAuthProvider {
     }
 
     async fn authenticate_imap(&self, username: &str, password: &str) -> AppResult<Principal> {
-        if let Some(principal) = self.match_scoped_token(password) {
+        if let Some(mut principal) = self.match_scoped_token(password) {
             let is_primary_token = principal.mailbox_id.eq_ignore_ascii_case(&self.mailbox_id);
             if username.eq_ignore_ascii_case(&principal.mailbox_id)
                 || (is_primary_token && username.eq_ignore_ascii_case(&self.imap_username))
             {
+                return Ok(principal);
+            }
+            if principal.can_access_mailbox(username) {
+                principal.mailbox_id = crate::config::normalize_mailbox_id(username);
                 return Ok(principal);
             }
             return Err(AppError::Unauthorized(
@@ -352,11 +400,14 @@ impl AuthProvider for StaticTokenAuthProvider {
                 "Missing XOAUTH2 access token".to_string(),
             ));
         }
-        let principal = self.authenticate_bearer(Some(access_token)).await?;
+        let mut principal = self.authenticate_bearer(Some(access_token)).await?;
         let is_primary_token = principal.mailbox_id.eq_ignore_ascii_case(&self.mailbox_id);
         if username.eq_ignore_ascii_case(&principal.mailbox_id)
             || (is_primary_token && username.eq_ignore_ascii_case(&self.imap_username))
         {
+            Ok(principal)
+        } else if principal.can_access_mailbox(username) {
+            principal.mailbox_id = crate::config::normalize_mailbox_id(username);
             Ok(principal)
         } else {
             Err(AppError::Unauthorized(
@@ -514,9 +565,74 @@ fn is_ai_v1_path(path: &str) -> bool {
         && !path.starts_with("/v1/people/")
 }
 
+fn extract_gmail_user_id_from_path(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/gmail/v1/users/")
+        .or_else(|| path.strip_prefix("/upload/gmail/v1/users/"))?;
+    let seg = rest.split('/').next()?;
+    (!seg.is_empty()).then_some(seg)
+}
+
+fn percent_decode_path_segment(raw: &str) -> AppResult<String> {
+    validate_resource_id(raw)?;
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf8(out).map_err(|_| {
+        AppError::validation(
+            "Path userId is not valid UTF-8",
+            Some("Provide a valid UTF-8 email address or 'me'.".to_string()),
+        )
+    })?;
+    validate_resource_id(&decoded)?;
+    Ok(decoded)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Extract and validate the optional `X-Nogml-Mailbox` request header.
+pub fn extract_mailbox_header(headers: &HeaderMap) -> AppResult<Option<String>> {
+    let Some(val) = headers.get(MAILBOX_HEADER) else {
+        return Ok(None);
+    };
+    let raw = val.to_str().map_err(|_| {
+        AppError::validation(
+            "Invalid X-Nogml-Mailbox header encoding",
+            Some("Provide a valid ASCII/UTF-8 mailbox email address.".to_string()),
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    validate_resource_id(trimmed)?;
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Axum middleware authenticating requests via `state.auth` (`Authorization: Bearer <token>`,
 /// `X-API-Key`, or `?access_token=`), enforcing [`required_http_scope`] (`403 Forbidden` on
-/// insufficient scope), and inserting the resolved [`Principal`] into request extensions.
+/// insufficient scope), validating target mailbox access (Gmail `{userId}` and optional
+/// `X-Nogml-Mailbox` header against [`Principal::can_access_mailbox`]), and inserting the
+/// resolved [`Principal`] and [`ResolvedMailbox`] into request extensions.
 ///
 /// Always exempts `/healthz`, `/readyz`, `/webhooks/resend`, `/webhooks/ses`,
 /// `/oauth2/token`, and `/.well-known/oauth-authorization-server`.
@@ -556,6 +672,35 @@ pub async fn require_auth(
         return Err(err);
     }
 
+    let resolved_mailbox = if let Some(raw_user_id) = extract_gmail_user_id_from_path(&path) {
+        let decoded = percent_decode_path_segment(raw_user_id)?;
+        let authorized = resolve_user_id_for_principal(&decoded, &principal)?;
+        crate::config::normalize_mailbox_id(authorized)
+    } else {
+        match extract_mailbox_header(req.headers()) {
+            Ok(Some(requested)) => {
+                if !principal.can_access_mailbox(&requested) {
+                    let err =
+                        AppError::Forbidden(format!("Access denied for mailbox '{requested}'"));
+                    if is_ai_v1_path(&path) {
+                        return Ok(err.into_ai_response());
+                    }
+                    return Err(err);
+                }
+                crate::config::normalize_mailbox_id(&requested)
+            }
+            Ok(None) => crate::config::normalize_mailbox_id(&principal.mailbox_id),
+            Err(err) => {
+                if is_ai_v1_path(&path) {
+                    return Ok(err.into_ai_response());
+                }
+                return Err(err);
+            }
+        }
+    };
+
+    req.extensions_mut()
+        .insert(ResolvedMailbox(resolved_mailbox));
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
@@ -665,9 +810,11 @@ pub fn resolve_user_id<'a>(user_id: &str, config: &'a Config) -> AppResult<&'a s
     }
 }
 
-/// Resolve Gmail `{userId}` path parameter against an authenticated [`Principal`]'s `mailbox_id`.
+/// Resolve Gmail `{userId}` path parameter against an authenticated [`Principal`]'s
+/// `mailbox_id` and `shared_mailboxes`.
 ///
-/// Accepts `"me"` or `principal.mailbox_id` (case-insensitive). Returns `403 Forbidden` for
+/// Accepts `"me"`, `principal.mailbox_id`, or any mailbox authorized by
+/// [`Principal::can_access_mailbox`] (case-insensitive). Returns `403 Forbidden` for
 /// any other user ID, or `400 Bad Request` if `user_id` fails input hardening checks.
 pub fn resolve_user_id_for_principal<'a>(
     user_id: &str,
@@ -677,6 +824,12 @@ pub fn resolve_user_id_for_principal<'a>(
 
     if user_id == "me" || user_id.eq_ignore_ascii_case(&principal.mailbox_id) {
         Ok(principal.mailbox_id.as_str())
+    } else if let Some(shared) = principal
+        .shared_mailboxes
+        .iter()
+        .find(|mb| mb.trim().eq_ignore_ascii_case(user_id))
+    {
+        Ok(shared.as_str())
     } else {
         Err(AppError::Forbidden(format!(
             "Delegation denied for userId '{user_id}'"
@@ -1021,6 +1174,7 @@ mod tests {
         cfg.scoped_tokens = vec![ScopedTokenConfig {
             token: "ro-tok".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: Some(true),
             allowed_recipients: Some(vec!["@example.com".to_string()]),

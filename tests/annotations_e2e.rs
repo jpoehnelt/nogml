@@ -500,6 +500,7 @@ async fn mcp_annotate_thread_get_annotations_list_threads_and_scopes() {
         ScopedTokenConfig {
             token: "tok_read_only".to_string(),
             mailbox_id: Some(cfg.user_email.clone()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -508,6 +509,7 @@ async fn mcp_annotate_thread_get_annotations_list_threads_and_scopes() {
         ScopedTokenConfig {
             token: "tok_read_write".to_string(),
             mailbox_id: Some(cfg.user_email.clone()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -783,6 +785,7 @@ async fn multi_mailbox_annotations_isolation_via_rest_and_mcp() {
         ScopedTokenConfig {
             token: "tok_alice".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -791,6 +794,7 @@ async fn multi_mailbox_annotations_isolation_via_rest_and_mcp() {
         ScopedTokenConfig {
             token: "tok_bob".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,

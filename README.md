@@ -234,12 +234,13 @@ Every CLI flag has a matching environment variable:
 | `NOGML_BLOB_S3_SESSION_TOKEN` | `--blob-s3-session-token` | *(none)* | Optional S3 STS session token |
 | `NOGML_BLOB_S3_FORCE_PATH_STYLE` | `--blob-s3-force-path-style` | *(true with endpoint)* | Use path-style URLs (`/{bucket}/{key}`) instead of virtual-host URLs |
 | `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens with full scopes |
-| `NOGML_SCOPED_TOKENS` | `--scoped-tokens` | *(none)* | JSON array of scoped API keys (`token`, `mailbox_id`, `scopes`, `draft_only`, `allowed_recipients`, `max_send_recipients`) |
+| `NOGML_SCOPED_TOKENS` | `--scoped-tokens` | *(none)* | JSON array of scoped API keys (`token`, `mailbox_id`, `shared_mailboxes`, `scopes`, `draft_only`, `allowed_recipients`, `max_send_recipients`) |
 | `NOGML_OAUTH2_CLIENT_ID` | `--oauth2-client-id` | *(disabled)* | Local OAuth2 client ID (enables `/oauth2/*` and `/.well-known/oauth-authorization-server` when paired with `NOGML_OAUTH2_SIGNING_SECRET`) |
 | `NOGML_OAUTH2_CLIENT_SECRET` | `--oauth2-client-secret` | *(none)* | Optional local OAuth2 client secret verified on `POST /oauth2/token` |
 | `NOGML_OAUTH2_SIGNING_SECRET` | `--oauth2-signing-secret` | *(disabled)* | HMAC-SHA256 signing secret for local OAuth2 JWT access and refresh tokens |
 | `NOGML_USER_EMAIL` | `--user-email` | `me@localhost` | Primary mailbox address |
 | `NOGML_MAILBOXES` | `--mailboxes` | *(empty)* | Comma-separated additional local mailboxes hosted by this instance |
+| `NOGML_MAILBOX_ALIASES` | `--mailbox-aliases` | *(empty)* | Comma-separated alias mappings (`alias@example.com=target@example.com`) |
 | `NOGML_DEFAULT_DOMAIN` | `--default-domain` | `localhost` | Default domain for generated `Message-ID` headers |
 | `NOGML_TRANSPORT` | `--transport` | `resend` | `MailTransport` backend (`resend`, `ses`, or `smtp`) |
 | `RESEND_API_KEY` | `--resend-api-key` | *(none)* | Resend API key (`re_...`) for outbound sends and the Receiving API |
@@ -395,10 +396,10 @@ NOGML_SCOPED_TOKENS='[{"token":"tok_alice","mailbox_id":"alice@example.com","sco
 nogml serve --imap-bind 127.0.0.1:1143
 ```
 
-- **HTTP and MCP**: Authenticated requests are scoped automatically to `Principal.mailbox_id`. Gmail API paths accept `me` or the caller's own email address and return `403 Forbidden` when a caller requests another user's `userId`.
-- **Inbound webhooks**: When multiple mailboxes are configured, `POST /webhooks/resend` and `POST /webhooks/ses` inspect `To`, `Cc`, `Bcc`, and delivery headers (`Delivered-To`, `X-Original-To`, `Envelope-To`) and deliver only to matching local mailboxes.
-- **IMAP**: Clients authenticate with `LOGIN <mailbox_id> <scoped_token>`, `AUTHENTICATE PLAIN`, or `AUTHENTICATE XOAUTH2` and see only their own folders, UIDs, messages, and `IDLE` updates.
-- **Upstream sync**: Run `nogml sync gmail --mailbox bob@example.com` to sync into a specific local mailbox with isolated `sync_state` checkpoints.
+- **HTTP and MCP**: Authenticated requests are scoped automatically to `Principal.mailbox_id`. Scoped tokens with `shared_mailboxes` can also access authorized team mailboxes via `/gmail/v1/users/<shared>/...` or the `X-Nogml-Mailbox: <shared>` header on `/v1/*` and `POST /mcp`, while requests targeting any unauthorized mailbox return `403 Forbidden`.
+- **Inbound webhooks and aliases**: When multiple mailboxes or `[mailboxes.aliases]` (`NOGML_MAILBOX_ALIASES`) are configured, `POST /webhooks/resend` and `POST /webhooks/ses` map alias envelope recipients to their target mailbox and deliver only to matching local mailboxes. Mailbox owners can also send from their configured aliases via `from` / `From:` and Gmail `settings/sendAs`.
+- **IMAP**: Clients authenticate with `LOGIN <mailbox_id> <scoped_token>`, `AUTHENTICATE PLAIN`, or `AUTHENTICATE XOAUTH2` for their own mailbox or any mailbox listed in their token's `shared_mailboxes`, and see only that mailbox's folders, UIDs, messages, and `IDLE` updates.
+- **Multi-account upstream sync**: Configure multiple `[[sync.accounts]]` entries in `nogml.toml` to run independent per-mailbox background sync loops in `nogml serve`, or run `nogml sync gmail --mailbox bob@example.com` to select and sync a specific account with isolated `sync_state` checkpoints.
 
 ### IMAP clients
 

@@ -376,6 +376,7 @@ async fn e2e_audit_log_across_v1_mcp_gmail_scopes_and_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_alice_full".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,
@@ -389,6 +390,7 @@ async fn e2e_audit_log_across_v1_mcp_gmail_scopes_and_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_alice_read".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -397,6 +399,7 @@ async fn e2e_audit_log_across_v1_mcp_gmail_scopes_and_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_alice_write_only".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -405,6 +408,7 @@ async fn e2e_audit_log_across_v1_mcp_gmail_scopes_and_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_bob_full".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,

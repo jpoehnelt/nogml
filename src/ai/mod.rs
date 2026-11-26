@@ -371,7 +371,7 @@ pub async fn execute_send_email_with_context(
         validate_email_header("subject", subj)?;
     }
 
-    let resolved = safety::resolve_reply_threading(
+    let mut resolved = safety::resolve_reply_threading(
         state,
         &req.to,
         &req.cc,
@@ -382,6 +382,7 @@ pub async fn execute_send_email_with_context(
         req.reply_to_message_id.as_deref(),
     )
     .await?;
+    resolved.from = safety::resolve_authorized_from(state, req.from.as_deref()).await?;
 
     validate_email_header("subject", &resolved.subject)?;
 
@@ -811,7 +812,7 @@ pub async fn execute_create_draft_with_context(
         }
     }
 
-    let resolved = safety::resolve_reply_threading(
+    let mut resolved = safety::resolve_reply_threading(
         state,
         &req.to,
         &req.cc,
@@ -822,6 +823,7 @@ pub async fn execute_create_draft_with_context(
         req.reply_to_message_id.as_deref(),
     )
     .await?;
+    resolved.from = safety::resolve_authorized_from(state, req.from.as_deref()).await?;
 
     validate_email_header("subject", &resolved.subject)?;
 

@@ -1040,6 +1040,8 @@ pub struct DryRunResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiSendEmailRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     #[serde(default)]
     pub to: Vec<String>,
     #[serde(default)]
@@ -1069,6 +1071,8 @@ pub struct SnoozeThreadRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiCreateDraftRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     #[serde(default)]
     pub to: Vec<String>,
     #[serde(default)]

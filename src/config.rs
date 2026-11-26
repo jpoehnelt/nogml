@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -26,6 +26,50 @@ use crate::{
 /// Normalize a mailbox identifier (email address) by trimming whitespace and lowercasing ASCII.
 pub fn normalize_mailbox_id(mailbox_id: &str) -> String {
     mailbox_id.trim().to_ascii_lowercase()
+}
+
+/// Parse a comma-separated list of mailbox alias mappings (`alias@example.com=target@example.com`)
+/// into a normalized lowercase `HashMap<alias, target>`.
+pub fn parse_mailbox_aliases(raw: &str) -> AppResult<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((alias_raw, target_raw)) = trimmed.split_once('=') else {
+            return Err(AppError::Config(format!(
+                "Invalid mailbox alias mapping '{trimmed}': expected 'alias@domain=target@domain'"
+            )));
+        };
+        let alias = normalize_mailbox_id(alias_raw);
+        let target = normalize_mailbox_id(target_raw);
+        if alias.is_empty() || !alias.contains('@') || alias.contains(char::is_whitespace) {
+            return Err(AppError::Config(format!(
+                "Invalid mailbox alias address '{alias_raw}' in '{trimmed}'"
+            )));
+        }
+        if target.is_empty() || !target.contains('@') || target.contains(char::is_whitespace) {
+            return Err(AppError::Config(format!(
+                "Invalid mailbox alias target '{target_raw}' in '{trimmed}'"
+            )));
+        }
+        out.insert(alias, target);
+    }
+    Ok(out)
+}
+
+/// Normalize all keys and target values in a mailbox alias map to trimmed lowercase strings.
+pub fn normalize_mailbox_aliases(aliases: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(aliases.len());
+    for (k, v) in aliases {
+        let key = normalize_mailbox_id(k);
+        let val = normalize_mailbox_id(v);
+        if !key.is_empty() && !val.is_empty() {
+            out.insert(key, val);
+        }
+    }
+    out
 }
 
 /// Extract normalized lowercase email addresses from raw header/recipient entries
@@ -163,6 +207,246 @@ pub enum SyncMode {
     Imap,
 }
 
+fn default_gmail_user_id() -> String {
+    "me".to_string()
+}
+
+fn default_gmail_api_base_url() -> String {
+    "https://gmail.googleapis.com".to_string()
+}
+
+fn default_gmail_oauth_token_url() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
+fn default_gmail_imap_host() -> String {
+    "imap.gmail.com".to_string()
+}
+
+fn default_gmail_imap_port() -> u16 {
+    993
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_gmail_imap_mailbox() -> String {
+    "[Gmail]/All Mail".to_string()
+}
+
+/// Per-account upstream Gmail sync configuration entry parsed from `[[sync.accounts]]`.
+///
+/// Implements a custom [`fmt::Debug`] that replaces all credential and token fields
+/// with `"[REDACTED]"`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncAccountConfig {
+    pub mailbox_id: String,
+    pub mode: SyncMode,
+    pub interval_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_messages: Option<usize>,
+    pub bidirectional: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_access_token: Option<String>,
+    #[serde(default = "default_gmail_user_id")]
+    pub gmail_user_id: String,
+    #[serde(default = "default_gmail_api_base_url")]
+    pub gmail_api_base_url: String,
+    #[serde(default = "default_gmail_oauth_token_url")]
+    pub gmail_oauth_token_url: String,
+    #[serde(default = "default_gmail_imap_host")]
+    pub gmail_imap_host: String,
+    #[serde(default = "default_gmail_imap_port")]
+    pub gmail_imap_port: u16,
+    #[serde(default = "default_true")]
+    pub gmail_imap_tls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_imap_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_imap_password: Option<String>,
+    #[serde(default = "default_gmail_imap_mailbox")]
+    pub gmail_imap_mailbox: String,
+}
+
+impl Default for SyncAccountConfig {
+    fn default() -> Self {
+        Self {
+            mailbox_id: String::new(),
+            mode: SyncMode::Api,
+            interval_secs: 0,
+            query: None,
+            max_messages: None,
+            bidirectional: false,
+            gmail_client_id: None,
+            gmail_client_secret: None,
+            gmail_refresh_token: None,
+            gmail_access_token: None,
+            gmail_user_id: default_gmail_user_id(),
+            gmail_api_base_url: default_gmail_api_base_url(),
+            gmail_oauth_token_url: default_gmail_oauth_token_url(),
+            gmail_imap_host: default_gmail_imap_host(),
+            gmail_imap_port: default_gmail_imap_port(),
+            gmail_imap_tls: default_true(),
+            gmail_imap_user: None,
+            gmail_imap_password: None,
+            gmail_imap_mailbox: default_gmail_imap_mailbox(),
+        }
+    }
+}
+
+impl fmt::Debug for SyncAccountConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncAccountConfig")
+            .field("mailbox_id", &self.mailbox_id)
+            .field("mode", &self.mode)
+            .field("interval_secs", &self.interval_secs)
+            .field("query", &self.query)
+            .field("max_messages", &self.max_messages)
+            .field("bidirectional", &self.bidirectional)
+            .field("gmail_client_id", &self.gmail_client_id)
+            .field(
+                "gmail_client_secret",
+                &redacted_opt_debug(&self.gmail_client_secret),
+            )
+            .field(
+                "gmail_refresh_token",
+                &redacted_opt_debug(&self.gmail_refresh_token),
+            )
+            .field(
+                "gmail_access_token",
+                &redacted_opt_debug(&self.gmail_access_token),
+            )
+            .field("gmail_user_id", &self.gmail_user_id)
+            .field("gmail_api_base_url", &self.gmail_api_base_url)
+            .field("gmail_oauth_token_url", &self.gmail_oauth_token_url)
+            .field("gmail_imap_host", &self.gmail_imap_host)
+            .field("gmail_imap_port", &self.gmail_imap_port)
+            .field("gmail_imap_tls", &self.gmail_imap_tls)
+            .field("gmail_imap_user", &self.gmail_imap_user)
+            .field(
+                "gmail_imap_password",
+                &redacted_opt_debug(&self.gmail_imap_password),
+            )
+            .field("gmail_imap_mailbox", &self.gmail_imap_mailbox)
+            .finish()
+    }
+}
+
+impl SyncAccountConfig {
+    /// Returns `true` when upstream Gmail sync credentials are configured for this account.
+    pub fn is_configured(&self) -> bool {
+        match self.mode {
+            SyncMode::Api => {
+                self.gmail_access_token
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || (self
+                        .gmail_client_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        && self
+                            .gmail_client_secret
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        && self
+                            .gmail_refresh_token
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty()))
+            }
+            SyncMode::Imap => {
+                self.gmail_imap_user
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && self
+                        .gmail_imap_password
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty())
+            }
+        }
+    }
+
+    /// Return a cloned [`Config`] scoped to `self.mailbox_id` with all sync settings overridden
+    /// from this account entry.
+    pub fn apply_to_config(&self, base: &Config) -> Config {
+        let mut cfg = base.clone();
+        let target = normalize_mailbox_id(&self.mailbox_id);
+        if !target.is_empty() {
+            let base_primary = normalize_mailbox_id(&base.user_email);
+            if !base_primary.is_empty()
+                && base_primary != target
+                && !cfg
+                    .mailboxes
+                    .iter()
+                    .any(|m| normalize_mailbox_id(m) == base_primary)
+            {
+                cfg.mailboxes.push(base_primary);
+            }
+            cfg.user_email = target;
+        }
+        cfg.sync_mode = self.mode;
+        cfg.sync_interval_secs = self.interval_secs;
+        cfg.sync_query = self.query.clone();
+        cfg.sync_max_messages = self.max_messages;
+        cfg.sync_bidirectional = self.bidirectional;
+        cfg.gmail_client_id = self.gmail_client_id.clone();
+        cfg.gmail_client_secret = self.gmail_client_secret.clone();
+        cfg.gmail_refresh_token = self.gmail_refresh_token.clone();
+        cfg.gmail_access_token = self.gmail_access_token.clone();
+        cfg.gmail_user_id = self.gmail_user_id.clone();
+        cfg.gmail_api_base_url = self.gmail_api_base_url.clone();
+        cfg.gmail_oauth_token_url = self.gmail_oauth_token_url.clone();
+        cfg.gmail_imap_host = self.gmail_imap_host.clone();
+        cfg.gmail_imap_port = self.gmail_imap_port;
+        cfg.gmail_imap_tls = self.gmail_imap_tls;
+        cfg.gmail_imap_user = self.gmail_imap_user.clone();
+        cfg.gmail_imap_password = self.gmail_imap_password.clone();
+        cfg.gmail_imap_mailbox = self.gmail_imap_mailbox.clone();
+        cfg
+    }
+
+    /// Return a redacted JSON summary of this account for `nogml config check`.
+    pub fn redacted_summary(&self) -> Value {
+        let redact_opt = |opt: &Option<String>| -> Value {
+            if opt.is_some() {
+                Value::String(REDACTED.to_string())
+            } else {
+                Value::Null
+            }
+        };
+        json!({
+            "mailbox_id": self.mailbox_id,
+            "mode": self.mode,
+            "interval_secs": self.interval_secs,
+            "query": self.query,
+            "max_messages": self.max_messages,
+            "bidirectional": self.bidirectional,
+            "gmail_client_id": self.gmail_client_id,
+            "gmail_client_secret": redact_opt(&self.gmail_client_secret),
+            "gmail_refresh_token": redact_opt(&self.gmail_refresh_token),
+            "gmail_access_token": redact_opt(&self.gmail_access_token),
+            "gmail_user_id": self.gmail_user_id,
+            "gmail_api_base_url": self.gmail_api_base_url,
+            "gmail_oauth_token_url": self.gmail_oauth_token_url,
+            "gmail_imap_host": self.gmail_imap_host,
+            "gmail_imap_port": self.gmail_imap_port,
+            "gmail_imap_tls": self.gmail_imap_tls,
+            "gmail_imap_user": self.gmail_imap_user,
+            "gmail_imap_password": redact_opt(&self.gmail_imap_password),
+            "gmail_imap_mailbox": self.gmail_imap_mailbox,
+        })
+    }
+}
+
 /// Action taken by `AuthResultsFilter` when an SPF, DKIM, or DMARC check fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +521,10 @@ pub struct Config {
     /// Additional local mailbox email addresses hosted by this instance (`NOGML_MAILBOXES` / `--mailboxes`).
     #[serde(default)]
     pub mailboxes: Vec<String>,
+    /// Mailbox alias map (`alias@example.com` -> `target@example.com`) configured via
+    /// `[mailboxes.aliases]` or `NOGML_MAILBOX_ALIASES`.
+    #[serde(default)]
+    pub mailbox_aliases: HashMap<String, String>,
     /// Default domain for generated Message-IDs and fallback sender addresses.
     pub default_domain: String,
 
@@ -329,6 +617,9 @@ pub struct Config {
     pub sync_max_messages: Option<usize>,
     /// When `true`, push local label/flag/trash/delete changes back to the upstream account.
     pub sync_bidirectional: bool,
+    /// Optional multi-account upstream Gmail sync configurations (`[[sync.accounts]]`).
+    #[serde(default)]
+    pub sync_accounts: Vec<SyncAccountConfig>,
 
     // --- Optional Gmail /watch push webhook ---
     pub watch_webhook_url: Option<String>,
@@ -421,6 +712,7 @@ impl Default for Config {
             oauth2_redirect_uris: Vec::new(),
             user_email: "me@localhost".to_string(),
             mailboxes: Vec::new(),
+            mailbox_aliases: HashMap::new(),
             default_domain: "localhost".to_string(),
 
             transport: TransportBackend::Resend,
@@ -486,6 +778,7 @@ impl Default for Config {
             sync_query: None,
             sync_max_messages: None,
             sync_bidirectional: false,
+            sync_accounts: Vec::new(),
 
             watch_webhook_url: None,
 
@@ -548,7 +841,8 @@ impl Config {
     }
 
     /// Return the deduplicated, normalized list of all local mailboxes known to this instance:
-    /// `user_email`, `mailboxes`, and any explicit `mailbox_id` entries in `scoped_tokens`.
+    /// `user_email`, `mailboxes`, `mailbox_aliases` targets, `scoped_tokens` (`mailbox_id` and
+    /// `shared_mailboxes`), and `sync_accounts` `mailbox_id` entries.
     pub fn known_mailboxes(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut push_unique = |raw: &str| {
@@ -562,30 +856,94 @@ impl Config {
         for mb in &self.mailboxes {
             push_unique(mb);
         }
+        for target in self.mailbox_aliases.values() {
+            push_unique(target);
+        }
         for st in &self.scoped_tokens {
             if let Some(ref mb) = st.mailbox_id {
                 push_unique(mb);
             }
+            for shared in &st.shared_mailboxes {
+                push_unique(shared);
+            }
+        }
+        for acct in &self.sync_accounts {
+            push_unique(&acct.mailbox_id);
         }
         out
     }
 
     /// Returns `true` when more than one local mailbox is configured across `user_email`,
-    /// `mailboxes`, and `scoped_tokens`.
+    /// `mailboxes`, `mailbox_aliases`, `scoped_tokens`, and `sync_accounts`.
     pub fn is_multi_mailbox(&self) -> bool {
         self.known_mailboxes().len() > 1
     }
 
     /// Returns `true` when inbound webhooks should strictly route by recipient address
-    /// (true whenever `mailboxes` is non-empty or more than one mailbox is known).
+    /// (true whenever `mailboxes` or `mailbox_aliases` is non-empty, or more than one mailbox is known).
     pub fn has_explicit_mailbox_routing(&self) -> bool {
-        !self.mailboxes.is_empty() || self.is_multi_mailbox()
+        !self.mailboxes.is_empty() || !self.mailbox_aliases.is_empty() || self.is_multi_mailbox()
+    }
+
+    /// Look up the target mailbox for `address` in `mailbox_aliases` (case-insensitive).
+    pub fn resolve_alias_target(&self, address: &str) -> Option<String> {
+        let norm = normalize_mailbox_id(address);
+        if norm.is_empty() {
+            return None;
+        }
+        if let Some(target) = self.mailbox_aliases.get(&norm) {
+            let norm_target = normalize_mailbox_id(target);
+            return (!norm_target.is_empty()).then_some(norm_target);
+        }
+        self.mailbox_aliases
+            .iter()
+            .find(|(k, _)| normalize_mailbox_id(k) == norm)
+            .map(|(_, v)| normalize_mailbox_id(v))
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Return all normalized alias addresses configured to target `mailbox_id`.
+    pub fn aliases_for_mailbox(&self, mailbox_id: &str) -> Vec<String> {
+        let target_norm = normalize_mailbox_id(mailbox_id);
+        if target_norm.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (alias, target) in &self.mailbox_aliases {
+            if normalize_mailbox_id(target) == target_norm {
+                let alias_norm = normalize_mailbox_id(alias);
+                if !alias_norm.is_empty() && alias_norm != target_norm && !out.contains(&alias_norm)
+                {
+                    out.push(alias_norm);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Returns `true` when `candidate_from` (bare email or `"Display Name <email>"`) matches
+    /// `mailbox_id` itself or a configured alias targeting `mailbox_id`.
+    pub fn is_authorized_sender_for_mailbox(&self, mailbox_id: &str, candidate_from: &str) -> bool {
+        let target_norm = normalize_mailbox_id(mailbox_id);
+        if target_norm.is_empty() {
+            return false;
+        }
+        let Ok(parsed) = crate::storage::parse_strict_single_mailbox(candidate_from) else {
+            return false;
+        };
+        let from_norm = normalize_mailbox_id(&parsed.email);
+        if from_norm == target_norm {
+            return true;
+        }
+        self.resolve_alias_target(&from_norm)
+            .is_some_and(|resolved| resolved == target_norm)
     }
 
     /// Resolve which local mailbox(es) should receive an inbound message addressed to
-    /// `recipient_candidates`.
+    /// `recipient_candidates`, applying configured `mailbox_aliases` mappings.
     ///
-    /// When multi-mailbox routing is active (`has_explicit_mailbox_routing()`), returns ONLY
+    /// When explicit mailbox routing is active (`has_explicit_mailbox_routing()`), returns ONLY
     /// matching local mailboxes from `known_mailboxes()` (empty if none match).
     /// When running in default single-mailbox mode, falls back to `[normalize_mailbox_id(&user_email)]`.
     pub fn resolve_inbound_mailboxes(&self, recipient_candidates: &[String]) -> Vec<String> {
@@ -594,10 +952,35 @@ impl Config {
             return known;
         }
         let extracted = extract_email_addresses(recipient_candidates);
+        let mut resolved_recipients = Vec::with_capacity(extracted.len());
+        for rcpt in extracted {
+            if let Some(target) = self.resolve_alias_target(&rcpt) {
+                resolved_recipients.push(target);
+            } else {
+                resolved_recipients.push(rcpt);
+            }
+        }
         known
             .into_iter()
-            .filter(|mb| extracted.iter().any(|rcpt| rcpt == mb))
+            .filter(|mb| resolved_recipients.iter().any(|rcpt| rcpt == mb))
             .collect()
+    }
+
+    /// Return the matching `[[sync.accounts]]` entry for `mailbox_id` (case-insensitive), if any.
+    pub fn sync_account_for_mailbox(&self, mailbox_id: &str) -> Option<&SyncAccountConfig> {
+        let target = normalize_mailbox_id(mailbox_id);
+        if target.is_empty() {
+            return None;
+        }
+        self.sync_accounts
+            .iter()
+            .find(|acct| normalize_mailbox_id(&acct.mailbox_id) == target)
+    }
+
+    /// Returns `true` when either legacy `[sync]` or any `[[sync.accounts]]` entry has
+    /// background sync enabled (`interval_secs > 0`).
+    pub fn has_background_sync(&self) -> bool {
+        self.sync_interval_secs > 0 || self.sync_accounts.iter().any(|a| a.interval_secs > 0)
     }
 
     /// Returns `true` when any upstream Gmail sync credentials are configured.
@@ -678,6 +1061,7 @@ impl Config {
             oauth2_redirect_uris,
             user_email,
             mailboxes,
+            mailbox_aliases,
             default_domain,
             transport,
             resend_api_key,
@@ -736,6 +1120,7 @@ impl Config {
             sync_query,
             sync_max_messages,
             sync_bidirectional,
+            sync_accounts,
             watch_webhook_url,
             filter_auth_results,
             filter_dmarc_fail_action,
@@ -778,12 +1163,17 @@ impl Config {
                 json!({
                     "token": REDACTED,
                     "mailbox_id": st.mailbox_id,
+                    "shared_mailboxes": st.shared_mailboxes,
                     "scopes": st.scopes,
                     "draft_only": st.draft_only,
                     "allowed_recipients": st.allowed_recipients,
                     "max_send_recipients": st.max_send_recipients,
                 })
             })
+            .collect();
+        let redacted_sync_accounts: Vec<Value> = sync_accounts
+            .iter()
+            .map(SyncAccountConfig::redacted_summary)
             .collect();
 
         json!({
@@ -815,6 +1205,9 @@ impl Config {
                 "default_domain": default_domain,
                 "tokens": redacted_auth_tokens,
                 "scoped_tokens": redacted_scoped_tokens,
+            },
+            "mailboxes": {
+                "aliases": mailbox_aliases,
             },
             "oauth2": {
                 "client_id": oauth2_client_id,
@@ -895,6 +1288,7 @@ impl Config {
                 "gmail_imap_user": gmail_imap_user,
                 "gmail_imap_password": redact_opt(gmail_imap_password),
                 "gmail_imap_mailbox": gmail_imap_mailbox,
+                "accounts": redacted_sync_accounts,
             },
             "watch": {
                 "webhook_url": watch_webhook_url
@@ -1290,6 +1684,30 @@ impl Config {
             }
         }
 
+        for (idx, acct) in self.sync_accounts.iter_mut().enumerate() {
+            macro_rules! resolve_acct_secret {
+                ($field_suffix:expr, $slot:expr) => {
+                    if let Some(raw) = $slot.clone()
+                        && (raw.starts_with("file://") || raw.starts_with("env://"))
+                    {
+                        let field_name = format!("sync.accounts[{idx}].{}", $field_suffix);
+                        $slot = resolve_secret_value(
+                            &field_name,
+                            &raw,
+                            base_dir,
+                            env_lookup,
+                            &mut report,
+                        );
+                    }
+                };
+            }
+
+            resolve_acct_secret!("gmail_client_secret", acct.gmail_client_secret);
+            resolve_acct_secret!("gmail_refresh_token", acct.gmail_refresh_token);
+            resolve_acct_secret!("gmail_access_token", acct.gmail_access_token);
+            resolve_acct_secret!("gmail_imap_password", acct.gmail_imap_password);
+        }
+
         report
     }
 
@@ -1330,6 +1748,7 @@ impl fmt::Debug for Config {
             oauth2_redirect_uris,
             user_email,
             mailboxes,
+            mailbox_aliases,
             default_domain,
             transport,
             resend_api_key,
@@ -1388,6 +1807,7 @@ impl fmt::Debug for Config {
             sync_query,
             sync_max_messages,
             sync_bidirectional,
+            sync_accounts,
             watch_webhook_url,
             filter_auth_results,
             filter_dmarc_fail_action,
@@ -1452,6 +1872,7 @@ impl fmt::Debug for Config {
             .field("oauth2_redirect_uris", oauth2_redirect_uris)
             .field("user_email", user_email)
             .field("mailboxes", mailboxes)
+            .field("mailbox_aliases", mailbox_aliases)
             .field("default_domain", default_domain)
             .field("transport", transport)
             .field("resend_api_key", &redacted_opt(resend_api_key))
@@ -1522,6 +1943,7 @@ impl fmt::Debug for Config {
             .field("sync_query", sync_query)
             .field("sync_max_messages", sync_max_messages)
             .field("sync_bidirectional", sync_bidirectional)
+            .field("sync_accounts", sync_accounts)
             .field(
                 "watch_webhook_url",
                 &watch_webhook_url
@@ -1573,6 +1995,7 @@ pub struct TomlConfig {
     pub storage: StorageTomlConfig,
     pub blob: BlobTomlConfig,
     pub auth: AuthTomlConfig,
+    pub mailboxes: MailboxesTomlConfig,
     pub oauth2: OAuth2TomlConfig,
     pub transport: TransportTomlConfig,
     pub resend: ResendTomlConfig,
@@ -1585,6 +2008,12 @@ pub struct TomlConfig {
     pub filters: FiltersTomlConfig,
     pub security: SecurityTomlConfig,
     pub search: SearchTomlConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MailboxesTomlConfig {
+    pub aliases: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1881,6 +2310,7 @@ pub struct SyncTomlConfig {
     pub gmail_imap_user: Option<String>,
     pub gmail_imap_password: Option<String>,
     pub gmail_imap_mailbox: Option<String>,
+    pub accounts: Option<Vec<SyncAccountConfig>>,
 }
 
 impl std::fmt::Debug for SyncTomlConfig {
@@ -1916,6 +2346,7 @@ impl std::fmt::Debug for SyncTomlConfig {
                 &redacted_opt_debug(&self.gmail_imap_password),
             )
             .field("gmail_imap_mailbox", &self.gmail_imap_mailbox)
+            .field("accounts", &self.accounts)
             .finish()
     }
 }
@@ -2146,6 +2577,11 @@ impl TomlConfig {
             cfg.scoped_tokens = v.clone();
         }
 
+        // [mailboxes]
+        if let Some(ref aliases) = self.mailboxes.aliases {
+            cfg.mailbox_aliases = normalize_mailbox_aliases(aliases);
+        }
+
         // [oauth2]
         if let Some(ref v) = self.oauth2.client_id {
             cfg.oauth2_client_id = Some(v.clone());
@@ -2347,6 +2783,16 @@ impl TomlConfig {
         }
         if let Some(ref v) = self.sync.gmail_imap_mailbox {
             cfg.gmail_imap_mailbox = v.clone();
+        }
+        if let Some(ref accounts) = self.sync.accounts {
+            cfg.sync_accounts = accounts
+                .iter()
+                .cloned()
+                .map(|mut acct| {
+                    acct.mailbox_id = normalize_mailbox_id(&acct.mailbox_id);
+                    acct
+                })
+                .collect();
         }
 
         // [watch]
@@ -2749,6 +3195,53 @@ pub fn validate_config(
         );
     }
 
+    let mut seen_sync_mailboxes = HashSet::new();
+    for (idx, acct) in config.sync_accounts.iter().enumerate() {
+        let mb = normalize_mailbox_id(&acct.mailbox_id);
+        if mb.is_empty() {
+            errors.push(format!("sync.accounts[{idx}].mailbox_id must not be empty"));
+        } else if !seen_sync_mailboxes.insert(mb.clone()) {
+            warnings.push(format!("sync.accounts[{idx}] duplicates mailbox_id '{mb}'"));
+        }
+        validate_optional_url(
+            &format!("sync.accounts[{idx}].gmail_api_base_url"),
+            Some(acct.gmail_api_base_url.as_str()),
+            &mut errors,
+        );
+        validate_optional_url(
+            &format!("sync.accounts[{idx}].gmail_oauth_token_url"),
+            Some(acct.gmail_oauth_token_url.as_str()),
+            &mut errors,
+        );
+        if acct.interval_secs > 0 && !acct.is_configured() {
+            warnings.push(format!(
+                "sync.accounts[{idx}] ('{}') has interval_secs > 0, but no upstream Gmail sync credentials are configured",
+                acct.mailbox_id
+            ));
+        }
+    }
+
+    for (alias, target) in &config.mailbox_aliases {
+        let norm_alias = normalize_mailbox_id(alias);
+        let norm_target = normalize_mailbox_id(target);
+        if norm_alias.is_empty()
+            || !norm_alias.contains('@')
+            || norm_alias.contains(char::is_whitespace)
+        {
+            errors.push(format!(
+                "mailboxes.aliases key '{alias}' must be a valid email address"
+            ));
+        }
+        if norm_target.is_empty()
+            || !norm_target.contains('@')
+            || norm_target.contains(char::is_whitespace)
+        {
+            errors.push(format!(
+                "mailboxes.aliases target '{target}' for '{alias}' must be a valid email address"
+            ));
+        }
+    }
+
     ConfigCheckReport {
         ok: errors.is_empty(),
         config_file,
@@ -2882,10 +3375,19 @@ mod tests {
         cfg.scoped_tokens = vec![ScopedTokenConfig {
             token: "super-secret-scoped-token".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: vec!["team@example.com".to_string()],
             scopes: vec![AuthScope::Read],
             draft_only: Some(true),
             allowed_recipients: None,
             max_send_recipients: None,
+        }];
+        cfg.sync_accounts = vec![SyncAccountConfig {
+            mailbox_id: "alice@example.com".to_string(),
+            gmail_client_secret: Some("super-secret-acct-client".to_string()),
+            gmail_refresh_token: Some("super-secret-acct-refresh".to_string()),
+            gmail_access_token: Some("super-secret-acct-access".to_string()),
+            gmail_imap_password: Some("super-secret-acct-imap".to_string()),
+            ..SyncAccountConfig::default()
         }];
         cfg.oauth2_client_secret = Some("super-secret-oauth-client".to_string());
         cfg.oauth2_signing_secret = Some("super-secret-oauth-sign".to_string());
@@ -2936,6 +3438,10 @@ mod tests {
             "super-secret-gmail-refresh",
             "super-secret-gmail-access",
             "super-secret-gmail-imap",
+            "super-secret-acct-client",
+            "super-secret-acct-refresh",
+            "super-secret-acct-access",
+            "super-secret-acct-imap",
             "super-secret-rspamd",
             "super-secret-llm",
             "super-secret-embed",

@@ -597,6 +597,7 @@ async fn batch_triage_mcp_scopes_and_multi_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_alice_rw".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -605,6 +606,7 @@ async fn batch_triage_mcp_scopes_and_multi_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_alice_ro".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -613,6 +615,7 @@ async fn batch_triage_mcp_scopes_and_multi_mailbox_isolation() {
         ScopedTokenConfig {
             token: "tok_bob_rw".to_string(),
             mailbox_id: Some("bob@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,

@@ -108,6 +108,7 @@ fn make_test_config(dir: &Path) -> Config {
         ScopedTokenConfig {
             token: "tok-rw".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -116,6 +117,7 @@ fn make_test_config(dir: &Path) -> Config {
         ScopedTokenConfig {
             token: "tok-admin".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,

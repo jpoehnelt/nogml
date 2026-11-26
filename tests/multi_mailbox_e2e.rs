@@ -131,6 +131,7 @@ fn multi_mailbox_config(storage: StorageBackend, require_approval: bool) -> Conf
         ScopedTokenConfig {
             token: TOK_ALICE.to_string(),
             mailbox_id: Some(ALICE.to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,
@@ -144,6 +145,7 @@ fn multi_mailbox_config(storage: StorageBackend, require_approval: bool) -> Conf
         ScopedTokenConfig {
             token: TOK_BOB.to_string(),
             mailbox_id: Some(BOB.to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![
                 AuthScope::Read,
                 AuthScope::Write,

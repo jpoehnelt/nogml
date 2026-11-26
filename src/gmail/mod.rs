@@ -555,12 +555,13 @@ async fn execute_gmail_send(
     let parsed = mime::parse_rfc2822(&raw_bytes)?;
     validate_parsed_headers(&parsed)?;
 
-    let outbound = parsed_to_outbound_message(
+    let mut outbound = parsed_to_outbound_message(
         &parsed,
         &state.config.user_email,
         &raw_bytes,
         idempotency_key,
     )?;
+    outbound.from = crate::ai::safety::resolve_authorized_from(state, Some(&outbound.from)).await?;
 
     let agent_policy = principal.and_then(|p| p.agent_policy.clone());
     let policy_check = OutboundCheck {

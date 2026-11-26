@@ -78,6 +78,7 @@ async fn openapi_endpoint_and_cli_cover_all_v1_routes() {
     cfg.scoped_tokens = vec![ScopedTokenConfig {
         token: "ro_openapi_token".to_string(),
         mailbox_id: Some(cfg.user_email.clone()),
+        shared_mailboxes: Vec::new(),
         scopes: vec![AuthScope::Read],
         draft_only: None,
         allowed_recipients: None,

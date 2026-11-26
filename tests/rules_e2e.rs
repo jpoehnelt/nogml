@@ -943,6 +943,7 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
         ScopedTokenConfig {
             token: "tok_read".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -951,6 +952,7 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
         ScopedTokenConfig {
             token: "tok_write".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -959,6 +961,7 @@ async fn dry_run_test_validation_patch_scopes_and_mcp_tools() {
         ScopedTokenConfig {
             token: "tok_admin".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,

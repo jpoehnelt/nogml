@@ -1163,6 +1163,47 @@ pub fn ensure_reply_subject(parent_subject: &str) -> String {
     }
 }
 
+/// Resolve and authorize an optional outbound `From` address for the active mailbox.
+///
+/// When `requested_from` is `None` or blank, defaults to `state.config.user_email`.
+/// Otherwise validates header safety and single-mailbox syntax and requires the email to match:
+/// - `state.mailbox_id()` or `state.config.user_email` (case-insensitive),
+/// - a configured alias in `state.config.mailbox_aliases` targeting `state.mailbox_id()`, or
+/// - a stored `SendAs` alias in `state.store.get_settings()`.
+pub async fn resolve_authorized_from(
+    state: &AppState,
+    requested_from: Option<&str>,
+) -> AppResult<String> {
+    let Some(raw) = requested_from.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(state.config.user_email.clone());
+    };
+
+    validate_email_header("from", raw)?;
+    let parsed = validate_single_recipient(raw)?;
+    let mailbox_id = state.mailbox_id();
+    if parsed.email.eq_ignore_ascii_case(&state.config.user_email)
+        || state
+            .config
+            .is_authorized_sender_for_mailbox(mailbox_id, raw)
+    {
+        return Ok(raw.to_string());
+    }
+
+    if let Ok(settings) = state.store.get_settings().await
+        && settings
+            .send_as
+            .iter()
+            .any(|s| s.send_as_email.eq_ignore_ascii_case(&parsed.email))
+    {
+        return Ok(raw.to_string());
+    }
+
+    Err(AppError::Forbidden(format!(
+        "Sender address '{}' is not authorized for mailbox '{}'",
+        parsed.email, mailbox_id
+    )))
+}
+
 /// Resolve `reply_to_message_id` against `MailStore`, auto-populating `thread_id`,
 /// `In-Reply-To`, `References`, `Re:` subject, and default `to` recipient if omitted.
 #[allow(clippy::too_many_arguments)]
@@ -1255,7 +1296,8 @@ pub async fn evaluate_send_dry_run_with_policy(
     req: &AiSendEmailRequest,
     agent_policy: Option<&AgentPolicyOverride>,
 ) -> AppResult<DryRunResponse> {
-    evaluate_resolved_dry_run(
+    let resolved_from = resolve_authorized_from(state, req.from.as_deref()).await?;
+    let mut res = evaluate_resolved_dry_run(
         state,
         &req.to,
         &req.cc,
@@ -1271,7 +1313,11 @@ pub async fn evaluate_send_dry_run_with_policy(
         None,
         agent_policy,
     )
-    .await
+    .await?;
+    if let Some(ref mut preview) = res.preview {
+        preview.from = resolved_from;
+    }
+    Ok(res)
 }
 
 #[allow(clippy::too_many_arguments)]

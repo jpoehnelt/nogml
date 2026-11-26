@@ -291,11 +291,19 @@ pub fn account_key_for_mode(state: &AppState, mode: SyncMode) -> String {
     open_sync_source(mode).account_key(&state.config)
 }
 
-/// Run a single upstream Gmail sync pass (guarded by `state.sync_lock`).
+/// Run a single upstream Gmail sync pass (guarded by the mailbox's `state.sync_lock`).
+///
+/// When `config.sync_accounts` contains an entry matching `state.mailbox_id()`, that account's
+/// credentials and sync parameters are applied automatically.
 pub async fn run_gmail_sync(state: &AppState, opts: SyncRunOptions) -> AppResult<SyncRunReport> {
-    let mode = opts.mode.unwrap_or(state.config.sync_mode);
+    let effective_state = state
+        .config
+        .sync_account_for_mailbox(state.mailbox_id())
+        .map(|acct| state.for_sync_account(acct));
+    let target_state = effective_state.as_ref().unwrap_or(state);
+    let mode = opts.mode.unwrap_or(target_state.config.sync_mode);
     let source = open_sync_source(mode);
-    run_sync_source(state, source.as_ref(), opts).await
+    run_sync_source(target_state, source.as_ref(), opts).await
 }
 
 /// Run a single sync pass for any [`SyncSource`] implementation (guarded by `state.sync_lock`).
@@ -723,6 +731,11 @@ async fn load_mutation_history_range(
 
 /// Build the current sync status snapshot (used by `GET /v1/sync/status` and MCP `sync_status`).
 pub async fn get_sync_status(state: &AppState) -> AppResult<SyncStatusResponse> {
+    let effective_state = state
+        .config
+        .sync_account_for_mailbox(state.mailbox_id())
+        .map(|acct| state.for_sync_account(acct));
+    let state = effective_state.as_ref().unwrap_or(state);
     let mode = state.config.sync_mode;
     let source = open_sync_source(mode);
     let provider = source.provider_name();
@@ -785,14 +798,56 @@ pub async fn get_sync_status(state: &AppState) -> AppResult<SyncStatusResponse> 
     })
 }
 
-/// Spawn periodic background sync when `config.sync_interval_secs > 0`, stopping on `shutdown`.
-pub async fn run_background_sync(state: AppState, mut shutdown: watch::Receiver<bool>) {
-    let interval_secs = state.config.sync_interval_secs;
+/// Run periodic background sync loops for all configured `[[sync.accounts]]` entries
+/// (each with its own independent per-mailbox lock and interval) and/or legacy `[sync]`
+/// when `config.sync_interval_secs > 0`, stopping cleanly when `shutdown` signals `true`.
+pub async fn run_background_sync(state: AppState, shutdown: watch::Receiver<bool>) {
+    let mut handles = Vec::new();
+    let mut covered_mailboxes = HashSet::new();
+
+    for acct in &state.config.sync_accounts {
+        let norm_mb = crate::config::normalize_mailbox_id(&acct.mailbox_id);
+        if norm_mb.is_empty() {
+            continue;
+        }
+        covered_mailboxes.insert(norm_mb);
+        if acct.interval_secs == 0 {
+            continue;
+        }
+        let acct_state = state.for_sync_account(acct);
+        let acct_shutdown = shutdown.clone();
+        let interval_secs = acct.interval_secs;
+        handles.push(tokio::spawn(async move {
+            run_single_sync_loop(acct_state, interval_secs, acct_shutdown).await;
+        }));
+    }
+
+    let primary_mb = crate::config::normalize_mailbox_id(state.mailbox_id());
+    if state.config.sync_interval_secs > 0 && !covered_mailboxes.contains(&primary_mb) {
+        let interval_secs = state.config.sync_interval_secs;
+        let legacy_state = state.clone();
+        let legacy_shutdown = shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            run_single_sync_loop(legacy_state, interval_secs, legacy_shutdown).await;
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+async fn run_single_sync_loop(
+    state: AppState,
+    interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     if interval_secs == 0 {
         return;
     }
 
     info!(
+        mailbox = %state.mailbox_id(),
         interval_secs,
         bidirectional = state.config.sync_bidirectional,
         "Starting background upstream Gmail sync loop"
@@ -812,6 +867,7 @@ pub async fn run_background_sync(state: AppState, mut shutdown: watch::Receiver<
                 match run_gmail_sync(&state, SyncRunOptions::default()).await {
                     Ok(report) => {
                         info!(
+                            mailbox = %state.mailbox_id(),
                             provider = %report.provider,
                             added = report.messages_added,
                             updated = report.messages_updated,
@@ -821,13 +877,20 @@ pub async fn run_background_sync(state: AppState, mut shutdown: watch::Receiver<
                         );
                     }
                     Err(err) => {
-                        error!(%err, "Background Gmail sync failed");
+                        error!(
+                            mailbox = %state.mailbox_id(),
+                            %err,
+                            "Background Gmail sync failed"
+                        );
                     }
                 }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    info!("Background Gmail sync shutting down");
+                    info!(
+                        mailbox = %state.mailbox_id(),
+                        "Background Gmail sync shutting down"
+                    );
                     break;
                 }
             }

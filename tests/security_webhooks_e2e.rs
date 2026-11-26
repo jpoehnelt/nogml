@@ -105,6 +105,7 @@ async fn rule_webhooks_enforce_admin_scope_ssrf_allowlist_and_no_redirects() {
         ScopedTokenConfig {
             token: "tok_write".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -113,6 +114,7 @@ async fn rule_webhooks_enforce_admin_scope_ssrf_allowlist_and_no_redirects() {
         ScopedTokenConfig {
             token: "tok_admin".to_string(),
             mailbox_id: Some("agent@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,

@@ -239,6 +239,7 @@ async fn e2e_scoped_readonly_token_enforced_across_v1_gmail_batch_mcp_and_imap()
         ScopedTokenConfig {
             token: "tok-read-only".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -247,6 +248,7 @@ async fn e2e_scoped_readonly_token_enforced_across_v1_gmail_batch_mcp_and_imap()
         ScopedTokenConfig {
             token: "tok-read-write".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write],
             draft_only: None,
             allowed_recipients: None,
@@ -255,6 +257,7 @@ async fn e2e_scoped_readonly_token_enforced_across_v1_gmail_batch_mcp_and_imap()
         ScopedTokenConfig {
             token: "tok-admin".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,
@@ -564,6 +567,7 @@ async fn e2e_scoped_agent_policy_overrides_enforce_draft_only_allowlist_and_max_
         ScopedTokenConfig {
             token: "tok-draft-only".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
             draft_only: Some(true),
             allowed_recipients: None,
@@ -572,6 +576,7 @@ async fn e2e_scoped_agent_policy_overrides_enforce_draft_only_allowlist_and_max_
         ScopedTokenConfig {
             token: "tok-narrow-rcpt".to_string(),
             mailbox_id: None,
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
             draft_only: Some(false),
             allowed_recipients: Some(vec!["@allowed.example".to_string()]),
@@ -1148,6 +1153,7 @@ async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pr
         ScopedTokenConfig {
             token: "tok-alice-read".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Read],
             draft_only: None,
             allowed_recipients: None,
@@ -1156,6 +1162,7 @@ async fn e2e_oauth2_hardening_auth_redirect_allowlist_scope_cap_pkce_and_code_pr
         ScopedTokenConfig {
             token: "tok-alice-admin".to_string(),
             mailbox_id: Some("alice@example.com".to_string()),
+            shared_mailboxes: Vec::new(),
             scopes: vec![AuthScope::Admin],
             draft_only: None,
             allowed_recipients: None,

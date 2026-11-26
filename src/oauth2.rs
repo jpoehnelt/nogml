@@ -118,6 +118,7 @@ impl OAuth2Verifier {
         }
         Ok(Principal {
             mailbox_id: claims.sub,
+            shared_mailboxes: Vec::new(),
             scopes: claims.scopes,
             agent_policy: claims.agent_policy,
         })
@@ -1120,6 +1121,7 @@ async fn token_handler(State(state): State<AppState>, headers: HeaderMap, body: 
                 };
                 let orig = Principal {
                     mailbox_id: claims.sub.clone(),
+                    shared_mailboxes: Vec::new(),
                     scopes: claims.scopes.clone(),
                     agent_policy: claims.agent_policy.clone(),
                 };

@@ -2151,6 +2151,7 @@ impl AuthProvider for ScopedCustomAuth {
         match token {
             Some("scoped-agent-jwt") => Ok(Principal {
                 mailbox_id: "agent@example.com".to_string(),
+                shared_mailboxes: Vec::new(),
                 scopes: vec![AuthScope::Read, AuthScope::Write, AuthScope::Send],
                 agent_policy: Some(AgentPolicyOverride {
                     draft_only: Some(false),
@@ -2169,6 +2170,7 @@ impl AuthProvider for ScopedCustomAuth {
         if username == "custom-imap-user" && password == "custom-imap-pass" {
             Ok(Principal {
                 mailbox_id: "agent@example.com".to_string(),
+                shared_mailboxes: Vec::new(),
                 scopes: vec![AuthScope::Read, AuthScope::Write],
                 agent_policy: None,
             })
