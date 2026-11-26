@@ -405,6 +405,9 @@ impl SyncSource for GmailApiSyncSource {
                     }
                     pushed += 1;
                 }
+                LocalMutationKind::AppendMessage { .. } => {
+                    // Handled by IMAP APPEND pushback (and future Gmail API pushback).
+                }
             }
         }
 

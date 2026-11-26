@@ -235,6 +235,10 @@ fn default_gmail_imap_mailbox() -> String {
     "[Gmail]/All Mail".to_string()
 }
 
+fn default_gmail_imap_archive_mailbox() -> String {
+    "Archive".to_string()
+}
+
 /// Per-account upstream Gmail sync configuration entry parsed from `[[sync.accounts]]`.
 ///
 /// Implements a custom [`fmt::Debug`] that replaces all credential and token fields
@@ -276,6 +280,12 @@ pub struct SyncAccountConfig {
     pub gmail_imap_password: Option<String>,
     #[serde(default = "default_gmail_imap_mailbox")]
     pub gmail_imap_mailbox: String,
+    #[serde(default)]
+    pub gmail_imap_folders: Vec<String>,
+    #[serde(default = "default_gmail_imap_archive_mailbox")]
+    pub gmail_imap_archive_mailbox: String,
+    #[serde(default)]
+    pub gmail_imap_idle: bool,
 }
 
 impl Default for SyncAccountConfig {
@@ -300,6 +310,9 @@ impl Default for SyncAccountConfig {
             gmail_imap_user: None,
             gmail_imap_password: None,
             gmail_imap_mailbox: default_gmail_imap_mailbox(),
+            gmail_imap_folders: Vec::new(),
+            gmail_imap_archive_mailbox: default_gmail_imap_archive_mailbox(),
+            gmail_imap_idle: false,
         }
     }
 }
@@ -338,39 +351,49 @@ impl fmt::Debug for SyncAccountConfig {
                 &redacted_opt_debug(&self.gmail_imap_password),
             )
             .field("gmail_imap_mailbox", &self.gmail_imap_mailbox)
+            .field("gmail_imap_folders", &self.gmail_imap_folders)
+            .field(
+                "gmail_imap_archive_mailbox",
+                &self.gmail_imap_archive_mailbox,
+            )
+            .field("gmail_imap_idle", &self.gmail_imap_idle)
             .finish()
     }
 }
 
 impl SyncAccountConfig {
+    /// Returns `true` when Gmail OAuth2 credentials (static access token or refresh flow) are set.
+    pub fn has_gmail_oauth2(&self) -> bool {
+        self.gmail_access_token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || (self
+                .gmail_client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                && self
+                    .gmail_client_secret
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && self
+                    .gmail_refresh_token
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()))
+    }
+
     /// Returns `true` when upstream Gmail sync credentials are configured for this account.
     pub fn is_configured(&self) -> bool {
         match self.mode {
-            SyncMode::Api => {
-                self.gmail_access_token
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || (self
-                        .gmail_client_id
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                        && self
-                            .gmail_client_secret
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty())
-                        && self
-                            .gmail_refresh_token
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty()))
-            }
+            SyncMode::Api => self.has_gmail_oauth2(),
             SyncMode::Imap => {
                 self.gmail_imap_user
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
-                    && self
+                    && (self
                         .gmail_imap_password
                         .as_deref()
                         .is_some_and(|s| !s.is_empty())
+                        || self.has_gmail_oauth2())
             }
         }
     }
@@ -411,6 +434,9 @@ impl SyncAccountConfig {
         cfg.gmail_imap_user = self.gmail_imap_user.clone();
         cfg.gmail_imap_password = self.gmail_imap_password.clone();
         cfg.gmail_imap_mailbox = self.gmail_imap_mailbox.clone();
+        cfg.gmail_imap_folders = self.gmail_imap_folders.clone();
+        cfg.gmail_imap_archive_mailbox = self.gmail_imap_archive_mailbox.clone();
+        cfg.gmail_imap_idle = self.gmail_imap_idle;
         cfg
     }
 
@@ -443,6 +469,9 @@ impl SyncAccountConfig {
             "gmail_imap_user": self.gmail_imap_user,
             "gmail_imap_password": redact_opt(&self.gmail_imap_password),
             "gmail_imap_mailbox": self.gmail_imap_mailbox,
+            "gmail_imap_folders": self.gmail_imap_folders,
+            "gmail_imap_archive_mailbox": self.gmail_imap_archive_mailbox,
+            "gmail_imap_idle": self.gmail_imap_idle,
         })
     }
 }
@@ -616,6 +645,18 @@ pub struct Config {
     pub gmail_imap_user: Option<String>,
     pub gmail_imap_password: Option<String>,
     pub gmail_imap_mailbox: String,
+    /// Optional list of IMAP folders to sync with independent per-folder checkpoints
+    /// (`NOGML_GMAIL_IMAP_FOLDERS` / `[sync].gmail_imap_folders`). When non-empty, supersedes
+    /// the single `gmail_imap_mailbox` setting for multi-folder IMAP servers.
+    #[serde(default)]
+    pub gmail_imap_folders: Vec<String>,
+    /// Target archive folder for non-Gmail IMAP servers without `X-GM-EXT-1` (default `"Archive"`).
+    #[serde(default = "default_gmail_imap_archive_mailbox")]
+    pub gmail_imap_archive_mailbox: String,
+    /// When `true`, maintain a dedicated read-only background IMAP `IDLE` connection to trigger
+    /// immediate incremental sync on server updates (default `false`).
+    #[serde(default)]
+    pub gmail_imap_idle: bool,
     pub sync_interval_secs: u64,
     pub sync_query: Option<String>,
     pub sync_max_messages: Option<usize>,
@@ -779,6 +820,9 @@ impl Default for Config {
             gmail_imap_user: None,
             gmail_imap_password: None,
             gmail_imap_mailbox: "[Gmail]/All Mail".to_string(),
+            gmail_imap_folders: Vec::new(),
+            gmail_imap_archive_mailbox: default_gmail_imap_archive_mailbox(),
+            gmail_imap_idle: false,
             sync_interval_secs: 0,
             sync_query: None,
             sync_max_messages: None,
@@ -983,21 +1027,49 @@ impl Config {
     }
 
     /// Returns `true` when either legacy `[sync]` or any `[[sync.accounts]]` entry has
-    /// background sync enabled (`interval_secs > 0`).
+    /// background sync enabled (`interval_secs > 0` or IMAP `IDLE` enabled).
     pub fn has_background_sync(&self) -> bool {
-        self.sync_interval_secs > 0 || self.sync_accounts.iter().any(|a| a.interval_secs > 0)
+        self.sync_interval_secs > 0
+            || (self.sync_mode == SyncMode::Imap && self.gmail_imap_idle)
+            || self
+                .sync_accounts
+                .iter()
+                .any(|a| a.interval_secs > 0 || (a.mode == SyncMode::Imap && a.gmail_imap_idle))
+    }
+
+    /// Returns `true` when Gmail OAuth2 credentials (static access token or refresh flow) are set.
+    pub fn has_gmail_oauth2(&self) -> bool {
+        self.gmail_access_token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || (self
+                .gmail_client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                && self
+                    .gmail_client_secret
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && self
+                    .gmail_refresh_token
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()))
     }
 
     /// Returns `true` when any upstream Gmail sync credentials are configured.
     pub fn gmail_sync_configured(&self) -> bool {
         match self.sync_mode {
-            SyncMode::Api => {
-                self.gmail_access_token.is_some()
-                    || (self.gmail_client_id.is_some()
-                        && self.gmail_client_secret.is_some()
-                        && self.gmail_refresh_token.is_some())
+            SyncMode::Api => self.has_gmail_oauth2(),
+            SyncMode::Imap => {
+                self.gmail_imap_user
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && (self
+                        .gmail_imap_password
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty())
+                        || self.has_gmail_oauth2())
             }
-            SyncMode::Imap => self.gmail_imap_user.is_some() && self.gmail_imap_password.is_some(),
         }
     }
 
@@ -1122,6 +1194,9 @@ impl Config {
             gmail_imap_user,
             gmail_imap_password,
             gmail_imap_mailbox,
+            gmail_imap_folders,
+            gmail_imap_archive_mailbox,
+            gmail_imap_idle,
             sync_interval_secs,
             sync_query,
             sync_max_messages,
@@ -1295,6 +1370,9 @@ impl Config {
                 "gmail_imap_user": gmail_imap_user,
                 "gmail_imap_password": redact_opt(gmail_imap_password),
                 "gmail_imap_mailbox": gmail_imap_mailbox,
+                "gmail_imap_folders": gmail_imap_folders,
+                "gmail_imap_archive_mailbox": gmail_imap_archive_mailbox,
+                "gmail_imap_idle": gmail_imap_idle,
                 "accounts": redacted_sync_accounts,
             },
             "watch": {
@@ -1811,6 +1889,9 @@ impl fmt::Debug for Config {
             gmail_imap_user,
             gmail_imap_password,
             gmail_imap_mailbox,
+            gmail_imap_folders,
+            gmail_imap_archive_mailbox,
+            gmail_imap_idle,
             sync_interval_secs,
             sync_query,
             sync_max_messages,
@@ -1948,6 +2029,9 @@ impl fmt::Debug for Config {
             .field("gmail_imap_user", gmail_imap_user)
             .field("gmail_imap_password", &redacted_opt(gmail_imap_password))
             .field("gmail_imap_mailbox", gmail_imap_mailbox)
+            .field("gmail_imap_folders", gmail_imap_folders)
+            .field("gmail_imap_archive_mailbox", gmail_imap_archive_mailbox)
+            .field("gmail_imap_idle", gmail_imap_idle)
             .field("sync_interval_secs", sync_interval_secs)
             .field("sync_query", sync_query)
             .field("sync_max_messages", sync_max_messages)
@@ -2324,6 +2408,9 @@ pub struct SyncTomlConfig {
     pub gmail_imap_user: Option<String>,
     pub gmail_imap_password: Option<String>,
     pub gmail_imap_mailbox: Option<String>,
+    pub gmail_imap_folders: Option<Vec<String>>,
+    pub gmail_imap_archive_mailbox: Option<String>,
+    pub gmail_imap_idle: Option<bool>,
     pub accounts: Option<Vec<SyncAccountConfig>>,
 }
 
@@ -2360,6 +2447,12 @@ impl std::fmt::Debug for SyncTomlConfig {
                 &redacted_opt_debug(&self.gmail_imap_password),
             )
             .field("gmail_imap_mailbox", &self.gmail_imap_mailbox)
+            .field("gmail_imap_folders", &self.gmail_imap_folders)
+            .field(
+                "gmail_imap_archive_mailbox",
+                &self.gmail_imap_archive_mailbox,
+            )
+            .field("gmail_imap_idle", &self.gmail_imap_idle)
             .field("accounts", &self.accounts)
             .finish()
     }
@@ -2800,6 +2893,15 @@ impl TomlConfig {
         }
         if let Some(ref v) = self.sync.gmail_imap_mailbox {
             cfg.gmail_imap_mailbox = v.clone();
+        }
+        if let Some(ref v) = self.sync.gmail_imap_folders {
+            cfg.gmail_imap_folders = v.clone();
+        }
+        if let Some(ref v) = self.sync.gmail_imap_archive_mailbox {
+            cfg.gmail_imap_archive_mailbox = v.clone();
+        }
+        if let Some(v) = self.sync.gmail_imap_idle {
+            cfg.gmail_imap_idle = v;
         }
         if let Some(ref accounts) = self.sync.accounts {
             cfg.sync_accounts = accounts

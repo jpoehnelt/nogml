@@ -1358,6 +1358,8 @@ async fn exercise_mail_store_roundtrip(store: &dyn MailStore) -> (String, String
             imap_mailbox: None,
             imap_uid_validity: None,
             imap_last_uid: None,
+            imap_highest_modseq: None,
+            imap_folder_states: Default::default(),
             last_sync_at: None,
             last_full_sync_at: None,
             status: "idle".to_string(),

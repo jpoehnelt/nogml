@@ -2993,6 +2993,44 @@ impl MailStore for MemoryStore {
         )
     }
 
+    async fn update_synced_message_flags(
+        &self,
+        id: &str,
+        is_answered: bool,
+        is_deleted: bool,
+    ) -> AppResult<Option<StoredMessage>> {
+        let mut state = self.write_state()?;
+        let Some(msg) = state.messages.get_mut(id) else {
+            return Ok(None);
+        };
+        if msg.is_answered != is_answered || msg.is_deleted != is_deleted {
+            let new_hid = state.bump_history_id();
+            let msg = state.messages.get_mut(id).expect("checked above");
+            msg.is_answered = is_answered;
+            msg.is_deleted = is_deleted;
+            msg.history_id = new_hid;
+            return Ok(Some(msg.clone()));
+        }
+        Ok(Some(msg.clone()))
+    }
+
+    async fn link_message_upstream_id(
+        &self,
+        message_id: &str,
+        upstream_gmail_id: &str,
+        upstream_thread_id: Option<&str>,
+    ) -> AppResult<bool> {
+        let mut state = self.write_state()?;
+        let Some(msg) = state.messages.get_mut(message_id) else {
+            return Ok(false);
+        };
+        msg.upstream_gmail_id = Some(upstream_gmail_id.to_string());
+        if let Some(tid) = upstream_thread_id {
+            msg.upstream_thread_id = Some(tid.to_string());
+        }
+        Ok(true)
+    }
+
     async fn find_message_by_upstream_id(
         &self,
         upstream_gmail_id: &str,
