@@ -1,57 +1,121 @@
 # nogml
 
-`nogml` is a headless Rust email server built for AI agents and Gmail API clients. It runs as a single binary backed by embedded SQLite FTS5 by default.
+`nogml` is a headless, pluggable Rust email server built for AI agents, Gmail API clients, and IMAP clients.
 
-It exposes four protocols against one mailbox store:
+Start with a single binary backed by embedded SQLite FTS5, and swap any backend layer (storage, blobs, outbound transport, inbound filtering, authentication, search, outbound guardrails, custom domain provisioning, upstream sync, or cross-node events) through `nogml.toml` / environment variables or custom Rust trait implementations without touching protocol code.
 
-- An MCP server over stdio (`nogml mcp`) and Streamable HTTP (`POST /mcp`).
-- A JSON REST API (`/v1`) with real-time Server-Sent Events (`/v1/events`) and outbound safety checks.
-- A Gmail REST API v1 server (`/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`) for clients such as Superhuman and official Google SDKs.
-- An IMAP4rev1 server with `IDLE`, `MOVE`, `UIDPLUS`, `SPECIAL-USE`, `CHILDREN`, `XLIST`, `COMPRESS=DEFLATE`, `UTF8=ACCEPT`, `QUOTA`, `APPENDLIMIT`, `STATUS=SIZE`, `WITHIN`, `STARTTLS`, `AUTH=XOAUTH2`, `AUTH=OAUTHBEARER`, and Gmail `X-GM-EXT-1` extensions.
+Every backend feeds four protocols against one mailbox core:
 
-Outbound mail sends through Resend by default, with built-in AWS SESv2 raw MIME, SMTP submission (including `AUTH XOAUTH2`), and native Gmail REST API (`GmailApiTransport`) backends (`NOGML_TRANSPORT=resend|ses|smtp|gmail`). Inbound mail arrives through Svix-verified Resend webhooks (`POST /webhooks/resend`), AWS SNS/SES webhooks (`POST /webhooks/ses` with inline base64 or SigV4 S3 `.eml` fetches), or upstream Gmail sync (REST API or IMAP).
+- **MCP server** over stdio (`nogml mcp`) and Streamable HTTP (`POST /mcp`) with 27 tools, `nogml://` resources, and 4 built-in prompts.
+- **AI JSON REST API (`/v1`)** with real-time Server-Sent Events (`/v1/events`), OpenAPI 3.1 (`GET /v1/openapi.json`), and composable outbound safety guardrails.
+- **Gmail REST API v1** (`/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`) for clients such as Superhuman and official Google SDKs.
+- **IMAP4rev1 server** with `X-GM-EXT-1`, `COMPRESS=DEFLATE`, `UTF8=ACCEPT`, `QUOTA`, `XLIST`, `CHILDREN`, `CONDSTORE`/`QRESYNC`, `IDLE`, `SORT`, `THREAD`, `ESEARCH`, `LIST-STATUS`, `UNSELECT`, `APPENDLIMIT`, `STATUS=SIZE`, `WITHIN`, `STARTTLS`, `AUTH=XOAUTH2`, and `AUTH=OAUTHBEARER`.
 
-## Features
+## Pluggable architecture
 
-- **AI REST API (`/v1`) and SSE (`/v1/events`)**: Returns parsed text, automatic HTML-to-Markdown conversion for HTML-only or stub plain-text emails, tracking-pixel stripping on HTML previews and extracted HTML link inspection (`links` with `domain_mismatch` detection on `CompactMessage`), bounded attachment text extraction (`GET /v1/messages/{id}/attachments/{attachment_id}/text` and `?extract_attachment_text=true` for `.txt`, `.csv`, `.md`, `.json`, `.html`, `.ics`, and `.pdf`), persistent per-mailbox thread annotations and extracted JSON state (`GET`/`PUT`/`PATCH`/`DELETE /v1/threads/{id}/annotations`, included on `ThreadSummary` and `ThreadDetail` and filterable via `GET /v1/threads?needs_reply=true&waiting_on=me`), a single-call reply context (`GET /v1/threads/{id}/reply-context` and MCP `get_reply_context`) that returns the quote-stripped thread, its annotation, participant contact profiles, recent sent style samples to the primary recipient, and related threads, atomic batch thread triage (`POST /v1/threads/batch_triage` supporting per-thread operations, thread ID lists, Gmail `q=` query matching, `dry_run` label-diff previews with zero writes or events, and a `max_threads` safety cap), thread snoozing (`POST`/`DELETE /v1/threads/{id}/snooze`) and scheduled outbound sends (`send_at` on `POST /v1/messages/send`, `GET /v1/scheduled`, `DELETE /v1/scheduled/{id}`) driven by a background scheduler in `nogml serve`, a per-mailbox contact graph with automatic VIP detection (`GET /v1/contacts`, `GET /v1/contacts/{email}`, `PATCH /v1/contacts/{email}`, plus `sender_contact` summaries on messages and threads), event-driven inbox rules (`GET`/`POST`/`PATCH`/`DELETE /v1/rules` and `POST /v1/rules/{id}/test` dry-run) that match Gmail queries or VIP senders on inbound ingestion to mutate labels, archive, mark read, and deliver async HMAC-SHA256 signed compact JSON webhooks (`X-Nogml-Signature`) without base64 decoding, and a compact daily briefing (`GET /v1/briefing?since=&followup_days=&limit=`) that lists unread VIP threads, `needs_reply` or `waiting_on=me` threads, sent threads with no reply after `followup_days` (default 3), pending approvals, and due snoozes with counts and no full bodies. Supports quote stripping, body character limits, `?fields=` projection masks, `dry_run` send previews, `draft_only`, `allowed_recipients`, first-contact approval gates (`first_contact_approval`), outbound secret and PII DLP scanning (`dlp_action=off|hold|deny`), persistent human-in-the-loop send approvals (`/v1/approvals` with optional webhook notifications), 24-hour send and draft idempotency keys (`idempotency_key` body field or `Idempotency-Key` HTTP header), an immutable append-only audit log (`GET /v1/audit` across `/v1`, `/mcp`, and `/gmail/v1`), RFC 2369/8058 unsubscribe header detection and safe `POST /v1/messages/{id}/unsubscribe` (with SSRF protection and outbound policy checks), control and BiDi character stripping, and `Last-Event-ID` event replay.
-- **Built-in MCP server (`nogml mcp` and `POST /mcp`)**: Implements JSON-RPC 2.0 over stdio (logging strictly to stderr) and Streamable HTTP. Exposes 27 tools (`search_emails`, `list_threads`, `read_thread`, `read_email`, `read_attachment_text`, `send_email`, `create_draft`, `send_draft`, `triage_thread`, `batch_triage`, `snooze_thread`, `list_scheduled_sends`, `cancel_scheduled_send`, `annotate_thread`, `get_thread_annotations`, `get_reply_context`, `modify_labels`, `unsubscribe`, `list_labels`, `lookup_contact`, `list_vips`, `get_briefing`, `list_rules`, `create_rule`, `delete_rule`, `sync_gmail`, `sync_status`), `nogml://` resources (including `nogml://briefing`), and four built-in MCP prompts (`triage_inbox`, `daily_briefing`, `draft_reply`, `find_followups`) served by `prompts/list` and `prompts/get`. The prompts guide an agent through dry-run triage, daily briefings, reply drafting, and follow-up drafting, and always keep you in the loop before anything is archived, trashed, or sent.
-- **Gmail REST API v1**: Implements `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch` and `stop` (with optional push webhook delivery), `settings/*` (`sendAs` including `PATCH` and `/verify`, `filters` automatically evaluated on inbound mail, `forwardingAddresses`, `delegates`, `language`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...` (`media`, `multipart`, and chunked `resumable` uploads), `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, and Gmail `q=` search operators.
-- **Embedded IMAP4rev1 server**: Serves standard IMAP clients (Thunderbird, Apple Mail, mutt, `async-imap`) over TCP, `STARTTLS`, or implicit TLS with `COMPRESS=DEFLATE`, `UTF8=ACCEPT`, `QUOTA`, `XLIST`, `CHILDREN`, `APPENDLIMIT`, `STATUS=SIZE`, `WITHIN`, `CONDSTORE`/`QRESYNC`, and `AUTH=OAUTHBEARER`/`AUTH=XOAUTH2`. Maps Gmail labels to folders including `[Gmail]/All Mail` and `[Gmail]/Important`, syncs flags to labels, supports `X-GM-MSGID`, `X-GM-THRID`, `X-GM-LABELS`, and `X-GM-RAW`, and pushes updates over `IDLE`.
-- **Pluggable mail transports (Resend, AWS SES, SMTP, Gmail API)**: Sends outbound mail via Resend (`POST /emails` with `Idempotency-Key`), AWS SESv2 raw MIME (`POST /v2/email/outbound-emails` signed with AWS SigV4), direct SMTP (`STARTTLS`, implicit TLS, or plain TCP with `AUTH PLAIN`, `AUTH LOGIN`, or `AUTH XOAUTH2` and RFC 5321 dot-stuffing), or native Gmail REST API (`POST /gmail/v1/users/me/messages/send` with automatic OAuth2 401 refresh retry, `threadId` threading, and `upstream_gmail_id` dedup). Verifies `POST /webhooks/resend` Svix HMAC-SHA256 signatures and handles `POST /webhooks/ses` SNS notifications (inline base64 or S3 downloads) through the same inbound ingestion and filtering pipeline.
-- **Upstream Gmail sync (`SyncSource`)**: Imports existing Gmail accounts via pluggable `SyncSource` connectors (`GmailApiSyncSource` for Gmail REST API v1 with OAuth2 refresh, paginated backfill, drafts pull/push, and incremental `history.list` with automatic 404 full resync, or `GmailImapSyncSource` for Gmail IMAP with `X-GM-EXT-1` and UID checkpointing). Deduplicates by upstream Gmail ID and RFC 2822 `Message-ID`, and supports optional bidirectional pushback (`NOGML_SYNC_BIDIRECTIONAL=true`) for label changes, trash/delete, drafts (`drafts.create`/`update`/`delete`), locally created Sent and imported messages (`messages.import`), and custom labels (`labels.create`/`patch`/`delete`).
-- **CLI (`nogml mail`, `nogml crypto`)**: Runs against the local store or a remote server (`--url`). Outputs JSON automatically when stdout is not a TTY, supports `--ndjson`, `--fields`, and `--payload @-`, provides AES-256-GCM encryption at rest with `nogml crypto generate-key` and `nogml crypto rotate-key`, and returns deterministic exit codes (`0` ok, `2` validation or config error, `3` policy block, `4` auth or upstream error, `1` runtime error).
-
-## Pluggable traits
-
-Protocol code (MIME parsing and building, threading, Gmail `q=` parsing, `?fields=` masking, HTTP batching, IMAP wire codec, and MCP JSON-RPC) is concrete. Backend storage, delivery, filtering, auth, search, and outbound policy sit behind seven async traits on `AppState`:
+All protocol mechanics (MIME parsing and building, RFC 5322 threading, Gmail `q=` query parsing, `?fields=` projection masks, HTTP batching, IMAP wire codec, and MCP JSON-RPC) are concrete and shared. Every infrastructure dependency sits behind async Rust traits on `AppState` so you can mix and match built-in backends by configuration or plug in your own implementations when embedding `nogml` as a crate.
 
 ```text
-  HTTP (/v1, /gmail/v1, /mcp, /webhooks/resend, /webhooks/ses) | IMAP4rev1 | MCP stdio | CLI / Sync
-  -------------------------------------------------------------------------------------------------
-                                              AppState
-  +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
-  | MailStore  | | BlobStore | | MailTransport | | InboundFilter | | AuthProvider | | SearchIndex | | OutboundPolicy |
-  +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
-  | SqliteStore| | Inline    | | ResendTransp. | | NoopFilter    | | StaticToken  | | StoreSearch | | ConfigPolicy   |
-  | MemoryStore| | FsBlob    | | SesTransport  | | FilterChain   | | (JWT / OIDC) | | HybridSearch| | (Approval /    |
-  | (Postgres) | | MemoryBlob| | SmtpTransport | | AuthResults   | |              | | (FTS5+Vec)  | |  DLP / Budget) |
-  |            | | S3Blob    | |               | | Rspamd / LLM  | |              | |             | |                |
-  +------------+ +-----------+ +---------------+ +---------------+ +--------------+ +-------------+ +----------------+
+  HTTP (/v1, /gmail/v1, /mcp, /webhooks/resend, /webhooks/ses) | IMAP4rev1 | MCP stdio | CLI
+  ==========================================================================================
+                                     Protocol & MIME Core
+  ------------------------------------------------------------------------------------------
+                                           AppState
+  +-------------+ +------------+ +---------------+ +---------------+ +--------------+
+  | MailStore   | | BlobStore  | | MailTransport | | InboundFilter | | AuthProvider |
+  +-------------+ +------------+ +---------------+ +---------------+ +--------------+
+  | SqliteStore | | Inline     | | Resend        | | NoopFilter    | | StaticToken  |
+  | MemoryStore | | FsBlob     | | AWS SESv2     | | FilterChain   | | Scoped Keys  |
+  | Postgres*   | | MemoryBlob | | SMTP / XOAUTH2| | AuthResults   | | Local OAuth2 |
+  +-------------+ | S3 / R2    | | Gmail API     | | Rspamd / LLM  | +--------------+
+                  +------------+ +---------------+ +---------------+
+
+  +-----------------+ +---------------------+ +----------------+ +--------------+ +-------------+
+  | SearchIndex     | | OutboundPolicy      | | DomainProvider | | SyncSource   | | EventBridge |
+  +-----------------+ +---------------------+ +----------------+ +--------------+ +-------------+
+  | StoreSearch     | | ConfigPolicy        | | SesDomain      | | GmailApiSync | | In-process  |
+  | HybridSearch    | | FirstContactPolicy  | | ResendDomain   | | GmailImapSync| | Postgres    |
+  |  + Embedding    | | DlpOutboundPolicy   | | ManualDomain   | +--------------+ | LISTEN/     |
+  |  + VectorStore  | | VerifiedFromDomain  | +----------------+                  | NOTIFY*     |
+  +-----------------+ | Deliverability      |                                     +-------------+
+                      +---------------------+           (* enabled with `--features postgres`)
 ```
 
-| Trait | Module | Built-in implementations | Role |
-| --- | --- | --- | --- |
-| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore`, `PostgresStore` (`--features postgres`) | Messages, threads, thread annotations, snoozed threads, scheduled sends, labels, drafts, contacts, inbox rules, pending approvals, idempotency keys, immutable audit log, history, IMAP UIDs, watch state, and sync state |
-| `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | Raw RFC 2822 bytes and attachment blobs (inline, atomic local disk, memory, or AWS S3, Cloudflare R2, and MinIO via SigV4) |
-| `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport`, `GmailApiTransport` | Outbound delivery carrying structured fields and verbatim RFC 2822 bytes |
-| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | Pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` hook on Resend/SES webhooks, Gmail import, IMAP `APPEND`, and Gmail sync (runs `auth_results` -> `rspamd` -> `llm_triage` and short-circuits on `Reject`/`Spam`) |
-| `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` (static tokens, scoped API keys, local OAuth2 HS256 JWTs) | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP (`LOGIN`, `PLAIN`, `XOAUTH2`) authentication returning `Principal`, scopes, and per-agent safety overrides |
-| `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` | Full-text or hybrid FTS5 plus cosine-similarity vector search (with RRF fusion) used by `/v1/search`, MCP `search_emails`, and `nogml mail search` |
-| `OutboundPolicy` | `src/ai/safety.rs`, `src/deliverability.rs` | `ConfigOutboundPolicy`, `OutboundPolicyChain`, `FirstContactPolicy`, `DlpOutboundPolicy`, `VerifiedFromDomainPolicy`, `DeliverabilityPolicy` (`SuppressionListPolicy`, `DomainQuotaPolicy`, `DeliverabilityCircuitBreakerPolicy`) | Composable send guardrails (`Allow`, `DowngradeToDraft`, `HoldForApproval` returning 202 and queueing for `/v1/approvals`, `Deny` returning 403), persistent suppression lists auto-populated from Resend and AWS SES SNS bounce/complaint webhooks, per-domain daily send limits, rolling bounce/complaint circuit breakers (`/v1/suppression`, `/v1/deliverability/stats`, `/v1/deliverability/domains/{domain}/resume`), first-contact approval gating, verified `From` domain anti-spoofing, outbound secret and PII DLP scanning, and `dry_run` checks |
-| `DomainProvider` | `src/domains/` | `SesDomainProvider`, `ResendDomainProvider`, `ManualDomainProvider` | Self-serve BYOD custom domain onboarding (`/v1/domains`), DNS record provisioning, live verification checks, and verified catch-all inbound routing |
-| `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | Pluggable upstream pull and optional bidirectional pushback sharing single-flight locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
+### Core pluggable traits
 
-Query `GET /v1/capabilities` to see the active backend names under `.backends`.
+| Trait | Module | Built-in implementations | Config selector | Role |
+| --- | --- | --- | --- | --- |
+| `MailStore` | `src/storage/` | `SqliteStore` (WAL + FTS5), `MemoryStore`, `PostgresStore` (`--features postgres`) | `NOGML_STORAGE` | Messages, threads, annotations, snoozes, scheduled sends, labels, drafts, contacts, rules, approvals, idempotency keys, audit log, history, IMAP UIDs, domains, suppressions, and sync state |
+| `BlobStore` | `src/blob/` | `InlineBlobStore`, `FsBlobStore`, `MemoryBlobStore`, `S3BlobStore` | `NOGML_BLOB_BACKEND` | Raw RFC 2822 bytes and attachment binaries stored inline, atomically on local disk, in memory, or in AWS S3 / Cloudflare R2 / MinIO via SigV4 |
+| `MailTransport` | `src/transport/` | `ResendTransport`, `SesTransport`, `SmtpTransport`, `GmailApiTransport` | `NOGML_TRANSPORT` | Outbound delivery via Resend, AWS SESv2 raw MIME, direct SMTP (`PLAIN`/`LOGIN`/`XOAUTH2`), or upstream Gmail REST API (`messages.send`) |
+| `InboundFilter` | `src/filter/` | `NoopFilter`, `FilterChain`, `AuthResultsFilter`, `RspamdFilter`, `LlmTriageFilter` | `NOGML_FILTER_*`, `NOGML_RSPAMD_URL`, `NOGML_LLM_TRIAGE_*` | Composable pre-storage `Allow`, `Spam`, `Reject`, or `Mutate` pipeline across webhooks, Gmail import, IMAP `APPEND`, and upstream sync |
+| `AuthProvider` | `src/auth.rs` | `StaticTokenAuthProvider` (global tokens, scoped per-mailbox keys, local OAuth2 HS256 JWTs) | `NOGML_AUTH_TOKENS`, `NOGML_SCOPED_TOKENS`, `NOGML_OAUTH2_*` | HTTP (`Authorization`, `X-API-Key`, `?access_token=`) and IMAP (`LOGIN`, `PLAIN`, `XOAUTH2`, `OAUTHBEARER`) auth returning `Principal`, scopes, `shared_mailboxes`, and per-agent guardrails |
+| `SearchIndex` | `src/search_index/` | `StoreSearchIndex`, `HybridSearchIndex` (composable over `EmbeddingProvider` + `VectorStore`) | `NOGML_SEARCH_BACKEND`, `NOGML_EMBEDDING_*` | Lexical FTS5/`tsvector` search or hybrid keyword + cosine-similarity vector search fused with Reciprocal Rank Fusion (`OpenAiEmbeddingProvider` + `SqliteVectorStore` / `PostgresVectorStore` / `MemoryVectorStore`) |
+| `OutboundPolicy` | `src/ai/safety.rs`, `src/deliverability.rs` | `OutboundPolicyChain`, `ConfigOutboundPolicy`, `FirstContactPolicy`, `DlpOutboundPolicy`, `VerifiedFromDomainPolicy`, `DeliverabilityPolicy` (`SuppressionListPolicy`, `DomainQuotaPolicy`, `DeliverabilityCircuitBreakerPolicy`) | `NOGML_DRAFT_ONLY`, `NOGML_REQUIRE_APPROVAL`, `NOGML_DLP_ACTION`, `NOGML_DAILY_SEND_LIMIT_PER_DOMAIN`, etc. | Composable outbound guardrails returning `Allow`, `DowngradeToDraft`, `HoldForApproval` (HTTP 202 queued to `/v1/approvals`), or `Deny` (HTTP 403), including `dry_run` previews |
+| `DomainProvider` | `src/domains/` | `SesDomainProvider`, `ResendDomainProvider`, `ManualDomainProvider` | `/v1/domains` (`provider`) | Self-serve BYOD custom domain onboarding, DNS record provisioning (DKIM/SPF/DMARC/MX), live verification checks, and catch-all inbound routing |
+| `SyncSource` | `src/sync/` | `GmailApiSyncSource`, `GmailImapSyncSource` | `NOGML_SYNC_MODE`, `[[sync.accounts]]` | Pluggable upstream pull and optional bidirectional pushback sharing per-mailbox locking, `SyncState` checkpoints, `InboundFilter`, and `EventBus` emission |
+| `EventBridge` | `src/events.rs`, `src/storage/postgres.rs` | Local in-process `EventBus`, `PostgresEventBridge` (`LISTEN`/`NOTIFY`) | Automatic with `NOGML_STORAGE=postgres` | Real-time fan-out across SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch` webhooks on single or multi-node deployments |
+
+Query `GET /v1/capabilities` at runtime to inspect every active backend under `.backends`.
+
+### Swap backends with config (zero code changes)
+
+The same binary scales from a local agent sandbox to a multi-node cluster by changing configuration:
+
+| Profile | `MailStore` | `BlobStore` | `MailTransport` | `SearchIndex` | `InboundFilter` & `OutboundPolicy` |
+| --- | --- | --- | --- | --- | --- |
+| Local AI agent dev | `sqlite` | `inline` | `resend` or `gmail` | `store` (FTS5) | `draft_only`, `dry_run`, `first_contact_approval` |
+| Single-VPS personal / team | `sqlite` | `fs` | `resend`, `ses`, `smtp`, or `gmail` | `hybrid` (Ollama / OpenAI) | `AuthResults` + `Rspamd` + `DlpOutboundPolicy` + `AES-256-GCM` |
+| Multi-user / multi-node SaaS | `postgres` (`LISTEN`/`NOTIFY`) | `s3` (S3 / R2 / MinIO) | `ses` or `resend` + BYOD `DomainProvider` | `hybrid` (`PostgresVectorStore`) | `VerifiedFromDomain` + `DeliverabilityPolicy` + `NOGML_ENCRYPTION_STRICT` |
+
+### Embed as a Rust library with custom traits
+
+Swap any subset of traits directly in Rust while keeping the full HTTP, MCP, Gmail API, IMAP, and webhook surface:
+
+```rust
+use std::sync::Arc;
+use nogml::{AppState, build_router, config::Config};
+
+// Swap individual backends onto the config-built AppState:
+let state = AppState::from_config(Config::default())?
+    .with_blobs(Arc::new(my_s3_blob_store))
+    .with_transport(Arc::new(my_ses_transport))
+    .with_filter(Arc::new(my_spam_filter_chain))
+    .with_auth(Arc::new(my_oidc_auth_provider))
+    .with_search(Arc::new(my_vector_search_index))
+    .with_outbound_policy(Arc::new(my_approval_policy))
+    .with_domain_provider(Arc::new(my_dns_domain_provider))
+    .with_cipher(Arc::new(my_secret_cipher));
+
+// Or pass a custom MailStore implementation directly via AppState::with_backends(config, store, resend).
+let router = build_router(state);
+```
+
+## Protocol and feature highlights
+
+- **AI REST API (`/v1`) and SSE (`/v1/events`)**:
+  - Clean agent-ready payloads: automatic HTML-to-Markdown conversion, quote stripping, body character limits, tracking-pixel stripping, extracted HTML link inspection (`links` with `domain_mismatch` flags), and bounded attachment text extraction (`.txt`, `.csv`, `.md`, `.json`, `.html`, `.ics`, `.pdf`).
+  - Agent workflow primitives: persistent thread annotations (`/v1/threads/{id}/annotations`), single-call `GET /v1/threads/{id}/reply-context`, atomic `POST /v1/threads/batch_triage` (with `dry_run` label-diff previews), thread snoozing (`/v1/threads/{id}/snooze`), scheduled sends (`send_at` / `/v1/scheduled`), per-mailbox contact graph and VIP detection (`/v1/contacts`), event-driven inbox rules with HMAC-SHA256 signed webhooks (`/v1/rules`), and compact daily briefings (`GET /v1/briefing`).
+  - Guardrails and compliance: composable `OutboundPolicyChain`, `dry_run` send previews, `draft_only`, `allowed_recipients`, `first_contact_approval`, outbound secret and PII DLP scanning (`dlp_action=off|hold|deny`), persistent human-in-the-loop approvals (`/v1/approvals`), 24-hour idempotency keys (`Idempotency-Key`), append-only audit log (`GET /v1/audit`), RFC 2369/8058 one-click unsubscribe with SSRF protection, BiDi/control character stripping, and SSE `Last-Event-ID` replay.
+- **Built-in MCP server (`nogml mcp` and `POST /mcp`)**:
+  - JSON-RPC 2.0 over stdio (logging strictly to stderr) and Streamable HTTP.
+  - Exposes 27 tools (`search_emails`, `list_threads`, `read_thread`, `read_email`, `read_attachment_text`, `send_email`, `create_draft`, `send_draft`, `triage_thread`, `batch_triage`, `snooze_thread`, `list_scheduled_sends`, `cancel_scheduled_send`, `annotate_thread`, `get_thread_annotations`, `get_reply_context`, `modify_labels`, `unsubscribe`, `list_labels`, `lookup_contact`, `list_vips`, `get_briefing`, `list_rules`, `create_rule`, `delete_rule`, `sync_gmail`, `sync_status`), `nogml://` resources (including `nogml://briefing`), and 4 built-in prompts (`triage_inbox`, `daily_briefing`, `draft_reply`, `find_followups`).
+- **Gmail REST API v1**:
+  - Full surface for Superhuman and official Google SDKs: `profile`, `messages`, `threads`, `labels`, `drafts`, `history`, `watch`/`stop`, `settings/*` (`sendAs` with `PATCH`/`verify`, `filters` evaluated automatically on inbound mail, `forwardingAddresses`, `delegates`, `language`, `vacation`, `autoForwarding`, `imap`, `pop`), `/upload/gmail/v1/...` (`media`, `multipart`, and chunked `resumable` uploads), `POST /batch/gmail/v1` `multipart/mixed` batching, `?fields=` partial responses, `/oauth2/v2|v3/userinfo`, `/v1/people/me`, and Gmail `q=` search operators.
+- **Embedded IMAP4rev1 server (`imap.gmail.com` parity)**:
+  - Serves Thunderbird, Apple Mail, mutt, `himalaya`, and `async-imap` over TCP, `STARTTLS`, or implicit TLS.
+  - Implements `X-GM-EXT-1` (`X-GM-MSGID`, `X-GM-THRID`, `X-GM-LABELS` fetch/search/store, `X-GM-RAW` backed by the Gmail query parser), `COMPRESS=DEFLATE` (with zip-bomb protection), `UTF8=ACCEPT`, `QUOTA` (`GETQUOTAROOT`/`GETQUOTA`), `XLIST`, `CHILDREN`, `CONDSTORE`/`QRESYNC`, `IDLE`, `SORT`, `THREAD` (`REFERENCES` and `ORDEREDSUBJECT`), `ESEARCH`, `LIST-EXTENDED`, `LIST-STATUS`, `UNSELECT`, `APPENDLIMIT`, `STATUS=SIZE`, `WITHIN` (`YOUNGER`/`OLDER`), `SASL-IR`, `LITERAL-`, `AUTH=XOAUTH2`, and `AUTH=OAUTHBEARER`.
+- **Upstream Gmail and generic IMAP sync (`SyncSource`)**:
+  - `GmailApiSyncSource`: OAuth2 refresh, paginated backfill, incremental `history.list` with 404 full-resync recovery, bidirectional drafts (`drafts.create`/`update`/`delete`), locally sent/imported message pushback (`messages.import`), and custom label pushback (`labels.create`/`patch`/`delete`).
+  - `GmailImapSyncSource`: `X-GM-EXT-1` bidirectional `X-GM-LABELS` pushback (including `\Inbox` archive/unarchive from `[Gmail]/All Mail`), non-Gmail `UID COPY`/`UID MOVE`, `APPEND` + `APPENDUID` dedup for local Sent/Drafts, `CONDSTORE`/`QRESYNC` flag and deletion pull updates, outbound `XOAUTH2` + `UTF8=ACCEPT`, multi-folder sync (`gmail_imap_folders`), and optional background `IDLE` wakeup (`gmail_imap_idle`).
+- **Multi-user, BYOD domains, encryption at rest, and deliverability**:
+  - Multi-mailbox isolation (`NOGML_MAILBOXES`), aliases (`NOGML_MAILBOX_ALIASES`), `shared_mailboxes` team access, and per-mailbox `[[sync.accounts]]`.
+  - BYOD custom domain onboarding (`/v1/domains`, `nogml domains`) for SES, Resend, and manual DNS with verified `From` anti-spoofing (`NOGML_REQUIRE_VERIFIED_FROM_DOMAIN`) and verified catch-all routing.
+  - Persistent suppression lists auto-populated from Resend and AWS SES SNS bounce/complaint webhooks, per-domain daily send limits, and rolling bounce/complaint circuit breakers (`/v1/suppression`, `/v1/deliverability/stats`).
+  - Pure-Rust `AES-256-GCM` encryption at rest (`src/crypto.rs`) with `zeroize` key handling, `NOGML_ENCRYPTION_STRICT`, and zero-downtime `nogml crypto rotate-key`.
+- **CLI and operations (`nogml`)**:
+  - `nogml mail`, `nogml config init|check`, `nogml doctor`, `nogml domains`, `nogml auth gmail|mint-token`, `nogml sync gmail`, `nogml storage migrate-blobs`, `nogml search reindex`, `nogml crypto generate-key|rotate-key`, `nogml schema`, and `nogml completions`.
+  - Automatic JSON output when stdout is not a TTY, `--ndjson`, `--fields`, `--payload @-`, and deterministic exit codes (`0` ok, `2` validation/config, `3` policy block, `4` auth/upstream, `1` runtime).
 
 ## Quickstart
 
@@ -105,7 +169,7 @@ nogml serve \
   --allowed-recipients @example.com,partner@acme.org
 ```
 
-Check health, readiness, capabilities, OpenAPI 3.1 schema, and Prometheus metrics:
+Check health, readiness, active pluggable backends, OpenAPI 3.1 schema, and Prometheus metrics:
 
 ```bash
 curl -s http://127.0.0.1:8080/healthz
@@ -146,7 +210,7 @@ nogml schema --openapi
 nogml completions zsh
 ```
 
-### 4. Sync a Gmail account (`nogml auth gmail`, `nogml sync gmail`)
+### 4. Sync a Gmail or IMAP account (`nogml auth gmail`, `nogml sync gmail`)
 
 Obtain an upstream Gmail OAuth2 refresh token using the loopback PKCE wizard (saved to a mode `0600` file, never logged), then run sync:
 
@@ -163,13 +227,13 @@ GMAIL_CLIENT_SECRET=... \
 GMAIL_REFRESH_TOKEN_FILE=./secrets/gmail_refresh_token \
 nogml sync gmail --mode api --max-messages 500
 
-# Upstream Gmail IMAP (App Password)
+# Upstream Gmail or generic IMAP (App Password or Gmail OAuth2 XOAUTH2)
 GMAIL_IMAP_USER=you@gmail.com \
 GMAIL_IMAP_PASSWORD=app-password \
 nogml sync gmail --mode imap
 ```
 
-Pass `--sync-interval-secs 60` to `nogml serve` to run sync periodically in the background. Set `NOGML_SYNC_BIDIRECTIONAL=true` (or pass `--sync-bidirectional`) to push local read, star, archive, label, trash, delete, draft (`drafts.create`/`update`/`delete`), locally created Sent or imported message (`messages.import`), and custom label (`labels.create`/`patch`/`delete`) changes back to upstream Gmail in API mode, or `UID STORE`/`UID MOVE`/`EXPUNGE` in IMAP mode. Set `NOGML_TRANSPORT=gmail` (or `transport = "gmail"` in `nogml.toml`) to send outbound mail directly through the Gmail REST API reusing the same OAuth2 credentials, or set `NOGML_TRANSPORT=smtp` with `NOGML_SMTP_HOST=smtp.gmail.com` and `NOGML_SMTP_OAUTH_TOKEN` (or Gmail OAuth2 credentials) to authenticate over SMTP `XOAUTH2`. Pushback counts and status are exposed on `GET /v1/sync/status`.
+Pass `--sync-interval-secs 60` to `nogml serve` to run sync periodically in the background (or enable `NOGML_GMAIL_IMAP_IDLE=true` for immediate IMAP push wakeups). Set `NOGML_SYNC_BIDIRECTIONAL=true` (or pass `--sync-bidirectional`) to push local read, star, archive, label, trash, delete, draft (`drafts.create`/`update`/`delete` or IMAP `APPEND`), locally created Sent or imported message (`messages.import` or IMAP `APPEND`), and custom label changes back upstream. Set `NOGML_TRANSPORT=gmail` (or `transport = "gmail"` in `nogml.toml`) to send outbound mail directly through the Gmail REST API reusing the same OAuth2 credentials, or set `NOGML_TRANSPORT=smtp` with `NOGML_SMTP_HOST=smtp.gmail.com` and `NOGML_SMTP_OAUTH_TOKEN` (or Gmail OAuth2 credentials) to authenticate over SMTP `XOAUTH2`. Pushback counts and status are exposed on `GET /v1/sync/status`.
 
 ### 5. Migrate blobs between backends (`nogml storage migrate-blobs`)
 
@@ -185,7 +249,7 @@ nogml storage migrate-blobs --db-path ./nogml.db --blob-backend inline --to s3
 
 ### 6. Enable hybrid semantic search (`nogml search reindex`)
 
-Set `NOGML_SEARCH_BACKEND=hybrid` with an OpenAI-compatible embeddings endpoint (OpenAI, Ollama `/v1`, Voyage, or Mistral) to combine FTS5 keyword search with vector cosine similarity via Reciprocal Rank Fusion (RRF). Embeddings are stored as little-endian `f32` blobs in SQLite (`message_embeddings`) with zero native extensions, and search falls back to lexical matching if the embedding endpoint is unavailable.
+Set `NOGML_SEARCH_BACKEND=hybrid` with an OpenAI-compatible embeddings endpoint (OpenAI, Ollama `/v1`, Voyage, or Mistral) to combine FTS5 keyword search with vector cosine similarity via Reciprocal Rank Fusion (RRF). Embeddings are stored as little-endian `f32` blobs in SQLite (`message_embeddings`) or PostgreSQL (`PostgresVectorStore`) with zero native extensions, and search falls back to lexical matching if the embedding endpoint is unavailable.
 
 ```bash
 # Backfill embeddings for an existing SQLite mailbox (for example with local Ollama)
@@ -207,7 +271,7 @@ NOGML_DATABASE_URL=postgres://postgres:postgres@db.internal:5432/nogml \
 nogml serve --bind 0.0.0.0:8080 --user-email agent@example.com
 ```
 
-`PostgresStore` creates its schema idempotently on startup, maintains atomic `history_id` and IMAP `uid_next` counters in PostgreSQL transactions, and uses PostgreSQL full-text search (`to_tsvector` and `plainto_tsquery` with `ILIKE` fallback). When `NOGML_STORAGE=postgres` is active, `EventBus` bridges events across nodes via PostgreSQL `LISTEN`/`NOTIFY` on the `nogml_events` channel (ignoring each node's own echoed notifications via a per-node UUID) so SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch` push hooks fan out across all replicas.
+`PostgresStore` creates its schema idempotently on startup inside an advisory-locked transaction, maintains atomic `history_id` and IMAP `uid_next` counters in PostgreSQL transactions, and uses PostgreSQL full-text search (`to_tsvector` and `plainto_tsquery` with `ILIKE` fallback). When `NOGML_STORAGE=postgres` is active, `EventBus` bridges events across nodes via `PostgresEventBridge` (`LISTEN`/`NOTIFY` on `nogml_events`) so SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch` push hooks fan out across all replicas.
 
 ## Configuration
 
@@ -234,7 +298,7 @@ Every CLI flag has a matching environment variable:
 | `NOGML_BLOB_S3_SECRET_ACCESS_KEY` | `--blob-s3-secret-access-key` | *(none)* | S3 secret access key |
 | `NOGML_BLOB_S3_SESSION_TOKEN` | `--blob-s3-session-token` | *(none)* | Optional S3 STS session token |
 | `NOGML_BLOB_S3_FORCE_PATH_STYLE` | `--blob-s3-force-path-style` | *(true with endpoint)* | Use path-style URLs (`/{bucket}/{key}`) instead of virtual-host URLs |
-| `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens with full scopes |
+| `NOGML_AUTH_TOKENS` | `--auth-tokens` | *(empty = dev mode)* | Comma-separated bearer/API tokens with full global operator scopes |
 | `NOGML_SCOPED_TOKENS` | `--scoped-tokens` | *(none)* | JSON array of scoped API keys (`token`, `mailbox_id`, `shared_mailboxes`, `scopes`, `draft_only`, `allowed_recipients`, `max_send_recipients`) |
 | `NOGML_OAUTH2_CLIENT_ID` | `--oauth2-client-id` | *(disabled)* | Local OAuth2 client ID (enables `/oauth2/*` and `/.well-known/oauth-authorization-server` when paired with `NOGML_OAUTH2_SIGNING_SECRET`) |
 | `NOGML_OAUTH2_CLIENT_SECRET` | `--oauth2-client-secret` | *(none)* | Optional local OAuth2 client secret verified on `POST /oauth2/token` |
@@ -255,7 +319,7 @@ Every CLI flag has a matching environment variable:
 | `NOGML_SMTP_HOST` / `PORT` | `--smtp-host` / `--smtp-port` | `127.0.0.1` / `587` | Upstream SMTP submission host and TCP port |
 | `NOGML_SMTP_TLS_MODE` | `--smtp-tls-mode` | `starttls` | SMTP TLS mode (`starttls`, `tls`, or `none`) |
 | `NOGML_SMTP_USERNAME` / `PASSWORD` | `--smtp-username` / `--smtp-password` | *(none)* | Optional SMTP AUTH credentials (`PLAIN` or `LOGIN`) |
-| `NOGML_SMTP_OAUTH_TOKEN` | `--smtp-oauth-token` | *(none)* | Optional static OAuth2 access token for SMTP `AUTH XOAUTH2` (when unset and `smtp_password` is unset, Gmail OAuth2 credentials are used automatically if configured) |
+| `NOGML_SMTP_OAUTH_TOKEN` | `--smtp-oauth-token` | *(none)* | Optional static OAuth2 access token for SMTP `AUTH XOAUTH2` (falls back to Gmail OAuth2 credentials when unset and `smtp_password` is unset) |
 | `NOGML_SMTP_HELO_DOMAIN` | `--smtp-helo-domain` | `NOGML_DEFAULT_DOMAIN` | Domain advertised in `EHLO` |
 | `NOGML_DRAFT_ONLY` | `--draft-only` | `false` | Prevent direct outbound sends |
 | `NOGML_DRAFT_ONLY_ACTION` | `--draft-only-action` | `block` | Action when `draft_only=true` (`block` or `downgrade`) |
@@ -263,6 +327,9 @@ Every CLI flag has a matching environment variable:
 | `NOGML_FIRST_CONTACT_APPROVAL` | `--first-contact-approval` | `false` | Hold outbound sends for human approval when any recipient has no prior sent history |
 | `NOGML_REQUIRE_VERIFIED_FROM_DOMAIN` | `--require-verified-from-domain` | `false` | Reject outbound sends whose `From` domain is neither `default_domain` nor a `verified` BYOD domain owned by the sender's mailbox |
 | `NOGML_DLP_ACTION` | `--dlp-action` | `off` | Outbound secret and PII DLP scanner action (`off`, `hold`, or `deny`) |
+| `NOGML_DAILY_SEND_LIMIT_PER_DOMAIN` | `--daily-send-limit-per-domain` | `0` (unlimited) | Maximum outbound sends per UTC day per sender domain |
+| `NOGML_MAX_BOUNCE_RATE` / `NOGML_MAX_COMPLAINT_RATE` | `--max-bounce-rate` / `--max-complaint-rate` | `0.05` / `0.001` | Rolling bounce and complaint thresholds that trip the per-domain circuit breaker |
+| `NOGML_DELIVERABILITY_MIN_SAMPLES` / `WINDOW_SECS` | `--deliverability-min-samples` / `--deliverability-window-secs` | `20` / `86400` | Minimum sent sample count and rolling window in seconds for the circuit breaker |
 | `NOGML_APPROVAL_TTL_SECS` | `--approval-ttl-secs` | `86400` | Time-to-live in seconds for pending outbound approval requests |
 | `NOGML_APPROVAL_WEBHOOK_URL` | `--approval-webhook-url` | *(none)* | Optional HTTP POST webhook URL (generic JSON and Slack-compatible `text`) notified when a send enters approval |
 | `NOGML_ALLOWED_RECIPIENTS` | `--allowed-recipients` | *(unrestricted)* | Comma-separated allowlist (`a@b.com`, `@domain.com`, `*.domain.com`) |
@@ -273,11 +340,13 @@ Every CLI flag has a matching environment variable:
 | `NOGML_IMAP_TLS_BIND` | `--imap-tls-bind` | *(disabled)* | Embedded IMAP implicit TLS listen address |
 | `NOGML_IMAP_TLS_CERT` / `KEY` | `--imap-tls-cert` / `--imap-tls-key` | *(none)* | PEM certificate chain and private key for IMAP TLS |
 | `NOGML_IMAP_USERNAME` / `PASSWORD` | `--imap-username` / `--imap-password` | *(user_email / first token)* | IMAP login override |
+| `NOGML_IMAP_QUOTA_BYTES` | `--imap-quota-bytes` | `16106127360` (15 GiB) | Storage quota ceiling advertised by RFC 2087 `GETQUOTAROOT` / `GETQUOTA` |
 | `NOGML_SYNC_MODE` | `--sync-mode` | `api` | Upstream Gmail sync mode (`api` or `imap`) |
-| `NOGML_SYNC_BIDIRECTIONAL` | `--sync-bidirectional` | `false` | Push local label, flag, trash, and delete changes back to the upstream account |
+| `NOGML_SYNC_BIDIRECTIONAL` | `--sync-bidirectional` | `false` | Push local label, flag, draft, Sent, trash, and delete changes back to the upstream account |
 | `NOGML_SYNC_INTERVAL_SECS` | `--sync-interval-secs` | `0` | Background sync interval in seconds (`0` disables) |
-| `GMAIL_CLIENT_ID` / `SECRET` / `REFRESH_TOKEN` / `ACCESS_TOKEN` | `--gmail-*` | *(none)* | Upstream Gmail REST API credentials |
-| `GMAIL_IMAP_USER` / `PASSWORD` | `--gmail-imap-*` | *(none)* | Upstream Gmail IMAP credentials |
+| `GMAIL_CLIENT_ID` / `SECRET` / `REFRESH_TOKEN` / `ACCESS_TOKEN` | `--gmail-*` | *(none)* | Upstream Gmail REST API and Gmail IMAP `XOAUTH2` credentials |
+| `GMAIL_IMAP_USER` / `PASSWORD` | `--gmail-imap-*` | *(none)* | Upstream IMAP login credentials |
+| `NOGML_GMAIL_IMAP_FOLDERS` / `ARCHIVE_MAILBOX` / `IDLE` | `--gmail-imap-folders` / `--gmail-imap-archive-mailbox` / `--gmail-imap-idle` | *(All Mail / Archive / `false`)* | Multi-folder IMAP sync list, non-Gmail archive target, and optional background `IDLE` wakeup |
 | `NOGML_WATCH_WEBHOOK_URL` | `--watch-webhook-url` | *(none)* | Optional push webhook URL for active Gmail `/watch` subscriptions |
 | `NOGML_FILTER_AUTH_RESULTS` | `--filter-auth-results` | `false` | Enable `AuthResultsFilter` to evaluate `Authentication-Results` headers (`spf`, `dkim`, `dmarc`) |
 | `NOGML_FILTER_DMARC_FAIL_ACTION` | `--filter-dmarc-fail-action` | `spam` | Action on DMARC failure (`spam`, `reject`, `tag`, `allow`) |
@@ -370,7 +439,7 @@ Superhuman-style and custom HTTP clients: override the Gmail REST root from `htt
 
 ### Scoped API keys and local OAuth2
 
-Use `nogml auth mint-token` or `NOGML_SCOPED_TOKENS` to issue least-privilege keys with explicit scopes (`read`, `write`, `send`, `admin`) and optional per-agent outbound overrides (`draft_only`, `allowed_recipients`, `max_send_recipients`). Scopes are enforced across `/v1`, `/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`, `/mcp`, and IMAP (`STORE`, `COPY`, `MOVE`, `EXPUNGE`, `APPEND`, `CREATE`, `DELETE`, and `RENAME` require `write`). Legacy `NOGML_AUTH_TOKENS` entries keep full scopes.
+Use `nogml auth mint-token` or `NOGML_SCOPED_TOKENS` to issue least-privilege keys with explicit scopes (`read`, `write`, `send`, `admin`) and optional per-agent outbound overrides (`draft_only`, `allowed_recipients`, `max_send_recipients`). Scopes are enforced across `/v1`, `/gmail/v1`, `/upload/gmail/v1`, `/batch/gmail/v1`, `/mcp`, and IMAP (`STORE`, `COPY`, `MOVE`, `EXPUNGE`, `APPEND`, `CREATE`, `DELETE`, and `RENAME` require `write`). Legacy `NOGML_AUTH_TOKENS` entries keep global operator privileges.
 
 ```bash
 # Mint a per-agent token stored in a mode 0600 file and emit a [[auth.scoped_tokens]] snippet
@@ -387,11 +456,11 @@ NOGML_SCOPED_TOKENS="$(nogml auth mint-token --mailbox agent@example.com --scope
 nogml serve --user-email agent@example.com
 ```
 
-To support Gmail API SDKs and IMAP clients that expect OAuth2 token exchange, set `NOGML_OAUTH2_CLIENT_ID`, `NOGML_OAUTH2_SIGNING_SECRET`, and optionally `NOGML_OAUTH2_CLIENT_SECRET`. `nogml` then exposes `GET /.well-known/oauth-authorization-server`, `GET /oauth2/authorize` (with PKCE `S256` and `plain`), and `POST /oauth2/token` (`authorization_code`, `refresh_token`, and `client_credentials`), minting HS256 JWT bearer tokens accepted on HTTP endpoints and IMAP `AUTHENTICATE XOAUTH2`.
+To support Gmail API SDKs and IMAP clients that expect OAuth2 token exchange, set `NOGML_OAUTH2_CLIENT_ID`, `NOGML_OAUTH2_SIGNING_SECRET`, and optionally `NOGML_OAUTH2_CLIENT_SECRET`. `nogml` then exposes `GET /.well-known/oauth-authorization-server`, `GET /oauth2/authorize` (with PKCE `S256` and `plain`), and `POST /oauth2/token` (`authorization_code`, `refresh_token`, and `client_credentials`), minting HS256 JWT bearer tokens accepted on HTTP endpoints and IMAP `AUTHENTICATE XOAUTH2` / `OAUTHBEARER`.
 
 ### Multi-mailbox hosting
 
-A single `nogml serve` process can host multiple isolated mailboxes by listing additional addresses in `NOGML_MAILBOXES` (or `--mailboxes`) and issuing per-mailbox credentials in `NOGML_SCOPED_TOKENS` (each entry carries a `mailbox_id`). Mailboxes are partitioned by `mailbox_id` across `MailStore` (both `SqliteStore` and `MemoryStore`), `BlobStore` (`mailboxes/<sanitized_mailbox>/...`), `SearchIndex` (FTS5 and vector embeddings), `EventBus` (SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch`), `sync_state`, contacts, inbox rules, and approvals.
+A single `nogml serve` process can host multiple isolated mailboxes by listing additional addresses in `NOGML_MAILBOXES` (or `--mailboxes`) and issuing per-mailbox credentials in `NOGML_SCOPED_TOKENS` (each entry carries a `mailbox_id`). Mailboxes are partitioned by `mailbox_id` across `MailStore` (`SqliteStore`, `MemoryStore`, and `PostgresStore`), `BlobStore` (`mailboxes/<sanitized_mailbox>/...`), `SearchIndex` (FTS5 and vector embeddings), `EventBus` (SSE `/v1/events`, IMAP `IDLE`, and Gmail `/watch`), `sync_state`, contacts, inbox rules, and approvals.
 
 ```bash
 NOGML_USER_EMAIL=alice@example.com \
@@ -402,7 +471,7 @@ nogml serve --imap-bind 127.0.0.1:1143
 
 - **HTTP and MCP**: Authenticated requests are scoped automatically to `Principal.mailbox_id`. Scoped tokens with `shared_mailboxes` can also access authorized team mailboxes via `/gmail/v1/users/<shared>/...` or the `X-Nogml-Mailbox: <shared>` header on `/v1/*` and `POST /mcp`, while requests targeting any unauthorized mailbox return `403 Forbidden`.
 - **Inbound webhooks and aliases**: When multiple mailboxes or `[mailboxes.aliases]` (`NOGML_MAILBOX_ALIASES`) are configured, `POST /webhooks/resend` and `POST /webhooks/ses` map alias envelope recipients to their target mailbox and deliver only to matching local mailboxes. Mailbox owners can also send from their configured aliases via `from` / `From:` and Gmail `settings/sendAs`.
-- **IMAP**: Clients authenticate with `LOGIN <mailbox_id> <scoped_token>`, `AUTHENTICATE PLAIN`, or `AUTHENTICATE XOAUTH2` for their own mailbox or any mailbox listed in their token's `shared_mailboxes`, and see only that mailbox's folders, UIDs, messages, and `IDLE` updates.
+- **IMAP**: Clients authenticate with `LOGIN <mailbox_id> <scoped_token>`, `AUTHENTICATE PLAIN`, `AUTHENTICATE XOAUTH2`, or `AUTHENTICATE OAUTHBEARER` for their own mailbox or any mailbox listed in their token's `shared_mailboxes`, and see only that mailbox's folders, UIDs, messages, and `IDLE` updates.
 - **Multi-account upstream sync**: Configure multiple `[[sync.accounts]]` entries in `nogml.toml` to run independent per-mailbox background sync loops in `nogml serve`, or run `nogml sync gmail --mailbox bob@example.com` to select and sync a specific account with isolated `sync_state` checkpoints.
 
 ### IMAP clients
@@ -411,28 +480,9 @@ Set `--imap-bind 127.0.0.1:1143` (or `--imap-tls-bind 127.0.0.1:1993` with a TLS
 
 ### Resend and AWS SES webhooks
 
-Set your Resend webhook endpoint to `POST https://<your-host>/webhooks/resend` with `RESEND_WEBHOOK_SECRET=whsec_...`. On each request, `nogml` verifies the Svix signature in constant time, fetches the inbound message and attachments from the Resend Receiving API, runs `InboundFilter`, threads replies using `In-Reply-To` and `References`, deduplicates by `Message-ID`, and records delivery status events (`email.sent`, `email.delivered`, `email.bounced`, and others).
+Set your Resend webhook endpoint to `POST https://<your-host>/webhooks/resend` with `RESEND_WEBHOOK_SECRET=whsec_...`. On each request, `nogml` verifies the Svix signature in constant time, fetches the inbound message and attachments from the Resend Receiving API, runs `InboundFilter`, threads replies using `In-Reply-To` and `References`, deduplicates by `Message-ID`, and records delivery status events (`email.sent`, `email.delivered`, `email.bounced`, `email.complained`, and others) into the deliverability suppression and circuit-breaker store.
 
-For AWS SES inbound mail, point an SNS HTTP(S) subscription at `POST https://<your-host>/webhooks/ses` (optionally adding `?secret=<token>` or `X-Nogml-Webhook-Secret` matching `NOGML_SES_WEBHOOK_SECRET`). `nogml` logs SNS `SubscriptionConfirmation` URLs and ingests `Received` notifications from either inline base64 `content` or SigV4-signed S3 `.eml` objects through the same `ingest_inbound_rfc2822` pipeline.
-
-## Embedding as a Rust library
-
-Pass custom trait implementations to `AppState` to embed `nogml` in your own Rust binary:
-
-```rust
-use std::sync::Arc;
-use nogml::{AppState, build_router, config::Config};
-
-let state = AppState::from_config(Config::default())?
-    .with_blobs(Arc::new(my_s3_blob_store))
-    .with_transport(Arc::new(my_ses_transport))
-    .with_filter(Arc::new(my_spam_filter_chain))
-    .with_auth(Arc::new(my_jwt_auth_provider))
-    .with_search(Arc::new(my_vector_search_index))
-    .with_outbound_policy(Arc::new(my_human_approval_policy));
-
-let router = build_router(state);
-```
+For AWS SES inbound mail, point an SNS HTTP(S) subscription at `POST https://<your-host>/webhooks/ses` (optionally adding `?secret=<token>` or `X-Nogml-Webhook-Secret` matching `NOGML_SES_WEBHOOK_SECRET`). `nogml` logs SNS `SubscriptionConfirmation` URLs, ingests `Received` notifications from either inline base64 `content` or SigV4-signed S3 `.eml` objects through the same `ingest_inbound_rfc2822` pipeline, and records SNS `Bounce` and `Complaint` notifications into the deliverability protection subsystem.
 
 ## License
 
